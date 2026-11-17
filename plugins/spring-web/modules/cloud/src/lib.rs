@@ -5,7 +5,10 @@
 
 mod checks;
 mod gateway_dsl;
+mod navigation;
+mod services;
 pub use gateway_dsl::GatewayRoute;
+pub use navigation::CHOOSE_TARGET;
 
 use openidea_plugin::providers::{CompletionItem, CompletionKind, Document, LineMarker, Providers};
 use openidea_plugin::text::offset;
@@ -109,6 +112,8 @@ pub struct Endpoint {
     pub label: String,
     /// Literal Feign `contextId` / `configuration` of the client, when written.
     pub note: String,
+    /// Literal discovery service name; absent for dynamic names or explicit URLs.
+    pub service: Option<String>,
 }
 
 /// The single string literal of `a`'s first set attribute among `names`; `None` when that attribute isn't one literal.
@@ -216,6 +221,7 @@ pub fn facts_in(path: &str, text: &str) -> JavaFacts {
                         range: span(m.at, &m.name),
                         label: format!("{}.{}()", c.name, m.name),
                         note: feign_note(feign),
+                        service: services::client_name(feign),
                     });
                 }
             }
@@ -246,6 +252,7 @@ pub fn facts_in(path: &str, text: &str) -> JavaFacts {
                         range: span(m.at, &m.name),
                         label: format!("{}.{}()", c.name, m.name),
                         note: String::new(),
+                        service: None,
                     });
                 }
             }
@@ -253,7 +260,7 @@ pub fn facts_in(path: &str, text: &str) -> JavaFacts {
             for m in c.methods() {
                 for (verb, path) in java::mappings(c, m) {
                     let label = format!("{}.{}()", c.name, m.name);
-                    out.servers.push(Endpoint { verb, path, range: span(m.at, &m.name), label, note: String::new() });
+                    out.servers.push(Endpoint { verb, path, range: span(m.at, &m.name), label, note: String::new(), service: None });
                 }
             }
         }
@@ -313,6 +320,8 @@ pub struct Name {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StreamConfig {
+    /// Static application-name evidence, not an effective runtime identity.
+    pub service: services::Config,
     /// Binding names written under `spring.cloud.stream.bindings.` and `spring.cloud.stream.function.bindings.`.
     pub bindings: Vec<Name>,
     /// The values of `spring.cloud.stream.function.bindings.*` (binding aliases).
@@ -576,7 +585,9 @@ fn config_file(path: &str, text: &str) -> Option<StreamConfig> {
     if !config::is_config_file(path) {
         return None;
     }
-    let found = stream_config(text, &config::keys(path, text));
+    let keys = config::keys(path, text);
+    let mut found = stream_config(text, &keys);
+    found.service = services::Config::parse(path, text, &keys);
     (found != StreamConfig::default()).then_some(found)
 }
 
@@ -586,7 +597,7 @@ fn same_path(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x == y || x.starts_with('{') || y.starts_with('{'))
 }
 
-/// Whether a Feign `client` method calls the `server` endpoint (any service: the name isn't compared).
+/// HTTP shape only; navigation also checks the server module's service identity.
 fn calls(client: &Endpoint, server: &Endpoint) -> bool {
     !client.path.contains("${")
         && !server.path.contains("${")
@@ -709,6 +720,7 @@ pub struct CloudTools {
     config: Indexes<StreamConfig>,
     builds: Indexes<checks::Build>,
     expansion: Expansion,
+    navigation: navigation::State,
 }
 
 impl Default for CloudTools {
@@ -718,6 +730,7 @@ impl Default for CloudTools {
             config: Indexes::new(CONFIG_GLOBS, config_file),
             builds: Indexes::new(checks::BUILD_GLOBS, checks::read_build),
             expansion: Expansion::default(),
+            navigation: navigation::State::default(),
         }
     }
 }
@@ -765,20 +778,14 @@ impl CloudTools {
             problems.extend(checks::legacy_stream(&doc.path, &doc.text, java).iter().map(|f| f.diagnostic(&doc.text)));
         }
         publish(&doc.path, &problems);
-        let endpoints = |pick: fn(&JavaFacts) -> &Vec<Endpoint>, matches: &dyn Fn(&Endpoint) -> bool| {
-            java.iter()
-                .flat_map(|(p, f)| pick(f).iter().map(move |e| (p, e)))
-                .filter(|(_, e)| matches(e))
-                .map(|(p, e)| (Location { path: p.to_owned(), range: e.range }, format!("{} ({} {})", e.label, e.verb, e.path)))
-                .collect::<Vec<_>>()
-        };
-        let mut markers = Vec::new();
-        for c in &facts.clients {
-            markers.extend(marker(c.range, "Calls", &endpoints(|f| &f.servers, &|s| calls(c, s))));
-        }
-        for s in &facts.servers {
-            markers.extend(marker(s.range, "Called by Feign client", &endpoints(|f| &f.clients, &|c| calls(c, s))));
-        }
+        let groups = navigation::groups(doc, &facts, java, config);
+        let mut markers: Vec<_> = groups
+            .iter()
+            .filter_map(|(&line, choices)| {
+                let [choice] = choices.as_slice() else { return None };
+                Some(LineMarker { line, icon: None, tooltip: choice.label.clone(), target: Some(choice.location.clone()) })
+            })
+            .collect();
         for f in &facts.functions {
             markers.extend(marker(f.range, "Stream bindings:", &uses(config, &f.name)));
         }
@@ -929,13 +936,11 @@ impl Providers for CloudTools {
     fn definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
         if is_jvm(doc) {
             let facts = facts_in(&doc.path, &doc.text);
-            let Some(client) = facts.clients.into_iter().find(|c| contains(c.range, at)) else { return Vec::new() };
-            let Some((java, _)) = self.indexes(doc) else { return Vec::new() };
-            return java
-                .iter()
-                .flat_map(|(p, f)| f.servers.iter().filter(|s| calls(&client, s)).map(move |s| (p, s)))
-                .map(|(p, s)| Location { path: p.to_owned(), range: s.range })
-                .collect();
+            if !facts.clients.iter().any(|c| contains(c.range, at)) {
+                return Vec::new();
+            }
+            let Some((java, config)) = self.indexes(doc) else { return Vec::new() };
+            return navigation::definitions(&facts, at, java, config);
         }
         if !config::is_config_file(&doc.path) {
             return Vec::new();
@@ -955,7 +960,10 @@ impl Providers for CloudTools {
 }
 
 impl Plugin for CloudTools {
-    fn run_command(&mut self, id: &str, _ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
+    fn run_command(&mut self, id: &str, ctx: &Invocation, arg: Option<&str>) -> Result<Option<String>, Error> {
+        if id == CHOOSE_TARGET {
+            return self.choose_target(ctx, arg);
+        }
         Err(Error::NotFound(format!("command {id}")))
     }
 }
@@ -1869,3 +1877,6 @@ impl CloudTools {
 }
 
 mod live;
+
+#[cfg(test)]
+mod service_navigation_tests;

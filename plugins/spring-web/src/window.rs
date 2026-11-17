@@ -42,6 +42,8 @@ struct Applies {
 
 mod live;
 mod path_actions;
+#[cfg(test)]
+mod feign_navigation_tests;
 
 pub struct Endpoints {
     live: live::Live,
@@ -267,6 +269,7 @@ impl Plugin for Endpoints {
         Ok(())
     }
     fn run_command(&mut self, id: &str, ctx: &Invocation, arg: Option<&str>) -> Result<Option<String>, Error> {
+        if id == cloud::CHOOSE_TARGET { return self.cloud.run_command(id, ctx, arg); }
         if matches!(id,crate::graphql_subscriptions::START|crate::graphql_subscriptions::POLL|crate::graphql_subscriptions::CANCEL){self.subscriptions.run_command(id,ctx)?;return Ok(None)}
         if id==crate::subscription_drafts::COMMAND {crate::subscription_drafts::run(&mut self.graphql,ctx,arg)?;return Ok(None)}
         if id==crate::source_lenses::GRAPHQL_COMMAND {crate::source_lenses::run_graphql(&mut self.graphql,ctx,arg)?;return Ok(None)}
@@ -528,6 +531,9 @@ mod transition_owner_tests {
 }
 
 impl openidea_plugin::language_features::LanguageFeatures for Endpoints {
+    fn gutter_actions(&mut self, doc: &Document) -> Vec<openidea_plugin::language_features::GutterAction> {
+        if self.wants_cloud(doc) { self.cloud.gutter_actions(doc) } else { Vec::new() }
+    }
     fn code_lenses(&mut self,doc:&Document)->Vec<openidea_plugin::language_features::CodeLens>{
         if !matches!(doc.language.as_str(),"java"|"kotlin"){return Vec::new()}
         let mut lenses=if self.wants_web(doc){crate::source_lenses::lenses(doc)}else{Vec::new()};
