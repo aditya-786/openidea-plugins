@@ -7,6 +7,7 @@ pub const INDEX_FILE: &str = "var/cache/dev/profiler/index.csv";
 pub const MAX_ROWS: usize = 100;
 const MAX_BYTES: usize = 1024 * 1024;
 const MAX_RECORDS: usize = 10_000;
+const OUTSIDE_PROJECT: &str = "The profiler index is outside this project. Use Choose CSV Source… to pick one inside it, then Refresh.";
 #[derive(Debug, PartialEq, Eq)]
 pub struct Request {
     pub line: u32,
@@ -114,30 +115,30 @@ fn display_url(raw: &str) -> String {
 }
 fn parse(text: &str) -> Result<(Vec<Request>, usize), &'static str> {
     if text.len() > MAX_BYTES {
-        return Err("Index exceeds1 MiB; refresh refused.");
+        return Err("The profiler index is larger than 1 MiB. Clear old profiles with cache:clear, then Refresh.");
     }
     let mut requests = Vec::new();
     let mut seen = BTreeSet::new();
     let mut ambiguous = BTreeSet::new();
     for (n, line) in text.lines().enumerate() {
         if n >= MAX_RECORDS {
-            return Err("Index exceeds10000 physical records; refresh refused.");
+            return Err("The profiler index has more than 10,000 lines. Clear old profiles with cache:clear, then Refresh.");
         }
         if line.is_empty() {
             continue;
         }
         // Refuse malformed records rather than accidentally treating a multiline continuation as a request.
         if line.len() > 16 * 1024 || line.chars().any(|c| c.is_control() && c != '\t') {
-            return Err("Malformed or unsupported index record; refresh refused.");
+            return Err("The profiler index has an unreadable line. Clear old profiles with cache:clear, then Refresh.");
         }
-        let mut f = fields(line).ok_or("Malformed or multiline CSV; refresh refused.")?;
+        let mut f = fields(line).ok_or("The profiler index is not valid CSV. Clear old profiles with cache:clear, then Refresh.")?;
         // Symfony 6.4+ appends virtual_type; older storage has seven columns.
         if f.len() == 8 {
             let kind=f.pop().unwrap();
             if !kind.is_empty() && kind != "request" { continue; }
         }
         let [token, ip, method, url, time, parent, status] = <[String; 7]>::try_from(f)
-            .map_err(|_| "Unsupported index columns; refresh refused.")?;
+            .map_err(|_| "This file is not a Symfony profiler index. Use Choose CSV Source… to pick profiler/index.csv.")?;
         if !parent.is_empty() {
             continue;
         }
@@ -198,10 +199,10 @@ fn configured_source() -> Result<String, &'static str> {
         None => INDEX_FILE.to_owned(),
         Some(raw) => {
             if raw.len() > 32 << 10 {
-                return Err("Profiler index setting exceeds its32KiB JSON bound.");
+                return Err("The Profiler index path setting is longer than 32 KiB. Shorten it in Settings › Plugins › Symfony.");
             }
             serde_json::from_str::<String>(&raw)
-                .map_err(|_| "Profiler index setting must be a JSON string.")?
+                .map_err(|_| "The Profiler index path setting must be text. Fix it in Settings › Plugins › Symfony.")?
         }
     };
     normalized_source(&value)
@@ -223,7 +224,7 @@ fn normalized_source(value: &str) -> Result<String, &'static str> {
             .any(|p| p.is_empty() || p == "." || p == "..")
     {
         return Err(
-            "Profiler index needs a normalized project-relative path (max4096 bytes,32 components; no traversal/globs/absolute paths).",
+            "The profiler index path must be relative to the project, at most 32 folders deep, without .., wildcards or a leading /.",
         );
     }
     Ok(source.into())
@@ -236,12 +237,12 @@ fn preference_key(root: &str) -> String {
 #[serde(deny_unknown_fields)]
 struct SourcePreference { version: u8, root: String, source: String }
 fn project_source(root: &str) -> Result<String, &'static str> {
-    let raw = host::storage::get(&preference_key(root)).map_err(|_| "Profiler project preference is unavailable; source selection refused.")?;
+    let raw = host::storage::get(&preference_key(root)).map_err(|_| "The saved profiler CSV source for this project can't be read. Use Choose CSV Source… to set it again.")?;
     let Some(raw) = raw else { return configured_source(); };
-    if raw.len() > 32 << 10 { return Err("Profiler project preference exceeds its bound."); }
-    let value: SourcePreference = serde_json::from_str(&raw).map_err(|_| "Profiler project preference is malformed.")?;
-    if value.version != 1 || value.root != root { return Err("Profiler project preference belongs to another root or version."); }
-    if value.source.trim().is_empty() { return Err("Profiler project preference has an empty source."); }
+    if raw.len() > 32 << 10 { return Err("The saved profiler CSV source for this project is invalid. Use Choose CSV Source… to set it again."); }
+    let value: SourcePreference = serde_json::from_str(&raw).map_err(|_| "The saved profiler CSV source for this project is invalid. Use Choose CSV Source… to set it again.")?;
+    if value.version != 1 || value.root != root { return Err("The saved profiler CSV source for this project is invalid. Use Choose CSV Source… to set it again."); }
+    if value.source.trim().is_empty() { return Err("The saved profiler CSV source for this project is invalid. Use Choose CSV Source… to set it again."); }
     normalized_source(&value.source)
 }
 /// Stores only a project-bound preference. Reading its CSV is a separate explicit action.
@@ -257,7 +258,7 @@ pub(crate) fn choose_source(ctx: &Invocation) -> Result<bool, Error> {
         || host::project_of(&format!("{}/composer.json", root.trim_end_matches('/'))).and_then(|p|p.root().ok()).as_deref() != Some(root.as_str()) {
         return Err(Error::Stale);
     }
-    if answer.len() > 32 << 10 { return Err(Error::Invalid("Profiler project source input exceeds its bound.".into())); }
+    if answer.len() > 32 << 10 { return Err(Error::Invalid("That path is too long (over 32 KiB).".into())); }
     if answer.trim().is_empty() { host::storage::delete(&key)?; }
     else {
         let source = normalized_source(&answer).map_err(|reason| Error::Invalid(reason.into()))?;
@@ -283,9 +284,9 @@ pub(crate) fn discover_source(ctx: &Invocation) -> Result<bool, Error> {
     let key = preference_key(&root);
     let baseline = host::storage::get(&key)?;
     let candidates = discovered_sources(&project, &root);
-    if candidates.is_empty() { return Err(Error::NotFound("No owned profiler/index.csv beside an existing configured compiled container; choose a project CSV path manually.".into())); }
+    if candidates.is_empty() { return Err(Error::NotFound("No profiler data yet: load a page in dev mode, then try again, or use Choose CSV Source…".into())); }
     let items: Vec<_> = candidates.iter().enumerate().map(|(i, path)| openidea_plugin::PickItem::new(&i.to_string(), path)).collect();
-    let Some(chosen) = host::pick("Project profiler CSV sources beside compiled containers", &items)? else { return Ok(false); };
+    let Some(chosen) = host::pick("Choose a profiler index", &items)? else { return Ok(false); };
     let selected = chosen.parse::<usize>().ok().and_then(|i| candidates.get(i)).ok_or(Error::Stale)?;
     if project.root()? != root || host::storage::get(&key)? != baseline
         || discovered_sources(&project, &root) != candidates { return Err(Error::Stale); }
@@ -336,7 +337,7 @@ impl Snapshot {
         let rows=self.rows.as_ref().ok_or(Error::Stale)?;
         let items:Vec<_>=rows.iter().map(|r|PickItem::new(&r.token,&format!("{} {} {}",r.token,r.method,r.url))).collect();
         let token=if let Some(token)=&self.selected {token.clone()} else {
-            let Some(token)=host::pick("Inspect local profiler collectors",&items)? else {return Ok(());};token
+            let Some(token)=host::pick("Choose a request to inspect",&items)? else {return Ok(());};token
         };
         let prior=rows.iter().find(|r|r.token==token).ok_or(Error::Stale)?;
         let (fresh,_)=load(&project,&source).map_err(|_|Error::Stale)?;
@@ -360,7 +361,7 @@ impl Snapshot {
             !path.is_empty() && (target == path || target.strip_prefix(path).is_some_and(|rest| rest.starts_with('/')) || self.details.is_some() && target.rsplit_once('/').is_some_and(|(parent,_)| path.starts_with(&format!("{parent}/"))))
         });
         if !affected || self.rows.is_none() { return false; }
-        let status = "STALE filesystem change observed; cached rows/details retained until explicit refresh.";
+        let status = "The profiler index changed. Refresh to see new requests.";
         let removed_details=self.details.take().is_some();
         if self.status == status { return removed_details; }
         self.status = status.into();
@@ -385,7 +386,7 @@ impl Snapshot {
             Err(reason) => {
                 *self = Self {
                     root,
-                    status: format!("{reason} No snapshot available for this source selection."),
+                    status: reason.to_owned(),
                     ..Self::default()
                 };
                 return;
@@ -405,16 +406,12 @@ impl Snapshot {
                 self.rows = Some(rows);
                 self.total = total;
                 self.page = 0;
-                self.status="Explicit project-visible index snapshot; may have changed since refresh, not live runtime data.".into();
+                self.status="Requests as of the last Refresh.".into();
             }
             Err(reason) => {
                 self.status = format!(
-                    "{reason} {}",
-                    if self.rows.is_some() {
-                        "STALE last-good snapshot retained; it may no longer describe the source."
-                    } else {
-                        "No snapshot available."
-                    }
+                    "{reason}{}",
+                    if self.rows.is_some() { " Showing the requests from the previous Refresh." } else { "" }
                 )
             }
         }
@@ -464,7 +461,7 @@ impl Snapshot {
         self.render_mode(ctx, ui_kit::web::is_rendering())
     }
     fn render_mode(&self, ctx: &Invocation, packaged: bool) -> View {
-        let refresh = Button::new("refresh-profiler", "Refresh index snapshot").icon("refresh");
+        let refresh = Button::new("refresh-profiler", "Refresh").icon("refresh");
         let Some(root) = ctx
             .project()
             .and_then(|p| p.root().ok())
@@ -479,10 +476,10 @@ impl Snapshot {
             Err(reason) => return View::message(reason).button(refresh).button(choose).button(discover),
         };
         if self.root != root || self.source != source {
-            return View::message(&format!("Refresh to read this project's profiler index ({source}). No automatic runtime requests.")).button(refresh).button(choose).button(discover);
+            return View::message(&format!("Refresh to read this project's profiler index ({source}).")).button(refresh).button(choose).button(discover);
         }
         if !owned_index(&root, &source) {
-            return View::message("Profiler index ownership is unavailable or changed; cached rows/details are hidden. Refresh after restoring this source scope.").button(refresh).button(choose).button(discover);
+            return View::message(OUTSIDE_PROJECT).button(refresh).button(choose).button(discover);
         }
         if let Some(details)=&self.details { return details.view(); }
         let Some(all_rows) = self.rows.as_ref() else {
@@ -502,7 +499,7 @@ impl Snapshot {
             ]
         };
         let body = if packaged {
-            let items:Vec<_>=rows.iter().map(|r|json!({"key":self.row_key(&r.token),"label":format!("{} {}",r.method,r.url),"cells":cells(r),"details":[{"label":"Open target","value":"Source index row; no collector/profile page"},{"label":"Source","value":self.source},{"label":"Source line","value":(r.line+1).to_string()},{"label":"Provenance","value":"Explicit project-visible CSV index snapshot; collector details unavailable"},{"label":"Token","value":r.token},{"label":"URL disclosure","value":"Userinfo removed; query and fragment presence only"}]})).collect();
+            let items:Vec<_>=rows.iter().map(|r|json!({"key":self.row_key(&r.token),"label":format!("{} {}",r.method,r.url),"cells":cells(r),"details":[{"label":"Details","value":"Use Inspect Profile to see its collectors"},{"label":"Source","value":self.source},{"label":"Source line","value":(r.line+1).to_string()},{"label":"Token","value":r.token},{"label":"URL","value":"Query, fragment and credentials are hidden"}]})).collect();
             Body::Other {
                 kind: "resources".into(),
                 data: json!({"columns":columns,"facets":[1,2],"items":items}).to_string(),
@@ -524,7 +521,7 @@ impl Snapshot {
             view = view.button(Button::new("profiler-next-page", "Older Requests").icon("arrow-right"));
         }
         view.status(&format!(
-            "{} Showing {}-{} of {} valid unambiguous main requests (newest first, {} per page). Source: {}",
+            "{} Showing {}-{} of {} main requests (newest first, {} per page). Source: {}",
             self.status,
             if rows.is_empty() { 0 } else { start + 1 },
             start + rows.len(),
@@ -537,23 +534,23 @@ impl Snapshot {
 fn load(project: &Project, source: &str) -> Result<(Vec<Request>, usize), &'static str> {
     let root = project.root().map_err(read_error)?;
     if !owned_index(&root, &source) {
-        return Err("Profiler index ownership is unavailable or changed; refresh refused.");
+        return Err(OUTSIDE_PROJECT);
     }
     let stat = project.stat(source).map_err(read_error)?;
     if stat.kind != FileKind::File {
-        return Err("Index does not resolve to a file; refresh refused.");
+        return Err("The profiler index path is not a file. Use Choose CSV Source… to fix it.");
     }
     if stat.size > MAX_BYTES as u64 {
-        return Err("Index exceeds1 MiB; refresh refused.");
+        return Err("The profiler index is larger than 1 MiB. Clear old profiles with cache:clear, then Refresh.");
     }
     let text = project.read_file(source).map_err(read_error)?;
     parse(&text)
 }
 fn read_error(error: Error) -> &'static str {
     match error {
-        Error::Denied(_) => "Index read denied.",
-        Error::NotFound(_) => "Profiler index is missing.",
-        _ => "Index unavailable or unreadable (absence is not established).",
+        Error::Denied(_) => "The IDE refused to read the profiler index. Check that it is inside the project, then Refresh.",
+        Error::NotFound(_) => "No profiler data yet: load a page in dev mode, then Refresh.",
+        _ => "The profiler index can't be read. Check the file, then Refresh.",
     }
 }
 
@@ -568,7 +565,7 @@ mod tests {
         let mut state=Snapshot::default();let ctx=host.invocation();state.refresh(&ctx);
         host.answer_next_prompt(None);state.inspect(&ctx).unwrap();assert!(host.process_runs().is_empty());
         state.select(&state.row_key("abcdef"),&ctx);
-        assert!(matches!(state.inspect(&ctx),Err(Error::Denied(_))));assert!(state.details.is_none());assert!(host.process_runs().is_empty());
+        assert!(matches!(state.inspect(&ctx),Err(Error::Invalid(m)) if m.contains("process:php permission. Allow it in Settings › Plugins › Symfony")));assert!(state.details.is_none());assert!(host.process_runs().is_empty());
         state.select("request:foreign:abcdef",&ctx);assert!(state.selected.is_none());
     }
     #[test]
@@ -773,7 +770,7 @@ mod tests {
         let root = ctx.project().unwrap().root().unwrap();
         let roots = BTreeSet::from([root]);
         assert!(state.invalidate_changes(&BTreeSet::new(), &roots, true));
-        assert!(state.status.contains("STALE filesystem change"));
+        assert!(state.status.contains("profiler index changed"));
         assert!(!state.invalidate_changes(&BTreeSet::new(), &roots, true), "no duplicate invalidation");
         assert!(state.rows.is_some());
         assert!(state.invalidate_changes(&BTreeSet::new(), &BTreeSet::new(), false));
@@ -792,7 +789,7 @@ mod tests {
         assert_eq!(state.rows.as_ref().unwrap().len(), 1);
         host.add_file(INDEX_FILE, "malformed");
         state.refresh(&ctx);
-        assert!(state.render(&ctx).status.unwrap().contains("STALE"));
+        assert!(state.render(&ctx).status.unwrap().contains("previous Refresh"));
         assert_eq!(state.rows.as_ref().unwrap().len(), 1);
         host.set_project_root(Some("/other"));
         let other = host.invocation();
@@ -825,7 +822,7 @@ mod tests {
         assert!(state.rows.is_none());
         assert_eq!(
             read_error(Error::Denied("project.read".into())),
-            "Index read denied."
+            "The IDE refused to read the profiler index. Check that it is inside the project, then Refresh."
         );
     }
     #[test]
@@ -916,7 +913,7 @@ mod tests {
         );
         host.add_file("cache/profiler.csv", "malformed");
         state.refresh(&host.invocation());
-        assert!(state.status.contains("STALE"));
+        assert!(state.status.contains("previous Refresh"));
         assert_eq!(state.row_key("abcdef"), second);
         assert!(state.open(&second, &host.invocation()).is_err());
         host.set_setting(PATH_SETTING, &serde_json::to_string(INDEX_FILE).unwrap());
@@ -951,7 +948,7 @@ mod tests {
             cold.rows.is_none(),
             "cold refresh must not adopt a nested project's index"
         );
-        assert!(cold.status.contains("ownership"));
+        assert!(cold.status.contains("outside this project"));
         state.refresh(&host.invocation());
         assert!(matches!(
             state.render_mode(&host.invocation(), true).body,
@@ -981,7 +978,7 @@ mod tests {
         assert_eq!(data["items"][0]["cells"][5], "abcdef");
         assert_eq!(
             data["items"][0]["details"][0]["value"],
-            "Source index row; no collector/profile page"
+            "Use Inspect Profile to see its collectors"
         );
         assert_eq!(data["items"][0]["details"][1]["value"], INDEX_FILE);
         assert!(!data.to_string().contains("password"));
@@ -992,13 +989,13 @@ mod tests {
         let host = MockHost::install();
         let mut state = Snapshot::default();
         state.refresh(&host.invocation());
-        assert!(state.status.contains("missing"));
+        assert!(state.status.contains("No profiler data yet"));
         host.add_file(INDEX_FILE, &"x".repeat(MAX_BYTES + 1));
         state.refresh(&host.invocation());
         assert!(state.status.contains("1 MiB"));
         assert!(state.rows.is_none());
         assert!(
-            !read_error(Error::Invalid("host missing-or-unreadable".into())).contains("missing")
+            !read_error(Error::Invalid("host missing-or-unreadable".into())).contains("No profiler data yet")
         );
     }
 }

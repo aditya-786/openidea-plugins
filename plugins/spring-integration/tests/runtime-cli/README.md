@@ -1,6 +1,6 @@
 # Real Spring Batch CLI qualification
 
-Run `python3 plugins/spring-integration/tests/runtime-cli/verify.py` with Java17+ and Maven3.9+. Maven downloads pinned Spring Batch5.2.6 /6.0.6, H2 and their declared dependencies; an internet connection or populated Maven cache is required.
+Run `python3 plugins/spring-integration/tests/runtime-cli/verify.py` with Java 17+ and Maven3.9+. Maven downloads pinned Spring Batch5.2.6 /6.0.6, H2 and their declared dependencies; an internet connection or populated Maven cache is required.
 
 The runner always creates a fresh temporary directory. It never reads an existing application's settings, classpath or datasource configuration. It retains generated fixtures, Maven POMs, logs, dependency hashes and `receipt.json` there for inspection; jars and database state are not repository fixtures.
 

@@ -2,7 +2,8 @@
   "properties": {
     "diagnostics": {
       "type": "boolean",
-      "title": "Report missing routes, templates, services and translation keys, and duplicate routes",
+      "title": "Report missing routes, templates, services and translation keys",
+      "description": "Also reports duplicate routes.",
       "default": true
     },
     "controllerChecks": {
@@ -12,17 +13,20 @@
     },
     "serviceChecks": {
       "type": "boolean",
-      "title": "Report deprecated service classes, duplicate parameters and unknown named arguments",
+      "title": "Report deprecated service classes and service definition mistakes",
+      "description": "Deprecated service classes, duplicate parameters and unknown named arguments.",
       "default": true
     },
     "phpCallChecks": {
       "type": "boolean",
-      "title": "Report removed form type names, missing assets and unknown translation domains in PHP",
+      "title": "Report removed form type names, missing assets and domains in PHP",
+      "description": "Removed form type names, missing assets and unknown translation domains in PHP code.",
       "default": true
     },
     "twigChecks": {
       "type": "boolean",
-      "title": "Report missing routes, assets and translation domains and unknown route comparisons in Twig templates",
+      "title": "Report missing routes, assets and translation domains in Twig",
+      "description": "Also reports route names compared with the current route that no route defines.",
       "default": true
     },
     "twigSyntaxChecks": {
@@ -37,7 +41,8 @@
     },
     "commandChecks": {
       "type": "boolean",
-      "title": "Report invokable commands without an int return type and invalid console input modes",
+      "title": "Report console command return types and input mode mistakes",
+      "description": "Invokable commands without an int return type and invalid console input modes.",
       "default": true
     },
     "deprecationChecks": {
@@ -47,7 +52,8 @@
     },
     "practiceChecks": {
       "type": "boolean",
-      "title": "Hint at container access in controllers and constructors and report removed form and Twig APIs",
+      "title": "Hint at Symfony best practices and removed form and Twig APIs",
+      "description": "Container access in controllers and constructors, request-scoped values in constructors, and removed form and Twig APIs.",
       "default": true
     },
     "doctrineChecks": {
@@ -67,27 +73,32 @@
     },
     "compiledRoutes": {
       "type": "string",
-      "title": "Extra compiled route files, like url_generating_routes.php (project-relative, comma-separated)",
+      "title": "Extra compiled route files",
+      "description": "Project-relative, comma-separated, like var/cache/dev/url_generating_routes.php.",
       "default": ""
     },
     "extraServiceFiles": {
       "type": "string",
-      "title": "Extra service definition files outside config/ (project-relative, comma-separated YAML or XML)",
+      "title": "Extra service definition files outside config/",
+      "description": "Project-relative, comma-separated YAML or XML files.",
       "default": ""
     },
     "extraRoutingFiles": {
       "type": "string",
-      "title": "Extra routing files outside config/ (project-relative, comma-separated YAML or XML)",
+      "title": "Extra routing files outside config/",
+      "description": "Project-relative, comma-separated YAML or XML files.",
       "default": ""
     },
     "twigNamespaces": {
+      "title": "Extra Twig namespaces (legacy)",
       "type": "string",
-      "title": "Legacy global Twig navigation hints: name=relative-directory pairs (prefer project Twig Namespace Paths command; not runtime configuration)",
-      "default": ""
+      "default": "",
+      "description": "Legacy global Twig navigation hints: name=relative-directory pairs (prefer project Twig Namespace Paths command; not runtime configuration)"
     },
     "profilerIndexPath": {
       "type": "string",
-      "title": "Project-relative profiler CSV index (explicit refresh; empty uses default)",
+      "title": "Profiler index path",
+      "description": "Project-relative path of the profiler CSV index, read when you click Refresh in the Profiler tab. Empty uses var/cache/dev/profiler/index.csv.",
       "default": "var/cache/dev/profiler/index.csv"
     }
   }

@@ -49,72 +49,15 @@ pub(crate) struct State {
     next: u64,
     pending: BTreeMap<String, Pending>,
 }
-fn canonical(path: &str) -> bool {
-    let absolute = path.starts_with('/')
-        || path.as_bytes().get(1) == Some(&b':') && path.as_bytes().get(2) == Some(&b'/') && path.as_bytes()[0].is_ascii_alphabetic();
-    absolute
-        && path.len() <= 4096
-        && !path.chars().any(char::is_control)
-        && !path.contains(['\\'])
-        && !path.contains("//")
-        && !path.split('/').any(|p| matches!(p, "." | ".."))
-}
 fn root(doc: &Document) -> Option<String> {
-    let root = spring_text::index::project_of(&doc.path)?.root().ok()?;
-    if !canonical(&root)
-        || !canonical(&doc.path)
-        || root.ends_with('/')
-        || root.len() == 3 && root.as_bytes().get(1) == Some(&b':')
-        || root.is_empty()
-        || root == "/"
-        || root.contains(['\\', '\n', '\r'])
-        || root.contains("//")
-        || root.split('/').any(|p| matches!(p, "." | ".."))
-        || !doc.path.starts_with(&format!("{}/", root.trim_end_matches('/')))
-    {
-        return None;
-    }
-    Some(root)
-}
-fn wellformed(text: &str) -> bool {
-    use quick_xml::{events::Event, reader::NsReader};
-    let mut reader = NsReader::from_str(text);
-    let (mut depth, mut roots, mut nodes) = (0usize, 0, 0);
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e) | Event::Empty(e)) => {
-                nodes += 1;
-                if nodes > 2048 || depth >= 64 || !crate::xml_namespaces::valid(&reader, &e) {
-                    return false;
-                }
-                // Empty tags consume no depth; Reader's source position ends in '/>'.
-                let empty = text[..reader.buffer_position() as usize].ends_with("/>");
-                if depth == 0 {
-                    roots += 1;
-                }
-                if !empty {
-                    depth += 1;
-                }
-            }
-            Ok(Event::End(_)) => {
-                let Some(next) = depth.checked_sub(1) else {
-                    return false;
-                };
-                depth = next;
-            }
-            Ok(Event::Text(t)) if depth == 0 && !t.as_ref().trim().is_empty() => return false,
-            Ok(Event::DocType(_) | Event::GeneralRef(_) | Event::CData(_)) | Err(_) => return false,
-            Ok(Event::Eof) => return depth == 0 && roots == 1,
-            _ => {}
-        }
-    }
+    spring_text::index::owning_root(&doc.path)
 }
 fn debug_candidates(doc: &Document, selection: Range) -> Vec<(usize, usize)> {
     if doc.language != "xml"
         || !doc.path.ends_with(".xml")
         || doc.text.len() > MAX_TEXT
         || !host::setting_bool("springSecurity.checkDebug").unwrap_or(true)
-        || !wellformed(&doc.text)
+        || !spring_text::xml::generation_valid(&doc.text)
     {
         return Vec::new();
     }
@@ -311,6 +254,17 @@ mod tests {
         host.answer_next_prompt(Some(&["yes"]));
         assert_eq!(tools.resolve_file_action(&d, action).unwrap().edits.len(), 1);
         assert!(host.process_runs().is_empty());
+    }
+    #[test]
+    fn debug_removal_works_under_a_windows_drive_root() {
+        let host = MockHost::install();
+        host.set_project_root(Some(r"C:\work\app"));
+        host.add_file("C:/work/app/security.xml", XML);
+        let d = Document { path: "C:/work/app/security.xml".into(), ..doc(XML) };
+        let mut tools = SecurityTools::default();
+        let action = tools.file_actions(&d, cursor(&d)).pop().expect("offered under C:");
+        host.answer_next_prompt(Some(&["yes"]));
+        assert_eq!(tools.resolve_file_action(&d, action).unwrap().edits.len(), 1);
     }
     #[test]
     fn cancellation_produces_no_edit() {

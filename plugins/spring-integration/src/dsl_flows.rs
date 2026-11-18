@@ -80,14 +80,14 @@ fn lambda_param(arg: &str) -> Option<&str> {
 }
 
 /// Java (and Kotlin `IntegrationFlow.from`) chains.
-pub(crate) fn java_chains(file: &JavaFile, text: &str, calls: &[Call], kotlin: bool, out: &mut Vec<Ref>) {
+pub(crate) fn java_chains(file: &JavaFile, text: &str, tokens: &[spring_text::java::Tok], calls: &[Call], kotlin: bool, out: &mut Vec<Ref>) {
     let mut ends: Vec<(usize, usize)> = Vec::new();
     let mut members: Vec<(&Call, usize)> = Vec::new();
     for c in calls {
         let starts = c.name == "from"
             && !c.is_new
             && matches!(c.receiver.as_deref(), Some("IntegrationFlow" | "IntegrationFlows"))
-            && dsl_factory_owned(file, text, c, c.receiver.as_deref().unwrap_or_default());
+            && dsl_factory_owned(file, tokens, c, c.receiver.as_deref().unwrap_or_default());
         let owner = if starts {
             Some(c.at + 1)
         } else if c.chained && !c.is_new {

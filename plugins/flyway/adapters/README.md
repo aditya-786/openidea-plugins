@@ -7,8 +7,8 @@ API with an explicitly selected dialect and standard JPA/physical naming strateg
 application, Spring, a persistence unit or a SessionFactory. It does not compare
 a live database or produce an incremental migration.
 
-Both profiles support Java17/21/25/26; disposable fixtures were exercised with
-Java26.0.1 on macOS arm64. The profiles are `hibernate-6.6.49-offline-v2` and
+Both profiles support Java 17/21/25/26; disposable fixtures were exercised with
+Java 26.0.1 on macOS arm64. The profiles are `hibernate-6.6.49-offline-v2` and
 `hibernate-7.4.15-offline-v2`; the previous `hibernate-6.6.49-h2-v1` remains H2-only.
 Other ORM versions, module paths and effective application naming/configuration
 profiles are not silently substituted.
@@ -47,7 +47,7 @@ fixture exposed omitted unique/foreign-key mappings in their stock exporters.
    needed by associations; converters/custom classes can require additional
    project dependencies. Each entity/converter declares its class, source file
    and compiled root. No persistence-unit discovery is implied.
-4. Run **Flyway: Generate Reviewed Offline Hibernate Schema SQL…**. The preliminary
+4. Run **Flyway: Generate Offline Hibernate Schema SQL…**. The preliminary
    pure-JDK inspection reads/hashes artifacts without loading the project model.
    Review the concrete runtime/classpath/source hashes and trusted-code warning
    before metadata generation starts.
@@ -86,7 +86,7 @@ inherited-name collisions instead of silently replacing user settings.
 
 Inputs are checked again after metadata generation and before migration creation.
 This detects observed changes, not every filesystem race. Captured SQL is
-instance-owned and expires after15minutes; relevant delivered file events clear
+instance-owned and expires after 15 minutes; relevant delivered file events clear
 it. No SQL execution is requested by the adapter; a later Flyway run remains a
 separate reviewed workflow.
 

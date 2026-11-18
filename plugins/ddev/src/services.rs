@@ -6,6 +6,19 @@ use openidea_plugin::{Error, Invocation, Plugin, host};
 const NO_PROJECT: &str = "status:no-project";
 const NOT_CONFIGURED: &str = "status:not-configured";
 const UNAVAILABLE: &str = "status:unavailable";
+/// A short reason for the unavailable row, from the describe failure.
+fn unavailable_reason(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("docker") {
+        "Container runtime not running"
+    } else if error.contains("not granted") {
+        "DDEV permission needed"
+    } else if error.contains("not found") || error.contains("no such file") {
+        "DDEV not installed"
+    } else {
+        "DDEV unavailable"
+    }
+}
 fn is_status(key: &str) -> bool {
     matches!(key, NO_PROJECT | NOT_CONFIGURED | UNAVAILABLE)
 }
@@ -37,18 +50,25 @@ impl Views for Main {
                     .icon("info").detail("Project access unavailable")]))
                     .status(&format!("Cannot read DDEV configuration: {error}"))),
             };
-            let result = self.description(&project).cloned();
-            let can_start = self.can_start(&project);
+            let cached = project
+                .root()
+                .is_ok_and(|root| self.snapshots.contains_key(&root));
+            let prefs = runtime::Prefs::load(&project);
+            let refreshing = cached && self.is_stale_with(&project, &prefs);
+            let _task = (!cached).then(|| host::begin_task("Reading DDEV status", false));
+            let result = self.load(&project, false, &prefs).cloned();
+            let can_start = self.can_start_with(&project, false, &prefs);
+            let last_known = project.root().ok().and_then(|root| {
+                self.snapshots.get(&root)?;
+                Some(runtime::now().saturating_sub(*self.refreshed_at.get(&root)?))
+            });
             let selected = self.selected.as_deref().unwrap_or(PROJECT);
             let desc = result.as_ref().ok();
-            let state = desc.map_or(
-                if configured {
-                    "Runtime unavailable"
-                } else {
-                    "Not configured"
-                },
-                |d| &d.status,
-            );
+            let state = match (&result, configured) {
+                (Ok(d), _) => d.status.as_str(),
+                (Err(error), true) => unavailable_reason(&error.to_string()),
+                (Err(_), false) => "Not configured",
+            };
             let name = desc.map_or("DDEV", |d| &d.name);
             if desc.is_none() {
                 runtime::publish(None, configured);
@@ -98,16 +118,20 @@ impl Views for Main {
             let running = desc.is_some_and(|d| d.status == "running");
             let container = root || service.is_some_and(|s| s.logs);
             let status = match &result {
+                Ok(d) if refreshing => format!("{} — {} (refreshing)", d.name, d.status),
                 Ok(d) => format!("{} — {}", d.name, d.status),
-                Err(e) => format!("{state}: {e}. Configuration and Help remain available."),
+                Err(e) => match last_known {
+                    Some(age) => format!("DDEV not reachable: {e} (last known status {age} s ago)"),
+                    None => format!("{state}: {e}. Configuration and Help remain available."),
+                },
             };
             Ok(View::new(Body::Tree(items))
                 .button(Button::new("refresh", "Refresh Status").icon("refresh"))
-                .button(Button::new("start", "Start DDEV").icon("run").enabled(can_start))
-                .button(Button::new("restart", "Restart DDEV").icon("rerun")
+                .button(Button::new("start", "Start Project").icon("run").enabled(can_start))
+                .button(Button::new("restart", "Restart Project").icon("rerun")
                     .enabled(running || desc.is_none() && can_start))
                 .button(
-                    Button::new("stop", "Stop DDEV")
+                    Button::new("stop", "Stop Project")
                         .icon("stop")
                         .enabled(running || desc.is_none() && can_start),
                 )
@@ -115,6 +139,7 @@ impl Views for Main {
                 .button(Button::new("logs", "Open Logs").icon("list").enabled(desc.is_some() && container))
                 .button(Button::new("open-service", "Open in Browser").icon("external-link").enabled(running && has_url))
                 .button(Button::new("actions", "More Actions…").icon("more"))
+                .button(Button::new("diagnose", "Help and Diagnostics").icon("help").enabled(desc.is_none() && configured))
                 .button(
                     Button::new(
                         if configured { "open-config" } else { "config" },
@@ -144,6 +169,10 @@ impl Views for Main {
         match event {
             ViewEvent::Select(key) => {
                 let project = ctx.project().ok_or("Open a project to use DDEV.")?;
+                let cached = project
+                    .root()
+                    .is_ok_and(|root| self.snapshots.contains_key(&root));
+                let _task = (!cached).then(|| host::begin_task("Reading DDEV status", false));
                 if key != PROJECT {
                     self.target(&project, Some(&key))?;
                 }
@@ -151,7 +180,22 @@ impl Views for Main {
                 let _ = host::storage::set(&format!("selection:{}", project.root()?), &key);
             }
             ViewEvent::Activate(key) => {
-                self.run_command("open-service", ctx, Some(&key))?;
+                let project = ctx.project().ok_or("Open a project to use DDEV.")?;
+                let cached = project
+                    .root()
+                    .is_ok_and(|root| self.snapshots.contains_key(&root));
+                let _task = (!cached).then(|| host::begin_task("Reading DDEV status", false));
+                let Ok(desc) = self.cached_description(&project) else {
+                    return Ok(());
+                };
+                let url = if key == PROJECT {
+                    desc.url.as_ref()
+                } else {
+                    desc.service(&key).and_then(|s| s.url.as_ref())
+                };
+                if url.is_some() && runtime::allowed(desc, "open-service") {
+                    self.run_command("open-service", ctx, Some(&key))?;
+                }
             }
             ViewEvent::Button(id) => {
                 let key = if matches!(id.as_str(), "refresh" | "start" | "restart" | "stop" | "actions" | "open-config" | "config") {
@@ -176,12 +220,16 @@ impl Details for Main {
             let message = match key {
                 NO_PROJECT => "Open a project containing .ddev/config.yaml to inspect its services and use DDEV controls.",
                 NOT_CONFIGURED => "This project has no DDEV configuration. Use Configure Project to review and create it. No runtime command runs when selecting this status.",
-                _ => "DDEV runtime details are unavailable. Refresh Status explicitly retries. Check the DDEV executable grant and Docker; Configuration and More Actions remain available for recovery.",
+                _ => "DDEV status is unavailable. Check that DDEV is installed, Docker is running and the process:ddev permission is allowed in Settings › Plugins › DDEV Integration, then Refresh Status. Configuration and More Actions still work.",
             };
             return Ok(vec![Tab::new("overview", "Overview", Pane::Message(message.into()))]);
         }
         let project = ctx.project().ok_or("Open a project to use DDEV.")?;
-        let result = self.description(&project).cloned();
+        let cached = project
+            .root()
+            .is_ok_and(|root| self.snapshots.contains_key(&root));
+        let _task = (!cached).then(|| host::begin_task("Reading DDEV status", false));
+        let result = self.cached_description(&project).cloned();
         if key != PROJECT {
             let desc = result.as_ref().map_err(|e| Error::from(e.to_string()))?;
             if desc.service(key).is_none() {
@@ -219,7 +267,7 @@ impl Details for Main {
                     tabs.push(Tab::new("database", "Database", Pane::Text(summary)));
                 }
             }
-            Err(e) => tabs.push(Tab::new("overview","Overview",Pane::Text(format!("DDEV runtime is unavailable: {e}\n\nAllow process:ddev in Settings > Plugins and check Docker. Configuration can still be read and edited.")))),
+            Err(e) => tabs.push(Tab::new("overview","Overview",Pane::Text(format!("DDEV runtime is unavailable: {e}\n\n{} Also check Docker. Configuration can still be read and edited.", ui_kit::denied::message("Reading DDEV runtime details", "process:ddev", "DDEV Integration"))))),
         }
         if key == PROJECT {
             let config = match project.read_file(crate::CONFIG) {
@@ -233,5 +281,18 @@ impl Details for Main {
             tabs.push(Tab::new("help", "Help", Pane::Text(runtime::HELP.into())));
         }
         Ok(tabs)
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::unavailable_reason;
+
+    #[test]
+    fn unavailable_reason_names_the_likely_cause() {
+        assert_eq!(unavailable_reason("permission denied: process:ddev is not granted"), "DDEV permission needed");
+        assert_eq!(unavailable_reason("ddev: command not found"), "DDEV not installed");
+        assert_eq!(unavailable_reason("ddev describe failed (exit Some(1)): Could not connect to a Docker provider"), "Container runtime not running");
+        assert_eq!(unavailable_reason("ddev describe failed (exit Some(1)): boom"), "DDEV unavailable");
     }
 }

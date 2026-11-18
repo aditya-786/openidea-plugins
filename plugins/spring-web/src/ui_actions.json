@@ -5,7 +5,7 @@
     "command": "copy-endpoint-curl",
     "when": "viewItemKind == route",
     "icon": "copy",
-    "label": "Copy as cURL"
+    "label": "Copy Endpoint as cURL"
   },
   {
     "menu": "viewItem.context",

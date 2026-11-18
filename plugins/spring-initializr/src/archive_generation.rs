@@ -3,13 +3,28 @@ use super::*;
 use openidea_plugin::{HttpRequest, host::Command};
 use serde_json::{Value, json};
 const ADAPTER: &str = include_str!("archive_adapter.py");
+fn denied(error:Error)->Error {
+    match error {
+        Error::Denied(cap) if cap.starts_with("net") => Error::Invalid(format!("Allow {cap} for Spring Initializr in Settings › Plugins.")),
+        Error::Denied(_) => Error::Invalid("Allow process:python3 for Spring Initializr in Settings › Plugins.".into()),
+        other => other,
+    }
+}
 fn adapter(ctx: &Invocation, request: &Value) -> Result<Value,Error> {
+    adapter_raw(ctx, request).map_err(denied)
+}
+/// The adapter call with permission denials left as `Error::Denied`, so Generate and Open can fall back to the browser.
+fn adapter_raw(ctx: &Invocation, request: &Value) -> Result<Value,Error> {
     let output=host::run_command(&Command::new("python3").args(["-I","-c",ADAPTER]),ctx.project().as_ref(),Some(&request.to_string()))?;
     if output.status!=Some(0) {
-        return Err(Error::Failed(format!("Archive adapter refused or failed. No project was opened. Any staging directory is retained for review. {}",ui_kit::prompts::readable_source(&output.stderr.chars().take(2048).collect::<String>()))));
+        let staging=output.stderr.lines().find_map(|line|serde_json::from_str::<Value>(line).ok()?["staging"].as_str().map(str::to_owned));
+        let kept=staging.map_or(String::new(),|path|format!(" Staging folder kept for review: {path}."));
+        return Err(Error::Failed(format!("Archive adapter refused or failed. No project was opened.{kept} {}",ui_kit::prompts::readable_source(&output.stderr.chars().take(2048).collect::<String>()))));
     }
     if output.stdout.len()>256<<10 {return Err(Error::Invalid("Archive adapter result exceeds 256 KiB.".into()));}
-    crate::strict_json::parse(&output.stdout,256<<10).map_err(|_|Error::Invalid("Malformed archive adapter result.".into()))
+    let value=crate::strict_json::parse(&output.stdout,256<<10).map_err(|_|Error::Invalid("Malformed archive adapter result.".into()))?;
+    if value["error"]=="not-local" {return Err(Error::Invalid("This folder doesn't exist on the machine running the project.".into()));}
+    Ok(value)
 }
 fn preview(proof:&Value,archive:bool)->Result<String,Error> {
     let files=proof["files"].as_array().filter(|files|!files.is_empty()&&files.len()<=512).ok_or(Error::Stale)?;
@@ -31,18 +46,24 @@ impl Launcher {
         if verified!=proof {return Err(Error::Stale)}
         host::open_project(target,true)
     }
+    /// Generate and Open; without its capabilities, the browser download instead (nothing is written before a denial).
     pub(crate) fn generate_archive(&mut self,ctx:&Invocation)->Result<Option<String>,Error> {
+        let result=match self.missing_archive_capability() {Some(capability)=>Err(Error::Denied(capability.into())),None=>self.generate_reviewed_archive(ctx)};
+        let Err(Error::Denied(capability))=result else {return result};
+        if let Some(problem)=self.problem() {return Err(Error::Invalid(problem));}
+        Self::warn(&format!("{} Downloading {}.zip in the browser instead.",ui_kit::denied::message("Generate and Open",&capability,"Spring Initializr Launcher"),self.get("artifactId")));
+        host::open_url(&self.starter_url())?;
+        Ok(None)
+    }
+    fn generate_reviewed_archive(&mut self,ctx:&Invocation)->Result<Option<String>,Error> {
         let _=self.changed();
         if self.server!=START {return Err(Error::Invalid("Complete archive generation uses the declared start.spring.io service.".into()));}
         self.load_metadata(false);
         if let Some(problem)=self.problem() {return Err(Error::Invalid(problem));}
         let artifact=self.get("artifactId");
-        if artifact.is_empty() || artifact.len()>128 || artifact.starts_with('.') || !artifact.bytes().all(|b|b.is_ascii_alphanumeric()||b"._-".contains(&b)) {return Err(Error::Invalid("Use one plain artifact directory name.".into()));}
         let owner=self.owner.clone();let query=self.query();let metadata=self.metadata.clone();
         let root=ctx.project().and_then(|p|p.root().ok());
         let Some(parent)=host::pick_directory("Choose a parent for a NEW generated project",root.as_deref())? else {return Ok(None)};
-        let request=format!("Download: {START}/starter.zip?{query}\nParent: {parent}\nNew folder: {artifact}\n\nThe optional approved python3 executable will validate and extract the full archive with its standard library, including binary wrappers and executable scripts. Nothing from the generated archive is executed. A complete file/hash manifest and canonical destination are reviewed before extraction. Existing destinations are refused.");
-        if !ui_kit::prompts::confirm_exact("Prepare complete Spring project?",&request)? {return Ok(None)}
         if self.owner!=owner || self.server!=START || self.query()!=query || self.metadata!=metadata {return Err(Error::Stale)}
         let task=host::begin_task("Generating reviewed Spring project",true);
         if task.is_cancelled(){return Err(Error::Cancelled)}
@@ -51,21 +72,26 @@ impl Launcher {
         if response.status!=200 || response.body.is_empty() || response.body.len()>8<<20 {return Err(Error::Invalid("Project ZIP failed or exceeds 8 MiB; no destination files were created.".into()));}
         let archive=format!("{}/generation-archive.zip",host::fs::plugin_dir()?.trim_end_matches('/'));
         host::fs::write_bytes(&archive,&response.body)?;
+        let outcome=(||->Result<Option<String>,Error> {
         let mut request=json!({"operation":"inspect","archive":archive,"parent":parent,"artifact":artifact});
-        let proof=adapter(ctx,&request)?;
+        let proof=adapter_raw(ctx,&request)?;
         if task.is_cancelled(){return Err(Error::Cancelled)}
         let descriptor=match self.get("type").as_str(){"maven-project"=>"pom.xml","gradle-project"=>"build.gradle","gradle-project-kotlin"=>"build.gradle.kts",_=>return Err(Error::Invalid("Unsupported generated build type.".into()))};
         if !proof["files"].as_array().is_some_and(|files|files.iter().any(|file|file["path"].as_str()==Some(descriptor))) {return Err(Error::Invalid("The archive does not contain the selected root build descriptor.".into()));}
-        if !ui_kit::prompts::confirm_exact("Generate and open reviewed Spring project?",&preview(&proof,true)?)? {return Ok(None)}
+        let review=format!("Downloaded: {START}/starter.zip?{query}\nValidated by the approved python3 adapter (standard library only).\n{}",preview(&proof,true)?);
+        if !ui_kit::prompts::confirm_exact("Generate and open reviewed Spring project?",&review)? {return Ok(None)}
         if self.owner!=owner || self.server!=START || self.query()!=query || self.metadata!=metadata {return Err(Error::Stale)}
         if task.is_cancelled(){return Err(Error::Cancelled)}
         request["operation"]=json!("extract");request["proof"]=proof.clone();
-        let result=adapter(ctx,&request)?;
+        let result=adapter_raw(ctx,&request)?;
         if task.is_cancelled(){return Err(Error::Cancelled)}
         let target=proof["target"].as_str().ok_or(Error::Stale)?;
         if result["committed"]!=true || result["target"].as_str()!=Some(target) || result["sha256"]!=proof["sha256"] {return Err(Error::Stale)}
         host::open_project(target,true)?;
         Ok(Some(format!("Generated {} archive files at {target}; requested normal project trust/open. No wrapper or build executed.",result["files"])))
+        })();
+        let _=adapter_raw(ctx,&json!({"operation":"remove-archive","archive":archive}));
+        outcome
     }
 }
 
@@ -82,7 +108,7 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
     fn run(request:&Value)->std::process::Output {
-        let mut child=NativeCommand::new("python3").args(["-I","-c",ADAPTER]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("Python3 adapter integration tests require Python3");
+        let mut child=NativeCommand::new("python3").args(["-I","-c",ADAPTER]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("Python 3 adapter integration tests require Python 3");
         child.stdin.take().unwrap().write_all(request.to_string().as_bytes()).unwrap();child.wait_with_output().unwrap()
     }
     #[test]
@@ -98,20 +124,109 @@ mod tests {
                 assert_eq!(&args[..2],["-I","-c"]);assert_eq!(args[2],ADAPTER);
                 let request:Value=serde_json::from_str(stdin.unwrap()).unwrap();
                 let proof=json!({"parent":"/outside","identity":[1,2],"target":"/outside/demo","python":"3.12.0","platform":"darwin","sha256":"reviewed-sha","directories":[],"files":[{"path":"pom.xml","bytes":10,"mode":420,"sha256":"source-sha"}]});
-                let result=if request["operation"]=="inspect" {proof} else {
+                let result=if request["operation"]=="remove-archive" {json!({"removed":true})} else if request["operation"]=="inspect" {proof} else {
                     assert_eq!(request["proof"],proof);
                     if mode==2 {return Ok(openidea_plugin::ProcessOutput{status:Some(1),stdout:String::new(),stderr:"Destination exists; no merge or overwrite".into()})}
                     json!({"target":"/outside/demo","sha256":"reviewed-sha","files":1,"committed":true})
                 };
                 Ok(openidea_plugin::ProcessOutput{status:Some(0),stdout:result.to_string(),stderr:String::new()})
             });
-            host.answer_next_prompt(Some(&["/outside"]));host.answer_next_prompt(Some(&[]));host.answer_next_prompt(if mode==1 {None} else {Some(&[])});
+            // One folder pick and one exact confirmation: no second prompt is scripted.
+            host.answer_next_prompt(Some(&["/outside"]));host.answer_next_prompt(if mode==1 {None} else {Some(&[])});
             let result=launcher.generate_archive(&host.invocation());
             assert_eq!(result.is_ok(),mode!=2);
-            assert_eq!(host.process_runs().len(),if mode==1 {1} else {2});
+            assert_eq!(host.process_runs().len(),if mode==1 {2} else {3});
             assert_eq!(host.opened_projects().len(),usize::from(matches!(mode,0|3)));
             if matches!(mode,0|3) {assert_eq!(host.opened_projects(),vec![("/outside/demo".into(),true)]);}
         }
+    }
+    fn scripted_generation(fail_extract:Option<&'static str>,not_local:bool)->(openidea_plugin::mock::MockHost,Result<Option<String>,Error>,std::rc::Rc<std::cell::RefCell<Vec<Value>>>) {
+        use openidea_plugin::mock::MockHost;
+        let host=MockHost::install().with_capabilities(&["storage","project.read","net:start.spring.io","process:python3"]);
+        let mut launcher=Launcher::default();launcher.bind(&host.invocation()).unwrap();let _=launcher.changed();
+        launcher.metadata=Some(json!({"bootVersion":{"default":"3.5.16","values":[{"id":"3.5.16"}]},"dependencies":{"values":[]}}));
+        host.on_fetch(|_|Ok(openidea_plugin::HttpResponse{status:200,headers:vec![],body:b"archive".to_vec()}));
+        let requests=std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));let seen=requests.clone();
+        host.on_process("python3",move |_,stdin| {
+            let request:Value=serde_json::from_str(stdin.unwrap()).unwrap();seen.borrow_mut().push(request.clone());
+            let proof=json!({"parent":"/outside","identity":[1,2],"target":"/outside/demo","python":"3.12.0","platform":"darwin","sha256":"reviewed-sha","directories":[],"files":[{"path":"pom.xml","bytes":10,"mode":420,"sha256":"source-sha"}]});
+            let out=|value:Value|Ok(openidea_plugin::ProcessOutput{status:Some(0),stdout:value.to_string(),stderr:String::new()});
+            match request["operation"].as_str().unwrap() {
+                "remove-archive"=>out(json!({"removed":true})),
+                _ if not_local=>out(json!({"error":"not-local"})),
+                "inspect"=>out(proof),
+                _=>match fail_extract {
+                    Some(stderr)=>Ok(openidea_plugin::ProcessOutput{status:Some(1),stdout:String::new(),stderr:stderr.into()}),
+                    None=>out(json!({"target":"/outside/demo","sha256":"reviewed-sha","files":1,"committed":true})),
+                },
+            }
+        });
+        host.answer_next_prompt(Some(&["/outside"]));host.answer_next_prompt(Some(&[]));host.answer_next_prompt(Some(&[]));
+        let result=launcher.generate_archive(&host.invocation());
+        (host,result,requests)
+    }
+    fn removes_archive_last(requests:&std::cell::RefCell<Vec<Value>>)->bool {
+        let requests=requests.borrow();let last=requests.last().unwrap();
+        last["operation"]=="remove-archive"&&last["archive"].as_str().is_some_and(|path|path.ends_with("/generation-archive.zip"))
+    }
+    #[test]
+    fn archive_removed_after_success() {
+        let (host,result,requests)=scripted_generation(None,false);
+        assert!(result.is_ok());assert!(removes_archive_last(&requests));
+        assert_eq!(host.opened_projects().len(),1);
+    }
+    #[test]
+    fn archive_removed_after_refusal() {
+        let (_host,result,requests)=scripted_generation(Some("Destination exists"),false);
+        assert!(result.is_err());assert!(removes_archive_last(&requests));
+    }
+    #[test]
+    fn failed_extract_reports_staging_path() {
+        let (_host,result,_)=scripted_generation(Some("{\"committed\": false, \"staging\": \"/outside/.initializr-ab12\"}\nOSError: disk full"),false);
+        let message=result.unwrap_err().to_string();
+        assert!(message.contains("Staging folder kept for review: /outside/.initializr-ab12."),"{message}");
+    }
+    #[test]
+    fn generate_refuses_parent_missing_on_runner() {
+        let (host,result,requests)=scripted_generation(None,true);
+        let message=result.unwrap_err().to_string();
+        assert!(message.contains("doesn't exist on the machine running the project"),"{message}");
+        assert!(host.opened_projects().is_empty());assert!(removes_archive_last(&requests));
+        let scratch=Scratch::new();
+        let output=run(&json!({"operation":"inspect","archive":scratch.0.join("none.zip"),"parent":scratch.0.join("missing"),"artifact":"demo"}));
+        assert!(output.status.success());assert_eq!(serde_json::from_slice::<Value>(&output.stdout).unwrap(),json!({"error":"not-local"}));
+    }
+    #[test]
+    fn real_adapter_removes_only_the_generation_archive() {
+        let scratch=Scratch::new();let archive=scratch.0.join("generation-archive.zip");let other=scratch.0.join("keep.zip");
+        std::fs::write(&archive,b"zip").unwrap();std::fs::write(&other,b"zip").unwrap();
+        assert!(run(&json!({"operation":"remove-archive","archive":archive})).status.success());assert!(!archive.exists());
+        assert!(run(&json!({"operation":"remove-archive","archive":archive})).status.success());
+        assert!(!run(&json!({"operation":"remove-archive","archive":other})).status.success());assert!(other.exists());
+    }
+    #[test]
+    fn known_missing_capability_downloads_in_the_browser_without_prompts() {
+        use openidea_plugin::mock::MockHost;
+        let host=MockHost::install().with_capabilities(&["storage","project.read","net:start.spring.io"]);
+        let mut launcher=Launcher::default();launcher.activate(&host.context("aritti.spring-initializr")).unwrap();
+        host.answer_next_prompt(Some(&["/outside"]));
+        launcher.handle("initializr",ViewEvent::Button("generate-archive".into()),&host.invocation()).unwrap();
+        assert!(host.opened_urls()[0].starts_with("https://start.spring.io/starter.zip?"));
+        assert!(host.notifications()[0].body.contains("process:python3"));
+        assert!(host.process_runs().is_empty() && host.opened_projects().is_empty() && host.fetches()==0);
+    }
+    #[test]
+    fn denial_during_generation_falls_back_to_the_browser_and_writes_nothing() {
+        use openidea_plugin::mock::MockHost;
+        let host=MockHost::install().with_capabilities(&["storage","project.read","net:start.spring.io"]);
+        let mut launcher=Launcher::default();launcher.bind(&host.invocation()).unwrap();let _=launcher.changed();
+        launcher.metadata=Some(json!({"bootVersion":{"default":"3.5.16","values":[{"id":"3.5.16"}]},"dependencies":{"values":[]}}));
+        host.on_fetch(|_|Ok(openidea_plugin::HttpResponse{status:200,headers:vec![],body:b"zip".to_vec()}));
+        host.answer_next_prompt(Some(&["/outside"]));
+        assert_eq!(launcher.generate_archive(&host.invocation()).unwrap(),None);
+        assert!(host.opened_urls()[0].starts_with("https://start.spring.io/starter.zip?"));
+        assert!(host.notifications().iter().any(|n|n.body.contains("needs the process:python3 permission. Allow it in Settings › Plugins › Spring Initializr Launcher. Downloading")));
+        assert!(host.opened_projects().is_empty());
     }
     #[test]
     fn actual_generated_tree_review_detects_changed_bytes_and_links() {

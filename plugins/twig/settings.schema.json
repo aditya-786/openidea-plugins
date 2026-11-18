@@ -6,9 +6,10 @@
       "default": false
     },
     "projectExtensions": {
+      "title": "Complete project filters, functions and tests",
       "type": "boolean",
-      "title": "Complete and navigate to the filters, functions and tests the project registers in src/, app/ and lib/ (outside Symfony projects)",
-      "default": true
+      "default": true,
+      "description": "Complete and navigate to the filters, functions and tests the project registers in src/, app/ and lib/ (outside Symfony projects)"
     },
     "diagnostics": {
       "type": "boolean",
@@ -16,13 +17,15 @@
       "default": true
     },
     "hover": {
+      "title": "Hover documentation",
       "type": "boolean",
-      "title": "Show Twig language and unique current-template macro source documentation",
-      "default": true
+      "default": true,
+      "description": "For core Twig tags and filters, and for macros defined in the current template."
     },
     "tagOpen": {
       "type": "string",
       "title": "Tag opening delimiter",
+      "description": "Starts a tag, as in {% if %}. Change only if your Twig environment uses custom delimiters.",
       "default": "{%",
       "minLength": 1,
       "maxLength": 16
@@ -30,6 +33,7 @@
     "tagClose": {
       "type": "string",
       "title": "Tag closing delimiter",
+      "description": "Ends a tag, as in {% if %}. Change only if your Twig environment uses custom delimiters.",
       "default": "%}",
       "minLength": 1,
       "maxLength": 16
@@ -37,6 +41,7 @@
     "variableOpen": {
       "type": "string",
       "title": "Variable opening delimiter",
+      "description": "Starts a printed expression, as in {{ name }}. Change only if your Twig environment uses custom delimiters.",
       "default": "{{",
       "minLength": 1,
       "maxLength": 16
@@ -44,6 +49,7 @@
     "variableClose": {
       "type": "string",
       "title": "Variable closing delimiter",
+      "description": "Ends a printed expression, as in {{ name }}. Change only if your Twig environment uses custom delimiters.",
       "default": "}}",
       "minLength": 1,
       "maxLength": 16
@@ -51,6 +57,7 @@
     "commentOpen": {
       "type": "string",
       "title": "Comment opening delimiter",
+      "description": "Starts a comment, as in {# note #}. Change only if your Twig environment uses custom delimiters.",
       "default": "{#",
       "minLength": 1,
       "maxLength": 16
@@ -58,24 +65,28 @@
     "commentClose": {
       "type": "string",
       "title": "Comment closing delimiter",
+      "description": "Ends a comment, as in {# note #}. Change only if your Twig environment uses custom delimiters.",
       "default": "#}",
       "minLength": 1,
       "maxLength": 16
     },
     "formatterEnabled": {
       "type": "boolean",
-      "title": "Enable reviewed official Twig-CS-Fixer 4.1.1 spacing formatter",
+      "title": "Format Twig files with Twig-CS-Fixer",
+      "description": "Fixes spacing around delimiters, operators and punctuation. Needs PHP and the Twig-CS-Fixer PHAR path below.",
       "default": false
     },
     "formatterPhar": {
       "type": "string",
-      "title": "Absolute path to official Twig-CS-Fixer 4.1.1 PHAR (exact release hash required)",
+      "title": "Twig-CS-Fixer PHAR path",
+      "description": "Absolute path to the official Twig-CS-Fixer 4.1.1 PHAR. Other versions or modified files are refused.",
       "default": ""
     },
     "staticTemplateReferences": {
+      "title": "Occurrence highlights and rename",
       "type": "boolean",
-      "title": "Build exact static macro/block/import models for navigation, highlights and reviewed Rename (no unchecked native indexed edits)",
-      "default": true
+      "default": true,
+      "description": "Go to Definition, highlighting, occurrence counts and Rename for names written literally in templates. Rename shows the changes and asks before editing."
     },
     "templateNamespaces": {
       "type": "array",
@@ -85,11 +96,24 @@
       "maxItems": 32,
       "items": {
         "type": "object",
-        "required": ["namespace", "path"],
+        "required": [
+          "namespace",
+          "path"
+        ],
         "additionalProperties": false,
         "properties": {
-          "namespace": { "type": "string", "title": "Namespace (without @)", "minLength": 1, "maxLength": 128 },
-          "path": { "type": "string", "title": "Project-relative directory", "minLength": 1, "maxLength": 128 }
+          "namespace": {
+            "type": "string",
+            "title": "Namespace (without @)",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "path": {
+            "type": "string",
+            "title": "Project-relative directory",
+            "minLength": 1,
+            "maxLength": 128
+          }
         }
       }
     }

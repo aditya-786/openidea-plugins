@@ -1,7 +1,7 @@
 {
   "title": "OpenAPI",
   "views": {
-    "endpoints": "OpenAPI",
+    "endpoints": "Endpoints",
     "compare": "Changes",
     "try-response": "Request / Response"
   },
@@ -28,7 +28,7 @@
     "tabs": [
       {
         "id": "endpoints",
-        "label": "OpenAPI"
+        "label": "Endpoints"
       },
       {
         "id": "compare",

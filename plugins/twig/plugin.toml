@@ -4,10 +4,13 @@ version = "0.3.0" # x-release-please-version
 description = "Twig support for .twig files: highlighting of Twig and the HTML around it, blocks and macros in the structure view, folding of tag pairs and multi-line comments, completion of tags, filters, functions, tests and imported macros, Go to Declaration for macros and templates, thirteen snippets (blk, mcr, esc, emb, ext, for, from, if, imp, inc, sbx, spl, verb), and inspections for unclosed tags, unexpected end tags and unterminated delimiters."
 authors = ["Arnaud Ritti <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Unreleased: twig.paths also reads the block list form (`- dir`), each entry a main-namespace directory like TwigBundle. Unreleased: twig.paths namespaces that are empty, 0 or false now map to the main namespace like TwigBundle. Unreleased: a literal `new \\Twig\\Lexer($twig, ['tag_block' => [..], 'tag_variable' => [..], 'tag_comment' => [..]])` in the only open project's src/app/lib PHP sets the delimiters when no delimiter setting is given (TwigBundle has no twig.yaml option; non-literal or conflicting Lexer configs are ignored); variables from literal `->render('x.twig', [..])`/`renderView` calls and `#[Template('x.twig')]` with one literal `return [..]` complete in expressions and Go to Definition jumps to the controller keys. Unreleased: Twig default_path and main-namespace (~) twig.paths now resolve plain template names; when@dev/prod/test blocks and config/packages/{dev,prod,test}/twig.yaml add directories, and a namespace mapped to different directories across them is refused. Unreleased: Symfony twig.paths in config/packages/twig.yaml (literal block mappings only; explicit templateNamespaces win) now also resolve @namespace/ template names. Unreleased: setting templateNamespaces maps @namespace/name.twig loader names to project directories for template and macro navigation; Preview Rename Macro Parameter is a reviewed action (no native Rename anchor) that refuses shadowed, string, comment and ambiguous cases. Unreleased: Go to Definition on block('name') jumps to the block defined by a plain {% use 'x.twig' %} target when exactly one used template defines it once (use-with renames, extends, local overrides and duplicates stay quiet); use/embed template names already navigate. Unreleased: read-only static macro/block/import source navigation/highlights and grammar/collision-reviewed Rename, current macro signatures/parameter navigation, and opt-in pinned Twig-CS-Fixer spacing formatting through an in-memory adapter. Unreleased: configurable Twig delimiters across physical-source syntax/providers, snippets and injections, including unequal-width/Unicode ranges. Unreleased: key/value loop binding anchors inside conditional bodies; automatic JavaScript injections for complete javascript blocks and script tags. Retain bounded local for-loop binding models with nested shadowing for read-only occurrences/reviewed edits; public indexed anchors are withheld because API1.4 cannot validate native Rename replacements. Unreleased: lexer-owned macro/template navigation, conservative lexical import scopes, fresh unique current-text macro targets, strict conventional template paths and Symfony macro completion ownership. macro name completion after `alias.` and `from 'x' import`, Go to Declaration for macros and template names, filters/functions/tests registered in project PHP (outside Symfony, setting projectExtensions), optional bracket check (setting expressionErrors). completion of Twig tags, filters, functions and tests, and thirteen snippets (blk, mcr, esc, emb, ext, for, from, if, imp, inc, sbx, spl, verb) in HTML text; inspections for unclosed tags, end tags without an opening tag and unterminated {{, {% and {# (setting 'diagnostics'). In a Symfony project (symfony.lock or symfony/framework-bundle in composer.json) name completion is left to aritti.symfony so nothing is listed twice; unclosed-tag is reported here in every project. The native language-definition fallback cannot format Twig; an optional API 1.4 spacing adapter is now available. 0.1.0: 0.1.0: first release, with .twig file detection, highlighting, structure view and folding."
+change-notes = """\
+Next release: A quick fix inserts the missing end tag of an unclosed tag using the configured delimiters, and code lenses read 1 occurrence or N occurrences in this file; twig.paths and default_path resolve template names, including dev, prod and test overrides, templateNamespaces map @namespace/ names, and render() variables complete in expressions; faster editing: PHP files are no longer scanned while you type, and project filters, functions and controller variables refresh when PHP files change; injected JavaScript and CSS keep working after a stray <, and Twig no longer asks for write access to your project; block() jumps to its block, gutter icons link parent, child and including templates and overridden blocks, Preview Rename Macro Parameter, clearer setting descriptions, rename previews and permission messages, and Toggle Comment and Show Occurrences show in Twig files only. \
+0.3.0: template and macro navigation. \
+0.2.0: plugin icon and tag completion."""
 categories = ["languages"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 # Highlighting, structure and folding come from this component; it is loaded
 # when the first Twig file is opened.
 wasm = "dist/plugin.wasm"
@@ -16,15 +19,20 @@ activation = ["on-language:twig"]
 [capabilities]
 required = ["project.read"]
 # events: the inspections run when a Twig file is opened or saved.
-optional = ["events", "editor.read", "editor.write", "project.write", "process:php"]
+optional = ["events", "editor.read", "editor.write", "process:php"]
 
 [contributes.settings]
 schema = "settings.schema.json"
 title = "Twig"
 
 [[contributes.providers]]
-kinds = ["completion", "definition", "injections"]
+kinds = ["completion", "definition", "injections", "line-markers"]
 languages = ["twig"]
+
+# Gutter icon on the first (or extends) line listing parent, child and including templates.
+[[contributes.markerIcons]]
+id = "related"
+icon = "icons/twig-logo.svg"
 
 [[contributes.languages]]
 path = "languages/twig.toml"
@@ -43,13 +51,11 @@ languages = ["twig"]
 kinds = ["hover"]
 languages = ["twig"]
 
-[[contributes.documentIndexers]]
-extensions = ["twig"]
-
 [[contributes.commands]]
 id = "toggle-comment"
 title = "Twig: Toggle Comment"
 category = "Twig"
+when = "editorLangId == twig"
 
 [[contributes.providers]]
 kinds = ["formatting", "signature-help", "document-highlights", "code-lenses", "code-actions"]
@@ -57,5 +63,6 @@ languages = ["twig"]
 
 [[contributes.commands]]
 id = "source-symbol-occurrences"
-title = "Twig: Review Static Source Occurrences"
+title = "Twig: Show Occurrences"
 category = "Twig"
+when = "editorLangId == twig"

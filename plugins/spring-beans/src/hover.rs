@@ -1,9 +1,14 @@
 //! Owned source declarations only: no effective bean candidate or Rename graph.
 use crate::*;
 use openidea_plugin::hover::{Hover, HoverProvider};
-use spring_text::java::{Annotation, JavaFile, MemberKind};
-fn known(file: &JavaFile, text: &str, a: &Annotation, expected: &str) -> bool {
-    crate::annotation_owners::Owners::new(file,text,false).known(text,a,expected)
+use crate::annotation_owners::Owners;
+use spring_text::java::{Annotation, MemberKind, TypeDecl};
+fn known(owners: &Owners, text: &str, a: &Annotation, expected: &str) -> bool {
+    owners.known(text, a, expected)
+}
+/// A generic type header: the shared model does not settle its identifiers.
+fn generic(text: &str, t: &TypeDecl) -> bool {
+    text.get(t.at + t.name.len()..t.end).and_then(|s| s.split_once('{')).is_some_and(|(header, _)| header.contains('<'))
 }
 fn literal(text: &str, s: &spring_text::java::Str) -> Option<String> {
     (s.value.len() <= 128
@@ -12,10 +17,10 @@ fn literal(text: &str, s: &spring_text::java::Str) -> Option<String> {
         && text.get(s.at..s.end) == Some(s.value.as_str()))
     .then(|| s.value.clone())
 }
-fn values(file: &JavaFile, text: &str, annotations: &[Annotation], expected: &str) -> Vec<String> {
+fn values(owners: &Owners, text: &str, annotations: &[Annotation], expected: &str) -> Vec<String> {
     annotations
         .iter()
-        .filter(|a| known(file, text, a, expected))
+        .filter(|a| known(owners, text, a, expected))
         .flat_map(|a| a.args.iter())
         .filter(|arg| java::tokens(&arg.text).iter().all(|t| {
             matches!(t.s, "{" | "}" | ",") || t.s.starts_with('"') && t.s.ends_with('"')
@@ -42,15 +47,11 @@ impl HoverProvider for Navigator {
         }
         let off = offset(&doc.text, at)?;
         let file = java::parse(&doc.text);
-        if file.types.iter().any(|t| {
-            doc.text
-                .get(t.at + t.name.len()..t.end)
-                .and_then(|s| s.split_once('{'))
-                .is_some_and(|(header, _)| header.contains('<'))
-        }) {
-            return None;
-        }
+        let owners = Owners::new(&file, &doc.text, false);
         if let Some(owner) = file.types.iter().find(|t| t.at <= off && off < t.at + t.name.len()) {
+            if generic(&doc.text, owner) {
+                return None;
+            }
             // Nested names in the shared model may be qualified; admit top-level
             // concrete classes only until their identifier ownership is established.
             if owner.outer.is_some() || owner.kind != "class" {
@@ -58,7 +59,7 @@ impl HoverProvider for Navigator {
             }
             let markers = ["Component", "Service", "Repository", "Controller"];
             let annotations: Vec<_> = owner.annotations.iter().filter(|a| {
-                markers.iter().any(|name| known(&file, &doc.text, a, &format!("org.springframework.stereotype.{name}")))
+                markers.iter().any(|name| known(&owners, &doc.text, a, &format!("org.springframework.stereotype.{name}")))
             }).collect();
             if annotations.len() != 1 {
                 return None;
@@ -81,11 +82,11 @@ impl HoverProvider for Navigator {
                 return None;
             }
             let mut content = format!("**Source bean declaration** `{}`\n\nStereotype: `@{}`\nDeclared class spelling: `{}`", safe(&bean.name), safe(&annotation.name), safe(&owner.name));
-            if owner.annotations.iter().any(|a| known(&file, &doc.text, a, "org.springframework.context.annotation.Primary")) {
+            if owner.annotations.iter().any(|a| known(&owners, &doc.text, a, "org.springframework.context.annotation.Primary")) {
                 content.push_str("\nSource marker: `@Primary`");
             }
             for (label, expected) in [("profile", "org.springframework.context.annotation.Profile"), ("qualifier", "org.springframework.beans.factory.annotation.Qualifier")] {
-                let facts = values(&file, &doc.text, &owner.annotations, expected);
+                let facts = values(&owners, &doc.text, &owner.annotations, expected);
                 if !facts.is_empty() {
                     content.push_str(&format!("\nDeclared {label} spellings: `{}`", facts.iter().map(|s| safe(s)).collect::<Vec<_>>().join("`, `")));
                 }
@@ -100,9 +101,12 @@ impl HoverProvider for Navigator {
             .find(|(_, m)| {
                 m.kind == MemberKind::Method && m.at <= off && off < m.at + m.name.len()
             })?;
+        if generic(&doc.text, owner) {
+            return None;
+        }
         if !method.annotations.iter().any(|a| {
             known(
-                &file,
+                &owners,
                 &doc.text,
                 a,
                 "org.springframework.context.annotation.Bean",
@@ -127,35 +131,35 @@ impl HoverProvider for Navigator {
         }
         let primary = method.annotations.iter().any(|a| {
             known(
-                &file,
+                &owners,
                 &doc.text,
                 a,
                 "org.springframework.context.annotation.Primary",
             )
         });
         let mut profiles = values(
-            &file,
+            &owners,
             &doc.text,
             &method.annotations,
             "org.springframework.context.annotation.Profile",
         );
         if !method.annotations.iter().any(|a| {
             known(
-                &file,
+                &owners,
                 &doc.text,
                 a,
                 "org.springframework.context.annotation.Profile",
             )
         }) {
             profiles = values(
-                &file,
+                &owners,
                 &doc.text,
                 &owner.annotations,
                 "org.springframework.context.annotation.Profile",
             );
         }
         let qualifiers = values(
-            &file,
+            &owners,
             &doc.text,
             &method.annotations,
             "org.springframework.beans.factory.annotation.Qualifier",
@@ -309,7 +313,9 @@ mod tests {
             text: d.text.clone(),
         });
         assert!(
-            edges.definitions.is_empty() && edges.references.is_empty() && edges.aliases.is_empty()
+            edges.definitions.iter().chain(&edges.references).all(|a| a.key.starts_with("class:") || a.key.starts_with("profile#"))
+                && edges.aliases.is_empty(),
+            "no bean-name anchor reaches the host index"
         );
         assert!(h.requests().is_empty() && h.process_runs().is_empty());
     }
@@ -406,5 +412,13 @@ mod tests {
         };
         assert!(nav.hover(&windows, at(&windows)).is_some());
         assert!(h.requests().is_empty() && h.process_runs().is_empty());
+    }
+    #[test]
+    fn hover_works_in_file_with_generic_class() {
+        let _h = MockHost::install();
+        let class = doc(&format!("{CLASS} class Box<T> {{}}"));
+        assert!(Navigator::default().hover(&class, class_at(&class)).unwrap().markdown.contains("`mail`"));
+        let factory = doc(&format!("{TEXT} class Box<T> {{}}"));
+        assert!(Navigator::default().hover(&factory, at(&factory)).unwrap().markdown.contains("`mail`"));
     }
 }

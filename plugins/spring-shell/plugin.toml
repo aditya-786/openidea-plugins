@@ -4,16 +4,19 @@ version = "0.3.0" # x-release-please-version
 description = "Spring Shell 3.x/4.x commands in Java and Kotlin projects, for both the @ShellComponent/@ShellMethod model and the @Command model. Checks availability methods (unknown command names, wrong return type), literal option/default/alias declarations and duplicate command names, completes command names, groups and provider beans, and links commands to their availability methods and providers."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Unreleased: custom gutter icon for availability markers. Hover on an availability selector naming an inherited @ShellMethod command shows its description and declaring class; reviewed command-key rename of a superclass command (also offered from an inheriting subclass's availability selector) edits the declaration and every inheriting subclass's literal availability selector in one reviewed action listed with path:line:col, and refuses when a subclass chain/selector is not fully literal or the new key collides. Inherited conventional <method>Availability lookup walks the literal project superclass chain (nearest wins, like findMethod) and no longer lets a local wildcard/keyed marker override it; @ShellMethod commands inherited by a @ShellComponent subclass over a fully literal chain join the subclass for availability selectors and duplicate-command checks (group still comes from the declaring class, as in Spring Shell 2.1/3.x). Legacy ShellMethodAvailability(\"name\") now links to an indicator inherited from a project superclass chain declared literally once (like Spring Shell's findMethod) and warns only when that whole chain is known and lacks it; duplicate-command messages name the other file. Native current-class occurrence highlights and code lenses with snapshot/project revalidation; unsafe automatic raw-string Rename remains unexported. Modern 3.x aliases and 4.x Command/CommandGroup source indexing, hover and separate core availability providers; reviewed Java/Kotlin aliases and implicit command keys materialize explicit names without renaming methods. Explicit Java command aliases and normalized multiword keys now support reviewed local rename and occurrence navigation; selectors follow only their selected alias. Add read-only closed Java command/availability occurrence navigation with separate indicator-method identity; preserve explicitly reviewed rename and exclude unknown/transformed scopes. Unreleased: source provider/interface/local-class and option type proofs reject aliases/shadows and ambiguous cached bean names; structural Java Unicode source is withheld while established safe literal spans remain supported. description hover withholds escaped/textblock values rather than presenting partial lexer decoding as a declared description. Availability return type completion requires exact written canonical ownership. annotation ownership guards reject aliased/static/conflicting imports, source typealias/generic shadows and package-root collisions before command hover or source claims. literal option names/primitive conversion profiles and modern alias collision checks, corrected 3.4 command/arity semantics, and an exact-preview atomic ShellComponent insertion. verified Spring Shell 3.4 source-local description/availability/option-arity checks, command-side availability role fix, all literal provider-array entries checked, and exact modern annotation ownership. 0.1.0 (first release): command index, availability checks and navigation, duplicate command check, completion of command names, groups and availability providers."
+change-notes = """\
+Next release: Plainer wording for checks, the @ShellComponent fix and the rename preview. New icon for availability markers, and code lenses only for commands with more than one occurrence; hover and rename for commands inherited from a superclass, and rename refuses to run on a partly indexed project; availability lookup follows superclasses, and abstract base classes are no longer asked to add @ShellComponent; Spring Shell 3 and 4 commands are indexed, and deleted or moved files no longer cause false duplicate-command errors; one name per command, row commands say what to select, fixes on unsaved files ask you to save first, and fixes work with Windows drive-letter roots. \
+0.3.0: command navigation and availability checks. \
+0.2.0: plugin icon and command markers."""
 categories = ["frameworks"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
-activation = ["on-language:java", "on-language:kotlin"]
+activation = ["on-language:java", "on-language:kotlin", "on-event:files-changed"]
 
 [capabilities]
 required = ["project.read"]
-optional = ["editor.read"]
+optional = ["editor.read", "events"]
 
 [[contributes.providers]]
 kinds = ["completion", "definition", "line-markers", "diagnostics", "hover", "code-actions"]
@@ -21,7 +24,7 @@ languages = ["java", "kotlin"]
 
 [[contributes.commands]]
 id = "command-occurrences"
-title = "Spring Shell: Find Literal Command or Availability Occurrences"
+title = "Spring Shell: Find Command Occurrences"
 category = "Spring Shell"
 
 [[contributes.providers]]

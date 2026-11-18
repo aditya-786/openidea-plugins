@@ -12,6 +12,10 @@ button{white-space:nowrap}
 /* Reuse kit tabs, toolbar and controls; only their composition lives here. */
 #view-tabs,#sections{flex:none;overflow-x:auto;overflow-y:hidden;border-bottom:1px solid var(--ui-separator);background:var(--ui-toolbar-bg,var(--ui-bg))}
 #view-tabs>button,#sections>button{flex:none}
+.view-nav{display:flex;flex:none;min-width:0}
+.view-nav>#view-tabs{flex:1 1 auto;min-width:0}
+.view-section-picker{flex:none;display:flex;align-items:center;padding:0 var(--ui-space-1) 0 var(--ui-space-2);border-bottom:1px solid var(--ui-separator);background:var(--ui-toolbar-bg,var(--ui-bg))}
+.view-section-picker .ui-select-shell{max-width:140px}
 #view-tabs>button{display:inline-flex;align-items:center;gap:6px}
 #view-tabs .tab-count{color:var(--ui-muted);font-weight:400;font-variant-numeric:tabular-nums}
 #view-tabs>button[aria-selected=true],#sections>button[aria-current=page]{border-bottom-color:var(--ui-accent)}
@@ -38,7 +42,6 @@ main{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
 .resource-facts dd{margin:2px 0;white-space:pre-wrap;min-width:0}
 #details .ui-dialog-footer{display:flex;justify-content:flex-end;padding:var(--ui-space-3)}
 .ui-table{width:100%}
-table.resources{min-width:650px}
 thead{position:sticky;top:0;z-index:1;background:var(--ui-bg)}
 th{white-space:nowrap}
 th .ui-button{border:0;border-radius:0;background:none;text-align:left;justify-content:flex-start;width:100%;height:24px;min-height:24px;padding:3px var(--ui-space-2)}
@@ -72,8 +75,24 @@ th .view-icon{width:12px;height:12px}
 @media(max-width:480px){
   .form>.ui-field{grid-template-columns:minmax(0,1fr);gap:var(--ui-space-1)}
 }
-/* The workspace scrolls within the dock; keep the status line at its bottom
-   even in shallow panels rather than reserving a fixed content height. */
+/* Narrow docks share the width between columns and ellipsize identifiers (full value in the cell title). */
+@media(max-width:640px){
+  table.resources{table-layout:fixed}
+  table.resources td{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  table.resources th .ui-button{display:block;overflow:hidden;text-overflow:ellipsis}
+}
+.empty-title{display:flex;align-items:center;gap:var(--ui-space-2)}
+/* Shallow docks (bottom panel at ~240 px): one compact filter row with scrolling facets,
+   a bounded table area that keeps rows visible, and the rest of main scrolls around it. */
+@media(max-height:420px){
+  main{overflow-y:auto}
+  .filters{flex-wrap:nowrap;padding-block:2px}
+  #facets{flex-wrap:nowrap;flex:0 1 auto;overflow-x:auto;overflow-y:hidden}
+  #facets label{flex:0 0 140px}
+  .search{min-width:110px}
+  .workspace{flex:1 0 0%;min-height:min(160px,60vh)}
+  footer{position:sticky;bottom:0;background:var(--ui-bg)}
+}
 
 .form .field-controls{display:flex;align-items:center;flex-wrap:wrap;gap:var(--ui-space-2);min-width:0}
 .form .field-controls>input{flex:1 1 100px;width:0;min-width:0}

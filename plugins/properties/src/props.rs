@@ -79,11 +79,21 @@ pub fn items(text: &str) -> Vec<Item> {
 
         let key_start = i;
         while i < b.len() && !matches!(b[i], b':' | b'=' | b' ' | b'\t' | b'\x0c' | b'\n' | b'\r') {
-            i = if b[i] == b'\\' { skip_escape(b, i) } else { i + 1 };
+            if b[i] != b'\\' {
+                i += 1;
+                continue;
+            }
+            let continued = matches!(b.get(i + 1), Some(b'\n' | b'\r'));
+            i = skip_escape(b, i);
+            if continued {
+                while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\x0c') {
+                    i += 1;
+                }
+            }
         }
         let key = key_start..i;
 
-        while i < b.len() && matches!(b[i], b' ' | b'\t') {
+        while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\x0c') {
             i += 1;
         }
 
@@ -91,7 +101,7 @@ pub fn items(text: &str) -> Vec<Item> {
         if i < b.len() && matches!(b[i], b':' | b'=') {
             sep = Some(i);
             i += 1;
-            while i < b.len() && matches!(b[i], b' ' | b'\t') {
+            while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\x0c') {
                 i += 1;
             }
         }
@@ -167,7 +177,7 @@ fn decoded_units(s: &str, strict: bool) -> Option<Vec<u16>> {
             Some('f') => out.push('\x0c' as u16),
             Some('\r' | '\n') => {
                 chars.next_if_eq(&'\n');
-                while chars.next_if(|c| matches!(c, ' ' | '\t')).is_some() {}
+                while chars.next_if(|c| matches!(c, ' ' | '\t' | '\x0c')).is_some() {}
             }
             Some(other) => out.extend(other.encode_utf16(&mut [0; 2]).iter()),
             None => {}
@@ -450,5 +460,57 @@ mod tests {
         assert_eq!(split_locale("my_messages_de"), ("my_messages", "de"));
         assert_eq!(split_locale("app_db"), ("app_db", ""));
         assert_eq!(split_locale("messages"), ("messages", ""));
+    }
+
+    #[test]
+    fn key_continued_over_indented_line() {
+        let text = "ke\\\n  y=v\n";
+        let props = parse(text);
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].unescaped_key(text), "key");
+        assert_eq!(unescape(&text[props[0].value.clone()]), "v");
+    }
+
+    #[test]
+    fn form_feed_around_separator() {
+        let text = "a\x0c=\x0cb\nc\x0c\x0cd\n";
+        let props = parse(text);
+        let pairs: Vec<(String, String)> =
+            props.iter().map(|p| (p.unescaped_key(text), text[p.value.clone()].to_owned())).collect();
+        assert_eq!(pairs, [("a".to_owned(), "b".to_owned()), ("c".to_owned(), "d".to_owned())]);
+    }
+
+    fn pairs(text: &str) -> Vec<(String, String)> {
+        parse(text).iter().map(|p| (p.unescaped_key(text), unescape(&text[p.value.clone()]))).collect()
+    }
+
+    #[test]
+    fn trailing_backslash_at_eof_is_dropped() {
+        assert_eq!(pairs("k=v\\"), [("k".to_owned(), "v".to_owned())]);
+        assert_eq!(pairs("k\\"), [("k".to_owned(), String::new())]);
+    }
+
+    #[test]
+    fn double_backslash_before_newline_is_not_a_continuation() {
+        assert_eq!(
+            pairs("a=x\\\\\nb=y\n"),
+            [("a".to_owned(), "x\\".to_owned()), ("b".to_owned(), "y".to_owned())]
+        );
+    }
+
+    #[test]
+    fn crlf_continuation_with_indentation() {
+        assert_eq!(pairs("k=a\\\r\n   b\r\nke\\\r\n  y=v\r\n"), [
+            ("k".to_owned(), "ab".to_owned()),
+            ("key".to_owned(), "v".to_owned()),
+        ]);
+    }
+
+    #[test]
+    fn escaped_separators_stay_in_keys() {
+        assert_eq!(
+            pairs("a\\=b\\:c\\ d=v\n"),
+            [("a=b:c d".to_owned(), "v".to_owned())]
+        );
     }
 }

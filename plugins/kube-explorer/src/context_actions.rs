@@ -20,7 +20,7 @@ impl KubeExplorer {
                 actions.extend([("resource-describe", "Describe", "info"), ("resource-yaml", "Edit YAML…", "file-yaml")]);
             }
             if kind == "pods" || WORKLOADS.contains(&kind.as_str()) {
-                actions.extend([("resource-logs", "Follow Logs", "file-log"), ("resource-log-view", "View Log Snapshot…", "filter"), ("resource-log-sources", "Select Log Sources…", "settings")]);
+                actions.extend([("resource-logs", "Follow Logs (Terminal)", "file-log"), ("resource-log-view", "Log Snapshot…", "filter"), ("resource-log-sources", "Follow Logs from Selected Sources…", "settings")]);
             }
             if kind == "pods" {
                 actions.extend([("resource-shell", "Open Shell", "terminal"), ("resource-attach", "Attach", "attach-to-process"), ("resource-debug", "Debug…", "debug")]);
@@ -80,11 +80,11 @@ impl KubeExplorer {
     }
 
     pub(super) fn tree_context_action(&mut self, id: &str, key: Option<&str>, ctx: &Invocation) -> Result<(), Error> {
-        let key = key.ok_or(Error::Stale)?;
+        let key = key.ok_or_else(|| Error::Invalid("Select a resource in the Kube Explorer window first.".into()))?;
         let current = self.render(TREE, None, ctx)?;
         let Body::Tree(items) = current.body else { return Err(Error::Stale); };
         let payload=self.service_payload(key)?;
-        let item = items.iter().find(|item|self.service_payload(&item.key).is_ok_and(|current|current == payload)).ok_or(Error::Stale)?;
+        let item = items.iter().find(|item|self.service_payload(&item.key).is_ok_and(|current|current == payload)).ok_or_else(|| Error::Invalid("This resource is no longer listed. Refresh the group.".into()))?;
         if !self.row_actions(item)?.iter().any(|action|action.0 == id) { return Err(Error::Stale); }
         let bare = self.checked_tree_key(key)?;
         match id {
@@ -97,7 +97,7 @@ impl KubeExplorer {
             }
             "tree-watch" | "tree-open-watch" | "tree-kubeconfig" | "tree-import-config" | "tree-review-config" => {
                 let command=match id {"tree-watch"=>"watch-resources","tree-open-watch"=>"open-resource-watch","tree-kubeconfig"=>"choose-kubeconfig","tree-import-config"=>"import-pasted-kubeconfig",_=>"review-imported-kubeconfigs"};
-                if let Some(message)=self.run_command(command,ctx,None)? {host::notify(NotificationLevel::Info,"Kubernetes",&message);}
+                if let Some(message)=self.run_command(command,ctx,None)? {host::notify(NotificationLevel::Info,"Kube Explorer",&message);}
             }
             "tree-create-secret" => { self.button_in("create-secret", Some(ctx))?; crate::ui_group::reveal_view(PANEL)?; }
             _ => return Err(Error::Stale),
@@ -121,6 +121,14 @@ mod tests {
             plugin.expanded.insert(group.into());plugin.children.insert(group.into(),Ok(names.into_iter().map(str::to_owned).collect()));
         }
         (host, plugin)
+    }
+    #[test]
+    fn resource_describe_without_selection_explains() {
+        let (host, mut plugin) = fixture();
+        for id in ["resource-describe", "tree-switch", "tree-refresh"] {
+            let error = plugin.run_command(id, &host.invocation(), None).unwrap_err();
+            assert!(matches!(error, Error::Invalid(ref message) if message == "Select a resource in the Kube Explorer window first."), "{id}: {error:?}");
+        }
     }
     fn request(host: &MockHost, plugin: &mut KubeExplorer, operation: Value) -> Value {
         let mut request = operation;
@@ -173,6 +181,15 @@ mod tests {
         assert_eq!(host.process_runs().len(),before);
         let native=plugin.render(TREE,None,&host.invocation()).unwrap();
         assert!(matches!(native.body,Body::Tree(_)));
+    }
+
+    #[test]
+    fn a_vanished_row_asks_to_refresh_the_group() {
+        let (host,mut plugin)=fixture();
+        let answer=request(&host,&mut plugin,json!({"op":"render"}));let target=row(&answer["model"],"remote");
+        plugin.children.insert("ctx".into(),Ok(vec!["local".into()]));
+        let error=plugin.run_command("tree-switch",&host.invocation(),Some(&target)).unwrap_err();
+        assert_eq!(error,Error::Invalid("This resource is no longer listed. Refresh the group.".into()));
     }
 
     #[test]

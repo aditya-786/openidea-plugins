@@ -57,7 +57,7 @@
     "menu": "viewItem.context",
     "view": "laravel-models",
     "command": "model-create-fields",
-    "label": "Create Fields…",
+    "label": "Create Model Fields…",
     "icon": "add"
   },
   {

@@ -64,7 +64,7 @@ pub(crate) fn run(owner: &Main, ctx: &Invocation) -> Result<Option<String>, Erro
         .start;
     let offset = text::offset(&origin.text, at).ok_or(Error::Stale)?;
     let reference=ownership::reference(&origin,offset).filter(|r|matches!(r.kind,Kind::Route|Kind::Service|Kind::Template))
-        .ok_or_else(||Error::Invalid("Place the caret inside a plain literal route, service or template reference. Dynamic/escaped expressions are not admitted.".into()))?;
+        .ok_or_else(||Error::Invalid("Put the caret on a route, service or template name written as a plain string. Names built at runtime are not supported.".into()))?;
     let index = owner.index_for(&origin.path).ok_or(Error::Stale)?;
     let name = &origin.text[reference.start..reference.end];
     if name.len() > 512 {
@@ -85,7 +85,7 @@ pub(crate) fn run(owner: &Main, ctx: &Invocation) -> Result<Option<String>, Erro
         _ => None,
     }
     .ok_or_else(|| {
-        Error::NotFound("No admitted cached source declaration; reindex this project first.".into())
+        Error::NotFound("No declaration of this name was found. Run Symfony: Reindex Project, then try again.".into())
     })?;
     if !owned(&project, &root, &entry.path) {
         return Err(Error::Stale);
@@ -182,11 +182,11 @@ pub(crate) fn run(owner: &Main, ctx: &Invocation) -> Result<Option<String>, Erro
         .collect();
     if items.is_empty() {
         return Ok(Some(
-            "No admitted source occurrences found; this is not proof of no runtime usages.".into(),
+            "No usages found in the project sources. Names built at runtime are not searched.".into(),
         ));
     }
     let title = format!(
-        "{}{} source occurrences of {name} · source-pattern candidates, not runtime usages",
+        "{}{} usages of {name} in project sources",
         if partial { "Partial: " } else { "" },
         items.len()
     );

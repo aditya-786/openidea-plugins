@@ -6,14 +6,16 @@
       "default": "{id} {summary}"
     },
     "fillCommitTemplate": {
+      "title": "Pre-fill the commit message from the active task",
       "type": "boolean",
-      "title": "Write the active task's commit message to git's commit.template, which pre-fills the commit field (needs git; a template you set yourself is left alone)",
-      "default": false
+      "default": false,
+      "description": "Write the active task's commit message to git's commit.template, which pre-fills the commit field (needs git; a template you set yourself is left alone)"
     },
     "branchNameFormat": {
+      "title": "Branch name format",
       "type": "string",
-      "title": "Branch name format ({id} and {summary} are replaced; local tasks have no ID, so an empty name falls back to the first two words of the summary)",
-      "default": "{id}"
+      "default": "{id}",
+      "description": "Branch name format ({id} and {summary} are replaced; local tasks have no ID, so an empty name falls back to the first two words of the summary)"
     },
     "updateIssuesAutomatically": {
       "type": "boolean",
@@ -32,12 +34,13 @@
     },
     "githubQuery": {
       "type": "string",
-      "title": "GitHub: extra search qualifiers (label:bug, milestone:v2\u2026)",
+      "title": "GitHub: extra search qualifiers (label:bug, milestone:v2…)",
       "default": ""
     },
     "gitlabProject": {
       "type": "string",
-      "title": "GitLab project as group/name (leave empty to use the gitlab.com remote, or all your issues if there is none)",
+      "title": "GitLab project as group/name",
+      "description": "Leave empty to use the gitlab.com remote, or all your issues if there is none.",
       "default": ""
     },
     "forgejoRepository": {
@@ -47,7 +50,8 @@
     },
     "youtrackHost": {
       "type": "string",
-      "title": "YouTrack host, such as acme.youtrack.cloud or youtrack.example.com (self-hosted asks for permission at first use)",
+      "title": "YouTrack host",
+      "description": "Such as acme.youtrack.cloud or youtrack.example.com. The IDE asks you to approve a self-hosted host on first use.",
       "default": ""
     },
     "youtrackQuery": {
@@ -72,7 +76,8 @@
     },
     "searchClosedIssues": {
       "type": "boolean",
-      "title": "Include closed GitHub, GitLab, Codeberg and Lighthouse issues in explicit Search Issues",
+      "title": "Include closed issues in Search Issues",
+      "description": "GitHub, GitLab, Codeberg and Lighthouse issues.",
       "default": false
     },
     "lighthouseHost": {
@@ -91,14 +96,15 @@
       "default": ""
     },
     "fogbugzProfile": {
+      "title": "FogBugz credential file",
       "type": "string",
-      "title": "Absolute path to externally provisioned0600 FogBugz credential profile (token stays outside plugin)",
-      "default": ""
+      "default": "",
+      "description": "Full path to the file that holds your FogBugz token, readable only by you (chmod 600). See FogBugz Cloud in the Tasks README."
     },
     "selfHostedProfiles": {
       "type": "array",
-      "title": "Approved self-hosted tracker credential profiles",
-      "description": "Nonsecret descriptors for explicit Redmine/Mantis/Generic searches through Python3. Credential JSON stays in an external0600 file.",
+      "title": "Redmine, MantisBT and generic trackers",
+      "description": "One entry per tracker, used by Search Issues. Tokens stay in a separate file readable only by you; see Self-hosted Redmine and MantisBT in the Tasks README.",
       "maxItems": 16,
       "items": {
         "type": "object",

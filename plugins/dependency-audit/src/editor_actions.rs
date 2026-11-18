@@ -130,11 +130,11 @@ fn current(doc: &Document, r: &Reference) -> Result<Project, Error> {
         return Err(Error::Stale);
     }
     let project = project_of(&doc.path).ok_or(Error::Stale)?;
-    if project.root()? != r.root
-        || !owned_source_path(&r.root, &doc.path)
-        || project.read_file(&doc.path)? != doc.text
-    {
+    if project.root()? != r.root || !owned_source_path(&r.root, &doc.path) {
         return Err(Error::Stale);
+    }
+    if project.read_file(&doc.path)? != doc.text {
+        return Err(Error::Invalid("Save the file first".into()));
     }
     Ok(project)
 }

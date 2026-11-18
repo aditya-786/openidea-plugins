@@ -1,13 +1,16 @@
 id = "aritti.spring-security"
 name = "Spring Security Tools"
 version = "0.3.0" # x-release-please-version
-description = "Spring Security checks for Java. Flags WebSecurityConfigurerAdapter, @EnableGlobalMethodSecurity, antMatchers/mvcMatchers/regexMatchers and authorizeRequests (removed or deprecated in Spring Security 6), redundant ROLE_ prefixes in hasRole/hasAnyRole, NoOpPasswordEncoder and {noop} passwords, with quick fixes where the change is mechanical. Completes security expressions and the project's role names in @PreAuthorize, @PostAuthorize, @PreFilter and @PostFilter."
+description = "Spring Security checks for Java, Kotlin and Spring XML that flag WebSecurityConfigurerAdapter, @EnableGlobalMethodSecurity, antMatchers/mvcMatchers/regexMatchers and authorizeRequests (removed or deprecated in Spring Security 6), redundant ROLE_ prefixes in hasRole/hasAnyRole, NoOpPasswordEncoder and {noop} passwords, with quick fixes where the change is mechanical. It also completes security expressions and role names in @PreAuthorize, @PostAuthorize, @PreFilter and @PostFilter and adds hover and go to definition for request matchers and security XML bean references."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Unreleased: role-prefix findings now follow Spring Security source (Java DSL hasRole(ROLE_X) throws at startup; SpEL hasRole strips it, reported as Info), anyRequest-not-last cites the real IllegalStateException, identical matchers with conflicting access name both rules, and @Secured/@RolesAllowed beside an @EnableMethodSecurity without securedEnabled/jsr250Enabled get an Info. Unreleased: @PreAuthorize/@PostAuthorize literals are checked for unbalanced SpEL, argument-less hasRole/hasAuthority calls and #name references that match no method parameter (or @P/@Param alias); filter-chain ordering checks (anyRequest not last, shadowed or duplicate matchers) unchanged. Unreleased: canonical method-security Java/Kotlin literals publish physical SpEL injection ranges; lexical rendering uses the core Spring SpEL language and does not infer authorization semantics. Unreleased: wider hand-written XML tables (<http>, <method-security>, <csrf>, <headers>, <cors>, <custom-filter>, <concurrency-control>, boolean and enabled/disabled values, more bean references), Info for bean references no project bean answers (userDetailsServiceBeanName, @bean in security expressions, ref attributes in security XML), table checks of <http>, <intercept-url>, <user> and related XML elements, opt-in warning for self-invocation of method-security protected methods, Conservative Go to Definition candidates from explicit security-namespace XML Ant patterns to literal controller mappings; unresolved Java/Kotlin/implicit matcher strategies are withheld. 0.1.0 (first release): Spring Security 6 migration checks with quick fixes, ROLE_ prefix and plain-text password checks, method security expression completion."
+change-notes = """\
+Next release: Clearer role prefix findings that match Spring Security behaviour; @PreAuthorize and @PostAuthorize expressions are checked for typos and unknown parameters; more security XML checks, and unknown bean reference notes stay on as the index follows saved and changed files; path globs such as /api/** in Java comments no longer hide the rest of the file, the path matcher checks path patterns, and quick fixes and bean navigation work on Windows drives; shorter matcher hints and hover text, short setting titles and clearer permission messages. \
+0.3.0: filter chain and method security checks. \
+0.2.0: plugin icon and XML checks."""
 categories = ["frameworks"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-language:java", "on-language:kotlin", "on-language:xml", "on-event:files-changed"]
 

@@ -352,12 +352,12 @@ pub(super) fn proof(doc: &Document) -> Option<Proof> {
         if platform.is_some() {
             return None;
         }
-        "literal Boot plugin plus dependency-management 1.1.7; source-declared management only"
+        "the Spring Boot and dependency-management plugins"
     } else {
         if platform.as_deref() != Some(&boot) {
             return None;
         }
-        "literal Boot plugin plus platform(spring-boot-dependencies) BOM of the same version"
+        "the Spring Boot plugin and the spring-boot-dependencies platform"
     };
     Some(Proof {
         boot,
@@ -620,7 +620,7 @@ mod tests {
     }
     fn ready(text: &str, kotlin: bool) -> (MockHost, Launcher, Document) {
         let (h, mut l, d) = setup(text, kotlin);
-        l.run_command("add-starters", &h.invocation(), None)
+        l.bound_cache(&h.invocation())
             .unwrap();
         (h, l, d)
     }
@@ -683,7 +683,7 @@ mod tests {
                     ..Default::default()
                 })
             });
-            l.run_command("add-starters", &h.invocation(), None)
+            l.bound_cache(&h.invocation())
                 .unwrap();
             let a = resolve(&h, &mut l, &d, &["data-jpa"]);
             let new = after(&d, &a);
@@ -739,7 +739,7 @@ mod tests {
         for text in bad {
             let (h, mut l, d) = setup(&text, false);
             assert!(
-                l.run_command("add-starters", &h.invocation(), None)
+                l.bound_cache(&h.invocation())
                     .is_err()
             );
             assert_eq!(h.fetches(), 0);
@@ -755,7 +755,7 @@ mod tests {
             let (h, mut l, _) = setup(GROOVY, false);
             h.add_file(name, "fixture");
             assert!(
-                l.run_command("add-starters", &h.invocation(), None)
+                l.bound_cache(&h.invocation())
                     .is_err(),
                 "{name}"
             );
@@ -766,14 +766,14 @@ mod tests {
     fn literal_settings_allowed_but_modules_custom_management_and_nested_source_refuse() {
         let (h, mut l, _) = setup(KOTLIN, true);
         h.add_file("settings.gradle.kts", "rootProject.name = \"demo\"\n");
-        assert!(l.run_command("add-starters", &h.invocation(), None).is_ok());
+        assert!(l.bound_cache(&h.invocation()).is_ok());
         let (h, mut l, _) = setup(GROOVY, false);
         h.add_file(
             "settings.gradle",
             "pluginManagement { repositories { mavenLocal() } }",
         );
         assert!(
-            l.run_command("add-starters", &h.invocation(), None)
+            l.bound_cache(&h.invocation())
                 .is_err()
         );
         assert_eq!(h.fetches(), 0);
@@ -781,7 +781,7 @@ mod tests {
         h.add_project("/project");
         h.set_project_root(Some("/other"));
         assert!(
-            l.run_command("add-starters", &h.invocation(), None)
+            l.bound_cache(&h.invocation())
                 .is_err()
         );
         assert_eq!(h.fetches(), 0);
@@ -789,7 +789,7 @@ mod tests {
         h.add_file("sub/build.gradle", GROOVY);
         h.open_editor("/project/sub/build.gradle", "groovy", GROOVY, &[]);
         assert!(
-            l.run_command("add-starters", &h.invocation(), None)
+            l.bound_cache(&h.invocation())
                 .is_err()
         );
         assert_eq!(h.fetches(), 0);
@@ -813,7 +813,7 @@ mod tests {
     #[test]
     fn metadata_bom_repository_version_and_provided_mapping_are_not_inferred() {
         for field in ["bom", "repository", "version", "scope"] {
-            let (h, mut l, d) = setup(GROOVY, false);
+            let (h, mut l, _d) = setup(GROOVY, false);
             let mut coords: serde_json::Value = serde_json::from_str(COORDS).unwrap();
             for dep in ["web", "data-jpa", "unknown-range"] {
                 coords["dependencies"][dep][field] = if field == "scope" {
@@ -834,12 +834,12 @@ mod tests {
                     ..Default::default()
                 })
             });
-            let prepared = l.run_command("add-starters", &h.invocation(), None);
+            let prepared = l.bound_cache(&h.invocation());
             assert!(prepared.is_err());
             assert_eq!(h.editor_text(), GROOVY);
         }
     }
-    fn apply(h: &MockHost, d: &Document, a: &FileAction) -> (String, Option<String>) {
+    fn apply(_h: &MockHost, d: &Document, a: &FileAction) -> (String, Option<String>) {
         let edit = |text: &str, e: &openidea_plugin::TextEdit| {
             let mut out = text.to_owned();
             out.replace_range(offset(text, e.range.start).unwrap()..offset(text, e.range.end).unwrap(), &e.text);
@@ -872,7 +872,7 @@ mod tests {
             assert!(build.contains("spring-boot-starter-web"));
             let mismatched = text.replace("dependencies:3.5.16", "dependencies:3.4.0");
             let (h, mut l, _) = setup(&mismatched, kotlin);
-            assert!(l.run_command("add-starters", &h.invocation(), None).is_err());
+            assert!(l.bound_cache(&h.invocation()).is_err());
             assert_eq!(h.fetches(), 0);
             let unmanaged = base.replace(dm, "");
             assert!(proof(&Document { text: unmanaged, ..d.clone() }).is_none());
@@ -884,7 +884,7 @@ mod tests {
             let text = if kotlin { KOTLIN } else { GROOVY };
             let (h, mut l, d) = setup(text, kotlin);
             h.add_file("gradle/libs.versions.toml", CATALOG);
-            l.run_command("add-starters", &h.invocation(), None).unwrap();
+            l.bound_cache(&h.invocation()).unwrap();
             let a = resolve(&h, &mut l, &d, &["web"]);
             let (build, catalog) = apply(&h, &d, &a);
             let catalog = catalog.unwrap();
@@ -904,17 +904,17 @@ mod tests {
         let referenced = GROOVY.replace("'org.springframework.boot:spring-boot-starter'", "libs.spring.boot.starter");
         let (h, mut l, d) = setup(&referenced, false);
         h.add_file("gradle/libs.versions.toml", CATALOG);
-        l.run_command("add-starters", &h.invocation(), None).unwrap();
+        l.bound_cache(&h.invocation()).unwrap();
         let a = resolve(&h, &mut l, &d, &["web"]);
         assert!(apply(&h, &d, &a).0.contains("libs.spring.boot.starter.web"));
         for bad in ["[bundles]\nx = [\"a\"]\n", "[libraries]\nx = { module = \"a:b\", other = \"c\" }\n", "[libraries]\nx = { module = \"a:b\" \n"] {
             let (h, mut l, _) = setup(&referenced, false);
             h.add_file("gradle/libs.versions.toml", bad);
-            assert!(l.run_command("add-starters", &h.invocation(), None).is_err(), "{bad}");
+            assert!(l.bound_cache(&h.invocation()).is_err(), "{bad}");
             assert_eq!(h.fetches(), 0);
         }
         let (h, mut l, _) = setup(&referenced, false);
-        assert!(l.run_command("add-starters", &h.invocation(), None).is_err());
+        assert!(l.bound_cache(&h.invocation()).is_err());
         assert_eq!(h.fetches(), 0);
         let _ = h;
     }
@@ -922,7 +922,7 @@ mod tests {
     fn catalog_without_libraries_table_gets_one() {
         let (h, mut l, d) = setup(GROOVY, false);
         h.add_file("gradle/libs.versions.toml", "[versions]\nspring = \"3.5.16\"");
-        l.run_command("add-starters", &h.invocation(), None).unwrap();
+        l.bound_cache(&h.invocation()).unwrap();
         let a = resolve(&h, &mut l, &d, &["web"]);
         assert_eq!(apply(&h, &d, &a).1.unwrap(), "[versions]\nspring = \"3.5.16\"\n\n[libraries]\nspring-boot-starter-web = { module = \"org.springframework.boot:spring-boot-starter-web\" }\n");
     }
@@ -931,7 +931,7 @@ mod tests {
         let (h, mut l, d) = setup(KOTLIN, true);
         assert!(l.file_actions(&d, Range::default()).is_empty());
         assert_eq!(h.fetches(), 0);
-        l.run_command("add-starters", &h.invocation(), None)
+        l.bound_cache(&h.invocation())
             .unwrap();
         let a = l.file_actions(&d, Range::default()).remove(0);
         let replay = a.clone();

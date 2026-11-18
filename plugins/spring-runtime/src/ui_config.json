@@ -41,9 +41,31 @@
   "opaque_views": [
     "runtime-controls"
   ],
+  "toolbar_groups": {
+    "runtime-snapshot": [
+      {
+        "id": "selected-row",
+        "label": "Selected Row",
+        "icon": "run",
+        "items": [
+          "snapshot-related-beans",
+          "snapshot-open-browser",
+          "snapshot-send-request",
+          "snapshot-create-request",
+          "snapshot-copy-request"
+        ]
+      }
+    ]
+  },
   "context_buttons": {
     "runtime": [],
-    "runtime-snapshot": [],
+    "runtime-snapshot": [
+      "snapshot-related-beans",
+      "snapshot-open-browser",
+      "snapshot-send-request",
+      "snapshot-create-request",
+      "snapshot-copy-request"
+    ],
     "runtime-graph": [],
     "runtime-controls": []
   }

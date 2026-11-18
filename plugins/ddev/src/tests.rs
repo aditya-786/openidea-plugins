@@ -225,13 +225,13 @@ fn terminal_commands_preserve_arguments_and_confirm_destructive_actions() {
             output(&running())
         }
     });
-    for command in ["restart", "stop", "share"] {
+    for command in ["restart", "stop"] {
         plugin
             .run_command(command, &host.invocation(), None)
             .unwrap();
         assert_eq!(plugin.terminal_launches.last().unwrap().args, [command]);
     }
-    for command in ["delete", "poweroff", "config"] {
+    for command in ["share", "delete", "poweroff", "config"] {
         let before = plugin.terminal_launches.len();
         plugin
             .run_command(command, &host.invocation(), None)
@@ -517,6 +517,8 @@ fn database_setup_preserves_other_sources_and_never_writes_passwords() {
     let text = project.read_file(database::FILE).unwrap();
     assert!(text.contains("# Keep my source") && text.contains("Production"));
     assert!(!text.contains("secret-for-test") && !text.contains("password"));
+    let note = &host.notifications()[0].body;
+    assert!(note.contains("database.sources permission. Allow it in Settings › Plugins › DDEV Integration."), "{note}");
     let doc: toml_edit::DocumentMut = text.parse().unwrap();
     let sources = doc["data-source"].as_array_of_tables().unwrap();
     assert_eq!(sources.len(), 2);
@@ -605,6 +607,18 @@ fn state_controls_match_original_and_reject_invalid_runtime_actions() {
             .is_err()
     );
     assert_eq!(host.status_items()["ddev-status"].text, "DDEV: stopped");
+    let err = plugin.run_command("stop", &host.invocation(), None).unwrap_err().to_string();
+    assert!(err.contains("DDEV: Stop Project needs a running project"), "{err}");
+}
+
+#[test]
+fn status_bar_item_is_hidden_in_projects_without_ddev() {
+    let host = MockHost::install().with_capabilities(&["project.read", "process:ddev"]);
+    host.set_project_root(Some("/work/plain"));
+    let item = openidea_plugin::StatusItem { text: "DDEV: running".into(), tooltip: None, command: None };
+    host::set_window_status_item("ddev-status", &item).unwrap();
+    Main::default().render(VIEW, None, &host.invocation()).unwrap();
+    assert!(!host.status_items().contains_key("ddev-status"));
 }
 
 #[test]
@@ -641,6 +655,18 @@ fn events_refresh_status_and_watch_setting_is_respected() {
             .unwrap()
             .contains("running")
     );
+}
+
+#[test]
+fn guided_setup_opens_the_setup_form_and_help_command_is_gone() {
+    let host = mock().with_capabilities(&["project.read"]);
+    let mut plugin = Main::default();
+    plugin.run_command("setup", &host.invocation(), None).unwrap();
+    assert_eq!(host.revealed_views(), [support::SETUP.to_owned()]);
+    let manifest = include_str!("../plugin.toml");
+    assert!(!manifest.contains("id = \"help\""));
+    assert!(!manifest.contains("command = \"help\""));
+    assert!(!manifest.lines().find(|l| l.starts_with("description")).unwrap().contains("API 1.4"));
 }
 
 #[test]
@@ -2881,5 +2907,106 @@ fn run_target_validation_refuses_stopped_project_and_allows_running() {
     let error = host
         .validate_run_target(&mut plugin, "ddev", &launch)
         .unwrap_err();
-    assert!(error.contains("Start it with DDEV: Start"), "{error}");
+    assert!(error.contains("Run DDEV: Start"), "{error}");
+}
+
+const ROOT: &str = "/work/my project";
+
+fn status_text(plugin: &mut Main, host: &MockHost) -> String {
+    plugin.render(VIEW, None, &host.invocation()).unwrap().status.unwrap_or_default()
+}
+
+fn launch() -> openidea_plugin::RunTargetLaunch {
+    openidea_plugin::RunTargetLaunch {
+        operation: openidea_plugin::RunTargetOperation::Run,
+        program: "php".into(),
+        cwd: ROOT.into(),
+    }
+}
+
+#[test]
+fn second_render_runs_no_describe() {
+    let host = mock();
+    let mut plugin = Main::default();
+    plugin.render(VIEW, None, &host.invocation()).unwrap();
+    let runs = host.process_runs().len();
+    plugin.refreshed_at.insert(ROOT.into(), 0);
+    let status = status_text(&mut plugin, &host);
+    plugin.render(VIEW, None, &host.invocation()).unwrap();
+    plugin
+        .detail(VIEW, PROJECT, &host.invocation())
+        .unwrap();
+    assert_eq!(host.process_runs().len(), runs);
+    assert!(status.contains("refreshing"), "{status}");
+}
+
+#[test]
+fn two_roots_cached_separately() {
+    let host = mock();
+    let mut plugin = Main::default();
+    plugin.render(VIEW, None, &host.invocation()).unwrap();
+    host.set_project_root(Some("/work/other"));
+    plugin.render(VIEW, None, &host.invocation()).unwrap();
+    let runs = host.process_runs().len();
+    assert_eq!(runs, 2);
+    host.set_project_root(Some(ROOT));
+    plugin.render(VIEW, None, &host.invocation()).unwrap();
+    host.set_project_root(Some("/work/other"));
+    plugin.render(VIEW, None, &host.invocation()).unwrap();
+    assert_eq!(host.process_runs().len(), runs);
+    assert_eq!(plugin.snapshots.len(), 2);
+}
+
+#[test]
+fn run_validation_uses_fresh_snapshot() {
+    use openidea_plugin::RunTargetValidation;
+    let host = mock();
+    let mut plugin = Main::default();
+    plugin.render(VIEW, None, &host.invocation()).unwrap();
+    let runs = host.process_runs().len();
+    plugin.validate(ROOT, "ddev", &launch()).unwrap();
+    assert_eq!(host.process_runs().len(), runs);
+    plugin.refreshed_at.insert(ROOT.into(), 0);
+    plugin.validate(ROOT, "ddev", &launch()).unwrap();
+    assert_eq!(host.process_runs().len(), runs + 1);
+}
+
+#[test]
+fn activate_db_row_no_error() {
+    let host = mock();
+    let mut plugin = Main::default();
+    plugin.render(VIEW, None, &host.invocation()).unwrap();
+    plugin
+        .handle(VIEW, ViewEvent::Activate("service:db".into()), &host.invocation())
+        .unwrap();
+    assert!(host.opened_urls().is_empty());
+    plugin
+        .handle(VIEW, ViewEvent::Activate("service:redis".into()), &host.invocation())
+        .unwrap();
+    assert_eq!(host.opened_urls(), ["http://localhost:9000"]);
+}
+
+#[test]
+fn background_failure_with_snapshot_shows_error_not_refreshing() {
+    let host = mock();
+    let mut plugin = Main::default();
+    plugin.render(VIEW, None, &host.invocation()).unwrap();
+    host.on_process("ddev", |_, _| Err(Error::from("docker down")));
+    plugin.refresh_background(&host.invocation().project().unwrap());
+    plugin.refreshed_at.insert(ROOT.into(), 0);
+    let status = status_text(&mut plugin, &host);
+    assert!(status.contains("DDEV not reachable"), "{status}");
+    assert!(!status.contains("refreshing"), "{status}");
+}
+
+#[test]
+fn delete_question_names_the_project_and_its_path() {
+    assert_eq!(
+        delete_question(Some("demo"), "/work/demo"),
+        "Delete DDEV project demo (/work/demo)? DDEV will delete its containers and database."
+    );
+    assert_eq!(
+        delete_question(None, "/work/demo"),
+        "Delete DDEV project /work/demo? DDEV will delete its containers and database."
+    );
 }

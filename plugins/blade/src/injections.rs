@@ -29,6 +29,7 @@ impl Injections for crate::Blade {
 
 #[path = "injection_declarations.rs"]
 mod declarations;
+#[cfg(test)]
 fn bodies(text: &str) -> Vec<(std::ops::Range<usize>, &'static str)> {
     bodies_with(text, &std::collections::BTreeSet::new())
 }
@@ -41,6 +42,7 @@ fn bodies_with(
         text,
         bytes,
         out: crate::Lexed::default(),
+        in_tag: false,
     };
     let mut out = Vec::new();
     let mut i = 0;
@@ -96,7 +98,8 @@ fn bodies_with(
             continue;
         }
         let Some(tag_end) = tag_end(bytes, i) else {
-            break;
+            i += 1;
+            continue;
         };
         let header = &text[i + 1..tag_end];
         let name_end = header.bytes().take_while(u8::is_ascii_alphabetic).count();
@@ -307,6 +310,12 @@ mod tests {
         }
     }
     #[test]
+    fn unquoted_lt_before_a_script_does_not_hide_it() {
+        let found = bodies("a < b <script>x</script>");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, "javascript");
+    }
+    #[test]
     fn closed_static_bodies_and_utf16() {
         let text = "😀\r\n<SCRIPT>let x = 'é😀';</SCRIPT>\n<style>p { color: red; }</style>";
         let ranges = bodies(text);
@@ -393,5 +402,59 @@ mod tests {
             openidea_plugin::Position::new(0, 23)
         );
         assert_eq!(bodies(&"<script>x</script>".repeat(1001)).len(), 1000);
+    }
+
+    fn doc(text: &str) -> Document {
+        Document {
+            path: "/project/a.blade.php".into(),
+            language: "blade".into(),
+            version: 1,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn injection_declarations_cached() {
+        use openidea_plugin::mock::MockHost;
+        let host = MockHost::install().with_capabilities(&["project.read"]);
+        host.add_file("ide.json", r#"{"blade":{"directives":[{"name":"aaa"}]}}"#);
+        let mut plugin = crate::Blade;
+        assert_eq!(plugin.injections(&doc("@aaa($x)")).len(), 1);
+        host.add_file("ide.json", r#"{"blade":{"directives":[{"name":"bbb"}]}}"#);
+        assert_eq!(plugin.injections(&doc("@aaa($x)")).len(), 1);
+        assert!(plugin.injections(&doc("@bbb($x)")).is_empty());
+    }
+
+    #[test]
+    fn cache_refreshes_when_installed_json_mtime_changes() {
+        use openidea_plugin::mock::MockHost;
+        let host = MockHost::install().with_capabilities(&["project.read"]);
+        host.add_file("ide.json", r#"{"blade":{"directives":[{"name":"aaa"}]}}"#);
+        let mut plugin = crate::Blade;
+        assert_eq!(plugin.injections(&doc("@aaa($x)")).len(), 1);
+        host.add_file(
+            "ide.json",
+            r#"{"blade":{"directives":[{"name":"aaa"},{"name":"bbb"}]}}"#,
+        );
+        assert_eq!(plugin.injections(&doc("@bbb($x)")).len(), 1);
+    }
+
+    #[test]
+    fn stray_lt_does_not_stop_injections() {
+        use openidea_plugin::mock::MockHost;
+        let _host = MockHost::install().with_capabilities(&["project.read"]);
+        let mut plugin = crate::Blade;
+        let found = plugin.injections(&doc("<p>a < b</p><script>let x=1</script>"));
+        assert!(found.iter().any(|i| i.language == "javascript"));
+    }
+
+    #[test]
+    fn injections_work_without_project_read() {
+        use openidea_plugin::mock::MockHost;
+        let _host = MockHost::install().with_capabilities(&[]);
+        let mut plugin = crate::Blade;
+        let found = plugin.injections(&doc("<script>let x=1</script>@x($y)"));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].language, "javascript");
     }
 }

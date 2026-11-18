@@ -6,7 +6,7 @@ use openidea_plugin::providers::Document;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::BuildHasher;
 use std::time::{Duration, Instant};
-const MAX_SOURCE: usize = 12 << 10;
+const MAX_SOURCE: usize = 256 << 10;
 #[derive(Clone, Debug)]
 struct Node {
     name: String,
@@ -30,6 +30,14 @@ struct Proof {
     newline: &'static str,
     gradle: Option<bool>,
     refs: Vec<String>,
+}
+fn hunk(text: &str, from: usize, to: usize) -> String {
+    let starts: Vec<usize> = std::iter::once(0).chain(text.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    let line = |offset: usize| starts.partition_point(|&start| start <= offset) - 1;
+    let first = line(from).saturating_sub(3);
+    let last = (line(to.saturating_sub(1).max(from)) + 3).min(starts.len() - 1);
+    let end = starts.get(last + 1).copied().unwrap_or(text.len());
+    format!("Lines {}–{}:\n{}", first + 1, last + 1, text[starts[first]..end].trim_end_matches(['\r', '\n']))
 }
 fn literal(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
@@ -211,7 +219,7 @@ fn maven_proof(doc: &Document) -> Option<Proof> {
         (Some((parent,_)),None)=> {
             if nodes.iter().filter(|n|n.parent==Some(parent)).any(|n|!matches!(n.name.as_str(),"groupId"|"artifactId"|"version"|"relativePath")) {return None;}
             if value(&nodes,parent,"groupId")?!="org.springframework.boot"||value(&nodes,parent,"artifactId")?!="spring-boot-starter-parent"||value(&nodes,parent,"relativePath")?!="" {return None;}
-            (value(&nodes,parent,"version")?,"literal Spring Boot starter parent")
+            (value(&nodes,parent,"version")?,"the spring-boot-starter-parent POM")
         }
         (None,Some((managed,node)))=> {
             if !literal(&value(&nodes,0,"groupId")?)||!literal(&value(&nodes,0,"version")?)||!node.text.trim().is_empty() {return None;}
@@ -222,9 +230,9 @@ fn maven_proof(doc: &Document) -> Option<Proof> {
             let mut names=BTreeSet::new();
             if nodes.iter().filter(|n|n.parent==Some(dependency)).any(|n|!names.insert(&n.name)||!matches!(n.name.as_str(),"groupId"|"artifactId"|"version"|"type"|"scope")) {return None;}
             if value(&nodes,dependency,"groupId")?!="org.springframework.boot"||value(&nodes,dependency,"artifactId")?!="spring-boot-dependencies"||value(&nodes,dependency,"type")?!="pom"||value(&nodes,dependency,"scope")?!="import" {return None;}
-            (value(&nodes,dependency,"version")?,"sole literal imported Spring Boot dependency BOM (no parent)")
+            (value(&nodes,dependency,"version")?,"the imported spring-boot-dependencies BOM")
         }
-        (None,None)=>(String::new(),"no Boot management (explicit dependency versions only)"),
+        (None,None)=>(String::new(),"no Spring Boot version management"),
         _=>return None,
     };
     if !boot.is_empty()&&!ga_version(&boot) {
@@ -407,7 +415,7 @@ fn fresh_source(doc: &Document, root: &str) -> Result<(), Error> {
     for _ in 0..32 {
         for config in ["maven.config", "jvm.config", "extensions.xml"] {
             if project.exists(&format!("{directory}/.mvn/{config}"))? {
-                return Err("Project Maven command/JVM/extension configuration is unsupported; no effective model is inferred.".into());
+                return Err("This project has .mvn/maven.config, jvm.config or extensions.xml, which can change the build in ways the plugin can't see. Add starters by hand.".into());
             }
         }
         if directory == root {
@@ -415,7 +423,7 @@ fn fresh_source(doc: &Document, root: &str) -> Result<(), Error> {
         }
         directory = directory.rsplit_once('/').map(|(p, _)| p).filter(|p| p.len() >= root.len()).ok_or(Error::Stale)?;
     }
-    Err("Maven module ancestry exceeds the bounded source check.".into())
+    Err("The pom.xml is nested more than 32 folders deep; add starters by hand.".into())
 }
 #[derive(Clone)]
 struct Starter {
@@ -441,26 +449,88 @@ struct Pending {
     root: String,
     boot: String,
 }
+/// Starters chosen and confirmed in the command, waiting for the one ⌥⏎ action that inserts them.
+struct Staged {
+    doc: Document,
+    expected: Vec<(String, String)>,
+    action: FileAction,
+}
+/// Writes the confirmed starters; `Some(reason)` when nothing was written and the ⌥⏎ action has to insert them.
+fn write_starters(staged: &Staged) -> Result<Option<String>, Error> {
+    for (path, text) in &staged.expected {
+        if host::project_of(path).ok_or(Error::Stale)?.read_file(path)? != *text {
+            return Err("The build file changed since the preview, so nothing was written. Run Add Spring Boot Starters again.".into());
+        }
+    }
+    if let Some(open) = host::open_editors().unwrap_or_default().into_iter().find(|e| e.dirty && staged.expected.iter().any(|(p, _)| *p == e.path)) {
+        return Ok(Some(format!("{} has unsaved changes, so it wasn't written. Save it and run Add Spring Boot Starters again.", open.path.rsplit('/').next().unwrap_or_default())));
+    }
+    // The version catalog goes first, so the build file never names an alias that isn't there.
+    for (written, ((path, edits), (_, before))) in staged.action.edits.iter().zip(&staged.expected).rev().enumerate() {
+        let mut after = before.clone();
+        for edit in edits.iter().rev() {
+            let from = openidea_plugin::text::offset(before, edit.range.start).ok_or(Error::Stale)?;
+            let to = openidea_plugin::text::offset(before, edit.range.end).ok_or(Error::Stale)?;
+            after.replace_range(from..to, &edit.text);
+        }
+        match host::project_of(path).ok_or(Error::Stale)?.write_file(path, &after) {
+            Err(Error::Denied(_)) if written == 0 => {
+                return Ok(Some(ui_kit::denied::message("Add Spring Boot Starters", "project.write", "Spring Initializr Launcher")));
+            }
+            result => result.map_err(|e| ui_kit::denied::map(e, "Add Spring Boot Starters", "project.write", "Spring Initializr Launcher"))?,
+        }
+    }
+    Ok(None)
+}
+const STAGED: &str = "starters:staged";
 #[derive(Default)]
 pub(crate) struct State {
     cache: Option<Cache>,
     pending: BTreeMap<String, Pending>,
+    staged: Option<Staged>,
 }
 impl State {
     pub(crate) fn invalidate(&mut self) {
         self.cache = None;
         self.pending.clear();
+        self.staged = None;
     }
 }
 impl Launcher {
+    /// Loads the starters, asks which to add, shows the change and writes it, or stages it for ⌥⏎
+    /// when the build file can't be written (no project.write, unsaved changes).
     pub(crate) fn prepare_starters(&mut self, ctx: &Invocation) -> Result<Option<String>, Error> {
+        let doc = self.cache_starters(ctx)?;
+        let root = self.starter_edits.cache.as_ref().ok_or(Error::Stale)?.root.clone();
+        let preview = self.starter_file_actions(&doc, Range::default()).pop().ok_or(Error::Stale)?;
+        let action = self.resolve_starter_file_action(&doc, preview)?;
+        let mut expected = Vec::new();
+        for (path, _) in &action.edits {
+            expected.push((path.clone(), host::project_of(path).ok_or(Error::Stale)?.read_file(path)?));
+        }
+        let file = doc.path.rsplit('/').next().unwrap_or_default().to_owned();
+        let staged = Staged { doc, expected, action };
+        let Some(reason) = write_starters(&staged)? else {
+            let (path, edits) = &staged.action.edits[0];
+            let _ = host::open_location(path, edits[0].range.start.line, 0);
+            let shown = path.strip_prefix(&format!("{root}/")).unwrap_or(path);
+            return Ok(Some(format!("{} to {shown}.", staged.action.title.replacen("Add", "Added", 1))));
+        };
+        let message = format!("{reason} Or press ⌥⏎ in {file} and choose {} to insert them. One Undo removes them again.", staged.action.title);
+        self.starter_edits.staged = Some(staged);
+        Ok(Some(message))
+    }
+    fn cache_starters(&mut self, ctx: &Invocation) -> Result<Document, Error> {
         self.starter_edits.invalidate();
-        let editor = ctx.editor().ok_or("Open a supported managed Maven or literal Gradle build first.")?;
-        let snapshot = editor.document()?;
+        let editor = ctx.editor().ok_or("Open a pom.xml, build.gradle or build.gradle.kts in the editor first. If one is open, allow editor.read for Spring Initializr in Settings › Plugins.")?;
+        let snapshot = editor.document().map_err(|error| match error {
+            Error::Denied(_) => Error::Invalid("Allow editor.read for Spring Initializr in Settings › Plugins.".into()),
+            other => other,
+        })?;
         let doc = Document { path: editor.path(), language: editor.language(), version: snapshot.version, text: snapshot.text };
         let first = proof(&doc);
         if first.is_none() && aggregator(&doc).is_none() {
-            return Err("Use a supported literal Boot-managed Maven POM, a literal Maven aggregator or project-root Gradle build; dynamic scripts, custom repositories and unknown management are refused.".into());
+            return Err("This build file isn't supported. Use a Maven pom.xml with the Spring Boot parent or BOM, a Maven aggregator, or the project-root build.gradle(.kts); builds with dynamic scripts or custom repositories can't be edited.".into());
         }
         let root = root(&doc).ok_or(Error::Stale)?;
         if ctx.project().and_then(|p| p.root().ok()).as_deref() != Some(&root)
@@ -471,7 +541,7 @@ impl Launcher {
         fresh_source(&doc, &root)?;
         let _ = self.changed();
         if self.server != START {
-            return Err("Add Starters supports the declared start.spring.io server only.".into());
+            return Err("Add Spring Boot Starters works only with start.spring.io. Set Server URL to https://start.spring.io in the Spring Initializr tool window.".into());
         }
         let selector = host::storage::get(&session::locator(&self.owner, "selector"))?;
         if let Some(raw) = &selector {
@@ -489,7 +559,7 @@ impl Launcher {
                 let targets = module_targets(&doc);
                 let items: Vec<_> = targets.iter().map(|(m, p)| PickItem::new(&m.path, &m.path).description(&format!("{} · {}", p.management, p.boot))).collect();
                 if items.is_empty() {
-                    return Err("No literal module pom of this aggregator proves Boot management or a plain unmanaged build; nothing to add starters to.".into());
+                    return Err("None of this aggregator's modules has a supported pom.xml. Open a module's pom.xml and try again.".into());
                 }
                 let chosen = host::pick("Add starters to which module?", &items)?.ok_or(Error::Cancelled)?;
                 let (module_doc, p) = targets.into_iter().find(|(m, _)| m.path == chosen).ok_or(Error::Stale)?;
@@ -498,15 +568,15 @@ impl Launcher {
             }
         };
         self.load_metadata(false);
-        let metadata = self.metadata.as_ref().ok_or("Load verified Initializr metadata first.")?.clone();
+        let metadata = self.metadata.as_ref().ok_or("Couldn't load the starter list from start.spring.io. Check the connection and run Add Spring Boot Starters again.")?.clone();
         let unmanaged = p.boot.is_empty();
-        let boot = if unmanaged { metadata["bootVersion"]["default"].as_str().filter(|v| ga_version(v)).ok_or("Metadata names no default Boot version for an unmanaged build; nothing is guessed.")?.to_owned() } else { p.boot.clone() };
+        let boot = if unmanaged { metadata["bootVersion"]["default"].as_str().filter(|v| ga_version(v)).ok_or("start.spring.io didn't name a default Spring Boot version for this build without Spring Boot management.")?.to_owned() } else { p.boot.clone() };
         if !metadata["bootVersion"]["values"].as_array().is_some_and(|v| v.iter().any(|v| v["id"].as_str() == Some(&boot))) {
-            return Err("The build's Boot version is not advertised by the saved metadata; no version is guessed.".into());
+            return Err(format!("start.spring.io doesn't offer Spring Boot {boot}, the version this build uses. Update the Spring Boot version, then try again.").into());
         }
         let coords = starters::get(&format!("/dependencies?bootVersion={boot}"))?;
         if coords["bootVersion"].as_str() != Some(&boot) {
-            return Err("Coordinate response does not prove the requested build Boot version.".into());
+            return Err(format!("start.spring.io answered for a different Spring Boot version than {boot}. Try again later.").into());
         }
         let catalogue = dependencies::Catalogue::from_metadata(&metadata);
         let mut found = Vec::new();
@@ -550,14 +620,14 @@ impl Launcher {
             found.push(Starter { id: dep.id.clone(), name: dep.name.clone(), group: group.into(), artifact: artifact.into(), scope: scope.into(), version });
         }
         if found.is_empty() {
-            return Err("No compatible plain Boot-managed (or, for unmanaged builds, exact-version) starters are established by this metadata response.".into());
+            return Err(format!("start.spring.io lists no starters that can be added to this build for Spring Boot {boot}.").into());
         }
         if host::storage::get(&session::locator(&self.owner, "selector"))? != selector {
             return Err(Error::Stale);
         }
         self.starter_edits.cache =
-            Some(Cache { root, path: doc.path, boot, module, at: Instant::now(), metadata, starters: found, selector });
-        Ok(Some("Cached version-bound starters for this current build. Invoke Preview Add Spring Boot Starters… in its code-action menu to choose, preview and apply an undoable edit. No source was changed.".into()))
+            Some(Cache { root, path: doc.path.clone(), boot, module, at: Instant::now(), metadata, starters: found, selector });
+        Ok(doc)
     }
 }
 impl Launcher {
@@ -565,6 +635,9 @@ impl Launcher {
         let Some(root) = root(doc) else {
             return Vec::new();
         };
+        if let Some(staged) = self.starter_edits.staged.as_ref().filter(|s| s.doc.path == doc.path && s.doc.version == doc.version && s.doc.text == doc.text) {
+            return vec![FileAction { title: staged.action.title.clone(), kind: Some("source".into()), preferred: true, data: Some(STAGED.into()), ..FileAction::default() }];
+        }
         let Some(cache) = &self.starter_edits.cache else {
             return Vec::new();
         };
@@ -595,6 +668,18 @@ impl Launcher {
     }
     fn resolve_starter_file_action(&mut self, doc: &Document, action: FileAction) -> Result<FileAction, Error> {
         let token = action.data.as_deref().ok_or(Error::Stale)?;
+        if token == STAGED {
+            let staged = self.starter_edits.staged.take().ok_or(Error::Stale)?;
+            if staged.doc.path != doc.path || staged.doc.version != doc.version || staged.doc.text != doc.text {
+                return Err(Error::Stale);
+            }
+            for (path, text) in &staged.expected {
+                if host::project_of(path).ok_or(Error::Stale)?.read_file(path)? != *text {
+                    return Err("The build file changed since the starters were chosen. Run Add Spring Boot Starters again.".into());
+                }
+            }
+            return Ok(staged.action);
+        }
         let pending = self.starter_edits.pending.get(token).ok_or(Error::Stale)?;
         if doc.path != pending.doc.path
             || doc.language != pending.doc.language
@@ -640,14 +725,14 @@ impl Launcher {
             })
             .collect();
         if items.is_empty() {
-            return Err("All established starters are already declared; no edit prepared.".into());
+            return Err("Every starter start.spring.io offers for this build is already declared.".into());
         }
-        let ids = host::pick_many("Preview starters managed by this build's Boot version", &items)?.ok_or(Error::Cancelled)?;
+        let ids = host::pick_many("Choose Spring Boot starters to add", &items)?.ok_or(Error::Cancelled)?;
         if ids.is_empty() {
             return Err(Error::Cancelled);
         }
         if ids.len() > 8 || ids.iter().collect::<BTreeSet<_>>().len() != ids.len() {
-            return Err("Choose at most eight distinct advertised starters.".into());
+            return Err("Choose at most eight starters at a time.".into());
         }
         let inner = &p.inner;
         let mut insertion = p.before.clone();
@@ -692,17 +777,24 @@ impl Launcher {
             (c.path.clone(), at, text, resulting)
         });
         let mut preview = format!(
-            "File: {}\nSource version: {}\nBoot dependency management: {} — {}\nMetadata: {START}, version-bound session cache (15 min maximum)\n{}\n\nExact complete resulting file:\n{after}",
-            doc.path, doc.version, p.management,cache.boot,
-            if p.boot.is_empty() { "Explicit <version> values come from the dependency's own start.spring.io metadata for the default Boot version; no repositories or BOMs added." } else { "No repositories, BOMs or explicit dependency versions added." }
+            "File: {}\nVersions come from {} (Spring Boot {}).\n{}\n\nChange, with 3 lines around it:\n{}",
+            doc.path, p.management, cache.boot,
+            if p.boot.is_empty() { "Each starter gets the version start.spring.io lists for this Spring Boot version. No repositories or BOMs are added." } else { "No repositories, BOMs or versions are added." },
+            hunk(&after, p.at, p.at + insertion.len())
         );
-        if let Some((path, _, _, resulting)) = &catalog_edit {
-            preview.push_str(&format!("\n\nVersion catalog {path}, exact complete resulting file:\n{resulting}"));
+        if let Some((path, at, text, resulting)) = &catalog_edit {
+            preview.push_str(&format!("\n\nVersion catalog {path}, change:\n{}", hunk(resulting, *at, at + text.len())));
         }
-        if !ui_kit::prompts::confirm_exact("Apply previewed build starters?", &preview)? {
+        let title = format!("Add {} Spring Boot Starter{}", ids.len(), if ids.len() == 1 { "" } else { "s" });
+        if !ui_kit::prompts::confirm_exact(&format!("{title} to {}?", doc.path.rsplit('/').next().unwrap_or_default()), &preview)? {
             return Err(Error::Cancelled);
         }
         fresh_source(doc, &pending.root)?;
+        if let Some(c) = &catalog {
+            if host::project_of(&c.path).ok_or(Error::Stale)?.read_file(&c.path)? != c.text {
+                return Err(Error::Stale);
+            }
+        }
         if root(doc).as_deref() != Some(&pending.root)
             || self.server != START
             || cache.at.elapsed() > Duration::from_secs(900)
@@ -719,7 +811,7 @@ impl Launcher {
             edits.push((path, vec![TextEdit { range: Range::new(at, at), text }]));
         }
         Ok(FileAction {
-            title: "Add previewed Spring Boot starters".into(),
+            title,
             kind: Some("source".into()),
             edits,
             ..FileAction::default()
@@ -729,7 +821,7 @@ impl Launcher {
 
 pub(crate) fn generated_pom(text: &str, group: &str, artifact: &str, boot: &str, java: &str) -> bool {
     let doc = Document { path: "/project/pom.xml".into(), language: "xml".into(), version: 0, text: text.into() };
-    proof(&doc).is_some_and(|p| p.boot == boot && p.management == "literal Spring Boot starter parent")
+    proof(&doc).is_some_and(|p| p.boot == boot && p.management == "the spring-boot-starter-parent POM")
         && parse(text)
             .is_some_and(|n| {
                 value(&n, 0, "groupId").as_deref() == Some(group)
@@ -780,6 +872,15 @@ impl FileActions for Launcher {
 }
 
 #[cfg(test)]
+impl Launcher {
+    /// What the command does before its dialogs: bind the project, then load the starters.
+    fn bound_cache(&mut self, ctx: &Invocation) -> Result<Document, Error> {
+        self.bind(ctx)?;
+        self.cache_starters(ctx)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use openidea_plugin::{mock::MockHost, text::offset};
@@ -787,7 +888,11 @@ mod tests {
     pub(super) const META: &str = r#"{"bootVersion":{"values":[{"id":"3.5.16"},{"id":"4.0.0"}]},"dependencies":{"values":[{"name":"Web","values":[{"id":"web","name":"Spring Web","compatibilityRange":"[3.0.0,4.0.0)"},{"id":"data-jpa","name":"JPA"},{"id":"cloud","name":"Cloud"},{"id":"unknown-range","compatibilityRange":"mystery"}]}]}}"#;
     pub(super) const COORDS: &str = r#"{"bootVersion":"3.5.16","dependencies":{"web":{"groupId":"org.springframework.boot","artifactId":"spring-boot-starter-web"},"data-jpa":{"groupId":"org.springframework.boot","artifactId":"spring-boot-starter-data-jpa","scope":"runtime"},"cloud":{"groupId":"org.springframework.cloud","artifactId":"spring-cloud-starter","bom":"cloud"},"unknown-range":{"groupId":"org.springframework.boot","artifactId":"spring-boot-starter-unknown"}}}"#;
     fn setup(text: &str) -> (MockHost, Launcher, Document) {
-        let host = MockHost::install().with_capabilities(&["storage", "editor.read", "project.read", "net:start.spring.io"]);
+        setup_with(text, &["storage", "editor.read", "project.read", "net:start.spring.io"])
+    }
+    const WRITABLE: [&str; 5] = ["storage", "editor.read", "project.read", "project.write", "net:start.spring.io"];
+    fn setup_with(text: &str, capabilities: &[&str]) -> (MockHost, Launcher, Document) {
+        let host = MockHost::install().with_capabilities(capabilities);
         host.add_file("pom.xml", text);
         host.open_editor("/project/pom.xml", "xml", text, &[]);
         host.on_fetch(|req| {
@@ -803,7 +908,7 @@ mod tests {
     }
     fn ready(text: &str) -> (MockHost, Launcher, Document) {
         let (host, mut l, doc) = setup(text);
-        l.run_command("add-starters", &host.invocation(), None).unwrap();
+        l.bound_cache(&host.invocation()).unwrap();
         (host, l, doc)
     }
     fn action(l: &mut Launcher, d: &Document) -> FileAction {
@@ -815,7 +920,87 @@ mod tests {
         let text="plugins {\n    id 'java'\n    id 'org.springframework.boot' version '3.5.16'\n    id 'io.spring.dependency-management' version '1.1.7'\n}\ngroup = 'com.example'\nversion = '1.0.0'\nrepositories { mavenCentral() }\ndependencies {\n}\n";
         h.add_file("build.gradle",text);h.open_editor("/project/build.gradle","groovy",text,&[]);
         h.on_fetch(|req|Ok(openidea_plugin::HttpResponse{status:200,body:if req.url.contains("metadata/client"){META.as_bytes().to_vec()}else{COORDS.as_bytes().to_vec()},..Default::default()}));
-        assert!(Launcher::default().run_command("add-starters",&h.invocation(),None).is_ok(),"literal Gradle should prepare advertised version-bound starters");
+        assert!(Launcher::default().bound_cache(&h.invocation()).is_ok(),"literal Gradle should prepare advertised version-bound starters");
+    }
+    #[test]
+    fn command_picks_and_confirms_then_one_alt_enter_action_inserts_without_more_dialogs() {
+        let (host, mut l, d) = setup(POM);
+        host.answer_next_prompt(Some(&["web"]));
+        host.answer_next_prompt(Some(&["yes"]));
+        let message = l.run_command("add-starters", &host.invocation(), None).unwrap().unwrap();
+        assert!(message.contains("Add Spring Boot Starters needs the project.write permission. Allow it in Settings › Plugins › Spring Initializr Launcher."), "{message}");
+        assert!(message.contains("⌥⏎ in pom.xml") && message.contains("Add 1 Spring Boot Starter"), "{message}");
+        let actions = l.file_actions(&d, Range::default());
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].title, "Add 1 Spring Boot Starter");
+        let resolved = l.resolve_file_action(&d, actions[0].clone()).unwrap();
+        assert!(apply_one(&d, &resolved).contains("spring-boot-starter-web"));
+        assert!(l.resolve_file_action(&d, actions[0].clone()).is_err());
+        assert_eq!(host.editor_text(), POM);
+    }
+    fn read(path: &str) -> String {
+        host::project_of(path).unwrap().read_file(path).unwrap()
+    }
+    #[test]
+    fn with_project_write_the_command_writes_the_module_pom_after_one_confirm_and_opens_it() {
+        let (host, mut l, _) = setup_with(AGG, &WRITABLE);
+        host.add_file("app/pom.xml", POM);
+        host.add_file("lib/pom.xml", &POM.replace("<relativePath/>", ""));
+        host.answer_next_prompt(Some(&["/project/app/pom.xml"]));
+        host.answer_next_prompt(Some(&["web"]));
+        host.answer_next_prompt(Some(&["yes"]));
+        let message = l.run_command("add-starters", &host.invocation(), None).unwrap().unwrap();
+        assert_eq!(message, "Added 1 Spring Boot Starter to app/pom.xml.");
+        assert!(read("/project/app/pom.xml").contains("<artifactId>spring-boot-starter-web</artifactId>"));
+        assert_eq!(read("/project/pom.xml"), AGG);
+        assert_eq!(host.opened_locations()[0].0, "/project/app/pom.xml");
+        assert!(l.starter_edits.staged.is_none());
+    }
+    #[test]
+    fn cancelling_the_confirm_writes_nothing() {
+        let (host, mut l, _) = setup_with(AGG, &WRITABLE);
+        host.add_file("app/pom.xml", POM);
+        host.answer_next_prompt(Some(&["/project/app/pom.xml"]));
+        host.answer_next_prompt(Some(&["web"]));
+        host.answer_next_prompt(None);
+        assert!(matches!(l.run_command("add-starters", &host.invocation(), None), Err(Error::Cancelled)));
+        assert_eq!(read("/project/app/pom.xml"), POM);
+        assert!(l.starter_edits.staged.is_none());
+    }
+    #[test]
+    fn unsaved_build_file_is_not_written_and_waits_for_alt_enter() {
+        let (host, mut l, _) = setup_with(POM, &WRITABLE);
+        host.type_in_editor("");
+        host.answer_next_prompt(Some(&["web"]));
+        host.answer_next_prompt(Some(&["yes"]));
+        let message = l.run_command("add-starters", &host.invocation(), None).unwrap().unwrap();
+        assert!(message.starts_with("pom.xml has unsaved changes, so it wasn't written.") && message.contains("⌥⏎ in pom.xml"), "{message}");
+        assert!(l.starter_edits.staged.is_some());
+    }
+    #[test]
+    fn build_file_changed_since_the_preview_is_refused() {
+        let (host, mut l, _) = setup(POM);
+        host.answer_next_prompt(Some(&["web"]));
+        host.answer_next_prompt(Some(&["yes"]));
+        l.run_command("add-starters", &host.invocation(), None).unwrap();
+        let staged = l.starter_edits.staged.take().unwrap();
+        host.type_in_editor("<!-- edited -->");
+        let error = write_starters(&staged).unwrap_err();
+        assert!(error.to_string().contains("changed since the preview, so nothing was written"), "{error}");
+    }
+    #[test]
+    fn staged_starters_refuse_when_the_build_file_changed_and_cancel_stages_nothing() {
+        let (host, mut l, d) = setup(POM);
+        host.answer_next_prompt(Some(&["web"]));
+        host.answer_next_prompt(None);
+        assert!(matches!(l.run_command("add-starters", &host.invocation(), None), Err(Error::Cancelled)));
+        assert!(l.starter_edits.staged.is_none());
+        host.answer_next_prompt(Some(&["web"]));
+        host.answer_next_prompt(Some(&["yes"]));
+        l.run_command("add-starters", &host.invocation(), None).unwrap();
+        let staged = l.file_actions(&d, Range::default()).remove(0);
+        host.type_in_editor("changed");
+        assert!(l.resolve_file_action(&d, staged).is_err());
     }
     #[test]
     fn cached_picker_full_preview_prepares_atomic_utf16_crlf_edit_without_direct_write() {
@@ -853,7 +1038,7 @@ mod tests {
         assert_eq!(host.fetches(), 0);
         l.bind(&host.invocation()).unwrap();
         l.set("bootVersion", "4.0.0");
-        l.run_command("add-starters", &host.invocation(), None).unwrap();
+        l.bound_cache(&host.invocation()).unwrap();
         assert!(host.requests().iter().any(|r| r.url.ends_with("/dependencies?bootVersion=3.5.16")));
         assert_eq!(host.editor_text(), POM);
         assert_eq!(l.starter_edits.cache.as_ref().unwrap().starters.len(), 2);
@@ -916,7 +1101,7 @@ mod tests {
             format!("<!DOCTYPE project>{POM}"),
         ] {
             let (host, mut l, _) = setup(&text);
-            assert!(l.run_command("add-starters", &host.invocation(), None).is_err(), "{text}");
+            assert!(l.bound_cache(&host.invocation()).is_err(), "{text}");
             assert_eq!(host.fetches(), 0);
             assert_eq!(host.editor_text(), text);
         }
@@ -932,7 +1117,7 @@ mod tests {
             format!("{POM}{declaration}"),
         ] {
             let (host, mut l, _) = setup(&text);
-            let result = l.run_command("add-starters", &host.invocation(), None);
+            let result = l.bound_cache(&host.invocation());
             assert!(!matches!(&result, Err(Error::NotFound(_))), "must reach the actual Add Starters command");
             assert!(result.is_err(), "{text}");
             assert!(host.requests().is_empty());
@@ -947,7 +1132,7 @@ mod tests {
             POM.replace("<project ", "<project xsi:schemaLocation=\"urn:x source.xsd\" "),
         ] {
             let (host, mut l, _) = setup(&text);
-            let result = l.run_command("add-starters", &host.invocation(), None);
+            let result = l.bound_cache(&host.invocation());
             assert!(!matches!(&result, Err(Error::NotFound(_))), "must reach the actual Add Starters command");
             assert!(result.is_err(), "{text}");
             assert!(host.requests().is_empty());
@@ -965,7 +1150,7 @@ mod tests {
         ] {
             let text = format!("{declaration}{POM}");
             let (host, mut l, _) = setup(&text);
-            let result = l.run_command("add-starters", &host.invocation(), None);
+            let result = l.bound_cache(&host.invocation());
             assert!(!matches!(&result, Err(Error::NotFound(_))), "must reach the actual Add Starters command");
             assert!(result.is_err(), "{declaration}");
             assert!(host.requests().is_empty());
@@ -999,9 +1184,35 @@ mod tests {
         for config in [".mvn/maven.config", ".mvn/jvm.config", ".mvn/extensions.xml"] {
             let (host, mut l, _) = setup(POM);
             host.add_file(config, "custom");
-            assert!(l.run_command("add-starters", &host.invocation(), None).is_err());
+            assert!(l.bound_cache(&host.invocation()).is_err());
             assert_eq!(host.fetches(), 0);
         }
+    }
+    #[test]
+    fn add_starters_on_40kib_pom() {
+        let text = POM.replace("<!-- 😀 keep -->", &format!("<!--\n{}-->", "padding line of a long build file\n".repeat(1300)));
+        assert!(text.len() > 40 << 10);
+        let (host, mut l, d) = ready(&text);
+        let prepared = action(&mut l, &d);
+        host.answer_next_prompt(Some(&["web"]));
+        host.answer_next_prompt(Some(&["yes"]));
+        let resolved = l.resolve_file_action(&d, prepared).unwrap();
+        assert!(resolved.edits[0].1[0].text.contains("spring-boot-starter-web"));
+    }
+    #[test]
+    fn hunk_shows_only_the_changed_lines_with_three_lines_of_context() {
+        let text: String = (1..=20).map(|n| format!("line{n}\n")).collect();
+        let at = text.find("line10").unwrap();
+        let shown = hunk(&text, at, at + "line10\n".len());
+        assert_eq!(shown, "Lines 7–13:\nline7\nline8\nline9\nline10\nline11\nline12\nline13");
+    }
+    #[test]
+    fn add_starters_editor_denied_message() {
+        let host = MockHost::install().with_capabilities(&["storage", "project.read", "net:start.spring.io"]);
+        host.add_file("pom.xml", POM);
+        host.open_editor("/project/pom.xml", "xml", POM, &[]);
+        let error = Launcher::default().bound_cache(&host.invocation()).unwrap_err();
+        assert!(error.to_string().contains("editor.read"), "{error}");
     }
     #[test]
     fn matching_artifact_in_another_group_is_not_a_coordinate_collision() {
@@ -1027,7 +1238,7 @@ mod tests {
             if mode == 2 {
                 host::storage::set(&session::locator(&l.owner, "selector"), "corrupt").unwrap();
             }
-            assert!(l.run_command("add-starters", &host.invocation(), None).is_err());
+            assert!(l.bound_cache(&host.invocation()).is_err());
             assert_eq!(host.fetches(), 0);
             assert_eq!(host.editor_text(), text);
         }
@@ -1055,7 +1266,7 @@ mod tests {
                     ..Default::default()
                 })
             });
-            assert!(l.run_command("add-starters", &host.invocation(), None).is_err(), "{mode}");
+            assert!(l.bound_cache(&host.invocation()).is_err(), "{mode}");
             assert!(l.starter_edits.cache.is_none());
         }
     }
@@ -1134,7 +1345,7 @@ mod tests {
         for extra in ["<dependencyManagement/>", "<repositories/>", "<profiles/>"] {
             let text = absent.replace("</project>", &format!("{extra}</project>"));
             let (host, mut l, _) = setup(&text);
-            assert!(l.run_command("add-starters", &host.invocation(), None).is_err());
+            assert!(l.bound_cache(&host.invocation()).is_err());
             assert_eq!(host.fetches(), 0);
         }
         let inline = absent.replace("\n\n</project>", "</project>");
@@ -1161,7 +1372,7 @@ mod tests {
             bom.replace("</scope></dependency>","</scope><optional>true</optional></dependency>"),
             bom.replace("<groupId>com.example</groupId>",""),bom.replace("<version>1.0.0</version>",""),
             bom.replace("</project>","<repositories/></project>"),bom.replace("</project>","<profiles/></project>"),
-        ] {let (host,mut l,_)=setup(&text);assert!(l.run_command("add-starters",&host.invocation(),None).is_err(),"{text}");assert_eq!(host.fetches(),0);assert_eq!(host.editor_text(),text);}
+        ] {let (host,mut l,_)=setup(&text);assert!(l.bound_cache(&host.invocation()).is_err(),"{text}");assert_eq!(host.fetches(),0);assert_eq!(host.editor_text(),text);}
     }
     #[test]
     fn imported_bom_cancel_stale_version_and_existing_coordinate_keep_source_unchanged() {
@@ -1177,7 +1388,7 @@ mod tests {
         host.add_file("app/pom.xml", POM);
         host.add_file("lib/pom.xml", &POM.replace("<relativePath/>", ""));
         host.answer_next_prompt(Some(&["/project/app/pom.xml"]));
-        l.run_command("add-starters", &host.invocation(), None).unwrap();
+        l.bound_cache(&host.invocation()).unwrap();
         let a = action(&mut l, &d);
         host.answer_next_prompt(Some(&["web"]));
         host.answer_next_prompt(Some(&["yes"]));
@@ -1190,7 +1401,7 @@ mod tests {
         assert!(proof(&Document { text: after, ..module }).is_some());
         let (host, mut l, _) = setup(AGG);
         host.add_file("app/pom.xml", &POM.replace("<relativePath/>", ""));
-        assert!(l.run_command("add-starters", &host.invocation(), None).is_err());
+        assert!(l.bound_cache(&host.invocation()).is_err());
         assert_eq!(host.fetches(), 0);
     }
     #[test]
@@ -1208,7 +1419,7 @@ mod tests {
                 ..Default::default()
             })
         });
-        l.run_command("add-starters", &host.invocation(), None).unwrap();
+        l.bound_cache(&host.invocation()).unwrap();
         assert_eq!(l.starter_edits.cache.as_ref().unwrap().starters.len(), 1);
         let a = action(&mut l, &d);
         host.answer_next_prompt(Some(&["web"]));
@@ -1219,7 +1430,7 @@ mod tests {
         let p = proof(&Document { text: after, ..d.clone() }).unwrap();
         assert!(p.existing.contains(&("org.springframework.boot".into(), "spring-boot-starter-web".into())));
         let (host, mut l, _) = setup(&text);
-        assert!(l.run_command("add-starters", &host.invocation(), None).is_err());
+        assert!(l.bound_cache(&host.invocation()).is_err());
     }
     #[test]
     fn real_start_spring_io_responses_yield_expected_starters() {
@@ -1237,7 +1448,7 @@ mod tests {
                     ..Default::default()
                 })
             });
-            l.run_command("add-starters", &host.invocation(), None).unwrap();
+            l.bound_cache(&host.invocation()).unwrap();
             l.starter_edits.cache.as_ref().unwrap().starters.iter().map(|s| (s.id.clone(), s.version.clone())).collect::<Vec<_>>()
         };
         assert_eq!(ids(&managed), vec![("web".to_string(), None)]);

@@ -2,7 +2,6 @@
 use crate::*;
 use openidea_plugin::file_actions::{FileAction, FileActions};
 use openidea_plugin::{TextEdit, text};
-use quick_xml::{events::Event as XmlEvent, reader::NsReader};
 const MAX_TEXT: usize = 12 << 10;
 const BEANS_NS: &str = "http://www.springframework.org/schema/beans";
 #[derive(Clone)]
@@ -55,43 +54,7 @@ fn target(doc: &Document, at: usize) -> Option<Target> {
     {
         return None;
     }
-    let mut reader = NsReader::from_str(&doc.text);
-    let mut depth = 0usize;
-    let mut roots = 0usize;
-    for count in 0..=2048 {
-        if count == 2048 {
-            return None;
-        }
-        match reader.read_event() {
-            Ok(XmlEvent::Start(element)) => {
-                if depth == 0 {
-                    roots += 1;
-                }
-                if !crate::xml_namespaces::valid(&reader, &element) {
-                    return None;
-                }
-                depth += 1;
-            }
-            Ok(XmlEvent::Empty(element)) => {
-                if depth == 0 {
-                    roots += 1;
-                }
-                if !crate::xml_namespaces::valid(&reader, &element) {
-                    return None;
-                }
-            }
-            Ok(XmlEvent::End(_)) => depth = depth.checked_sub(1)?,
-            Ok(XmlEvent::DocType(_) | XmlEvent::GeneralRef(_)) => return None,
-            Ok(XmlEvent::Text(text)) if depth == 0 && !text.as_ref().trim().is_empty() => {
-                return None;
-            }
-            Ok(XmlEvent::CData(_)) if depth == 0 => return None,
-            Ok(XmlEvent::Eof) => break,
-            Err(_) => return None,
-            _ => {}
-        }
-    }
-    if depth != 0 || roots != 1 {
+    if !spring_text::xml::generation_valid(&doc.text) {
         return None;
     }
     let elements = xml::elements(&doc.text);
@@ -229,7 +192,7 @@ fn inventory_inner(
     for path in paths {
         if started.elapsed() > COMMAND_BUDGET {
             return Err(
-                "Source inventory deadline reached; cannot prove name availability.".into(),
+                "Ran out of time checking that the name is free. Try again.".into(),
             );
         }
         if beans::ignored(&path) {
@@ -251,7 +214,7 @@ fn inventory_inner(
         let source = project.read_file(&path)?;
         bytes = bytes.saturating_add(source.len());
         if source.len() > 512 * 1024 || bytes > 8 * 1024 * 1024 {
-            return Err("Source inventory byte budget exceeded.".into());
+            return Err("The project sources are too large to check that the name is free (over 512 KiB in one file or 8 MiB in total).".into());
         }
         let mut extra_names=Vec::new();
         if path.ends_with(".java") || path.ends_with(".kt") {
@@ -294,7 +257,7 @@ fn inventory_inner(
                         type_bytes = type_bytes.saturating_add(item.0.len() + item.1.len());
                     }
                     if types.len() > 8192 || type_bytes > 1024 * 1024 {
-                        return Err("Source type inventory budget exceeded.".into());
+                        return Err("The project has too many types to check that the name is free (over 8,192).".into());
                     }
                 }
             }
@@ -320,7 +283,7 @@ fn inventory_inner(
         if path.ends_with(".xml") {
             let elements=xml::elements(&source);
             if source.contains("www.springframework.org/schema/") || elements.first().is_some_and(|root|root.local()=="beans") {
-                if !crate::xml_namespaces::document_valid(&source) {return Err("Unsupported XML envelope/entities prevent a complete literal collision check.".into());}
+                if !spring_text::xml::generation_valid(&source) {return Err("Unsupported XML envelope/entities prevent a complete literal collision check.".into());}
                 // Collision safety intentionally overincludes raw candidate IDs
                 // even when the read-only source model cannot prove ownership.
                 references.extend(xml::bean_ids(&elements).into_iter().map(|attribute|Ref{name:attribute.value.clone(),role:Role::BeanCandidate,what:"XML collision candidate".into(),range:range(&source,attribute.value_at,attribute.value_end),checked:false,owner:0}));
@@ -346,7 +309,7 @@ fn inventory_inner(
                     name_bytes = name_bytes.saturating_add(name.len());
                 }
                 if names.len() > 8192 || name_bytes > 1024 * 1024 {
-                    return Err("Source name inventory budget exceeded.".into());
+                    return Err("The project has too many bean names to check that the name is free (over 8,192).".into());
                 }
             }
         }
@@ -559,7 +522,7 @@ impl FileActions for Integration {
             return Err(Error::Cancelled);
         };
         if !name(&entered) {
-            return Err("Use an ASCII channel ID up to128 bytes (letter/_ then letters/digits/_.-); default channels are reserved.".into());
+            return Err("Use an ASCII channel ID up to 128 bytes (letter/_ then letters/digits/_.-); default channels are reserved.".into());
         }
         current(&pending, doc)?;
         let before = names(&project, doc)?;
@@ -889,7 +852,7 @@ mod tests {
             );
         }
         assert!(
-            matches!(names(&host.invocation().project().unwrap(),&doc),Err(Error::Failed(message)) if message.contains("byte budget"))
+            matches!(names(&host.invocation().project().unwrap(),&doc),Err(Error::Failed(message)) if message.contains("too large to check that the name is free"))
         );
     }
     #[test]

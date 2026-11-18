@@ -1,19 +1,22 @@
 id = "aritti.spring-initializr"
 name = "Spring Initializr Launcher"
 version = "0.3.0" # x-release-please-version
-description = "Starts a Spring Boot project from a tool window. Pick the build, language, Spring Boot and Java versions, coordinates, packaging and dependencies. Generate Project then downloads the project zip from a Spring Initializr server (start.spring.io or your own) in the browser, and Explore in Browser opens the server's web page with the same options, and Generate with Spring Boot CLI runs `spring init` in an IDE terminal when the Spring Boot CLI is allowed. The plugin remembers the form."
+description = "Starts a Spring Boot project from a tool window. Pick the build, language, Spring Boot and Java versions, coordinates, packaging and dependencies. Generate and Open creates the project from start.spring.io in a folder you choose, Download ZIP gets the project zip from a Spring Initializr server (start.spring.io or your own) in the browser, Explore in Browser opens the server's web page with the same options, and Run Spring Boot CLI in Terminal runs `spring init` in an IDE terminal when the Spring Boot CLI is allowed. The plugin remembers the form."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Add Starters on Maven now also works from a literal packaging-pom aggregator (pick a module whose own pom has the Boot parent or sole BOM proof; the reviewed edit targets that module pom) and, for plain pom.xml files with no parent or dependency management, adds dependencies with an explicit <version> only when the start.spring.io dependency metadata gives an exact literal version for the default Boot version; otherwise still refused. Add Starters on Gradle now also accepts a literal platform(spring-boot-dependencies) BOM of the Boot plugin version (no dependency-management plugin) and a literal gradle/libs.versions.toml (adds the catalog entry and libs alias reference in one reviewed two-file edit); unmanaged builds and unrecognised catalogs stay refused. Complete ZIP generation now preserves safe unix permission bits (e.g. executable mvnw/gradlew; group/other write cleared) and ZIP entry timestamps on files; setuid/setgid/sticky, links and unsafe paths stay refused. Previewed literal Groovy/Kotlin Gradle Add Starters with exact Boot-bound metadata and unsupported BOM/repository refusal. Bounded unsaved conflict drafts survive project switches with guarded recovery. Separate reviewed managed CLI lifecycle with bounded observed output, cancellation and explicit unverified-tree status. Stale form/catalogue draft guards and confirmed reload recovery preserve newer saved state. Unreleased: keep the current form/server after failed persistence, and use a consistent bounded selector envelope so valid long project/server identities reload. Maven edit proof rejects misplaced/duplicate declarations, malformed comments, reserved XML PI targets and unbound xsi schema attributes before metadata fetch. reject duplicate-decoded or overbudget server/state JSON and malformed metadata containers while preserving accepted catalogue/state. source-only import revalidates current innermost ownership for parent, target and every planned/verified file, refusing nested-project destinations before fetch or creates. scoped in-memory Maven source-only ZIP import with full exact-source preview, atomic nonoverwrite creates, wrapper exclusions and separate reviewed-folder trust/open request. Previewed atomic Maven Add Starters from version-bound cached metadata, with strict parent/source/configuration guards; the immediate Maven/Gradle writer is removed. Dependencies section: browse the catalogue by category in a tree, with the chosen dependencies listed (and removable) under Selected, search, Clear all, and Boot-version compatibility filtering; replaces the Pick Dependencies button. README describes the pick lists and Add Spring Boot Starters. Pick Spring Boot Version and Pick Dependencies buttons (lists from start.spring.io), and a metadata preparation command for the previewed Maven source intention. 0.1.0: first release, with the Spring Initializr tool window (Generate Project and Explore in Browser) and the Open start.spring.io command."
+change-notes = """\
+Next release: Generate and Open is the main button with one confirmation and falls back to the browser download without its permissions, Generate Project is renamed Download ZIP, and artifact problems show before you click; with the optional project.write permission, Add Spring Boot Starters writes the build file after one confirmation (otherwise one ⌥⏎ action inserts them) and supports more Maven and Gradle layouts, including version catalogs; generated ZIPs keep executable scripts, the downloaded archive is deleted afterwards and a failed extract shows the kept folder, Import Maven Project creates the files after one confirmation, never overwriting any, and Open Source Folder, in Tools, opens without asking again; Generate and Open and source-only import are off for custom servers and refuse folders that are not on the machine running the project; unsaved form changes survive switching projects, the plugin no longer wakes when a pom.xml opens, the status line is one sentence, CLI buttons use plain names and Tools shows Add Starters only in Maven and Gradle projects. \
+0.3.0: Add Starters for Maven and Gradle and project generation. \
+0.2.0: plugin icon and server list."""
 categories = ["frameworks"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
-activation = ["on-view:initializr", "on-file:**/pom.xml"]
+activation = ["on-view:initializr"]
 
 [capabilities]
 required = ["storage"]
-optional = ["project.read", "process:spring", "process:python3", "net:start.spring.io", "editor.read"]
+optional = ["project.read", "process:spring", "process:python3", "net:start.spring.io", "editor.read", "project.write"]
 
 [[contributes.commands]]
 id = "open-start"
@@ -29,12 +32,14 @@ web = "web/resources/hub.html"
 
 [[contributes.commands]]
 id = "add-starters"
-title = "Spring Initializr: Prepare Add Spring Boot Starters"
+title = "Spring Initializr: Add Spring Boot Starters…"
 category = "Spring Initializr"
+when = "workspaceContains:pom.xml || workspaceContains:build.gradle || workspaceContains:build.gradle.kts"
 
 [[contributes.menus]]
 menu = "tools"
 command = "add-starters"
+when = "workspaceContains:pom.xml || workspaceContains:build.gradle || workspaceContains:build.gradle.kts"
 
 [[contributes.providers]]
 kinds = ["code-actions"]
@@ -42,13 +47,14 @@ languages = ["*"]
 
 [[contributes.commands]]
 id = "prepare-import"
-title = "Spring Initializr: Prepare Maven Source-only Import"
+title = "Spring Initializr: Import Maven Project…"
 category = "Spring Initializr"
 
 [[contributes.commands]]
 id = "open-reviewed-import"
-title = "Spring Initializr: Open Reviewed Source Folder"
+title = "Spring Initializr: Open Source Folder"
 category = "Spring Initializr"
+when = "plugin.aritti.spring-initializr.importReady"
 
 [[contributes.menus]]
 menu = "tools"
@@ -57,8 +63,9 @@ command = "prepare-import"
 [[contributes.menus]]
 menu = "tools"
 command = "open-reviewed-import"
+when = "plugin.aritti.spring-initializr.importReady"
 
 [[contributes.commands]]
 id = "generate-archive"
-title = "Spring Initializr: Generate and Open Complete Project"
+title = "Spring Initializr: Generate and Open…"
 category = "Spring Initializr"

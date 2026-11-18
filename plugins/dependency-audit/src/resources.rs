@@ -38,10 +38,27 @@ fn age(at: Option<u64>) -> String {
         format!("{elapsed}s ago")
     } else if elapsed < 3600 {
         format!("{}m ago", elapsed / 60)
-    } else {
+    } else if elapsed < 172_800 {
         format!("{}h ago", elapsed / 3600)
+    } else {
+        format!("{}d ago", elapsed / 86_400)
     };
-    format!("{age} (Unix {at})")
+    format!("{age} ({})", utc(at))
+}
+
+/// `2026-11-17 09:30 UTC` from Unix seconds (civil-from-days, proleptic Gregorian).
+pub(crate) fn utc(at: u64) -> String {
+    let (days, seconds) = (at / 86_400, at % 86_400);
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year}-{month:02}-{day:02} {:02}:{:02} UTC", seconds / 3600, seconds % 3600 / 60)
 }
 
 pub(crate) fn report_status(report: &Report, failure: Option<&ScanFailure>) -> String {
@@ -130,7 +147,7 @@ pub(crate) fn resource_body(root: &str, report: &Report, failure: Option<&ScanFa
         "Dependency Audit setting ignoredAdvisories; {} configured IDs/aliases. Matching advisories are hidden from this report.",
         ignored.len()
     );
-    let ignore_scope = format!("{ignore_scope} Separate project-scoped ignores: {}. Review scoped ignores to inspect reasons and restore retained evidence.",crate::scoped::load(root).len());
+    let ignore_scope = format!("{ignore_scope} Ignored findings in this project: {}. Review Ignored Findings shows their reasons and restores them.",crate::scoped::load(root).len());
     let mut items = Vec::new();
     let mut bytes = 0;
     let total_rows: usize = report.rows.iter().map(|r| 1 + r.advisories.len()).sum();
@@ -228,9 +245,10 @@ pub(crate) fn resource_body(root: &str, report: &Report, failure: Option<&ScanFa
     for [label, name, eco, spec, path] in &report.notes {
         let (name, eco, spec, label) = (clean(name), clean(eco), clean(spec), clean(label));
         let path = clean(&relative(path));
-        let (severity, why) = match label == manifest::LOCAL {
-            true => ("Not checked", "Resolved from the local workspace, not a registry package; its coordinates were never sent to OSV.dev."),
-            false => ("Audited", "The requirement carries a PEP 508 environment marker that was not evaluated; the pinned version is audited regardless of whether the marker applies here."),
+        let (severity, why) = match label.as_str() {
+            manifest::LOCAL => ("Not checked", "Resolved from the local workspace, not a registry package; its coordinates were never sent to OSV.dev."),
+            manifest::PRIVATE => ("Not checked", "Resolved from a registry or host outside the public ones; its name and version were never sent to OSV.dev."),
+            _ => ("Audited", "The requirement carries a PEP 508 environment marker that was not evaluated; the pinned version is audited regardless of whether the marker applies here."),
         };
         let details = vec![json!({"label":"Declared","value":format!("{name} {spec}")}),json!({"label":"Why","value":why})];
         if !push_row(&mut items, &mut bytes, json!({"key":format!("note:{label}|{eco}|{name}|{spec}|{path}"),"label":format!("{name} {spec}"),"cells":[label,name,eco,spec,"-",severity,"-",path],"details":details})) {

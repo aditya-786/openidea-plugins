@@ -12,6 +12,20 @@ pub struct Migration {
     pub version: String,
     pub description: String,
     pub filepath: Option<String>,
+    /// `YYYY-MM-DD` from `installedOnUTC` / `installedOn`, when Flyway printed one.
+    pub installed_on: Option<String>,
+}
+
+impl Migration {
+    /// A short project-tree note for the migration's file; `None` when the state is unknown.
+    pub fn note(&self) -> Option<String> {
+        match self.state {
+            "Applied" => Some(self.installed_on.as_ref().map_or("applied".into(), |date| format!("applied {date}"))),
+            "Superseded" => Some("outdated".into()),
+            "Unknown" => None,
+            state => Some(state.to_lowercase()),
+        }
+    }
 }
 
 fn state(raw: &str) -> (&'static str, &'static str) {
@@ -20,6 +34,8 @@ fn state(raw: &str) -> (&'static str, &'static str) {
         "success" | "baseline" => ("Applied", "success"),
         "pending" => ("Pending", "ci-pending"),
         "ignored" => ("Ignored", "ci-skipped"),
+        "baseline ignored" => ("Baseline ignored", "ci-skipped"),
+        "available" => ("Available", "history"),
         "deleted" => ("Deleted", "trash"),
         "undone" => ("Undone", "history"),
         "outdated" | "superseded" => ("Superseded", "history"),
@@ -76,6 +92,11 @@ pub fn parse(stdout: &str) -> Result<Vec<Migration>, String> {
                 version,
                 description,
                 filepath: Some(text(row, "filepath")).filter(|path| !path.is_empty()),
+                installed_on: ["installedOnUTC", "installedOn"].iter().find_map(|key| {
+                    let date = text(row, key).get(..10)?.to_owned();
+                    let bytes = date.as_bytes();
+                    (bytes.iter().enumerate().all(|(i, b)| if i == 4 || i == 7 { *b == b'-' } else { b.is_ascii_digit() })).then_some(date)
+                }),
             }
         })
         .collect())
@@ -112,10 +133,30 @@ mod tests {
     }
 
     #[test]
+    fn info_state_available_and_baseline_ignored() {
+        assert_eq!(state("Available"), ("Available", "history"));
+        assert_eq!(state("Baseline Ignored"), ("Baseline ignored", "ci-skipped"));
+    }
+
+    #[test]
     fn noisy_stdout_with_braces_still_parses() {
         let out = "[INFO] banner {not json} here\n{\"migrations\":[{\"category\":\"Undo\",\"version\":\"2\",\"description\":\"x\",\"state\":\"Pending\"}]}\n[INFO] done }";
         let migrations = parse(out).unwrap();
         assert_eq!(migrations[0].label, "U2 x");
         assert_eq!(migrations[0].kind, Kind::Undo);
+    }
+
+    #[test]
+    fn notes_show_state_and_install_date() {
+        let out = r#"{"migrations":[
+            {"version":"1","description":"a","state":"Success","installedOnUTC":"2026-11-10 08:00:00.000"},
+            {"version":"2","description":"b","state":"Success","installedOn":"bogus"},
+            {"version":"3","description":"c","state":"Pending"},
+            {"category":"Repeatable","description":"v","state":"Outdated"},
+            {"version":"4","description":"d","state":"Failed"},
+            {"version":"5","description":"e","state":"Whatever"}]}"#;
+        let notes: Vec<_> = parse(out).unwrap().iter().map(Migration::note).collect();
+        let expected = [Some("applied 2026-11-10"), Some("applied"), Some("pending"), Some("outdated"), Some("failed"), None];
+        assert_eq!(notes, expected.map(|note| note.map(str::to_owned)));
     }
 }

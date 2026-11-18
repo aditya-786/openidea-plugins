@@ -13,7 +13,42 @@ Plugins for [OpenIDEA](https://github.com/l0ng-ai/openidea), each a sandboxed We
 | Database migrations | `flyway`, `liquibase` |
 | Tooling and workflow | `dependency-audit`, `ddev`, `devcontainer`, `kube-explorer`, `gitlab`, `tasks` |
 
-Each plugin directory has its own `README.md` (features) and `LICENSE`.
+Each plugin directory has its own `README.md` (requirements, quick start, commands, settings, troubleshooting) and `LICENSE`.
+
+## Using the plugins
+
+### Install a plugin
+
+- **From the marketplace:** Settings › Plugins › Available, search for the plugin, **Install**.
+- **From a file:** Settings › Plugins › **Install Plugin from Package File…** and pick the `aritti.<name>-<version>.oiplugin`.
+
+The install page lists every permission the plugin asks for and whether the package is signed. Nothing is installed until you accept. Updates are offered once a day (**Update All Plugins**); an update that fails to start is rolled back automatically.
+
+### Permissions
+
+Each plugin has *required* permissions (granted at install) and *optional* ones that stay off until you allow them in Settings › Plugins › *plugin name*. Optional permissions unlock extra features, for example `process:php` to run Artisan or `net:gitlab.com` to talk to GitLab. A plugin keeps working without them; the feature that needs one says so in a notification or an empty view. Each plugin README has a Permissions table saying what each one is for.
+
+### Tokens and secrets
+
+Plugins that call a web service (GitLab, issue trackers, vulnerability databases) ask for a token in Settings › Plugins › *plugin name*. Tokens are stored in the system keychain. The plugin never reads them: the IDE adds them to the request on the way out.
+
+### Finding commands
+
+- Search Everywhere (⇧⇧) › Actions, then type the plugin name (`Laravel:`, `Flyway:`…).
+- Editor quick fixes and generators: ⌥⏎ (Alt+Enter) in a file the plugin understands.
+- Tool windows: View › Tool Windows, or the plugin's icon in the side bar.
+- Bind any command to a key in Settings › Keymap.
+
+### Troubleshooting
+
+| Problem | What to do |
+|---|---|
+| A feature does nothing | Check Settings › Plugins › *plugin*: is it enabled, and is the optional permission that feature needs allowed? |
+| The plugin shows as failed | Settings › Plugins shows why. Try **Reload**, or roll back with **Roll Back to …** in the plugin's details. |
+| A command needs a tool (PHP, Docker, kubectl, mvn…) | Install the tool so it's on the `PATH` the IDE sees, then allow `process:<tool>`. |
+| You need details for a bug report | Help › **Show Log in Finder** / **Explorer**; plugin lines are tagged with its id (`aritti.<name>`). Start the IDE with `RUST_LOG=info,ide_plugin=trace` for more. |
+
+Report problems at <https://github.com/arnaud-ritti/openidea-plugins/issues>.
 
 ## Upstream follow-up
 

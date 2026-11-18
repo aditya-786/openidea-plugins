@@ -186,8 +186,15 @@ fn candidates(scope: &Scope, snapshot: &Snapshot) -> Result<Vec<Candidate>, Erro
     }
     let mut output = Vec::new();
     let mut names = BTreeSet::new();
-    for source in &snapshot.sources {
-        if let Some(candidate) = target(scope, source)? {
+    for (index, source) in snapshot.sources.iter().enumerate() {
+        if let Some(mut candidate) = target(scope, source)? {
+            if candidate.password.is_none() {
+                if let Some((owner, password)) = &snapshot.datasource_password {
+                    if *owner == index {
+                        candidate.password = Some(password.clone());
+                    }
+                }
+            }
             if !names.insert(source.name.clone()) {
                 return Err(Error::Invalid("Duplicate captured property-source names cannot identify one owned connection.".into()));
             }
@@ -247,7 +254,7 @@ impl Runtime {
             return Err(Error::Stale);
         }
         let candidate = &choices[index];
-        let ids = project.data_sources()?;
+        let ids = allow(project.data_sources(), "database.sources")?;
         let message = format!(
             "{} an owned Database connection from this captured property source?\n\nProject: {}\nActuator: {}\nFetched Unix: {}\nProperty source: {}\nDriver: {}\nHost: {}\nPort: {}\nDatabase: {}\nUser: {}\nCredential: {}\n\nOnly exact fields from this source are used. Active runtime database identity, profile precedence and current values are unverified. Native driver defaults apply; review SSL/TLS and other transport settings in Database before connecting. No connection, schema read or SQL will run.",
             if ids.contains(&candidate.target.id) {
@@ -347,6 +354,26 @@ mod tests {
             candidate.target.id, moved.target.id,
             "a changed target must not inherit an old owned credential"
         );
+    }
+    #[test]
+    fn candidate_password_comes_from_memory_when_source_value_is_masked() {
+        let (_host, runtime) = setup();
+        let scope = runtime.scope.unwrap();
+        let mut snapshot = runtime.snapshot.unwrap();
+        snapshot.sources[0].props[2].1 = MASK.into();
+        snapshot.datasource_password = Some((0, "s3cret".into()));
+        let choices = candidates(&scope, &snapshot).unwrap();
+        assert_eq!(choices[0].password.as_deref(), Some("s3cret"));
+    }
+    #[test]
+    fn memory_password_attaches_only_to_the_source_it_came_from() {
+        let (_host, runtime) = setup();
+        let scope = runtime.scope.unwrap();
+        let mut snapshot = runtime.snapshot.unwrap();
+        snapshot.sources[0].props[2].1 = MASK.into();
+        snapshot.datasource_password = Some((1, "s3cret".into()));
+        let choices = candidates(&scope, &snapshot).unwrap();
+        assert_eq!(choices[0].password, None);
     }
     #[test]
     fn explicit_confirmation_creates_owned_source_and_cancel_preserves_database() {

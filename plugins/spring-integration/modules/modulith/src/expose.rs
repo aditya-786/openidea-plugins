@@ -8,8 +8,8 @@ struct Target {path:String,qualified:String,module:String}
 struct Pending {root:String,doc:Document,selection:Range,target:Target,open_module:bool}
 #[derive(Default)]
 pub(super) struct Exposes {next:u64,pending:BTreeMap<String,Pending>}
-fn target(index:&Index<Unit>,doc:&Document,selection:Range)->Option<Target> {
-    if !matches!(doc.language.as_str(),"java"|"kotlin")||is_test(&doc.path)||doc.text.len()>256*1024||!index.fresh()||index.files().len()>1000 {return None;}
+fn target(index:&Units<'_>,doc:&Document,selection:Range)->Option<Target> {
+    if !matches!(doc.language.as_str(),"java"|"kotlin")||is_test(&doc.path)||doc.text.len()>256*1024||!index.fresh()||index.len()>1000 {return None;}
     let root=host::project_of(&doc.path)?.root().ok()?;
     if index.iter().any(|(path,_)|host::project_of(path).and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str())) {return None;}
     let f=spring_text::parse_source(&doc.path,&doc.text);let model=Model::build(index);let (from,_)=model.module_of(&f.package)?;
@@ -24,9 +24,9 @@ fn snapshot(pending:&Pending)->Result<(String,Model),Error> {
     if host::project_of(&pending.doc.path).and_then(|p|p.root().ok()).as_deref()!=Some(pending.root.as_str())||host::project_of(&pending.target.path).and_then(|p|p.root().ok()).as_deref()!=Some(pending.root.as_str()) {return Err(Error::Stale);}
     let project=host::project_of(&pending.doc.path).ok_or(Error::Stale)?;
     if project.read_file(&pending.doc.path)?!=pending.doc.text {return Err(Error::Stale);}
-    let mut index=Index::new(&["**/*.java","**/*.kt"],scan);index.scan(&project,Duration::from_millis(150));let scope=source_scope::Scope::current(&pending.root).ok_or(Error::Stale)?;if !scope.prune(&mut index) {return Err(Error::Stale);}
+    spring_text::scope::scope_path(&pending.root).ok_or(Error::Stale)?;let mut index=spring_text::index::Index::new(&["**/*.java","**/*.kt"],scan).excluding_nested_projects();index.scan(&project,Duration::from_millis(150));let index=index.view(|unit|Some(unit));
     if target(&index,&pending.doc,pending.selection).as_ref()!=Some(&pending.target) {return Err(Error::Stale);}
-    let source=project.read_file(&pending.target.path)?;if source.len()>64*1024 {return Err(Error::Invalid("Target class exceeds the reviewed source limit.".into()));}
+    let source=project.read_file(&pending.target.path)?;if source.len()>64*1024 {return Err(Error::Invalid("The imported class is too large to edit (over 64 KiB).".into()));}
     Ok((source,Model::build(&index)))
 }
 fn insertion(path:&str,source:&str,qualified:&str,name:&str)->Result<(String,TextEdit),Error> {
@@ -60,7 +60,7 @@ fn open_module(pending:&Pending,before:&str,model:&Model)->Result<FileAction,Err
 }
 
 impl Exposes {
-    pub(super) fn actions(&mut self,index:&Index<Unit>,doc:&Document,selection:Range)->Vec<FileAction> {
+    pub(super) fn actions(&mut self,index:&Units<'_>,doc:&Document,selection:Range)->Vec<FileAction> {
         let Some(target)=target(index,doc,selection) else{return vec![];};let Some(root)=host::project_of(&doc.path).and_then(|p|p.root().ok()) else{return vec![];};
         if host::project_of(&target.path).and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str()) {return vec![];}
         self.next=self.next.wrapping_add(1);if self.pending.len()>=3 {self.pending.clear();}let key=format!("modulith-expose-interface:{}",self.next);
@@ -89,6 +89,7 @@ impl Exposes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::ModulithTools;
     use openidea_plugin::{mock::MockHost,text::{position,offset}};
     fn setup()->(MockHost,ModulithTools,Document) {
         let host=MockHost::install();

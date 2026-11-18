@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 pub const VIEW: &str = "live-tail";
 const SOURCE: &str = include_str!("../adapters/IdeologTail.java");
 const MAX_LINES: usize = 512;
+const EXPIRED: &str = "Stopped after 5 minutes. Click Start to follow again";
 struct Lease {
     child: host::Child,
     root: String,
@@ -40,7 +41,14 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, Error> {
         })
         .collect()
 }
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
 impl LiveTail {
+    pub(crate) fn source(&self) -> Option<(String, String)> {
+        let lease = self.lease.as_ref()?;
+        Some((lease.path.clone(), lease.root.clone()))
+    }
     fn stop(&mut self, message: &str) {
         if let Some(lease) = self.lease.take() {
             let _ = lease.child.kill();
@@ -61,10 +69,10 @@ impl LiveTail {
                 lease.ready = true;
                 self.rows.clear();
                 self.bytes = 0;
-                self.status = "Following owned UTF8 log · 5 minute lease".into();
+                self.status = format!("Following {} (stops in 5 min)", file_name(&lease.path));
             }
             ["TAIL1", "WAIT", "missing"] => {
-                self.status = "Waiting briefly for log rotation replacement".into();
+                self.status = format!("Waiting for {} to come back after log rotation", file_name(&lease.path));
             }
             ["TAIL1", "RESET", generation] => {
                 let generation = generation.parse::<u64>().map_err(|_| Error::Stale)?;
@@ -76,7 +84,7 @@ impl LiveTail {
                 lease.bytes.clear();
                 self.rows.clear();
                 self.bytes = 0;
-                self.status = "Log rotated/truncated; following new generation".into();
+                self.status = format!("{} was rotated or emptied; showing its new lines", file_name(&lease.path));
             }
             ["TAIL1", "DATA", generation, offset, hex] => {
                 let generation = generation.parse::<u64>().map_err(|_| Error::Stale)?;
@@ -93,10 +101,10 @@ impl LiveTail {
                 lease.bytes.extend(bytes);
                 while let Some(end) = lease.bytes.iter().position(|b| *b == b'\n') {
                     if end > 4096 {
-                        return Err("Tail line exceeds4096bytes.".into());
+                        return Err("Tail line exceeds 4096 bytes.".into());
                     }
                     let content = String::from_utf8(lease.bytes[..end].to_vec())
-                        .map_err(|_| "Tail profile requires UTF8 text.")?;
+                        .map_err(|_| "Live tail reads UTF-8 text only.")?;
                     lease.bytes.drain(..=end);
                     let content = content.trim_end_matches('\r').to_owned();
                     self.bytes += content.len();
@@ -108,13 +116,13 @@ impl LiveTail {
                     }
                 }
                 if lease.bytes.len() > 4096 {
-                    return Err("Tail line exceeds4096bytes.".into());
+                    return Err("Tail line exceeds 4096 bytes.".into());
                 }
             }
             ["TAIL1", "END", _] => {
-                self.status = "Tail lease expired; explicitly Start to follow again".into();
+                self.status = EXPIRED.into();
             }
-            _ => return Err("Invalid live-tail helper output.".into()),
+            _ => return Err("Live tail got unexpected output from Java. Click Start to try again.".into()),
         }
         Ok(())
     }
@@ -134,7 +142,7 @@ impl Ideolog {
             .iter()
             .any(|editor| editor.path == lease.path && editor.dirty)
         {
-            return Err("Tail stopped because the source has unsaved edits.".into());
+            return Err("Live tail stopped: the log has unsaved edits. Save it, then click Start.".into());
         }
         let project = ctx.project().ok_or(Error::Stale)?;
         match project.stat(&lease.path) {
@@ -149,12 +157,12 @@ impl Ideolog {
         ctx: &Invocation,
     ) -> Result<(), Error> {
         if self.tail.lease.is_some() {
-            return Err("Stop the active tail before starting another source.".into());
+            return Err("Stop the current live tail before starting another.".into());
         }
         let editor = ctx
             .editor()
             .filter(|e| matches!(e.language().as_str(), "log" | "ideolog"))
-            .ok_or("Focus the project log before starting its live tail.")?;
+            .ok_or("Focus a log file of this project, then click Start.")?;
         let path = editor.path();
         let project = project_of(&path).ok_or(Error::Stale)?;
         let root = project.root()?;
@@ -163,15 +171,15 @@ impl Ideolog {
                 .iter()
                 .any(|e| e.path == path && e.dirty)
         {
-            return Err("Live tail requires an owned project log without unsaved edits.".into());
+            return Err("Live tail follows saved log files of this project. Save the log, then click Start.".into());
         }
         if project.stat(&path)?.kind != openidea_plugin::FileKind::File {
             return Err(Error::Stale);
         }
         if !ui_kit::prompts::confirm_exact(
-            "Follow this local log?",
+            &format!("Follow {}?", file_name(&path)),
             &format!(
-                "Approved Java17+ helper reads only this UTF8 regular file through a secure directory handle.\nProject: {root}\nFile: {path}\nInitial tail: last64KiB; appends follow for at most5minutes/1MiB.\nNo project/application bootstrap. Rotation/truncation starts a new generation. Symlinks, unavailable secure-directory profiles and invalid UTF8 stop the helper. Switching tabs or closing the panel stops polling; the lease expires after 5 minutes."
+                "Java 17 or newer shows the last 64 KiB of {path}, then its new lines for up to 5 minutes (or 1 MiB).\nIt only reads this file; nothing in your project runs.\nSwitching tabs or closing the panel stops it."
             ),
         )? {
             return Err(Error::Cancelled);
@@ -191,7 +199,8 @@ impl Ideolog {
             &host::Command::new("java")
                 .args(["-Xmx64m", "--source", "17", &helper, &root, &path, "300000"]),
             None,
-        )?;
+        )
+        .map_err(|e| ui_kit::denied::map(e, "Live tail", "process:java", "Ideolog"))?;
         child.close_stdin()?;
         if self.tail.root != root || self.tail.path != path {
             self.tail.rows.clear();
@@ -199,7 +208,7 @@ impl Ideolog {
         }
         self.tail.root = root.clone();
         self.tail.path = path.clone();
-        self.tail.status = "Starting approved JVM tail profile…".into();
+        self.tail.status = format!("Starting Java to follow {}…", file_name(&path));
         self.tail.lease = Some(Lease {
             child,
             root,
@@ -217,12 +226,12 @@ impl Ideolog {
     fn poll_tail(&mut self, ctx: &Invocation) -> Result<(), Error> {
         if let Err(error) = self.verify_tail_source(ctx) {
             self.tail
-                .stop("Source invalidated or unsaved; previous tail retained");
+                .stop("Stopped: the log has unsaved edits or left the project. Click Start to follow again");
             return Err(error);
         }
         let lease = self.tail.lease.as_mut().ok_or(Error::Stale)?;
         if Instant::now() > lease.expires {
-            self.tail.stop("Tail lease expired");
+            self.tail.stop(EXPIRED);
             return Ok(());
         }
         if Instant::now() < lease.next {
@@ -233,20 +242,21 @@ impl Ideolog {
             Ok(chunk) => chunk,
             Err(error) => {
                 self.tail
-                    .stop("Tail child unavailable; previous rows retained");
+                    .stop("Java stopped unexpectedly. Click Start to try again");
                 return Err(error);
             }
         };
-        if !chunk.stderr.is_empty() {
+        let failure = failure_text(&chunk.stderr);
+        if !failure.is_empty() {
             self.tail.stop(&format!(
-                "JVM tail profile unavailable or failed: {}",
-                chunk.stderr.chars().take(256).collect::<String>()
+                "Java failed: {}. Check that Java 17 or newer is installed, then click Start",
+                failure.chars().take(256).collect::<String>()
             ));
             return Ok(());
         }
         lease.pending.push_str(&chunk.stdout);
         if lease.pending.len() > 65536 {
-            self.tail.stop("Tail output frame limit exceeded");
+            self.tail.stop("Stopped: the log wrote too much at once. Click Start to try again");
             return Err(Error::Stale);
         }
         let mut frames = Vec::new();
@@ -257,15 +267,15 @@ impl Ideolog {
         for frame in frames {
             if let Err(error) = self.tail.consume(&frame) {
                 self.tail
-                    .stop("Tail protocol/source rejected; previous rows retained");
+                    .stop("Stopped: the log file changed unexpectedly. Click Start to follow again");
                 return Err(error);
             }
         }
         if let Some(status) = chunk.status {
             self.tail.stop(if status == 0 {
-                "Tail finished; explicitly Start to follow again"
+                EXPIRED
             } else {
-                "Tail helper failed; previous rows retained"
+                "Java stopped with an error. Click Start to try again"
             });
         }
         Ok(())
@@ -280,9 +290,9 @@ impl Ideolog {
         let active = owned && self.tail.lease.is_some();
         let poll = active.then(|| serde_json::json!({"intervalMs": 1000, "message": {"op": "tail-tick"}}));
         let status = if owned {
-            format!("{} · {} · {} recent complete lines (at most 512 / 128 KiB)", self.tail.path, self.tail.status, items.len())
+            format!("{} · {} lines (the last 512 are kept)", self.tail.status, items.len())
         } else {
-            "Focus a project log and choose Start. UTF-8 files; Java 17+ helper, confirmed before each start.".into()
+            "Focus a log file of this project, then click Start. Needs Java 17 or newer.".into()
         };
         View::new(Body::Other {
             kind: "resources".into(),
@@ -329,12 +339,21 @@ impl Ideolog {
     pub(crate) fn tail_lifecycle(&mut self, ctx: &Invocation) {
         if self.tail.lease.is_some() && self.verify_tail_source(ctx).is_err() {
             self.tail
-                .stop("Tail source/project invalidated; previous rows retained");
+                .stop("Stopped: the log file or project changed. Click Start to follow again");
         }
     }
     pub(crate) fn stop_tail(&mut self) {
-        self.tail.stop("Tail stopped");
+        self.tail.stop("Stopped");
     }
+}
+
+/// The JVM announces `JAVA_TOOL_OPTIONS` on stderr; that is not a failure.
+fn failure_text(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|line| !line.starts_with("Picked up "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -375,6 +394,13 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+    #[test]
+    fn java_tool_options_banner_keeps_tail() {
+        let banner = "Picked up JAVA_TOOL_OPTIONS: -Xmx1g\nPicked up _JAVA_OPTIONS: -Dx=1\n";
+        assert!(failure_text(banner).is_empty());
+        assert_eq!(failure_text(&format!("{banner}Error: boom\n")), "Error: boom");
+        assert_eq!(failure_text("Error: boom"), "Error: boom");
     }
     #[test]
     fn tail_protocol_is_ordered_utf8_bounded_and_generation_scoped() {
@@ -419,6 +445,24 @@ mod tests {
         assert_eq!(tail.rows.len(), 512);
         assert_eq!(tail.bytes, 512 * 4);
         assert!(tail.consume("TAIL1\tRESET\t3").is_err());
+    }
+    #[test]
+    fn ready_status_names_the_file_and_when_it_stops() {
+        let (_host, mut tail) = fixture("/project", "/project/app.log");
+        tail.consume(&format!("TAIL1\tREADY\t{}\t{}", encoded("/project"), encoded("/project/app.log"))).unwrap();
+        assert_eq!(tail.status, "Following app.log (stops in 5 min)");
+    }
+    #[test]
+    fn start_without_java_permission_names_the_permission() {
+        let host = MockHost::install().with_capabilities(&["project.read", "editor.read"]);
+        host.set_project_root(Some("/project"));
+        host.add_file("/project/app.log", "line\n");
+        host.open_editor("/project/app.log", "log", "line\n", &[]);
+        host.answer_next_prompt(Some(&[]));
+        let mut plugin = Ideolog::default();
+        let error = plugin.start_tail(&host.invocation()).unwrap_err();
+        assert!(matches!(error, Error::Invalid(ref m) if m == "Live tail needs the process:java permission. Allow it in Settings › Plugins › Ideolog."), "{error:?}");
+        assert!(plugin.tail.lease.is_none());
     }
     #[test]
     fn source_invalidation_cancellation_and_stale_frames_stop_or_preserve_correct_lease() {

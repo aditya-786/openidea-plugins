@@ -160,7 +160,7 @@ impl Main {
         if tool == "profiler_requests" {
             let request: Listing = decode(arguments)?;
             self.profiler_snapshot.refresh(ctx);
-            let rows = self.profiler_snapshot.requests().ok_or("No profiler index snapshot: choose or discover a profiler source first.")?;
+            let rows = self.profiler_snapshot.requests().ok_or("No profiler requests loaded. Choose a profiler source first.")?;
             let rows = rows.into_iter().map(|(token, method, url, status, time)| vec![token, method, url, status, profiler::timestamp(time)]).collect();
             return table(&["token", "method", "url", "status", "time_utc"], rows, &request);
         }

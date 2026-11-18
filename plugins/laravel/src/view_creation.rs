@@ -227,6 +227,27 @@ pub(super) fn validate(project: &Project, root: &str, doc: &Document, name: &str
     }
     Ok((target, config))
 }
+/// The Create Missing command's path to the same view: confirm the destination, then write it.
+pub(crate) fn create_from_command(index: &Index, doc: &Document, at: usize) -> Result<(), Error> {
+    let (name, _, _) = literal(doc, at, index).ok_or_else(|| Error::Invalid(crate::ui_text::t(
+        "native.view_creation.commandUnsupported",
+        "Only views named by view('…'), @include, @includeIf or @extends can be created here.",
+    )))?;
+    let (project, root) = owner(doc, None)?;
+    let (target, config) = roots::select(&project, &root, doc, &name)?;
+    if !host::confirm(
+        &crate::ui_text::t("native.view_creation.commandConfirm", "Create view?"),
+        &crate::ui_text::format("native.view_creation.commandBody", "Create {target} for the view {name}?", &[("target", &target), ("name", &name)]),
+    )? {
+        return Ok(());
+    }
+    let (current, current_config) = roots::revalidate(&project, &root, doc, &name, &target, &config)?;
+    if current != target || current_config != config {
+        return Err(Error::Stale);
+    }
+    project.write_file(&target, CONTENT).map_err(|error| ui_kit::denied::map(error, "Creating views", "project.write", "Laravel"))?;
+    host::open_editor(&target, None)
+}
 impl FileActions for Main {
     fn file_actions(&mut self, doc: &Document, selection: Range) -> Vec<FileAction> {
         let mut found=self.generator_workspace.actions(doc);

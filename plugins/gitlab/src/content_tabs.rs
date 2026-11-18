@@ -168,7 +168,7 @@ impl GitLab {
                 if !self.trace_transport {return Err("Job trace snapshots require native host API1.4 redirect enforcement.".into());}
                 let selected=Self::job_membership(&repo.path,iid,pipeline,job)?;
                 if task.is_cancelled() {return Err("Snapshot loading cancelled.".into());}
-                body.push(&format!("\nPipeline: #{pipeline}\nJob: #{job}\nName: {}\nObserved status: {}\n\nHistorical bounded job trace snapshot, not a live stream or managed local process. MR membership does not assert this pipeline runs the current MR head. Refresh is explicit.\nHost transfer cap:8MiB; plugin accepts1MiB and displays up to384KiB with a truncation marker.\n\n",selected.name,selected.status));
+                body.push(&format!("\nPipeline: #{pipeline}\nJob: #{job}\nName: {}\nObserved status: {}\n\nHistorical bounded job trace snapshot, not a live stream or managed local process. MR membership does not assert this pipeline runs the current MR head. Refresh is explicit.\nHost transfer cap:8MiB; plugin accepts 1MiB and displays up to 384KiB with a truncation marker.\n\n",selected.name,selected.status));
                 body.push(&api::Project(&repo.path).job_trace(job)?);
                 if task.is_cancelled() {return Err("Snapshot loading cancelled.".into());}
                 Self::job_membership(&repo.path,iid,pipeline,job)?;
@@ -221,10 +221,7 @@ impl GitLab {
         let (pipeline, job) = self.pipeline_target();
         let (Some(pipeline), Some(job)) = (pipeline, job) else { return Err("Select a listed pipeline job first.".into()); };
         Self::job_membership(&repo.path, iid, pipeline.id, job.id)?;
-        let probe = ctx.project().ok_or(Error::Stale)?.run_process("glab", &["version".into()], None)?;
-        if probe.status != Some(0) || probe.stdout.len() > 4096 || !probe.stdout.lines().any(|line| line.strip_prefix("glab ").map(|version| version.strip_prefix("version ").unwrap_or(version)).and_then(|version| version.split_whitespace().next()).is_some_and(|version| version.starts_with("1.") && version.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())))) {
-            return Err("Install and approve GitLab CLI glab 1.x, authenticate it separately, then retry.".into());
-        }
+        require_glab_1x(ctx, "Following a job log")?;
         let repository = format!("{}/{}", api::server(), repo.path);
         if !host::confirm("Follow GitLab job log", &format!("Repository: {repository}\nMerge request: !{iid}\nPipeline: #{}\nJob: #{} ({})\n\nThe approved glab CLI follows this job using its own credentials and configuration. The native log tab owns output, restart and cancellation. This does not assert the pipeline runs the current MR head.", pipeline.id, job.id, job.name))? { return Ok(()); }
         let current = gitlab_project(ctx)?;
@@ -426,4 +423,19 @@ mod tests {
             assert_eq!(plugin.content_snapshots[&id].content, "original");
         }
     }
+}
+
+/// Runs `glab version` and accepts any GitLab CLI 1.x (`glab 1.46.1` or the older `glab version 1.22.0`).
+pub(crate) fn require_glab_1x(ctx: &Invocation, feature: &str) -> Result<(), Error> {
+    let probe = ctx.project().ok_or(Error::Stale)?.run_process("glab", &["version".into()], None)
+        .map_err(|e| ui_kit::denied::map(e, feature, "process:glab", "GitLab"))?;
+    let version = probe.stdout.lines().find_map(|line| line.strip_prefix("glab "))
+        .map(|version| version.strip_prefix("version ").unwrap_or(version))
+        .and_then(|version| version.split_whitespace().next());
+    let is_1x = version.is_some_and(|version| version.starts_with("1.") && version.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())));
+    if probe.status != Some(0) || probe.stdout.len() > 4096 || !is_1x {
+        let found = version.map(|v| format!(" (found {v})")).unwrap_or_default();
+        return Err(format!("{feature} needs GitLab CLI glab 1.x{found}. Install it, sign in with glab auth login, then retry.").into());
+    }
+    Ok(())
 }

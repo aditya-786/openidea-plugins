@@ -93,23 +93,50 @@ pub fn level(severity: Option<&str>) -> Severity {
     }
 }
 
-// ponytail: dotted-number compare; Maven qualifiers (Final, SP) and SemVer build metadata aren't ranked, use the ecosystem's rules if fixes come out wrong
+// ponytail: dotted-number compare with PEP 440 `post` above the release; Maven qualifiers (Final, SP) and SemVer build metadata aren't ranked, use the ecosystem's rules if fixes come out wrong
 pub fn compare(a: &str, b: &str) -> Ordering {
-    let separators = ['.', '-', '+', '_'];
-    let mut a = a.split(separators);
-    let mut b = b.split(separators);
+    let mut a = segments(a).into_iter();
+    let mut b = segments(b).into_iter();
 
     loop {
         match (a.next(), b.next()) {
             (None, None) => return Ordering::Equal,
-            (Some(x), None) => return if is_number(x) { Ordering::Greater } else { Ordering::Less },
-            (None, Some(y)) => return if is_number(y) { Ordering::Less } else { Ordering::Greater },
+            (Some(x), None) => return if is_number(x) || is_post(x) { Ordering::Greater } else { Ordering::Less },
+            (None, Some(y)) => return if is_number(y) || is_post(y) { Ordering::Less } else { Ordering::Greater },
             (Some(x), Some(y)) => match compare_segments(x, y) {
                 Ordering::Equal => {}
                 other => return other,
             },
         }
     }
+}
+
+fn segments(version: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+
+    for piece in version.split(['.', '-', '+', '_']) {
+        let mut start = 0;
+        let mut previous: Option<bool> = None;
+
+        for (at, c) in piece.char_indices() {
+            let digit = c.is_ascii_digit();
+
+            if previous.is_some_and(|was| was != digit) {
+                parts.push(&piece[start..at]);
+                start = at;
+            }
+
+            previous = Some(digit);
+        }
+
+        parts.push(&piece[start..]);
+    }
+
+    parts
+}
+
+fn is_post(segment: &str) -> bool {
+    matches!(segment.to_ascii_lowercase().as_str(), "post" | "rev" | "r")
 }
 
 fn is_number(segment: &str) -> bool {
@@ -124,7 +151,11 @@ fn compare_segments(a: &str, b: &str) -> Ordering {
         }
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
-        (false, false) => a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
+        (false, false) => match (is_post(a), is_post(b)) {
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            _ => a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
+        },
     }
 }
 
@@ -238,7 +269,8 @@ pub(crate) fn is_safe_id(id: &str) -> bool {
 }
 
 fn fetch(request: HttpRequest) -> Result<Vec<u8>, Error> {
-    let response = host::fetch(&HttpRequest { timeout_ms: Some(TIMEOUT_MS), ..request })?;
+    let response = host::fetch(&HttpRequest { timeout_ms: Some(TIMEOUT_MS), ..request })
+        .map_err(|e| ui_kit::denied::map(e, "Vulnerability lookup", "net:api.osv.dev", "Dependency Audit"))?;
 
     if response.status != 200 {
         return Err(Error::Failed(format!("OSV answered {}", response.status)));
@@ -447,6 +479,13 @@ pub(crate) fn cached_findings(deps: &[Dep], deadline: Instant) -> Vec<(Finding, 
 }
 
 pub fn audit(deps: &[Dep], online: bool, now: u64, deadline: Instant) -> Result<Vec<Finding>, Error> {
+    let mut unlimited = usize::MAX;
+
+    audit_within(deps, online, now, deadline, &mut unlimited)
+}
+
+/// Like `audit`, but queries at most `*budget` uncached coordinates and spends them from it.
+pub fn audit_within(deps: &[Dep], online: bool, now: u64, deadline: Instant, budget: &mut usize) -> Result<Vec<Finding>, Error> {
     drop_pre_alias_advisories();
     let mut cache = cached_queries();
     let mut seen: HashSet<String> = HashSet::new();
@@ -462,7 +501,8 @@ pub fn audit(deps: &[Dep], online: bool, now: u64, deadline: Instant) -> Result<
 
         let fresh = cache.get(&key).is_some_and(|c| now.saturating_sub(c.at) < QUERY_TTL_SECS);
 
-        if online && !fresh {
+        if online && !fresh && *budget > 0 {
+            *budget -= 1;
             missing.push(dep);
         }
 

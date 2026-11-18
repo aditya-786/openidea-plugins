@@ -3,7 +3,7 @@
 //! and the commit message as `commit.template`, which the IDE's commit field
 //! starts from. Needs `process:git`; without it tasks have no branches.
 
-use openidea_plugin::{Error, Project};
+use openidea_plugin::{host, Error, Project};
 
 use crate::model::Task;
 
@@ -79,12 +79,17 @@ impl<'a> Git<'a> {
     }
 
     /// Points `commit.template` at a file holding `message` (`None`: removes
-    /// it). A template the user set up is left alone.
+    /// it). A template the user set up is left alone. Git writes the file
+    /// into the git dir (the host refuses plugin writes there, and a path in
+    /// the plugin directory dangles after uninstall); only a repository
+    /// without commits, where `git log` fails, falls back to the plugin
+    /// directory.
     pub fn set_commit_template(&self, message: Option<&str>) -> Result<(), Error> {
-        let path = self.run(&["rev-parse", "--path-format=absolute", "--git-path", TEMPLATE_FILE])?;
+        let plugin_path = template_path(&self.project.root()?, &host::fs::plugin_dir()?);
+        let git_path = self.run(&["rev-parse", "--path-format=absolute", "--git-path", TEMPLATE_FILE])?;
         let current = self.run(&["config", "--local", "--get", "commit.template"]).ok();
 
-        if current.as_deref().is_some_and(|template| template != path) {
+        if current.as_deref().is_some_and(|template| template != plugin_path && !template.ends_with(&format!("/{TEMPLATE_FILE}"))) {
             return Ok(());
         }
 
@@ -95,10 +100,24 @@ impl<'a> Git<'a> {
             return Ok(());
         };
 
-        // The plugin can't write files; git can, with log's --output.
-        self.run(&["log", "-1", &format!("--format={}", message.replace('%', "%%")), &format!("--output={path}")])?;
+        let by_git = self.run(&["log", "-1", &format!("--format={}", message.replace('%', "%%")), &format!("--output={git_path}")]);
+        let path = match by_git {
+            Ok(_) => git_path,
+            Err(_) => {
+                host::fs::write_file(&plugin_path, &format!("{message}\n"))?;
+                plugin_path
+            }
+        };
+
         self.run(&["config", "--local", "commit.template", &path]).map(drop)
     }
+}
+
+/// One file per project, named after a hash of its root.
+fn template_path(root: &str, plugin_dir: &str) -> String {
+    let hash = root.bytes().fold(0xcbf29ce484222325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
+
+    format!("{}/commit-template-{hash:016x}", plugin_dir.trim_end_matches('/'))
 }
 
 fn stash_message(task_id: &str) -> String {
@@ -136,6 +155,17 @@ pub fn branch_name(task: &Task, format: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_path_is_outside_git_and_per_project() {
+        let a = template_path("/work/a", "/plugins/tasks/");
+        let b = template_path("/work/b", "/plugins/tasks");
+
+        assert!(a.starts_with("/plugins/tasks/commit-template-"));
+        assert!(!a.contains(".git"));
+        assert_ne!(a, b);
+        assert_eq!(a, template_path("/work/a", "/plugins/tasks"));
+    }
 
     #[test]
     fn names_branches_like_intellij() {

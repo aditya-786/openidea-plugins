@@ -41,7 +41,9 @@ impl Main {
         for project in projects { self.queue_index(&project); }
     }
 
+    /// One bounded step for events, schedules, commands and view ticks.
     pub(crate) fn advance_index(&mut self, project: &Project) {
+        let deadline = std::time::Instant::now() + index::STEP_BUDGET;
         let Ok(root) = project.root() else { return };
         if self.indexes.get(&root).is_some_and(|index|!index::index_settings_current(index)) { self.queue_index(project); }
         if !self.pending_indexes.contains(&root) {
@@ -97,7 +99,7 @@ impl Main {
                 Err(error) => { self.fail_index(&root, &error); return; }
             }
         }
-        let result = self.index_builders.get_mut(&root).expect("queued builder").step(project);
+        let result = self.index_builders.get_mut(&root).expect("queued builder").step(project, deadline);
         match result {
             Ok(index::BuildProgress::Pending { completed, total }) => {
                 task.report(completed.min(u32::MAX as usize) as u32,Some(total.min(u32::MAX as usize) as u32),None);
@@ -133,7 +135,24 @@ impl Main {
     }
 
     pub(crate) fn advance_document_index(&mut self, path: &str) {
-        if let Some(project) = crate::project_for(path) { self.advance_index(&project); }
+        if let Some(project) = crate::project_for(path) { self.advance_index_from_provider(&project); }
+    }
+
+    /// Editor providers only continue a builder an event already started, through
+    /// file reads under `PROVIDER_STEP_BUDGET`: no builder creation, listing,
+    /// heavy jobs, capture, rechecks or deferred automation.
+    fn advance_index_from_provider(&mut self, project: &Project) {
+        let Ok(root) = project.root() else { return };
+        if self.indexes.get(&root).is_some_and(|index|!index::index_settings_current(index)) { self.queue_index(project); }
+        if !self.pending_indexes.contains(&root) { return; }
+        let Some(builder) = self.index_builders.get_mut(&root) else { return };
+        let deadline = std::time::Instant::now() + index::PROVIDER_STEP_BUDGET;
+        match builder.provider_step(project, deadline) {
+            Ok(index::BuildProgress::Pending { completed, total }) => { self.index_progress.insert(root, (completed, total)); }
+            Ok(index::BuildProgress::Ready(index)) => self.publish_index(project, root, index),
+            Err(Error::Stale) => self.queue_index(project),
+            Err(error) => self.fail_index(&root, &error),
+        }
     }
 
     pub(crate) fn advance_context_index(&mut self, ctx: &Invocation) {
@@ -178,6 +197,34 @@ impl Main {
 mod tests {
     use crate::*;
     use openidea_plugin::mock::MockHost;
+
+    #[test]
+    fn provider_advance_on_a_fresh_project_creates_no_builder() {
+        let host=MockHost::install();
+        host.add_file("composer.json",r#"{"require":{"laravel/framework":"^13.0"}}"#);
+        host.add_file("app/Models/User.php","<?php namespace App\\Models; class User extends \\Illuminate\\Database\\Eloquent\\Model{}");
+        let mut plugin=Main::default();
+        plugin.activate(&host.context("aritti.laravel")).unwrap();
+        plugin.advance_document_index("/project/app/Models/User.php");
+        assert!(plugin.index_builders.is_empty());
+        assert!(plugin.index_progress.is_empty());
+        assert!(plugin.index_pending("/project"));
+    }
+
+    #[test]
+    fn provider_advance_runs_no_rechecks_or_deferred_work() {
+        let host=MockHost::install();
+        host.add_file("composer.json",r#"{"require":{"laravel/framework":"^13.0"}}"#);
+        let project=host.invocation().project().unwrap();
+        let mut plugin=Main::default();
+        plugin.activate(&host.context("aritti.laravel")).unwrap();
+        while plugin.index_pending("/project") { plugin.advance_index(&project); }
+        plugin.index_rechecks.insert("/project".into(),std::collections::VecDeque::from(["/project/composer.json".to_owned()]));
+        plugin.advance_document_index("/project/composer.json");
+        assert_eq!(plugin.index_rechecks["/project"].len(),1);
+        plugin.advance_index(&project);
+        assert!(!plugin.index_rechecks.contains_key("/project"));
+    }
 
     #[test]
     fn activation_queues_every_scope_without_starting_a_builder() {

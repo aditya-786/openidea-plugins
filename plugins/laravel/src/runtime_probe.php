@@ -1,5 +1,7 @@
 <?php
 // Explicit opt-in runtime inspection. No file installation, shell, job execution or payload reads.
+/** The only database-mode errors whose message reaches the UI; it is written by this script. */
+final class OpenIdeaLaravelProbeMessage extends RuntimeException {}
 $mode = $argv[1] ?? '';
 $options = json_decode($argv[2] ?? '{}', true, 16, JSON_THROW_ON_ERROR);
 if ($mode === 'logs') {
@@ -158,10 +160,10 @@ if ($mode === 'database-compare' || $mode === 'database-rows') {
     try {
         $selected = $options['connection'] ?? null;
         $declared = $app['config']->get('database.connections', []);
-        if ($selected !== null && (!is_string($selected) || !is_array($declared) || !array_key_exists($selected, $declared))) { throw new RuntimeException('Selected database connection is not configured.'); }
+        if ($selected !== null && (!is_string($selected) || !is_array($declared) || !array_key_exists($selected, $declared))) { throw new OpenIdeaLaravelProbeMessage('Selected database connection is not configured.'); }
         $connection = $app['db']->connection($selected);
         $schema = $connection->getSchemaBuilder();
-        if (!method_exists($schema, 'getTables') || !method_exists($schema, 'getColumns') || !method_exists($schema, 'getIndexes')) { throw new RuntimeException('This framework schema builder does not expose table, column and index metadata.'); }
+        if (!method_exists($schema, 'getTables') || !method_exists($schema, 'getColumns') || !method_exists($schema, 'getIndexes')) { throw new OpenIdeaLaravelProbeMessage('This framework schema builder does not expose table, column and index metadata.'); }
         $listed = [];
         foreach ($schema->getTables() as $found) {
             $found = (array) $found;
@@ -191,7 +193,7 @@ if ($mode === 'database-compare' || $mode === 'database-rows') {
             exit;
         }
         $table = $options['table'] ?? null;
-        if (!is_string($table) || !array_key_exists($table, $listed)) { throw new RuntimeException('The table does not exist in this connection.'); }
+        if (!is_string($table) || !array_key_exists($table, $listed)) { throw new OpenIdeaLaravelProbeMessage('The table does not exist in this connection.'); }
         $size = max(10, min(100, (int) ($options['size'] ?? 25)));
         $page = max(0, min(100000, (int) ($options['page'] ?? 0)));
         $qualified = $listed[$table];
@@ -234,8 +236,8 @@ if ($mode === 'database-compare' || $mode === 'database-rows') {
         }
         echo json_encode(['table' => $table, 'columns' => $columns, 'rows' => $rows, 'total' => $total, 'page' => $page, 'size' => $size, 'masked' => array_values(array_filter($columns, $masked))], JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
     } catch (Throwable $error) {
-        // Driver errors can include DSNs or SQL values: report the type, never the message.
-        echo json_encode(['error' => $error instanceof RuntimeException ? $error->getMessage() : 'Database inspection failed ('.get_class($error).').']);
+        // Driver and framework errors can include DSNs or SQL values: report the type, never the message.
+        echo json_encode(['error' => $error instanceof OpenIdeaLaravelProbeMessage ? $error->getMessage() : 'Database inspection failed ('.get_class($error).').']);
     }
     exit;
 }

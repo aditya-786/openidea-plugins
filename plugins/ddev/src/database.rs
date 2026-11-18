@@ -107,7 +107,7 @@ pub fn connection(desc: &Description) -> Result<&Value, Error> {
 pub fn summary(desc: &Description) -> Result<String, Error> {
     let db = connection(desc)?;
     Ok(format!(
-        "Database: {} {}\nHost: 127.0.0.1\nPort: {}\nName: {}\nUser: {}\n\nConfigure Database Data Source updates the owned connection, writes its password directly to the secure Database store and requests connection/introspection. Allow database.sources in plugin permissions. Without it, the optional project.write grant supports a connection file with manual password entry.",
+        "Database: {} {}\nHost: 127.0.0.1\nPort: {}\nName: {}\nUser: {}\n\nConfigure Database Data Source creates or updates this project's DDEV connection, saves its password in the secure Database store and connects. It needs the database.sources permission; without it, the connection is saved to a file (project.write) and you enter the password in Database.",
         text(db, "database_type"),
         text(db, "database_version"),
         db.get("published_port").unwrap_or(&Value::Null),

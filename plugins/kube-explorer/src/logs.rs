@@ -346,11 +346,15 @@ impl KubeExplorer {
                 REQUEST_TIMEOUT,
             ],
         };
-        let out = project.run_process(crate::KUBECTL, &scope.args(&args), None).map_err(|error|match error {
-            Error::Denied(_) | Error::Cancelled => error,
-            _ => Error::Failed("Log snapshot read failed; raw tool errors withheld.".into()),
-        })?;
-        if out.status!=Some(0) {return Err(Error::Failed("Log snapshot read failed; raw tool output withheld.".into()));}
+        let run = |args: &[&str]| {
+            project.run_process(crate::KUBECTL, &scope.args(args), None).map_err(|error| crate::tool_error("Reading logs", self.context.as_deref(), error))
+        };
+        let mut out = run(&args)?;
+        if out.status != Some(0) && out.stderr.contains("unknown flag") && args.contains(&"--all-pods=true") {
+            let older_kubectl: Vec<&str> = args.iter().copied().filter(|arg| *arg != "--all-pods=true").collect();
+            out = run(&older_kubectl)?;
+        }
+        if out.status!=Some(0) {return Err(Error::Failed(crate::failure_reason("Reading logs", self.context.as_deref(), &out.stderr)));}
         let (text, truncated) = cap(out.stdout);
         Ok((text.lines().map(str::to_owned).collect(), truncated))
     }
@@ -445,7 +449,7 @@ impl KubeExplorer {
                     Err(Error::Denied(_)) => host::notify(
                         NotificationLevel::Info,
                         "Copy logs",
-                        "Allow the optional clipboard capability to copy the shown lines.",
+                        &ui_kit::denied::message("Copying the shown lines", "clipboard", "Kube Explorer"),
                     ),
                     Err(error) => return Err(error),
                 }
@@ -941,6 +945,32 @@ mod tests {
         let denied = MockHost::install().with_capabilities(&["process:kubectl", "project.read", "storage"]);
         kube.log_button("log-copy", Some(&denied.invocation())).unwrap();
         assert_eq!(denied.notifications().len(), 1);
+    }
+
+    #[test]
+    fn all_pods_flag_fallback() {
+        let (host, runs) = host(LOG);
+        host.on_process(KUBECTL, {
+            let seen = runs.clone();
+            move |args, _| {
+                if args.iter().any(|a| a == "current-context") {
+                    return Ok(ProcessOutput { status: Some(0), stdout: "dev".into(), stderr: String::new() });
+                }
+                if args.iter().any(|a| a == "view") {
+                    return Ok(ProcessOutput { status: Some(0), stdout: r#"{"contexts":[{"name":"dev","context":{"cluster":"local","namespace":"shop"}}],"clusters":[{"name":"local","cluster":{"server":"https://dev.invalid"}}]}"#.into(), stderr: String::new() });
+                }
+                seen.borrow_mut().push(args.to_vec());
+                if args.iter().any(|a| a == "--all-pods=true") {
+                    return Ok(ProcessOutput { status: Some(1), stdout: String::new(), stderr: "error: unknown flag: --all-pods\n".into() });
+                }
+                Ok(ProcessOutput { status: Some(0), stdout: LOG.into(), stderr: String::new() })
+            }
+        });
+        let mut kube = KubeExplorer { namespace: Some("shop".into()), ..Default::default() };
+        kube.open_log_view("deployments", "web", Some(&host.invocation())).unwrap();
+        assert_eq!(runs.borrow().len(), 2);
+        assert!(!runs.borrow()[1].contains(&"--all-pods=true".to_owned()));
+        assert_eq!(kube.log_view.as_ref().unwrap().lines.len(), 5);
     }
 
     #[test]

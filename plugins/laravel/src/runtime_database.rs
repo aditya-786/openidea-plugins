@@ -321,7 +321,7 @@ fn docker_run(project: &Project, args: &[String]) -> Result<String, Error> {
         ),
         true,
     );
-    let child = host::start(&host::Command::new("docker").args(args), Some(project))?;
+    let child = host::start(&host::Command::new("docker").args(args), Some(project)).map_err(|error| ui_kit::denied::map(error, "Running Artisan in Docker", "process:docker", "Laravel"))?;
     if let Err(error) = child.close_stdin() {
         let _ = child.kill();
         return Err(error);

@@ -1,9 +1,10 @@
-//! Per-callback, project-owned directive declarations. There is deliberately no
-//! cross-project cache and no virtual PHP text attached to physical ranges.
-use openidea_plugin::{Project, host};
+//! Project-owned directive declarations, cached per project root and keyed on the
+//! stats of the files they come from. No virtual PHP text is attached to physical ranges.
+use openidea_plugin::{FileStat, Project, host};
 use serde_json::Value;
 use std::{
-    collections::BTreeSet,
+    cell::RefCell,
+    collections::{BTreeSet, HashMap},
     time::{Duration, Instant},
 };
 fn clean(path: &str) -> bool {
@@ -91,14 +92,44 @@ fn valid(name: &str) -> bool {
         && name.len() < 128
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
+const WATCHED: [&str; 4] = [
+    "ide.json",
+    ".ide.json",
+    ".idea/ide.json",
+    "vendor/composer/installed.json",
+];
+
+type Stamp = [Option<FileStat>; 4];
+
+thread_local! {
+    static CACHE: RefCell<HashMap<String, (Stamp, BTreeSet<String>)>> = RefCell::new(HashMap::new());
+}
+
 pub(super) fn for_path(path: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
     let Some(project) = host::project_of(path) else {
-        return out;
+        return BTreeSet::new();
     };
     let Ok(root) = project.root() else {
-        return out;
+        return BTreeSet::new();
     };
+    let stamp: Stamp = WATCHED.map(|file| project.stat(&format!("{root}/{file}")).ok());
+    let cached = CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&root)
+            .filter(|(known, _)| *known == stamp)
+            .map(|(_, names)| names.clone())
+    });
+    if let Some(names) = cached {
+        return names;
+    }
+    let names = scan(project, root.clone());
+    CACHE.with(|cache| cache.borrow_mut().insert(root, (stamp, names.clone())));
+    names
+}
+
+fn scan(project: Project, root: String) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
     let mut read = Reader {
         project,
         root,

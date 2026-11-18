@@ -1,6 +1,7 @@
 //! Actual-Wasm command/view workflows with a fixture-backed host; no external process/network/desktop UI.
 #![allow(unused_variables)]
 use ide_core::CancellationToken;
+use ide_extension::ledger::Subject;
 use ide_extension::Capability;
 use ide_plugin::*;
 use std::{path::Path, sync::Arc, time::Duration};
@@ -371,7 +372,11 @@ impl HostApi for WorkflowHost {
     fn task_end(&self, id: u64) {}
     fn refresh_view(&self, view: &str) {}
     fn post_view_message(&self, view: &str, message: String) -> Result<(), HostError> {
-        panic!("Unexpected host callback: post_view_message")
+        assert!(
+            matches!(view, "ddev" | "setup"),
+            "Unexpected view message: {view}"
+        );
+        Ok(())
     }
     fn open_terminal(
         &self,
@@ -497,6 +502,7 @@ fn main() {
             plugin_id: "aritti.ddev".into(),
             version: "0.1.0".into(),
             granted: grants,
+            subject: Subject::Installed("aritti.ddev".into()),
             host: host.clone(),
             limits: Limits::default(),
         },
@@ -555,7 +561,7 @@ fn main() {
         ("show-services", None),
         ("open-guide", None),
         ("open-releases", None),
-        ("report-issue", None),
+        ("open-docs", None),
     ] {
         command(&mut runtime, id, arg, invocation.clone(), &mut exercised);
     }
@@ -691,20 +697,13 @@ fn main() {
         )
         .unwrap();
         assert_eq!(wrapped.command, "/approved/ddev");
-        assert_eq!(
-            wrapped.args,
-            [
-                "exec",
-                "--raw",
-                "--dir=/var/www/html/public",
-                "--",
-                tool,
-                "/var/www/html/public/index.php",
-                "a b",
-                "$(literal)",
-                ""
-            ]
-        );
+        let argv = [tool, "/var/www/html/public/index.php", "a b", "$(literal)", ""];
+        // The composer override runs `ddev composer` without the exec prefix or workdir args.
+        let expected: Vec<&str> = match tool {
+            "composer" => argv.to_vec(),
+            _ => ["exec", "--raw", "--dir=/var/www/html/public", "--"].into_iter().chain(argv).collect(),
+        };
+        assert_eq!(wrapped.args, expected);
     }
     for id in ["php", "node", "composer"] {
         command(&mut runtime, id, None, invocation.clone(), &mut exercised);
@@ -912,6 +911,7 @@ fn main() {
             plugin_id: "aritti.ddev".into(),
             version: "0.1.0".into(),
             granted: vec![Capability::ProjectRead],
+            subject: Subject::Installed("aritti.ddev".into()),
             host: host.clone(),
             limits: Limits::default(),
         },

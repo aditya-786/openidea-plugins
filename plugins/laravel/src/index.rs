@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod read_cache;
 #[path="index_builder.rs"]
 mod builder;
-pub(crate) use builder::{Builder,BuildProgress};
+pub(crate) use builder::{Builder,BuildProgress,PROVIDER_STEP_BUDGET,STEP_BUDGET};
 
 use openidea_plugin::host::{self, Project};
 use openidea_plugin::{Error, Position};
@@ -733,7 +733,7 @@ impl Index {
     pub(crate) fn affects(&self, relative: &str) -> bool { self.metadata.affects(relative) || self.dependency_files.contains(relative) || self.dependency_roots.iter().any(|root|relative==root||relative.starts_with(&format!("{root}/"))) }
     pub fn build(project:&Project)->Index {
         let Ok(mut builder)=Builder::new(project)else{return Index{partial:true,..Index::default()};};
-        loop{match builder.step(project){Ok(BuildProgress::Ready(index))=>return index,Ok(BuildProgress::Pending{..})=>{},Err(_)=>return Index{partial:true,..Index::default()}}}
+        loop{match builder.step(project,std::time::Instant::now()+STEP_BUDGET){Ok(BuildProgress::Ready(index))=>return index,Ok(BuildProgress::Pending{..})=>{},Err(_)=>return Index{partial:true,..Index::default()}}}
     }
     fn build_pass(project:&Project,mut index:&mut Index,session:&builder::Session){
         let _syntax_scope=crate::eloquent_members::index_syntax_scope();

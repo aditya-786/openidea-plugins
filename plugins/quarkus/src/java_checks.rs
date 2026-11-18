@@ -208,7 +208,7 @@ fn health(file: &JavaFile, text: &str, out: &mut Vec<Problem>) {
 
         let Some(check) = t.implements.iter().find(|i| owned_check(i)).filter(|_| qualifier.is_none()) else { continue };
         let message = format!(
-            "`{}` directly declares HealthCheck without a literal supported health qualifier; runtime registration is not inferred.",
+            "`{}` implements HealthCheck without @Liveness, @Readiness or @Health, so Quarkus may not register it.",
             t.name
         );
         let fixes = ["Liveness", "Readiness"]

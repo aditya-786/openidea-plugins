@@ -21,24 +21,28 @@
       "default": 2000
     },
     "autoRefresh": {
+      "title": "Allow auto-refresh",
       "type": "boolean",
-      "title": "Allow bounded minute polling after explicit scoped Start (instance only)",
-      "default": false
+      "default": false,
+      "description": "Lets Start Auto-Refresh refresh every minute while Refresh Controls is visible. The setting alone never reads the Actuator."
     },
     "snapshotInlays": {
       "type": "boolean",
-      "title": "Show cached exact-key snapshot observations in configuration and @Value annotations",
+      "title": "Show snapshot hints on configuration keys and @Value",
+      "description": "Marks keys found in the last snapshot as observed or redacted. Values are never shown.",
       "default": true
     },
     "refreshBudgetMs": {
       "type": "integer",
-      "title": "Maximum cooperative refresh batch budget in ms (1,000\u201360,000)",
+      "title": "Time limit per refresh (ms, 1,000–60,000)",
+      "description": "How long one refresh of all Actuator endpoints may take.",
       "default": 20000
     },
     "pollAttempts": {
+      "title": "Auto-refresh attempts per start (1–10)",
       "type": "integer",
-      "title": "Maximum request batches per explicitly started polling lease (1\u201310; lease expires after 10 min)",
-      "default": 5
+      "default": 5,
+      "description": "How many refreshes one Start allows. Auto-refresh also ends after 10 minutes."
     }
   }
 }

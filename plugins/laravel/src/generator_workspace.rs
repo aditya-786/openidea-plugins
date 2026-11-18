@@ -3581,7 +3581,7 @@ impl State {
                 .map(|identity| json!({"class":identity.full,"path":identity.path}))
                 .collect::<Vec<_>>();
             return Ok(
-                json!({"draft":session.draft,"existing":self.existing.state(ctx)?,"catalog":catalog,"classes":classes,"models":model_catalog(&session.models,&root),"modelsComplete":session.models_complete,"indexPending":session.index_pending,"factoryDefaultsAvailable":true,"references":reference_catalog(&session.models,&root),"project":root,"prepared":session.pending.is_some(),"instruction":if session.index_pending {crate::ui_text::t("index.building","Indexing Laravel project…")} else {crate::ui_text::t("generator.native.cf5852eac8","Preview files, then prepare and apply the editor action. Native generation runs no PHP.")}}),
+                json!({"draft":session.draft,"existing":self.existing.state(ctx)?,"catalog":catalog,"classes":classes,"models":model_catalog(&session.models,&root),"modelsComplete":session.models_complete,"indexPending":session.index_pending,"factoryDefaultsAvailable":true,"references":reference_catalog(&session.models,&root),"project":root,"prepared":session.pending.is_some(),"instruction":if session.index_pending {crate::ui_text::t("index.building","Indexing Laravel project…")} else {crate::ui_text::t("generator.native.prepareWrites","Preview the files, then choose Finish to write them after one confirmation. No PHP runs.")}}),
             );
         }
         if matches!(request, Request::Discard) {
@@ -3754,6 +3754,11 @@ impl State {
                 _ => None,
             }
         })
+    }
+    /// Every generation prepared for this project, as (action key, anchor file).
+    pub(crate) fn prepared(&self, root: &str) -> Vec<(String, String)> {
+        let main = self.projects.get(root).and_then(|session| session.pending.as_ref()).map(|pending| (pending.key.clone(), pending.anchor.clone()));
+        [main, self.presets.prepared(root), self.existing.prepared(root), self.scaffolds.prepared(root)].into_iter().flatten().collect()
     }
     pub(crate) fn actions(&self, doc: &Document) -> Vec<FileAction> {
         let mut actions = self.presets.actions(doc);

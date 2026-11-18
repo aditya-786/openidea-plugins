@@ -304,7 +304,7 @@ pub(crate) fn configure_advanced(ctx: &Invocation) -> Result<(), Error> {
         return Err(Error::Invalid(
             crate::ui_text::text(
                 "native.model_helper_parameters.0e58c29116",
-                "Post-generation commands exceed64KiB",
+                "Post-generation commands exceed 64KiB",
             )
             .into(),
         ));

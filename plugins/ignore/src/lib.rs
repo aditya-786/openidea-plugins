@@ -4,10 +4,10 @@ use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Doc
 use openidea_plugin::syntax::{SyntaxProvider, Token};
 use openidea_plugin::views::{Body, Button, Field, FieldValue, TreeItem, View, ViewEvent, Viewport, Views};
 use openidea_plugin::{
-    Diagnostic, Error, Event, Invocation, Location, LogLevel, NotificationLevel, PickItem, Position, Project, Range, Severity, StatusItem,
+    Diagnostic, Error, Event, FileKind, Invocation, Location, NotificationLevel, PickItem, Position, Project, Range, Severity, StatusItem,
     TextEdit, host, text,
 };
-use std::collections::{HashSet,HashMap};
+use std::collections::HashSet;
 
 mod actions;
 mod unused;
@@ -32,20 +32,20 @@ fn range(text: &str, bytes: &std::ops::Range<usize>) -> Range {
     Range::new(text::position(text, bytes.start), text::position(text, bytes.end))
 }
 
-fn diagnostics(text: &str, dialect: Dialect) -> Vec<Diagnostic> {
-    check(text, dialect)
-        .into_iter()
+fn diagnostics(text: &str, problems: &[check::Problem]) -> Vec<Diagnostic> {
+    problems
+        .iter()
         .map(|p| {
             let severity = if p.warning { Severity::Warning } else { Severity::Error };
-            let mut diagnostic = Diagnostic::new(range(text, &(p.start..p.end)), severity, p.message);
+            let mut diagnostic = Diagnostic::new(range(text, &(p.start..p.end)), severity, p.message.clone());
             diagnostic.code = Some(p.code.into());
             diagnostic
         })
         .collect()
 }
 
-fn quick_fixes(doc: &Document, line: u32, dialect: Dialect) -> Vec<CodeAction> {
-    check(&doc.text, dialect)
+fn quick_fixes(doc: &Document, line: u32, problems: Vec<check::Problem>) -> Vec<CodeAction> {
+    problems
         .into_iter()
         .filter(|p| text::position(&doc.text, p.start).line == line)
         .flat_map(|p| p.fixes)
@@ -104,7 +104,7 @@ fn literal_entry(relative: &str) -> Result<String, Error> {
 const ROOT_IGNORE_FILES: [&str; 5] = [".gitignore", ".dockerignore", ".npmignore", ".prettierignore", ".eslintignore"];
 
 /// The focused ignore file and the ignore files at the project root; asks which one when there are several.
-fn pick_target(ctx: &Invocation, focused: Option<&str>) -> Result<Option<String>, Error> {
+fn pick_target(ctx: &Invocation, focused: Option<&str>, unignore: bool) -> Result<Option<String>, Error> {
     let mut candidates: Vec<String> = focused.filter(|path|preferences::can_edit(path)).map(str::to_owned).into_iter().collect();
 
     if let Some(project) = ctx.project() {
@@ -123,7 +123,7 @@ fn pick_target(ctx: &Invocation, focused: Option<&str>) -> Result<Option<String>
         _ => {
             let items: Vec<PickItem> = candidates.iter().map(|path| PickItem::new(path, path.rsplit('/').next().unwrap_or(path))).collect();
 
-            host::pick("Add to ignore file", &items)
+            host::pick(if unignore { "Unignore in ignore file" } else { "Add to ignore file" }, &items)
         }
     }
 }
@@ -138,12 +138,17 @@ fn selected_or_focused(ctx: &Invocation) -> Vec<String> {
 }
 
 fn add_selected(ctx: &Invocation, unignore: bool) -> Result<(), Error> {
+    let selected = selected_or_focused(ctx);
+    if selected.is_empty() {
+        return Err("Select files or folders in the Project view first.".into());
+    }
+
     let focused = ctx.editor().filter(|e| dialect(&e.path()).is_some());
-    let Some(file) = pick_target(ctx, focused.as_ref().map(|e| e.path()).as_deref())? else {
+    let Some(file) = pick_target(ctx, focused.as_ref().map(|e| e.path()).as_deref(), unignore)? else {
         return Ok(());
     };
 
-    let (_, root, _) = project_of(&file).ok_or("The ignore file must belong to the current project.")?;
+    let (project, root, _) = project_of(&file).ok_or("The ignore file must belong to the current project.")?;
     if !preferences::can_edit(&file) {return Err("Editor assistance is disabled for this ignore file type.".into());}
     if ctx.project().ok_or(Error::Stale)?.root()?.trim_end_matches('/') != root {
         return Err(Error::Stale);
@@ -151,28 +156,20 @@ fn add_selected(ctx: &Invocation, unignore: bool) -> Result<(), Error> {
     if !dialect(&file).is_some_and(|d| d.syntax == check::Syntax::Glob) {
         return Err("Selected-path append supports glob-syntax ignore file types only.".into());
     }
-    let editor = match focused.filter(|e| e.path() == file) {
-        Some(editor) => editor,
-        None => {
-            host::open_location(&file, 0, 0)?;
-            let Some(opened) = ctx.editor().filter(|e| e.path() == file) else {
-                host::notify(
-                    NotificationLevel::Info,
-                    ".ignore",
-                    &format!("Opened {file}. Run the command again to add the selected paths to it."),
-                );
-                return Ok(());
-            };
-            opened
+    let editor = focused.filter(|e| e.path() == file);
+    let (content, version) = match &editor {
+        Some(editor) => {
+            let doc = editor.document()?;
+            (doc.text, doc.version)
         }
+        None => (project.read_file(&file)?, 0),
     };
 
     let base = file.rsplit_once('/').map_or("", |(dir, _)| dir);
-    let doc = editor.document()?;
-    let listed: HashSet<&str> = doc.text.lines().collect();
+    let listed: HashSet<&str> = content.lines().collect();
     let negation = if unignore { "!" } else { "" };
     let mut entries: Vec<String> = Vec::new();
-    for path in selected_or_focused(ctx) {
+    for path in selected {
         let Some(relative) = path.strip_prefix(base).and_then(|r| r.strip_prefix('/')) else {
             continue;
         };
@@ -182,13 +179,25 @@ fn add_selected(ctx: &Invocation, unignore: bool) -> Result<(), Error> {
         }
     }
     if entries.is_empty() {
-        return Err("The selected paths are already listed or are outside the open ignore file's folder.".into());
+        return Err("The selected paths are already listed or are outside the ignore file's folder.".into());
     }
 
     let addition: String = entries.iter().map(|e| format!("{e}\n")).collect();
-    editor.apply_edits(doc.version, &[append(&doc.text, &addition, false)])?;
+    let edit = append(&content, &addition, false);
+    match editor {
+        Some(editor) => {
+            editor.apply_edits(version, &[edit])?;
+        }
+        None => {
+            project
+                .write_file(&file, &format!("{content}{}", edit.text))
+                .map_err(|e| ui_kit::denied::map(e, "Adding paths to an ignore file that is not open", "project.write", ".ignore"))?;
+            let _ = host::open_location(&file, 0, 0);
+        }
+    }
 
-    host::notify(NotificationLevel::Info, ".ignore", &format!("Added {} to the open ignore file.", entries.len()));
+    let name = file.rsplit('/').next().unwrap_or(&file);
+    host::notify(NotificationLevel::Info, ".ignore", &format!("Added {} to {name}.", entries.len()));
     Ok(())
 }
 
@@ -215,14 +224,32 @@ const IGNORE_FILE_NAMES: [&str; 20] = [
     ".chefignore",
 ];
 
-fn new_ignore_file(ctx: &Invocation) -> Result<(), Error> {
-    ctx.project().ok_or("Open a project first.")?.root()?;
-    host::notify(
-        NotificationLevel::Info,
-        "New Ignore File",
-        "Use New > .gitignore File (or another exact ignore type). From a project editor, enabled Create exact-name ignore file… choices follow Ignore preferences and offer confirmed, undoable creation.",
-    );
-    Ok(())
+fn new_ignore_file(plugin: &mut IgnorePlugin, ctx: &Invocation) -> Result<(), Error> {
+    let project = ctx.project().ok_or("Open a project first.")?;
+    let selected_dir = match ctx.selected_paths().first() {
+        Some(path) if project.stat(path).is_ok_and(|stat| stat.kind == FileKind::Directory) => Some(path.clone()),
+        Some(path) => path.rsplit_once('/').map(|(dir, _)| dir.to_owned()),
+        None => None,
+    };
+    if let Some(editor) = ctx.editor().filter(|_| selected_dir.is_none()) {
+        if ui_kit::command_file_action::run_titled(plugin, &project, &editor, "Create exact-name ignore file", ".ignore")? {
+            return Ok(());
+        }
+    }
+
+    let names = preferences::creatable_names();
+    if names.is_empty() {
+        return Err("No enabled Ignore Create actions are available.".into());
+    }
+
+    let items: Vec<_> = names.iter().map(|name| PickItem::new(name, name)).collect();
+    let Some(name) = host::pick("Ignore file type (exact filename)", &items)? else { return Ok(()) };
+    let dir = match selected_dir {
+        Some(dir) => dir,
+        None => project.root()?,
+    };
+    let target = format!("{}/{name}", dir.trim_end_matches('/'));
+    ui_kit::command_file_action::create_empty(&project, &target, "Create ignore file?", ".ignore")
 }
 
 /// The ignore files that apply to `relative`: `.git/info/exclude`, then the
@@ -302,10 +329,10 @@ fn entry_target(doc: &Document, at: Position) -> Option<Location> {
 }
 
 /// Entries named from the files below the ignore file's folder. The host
-/// hides dot paths and ignored files from `find_files`, so those are never offered.
+/// skips `.git` and gitignored paths in `find_files`, so those are never offered.
 fn path_completions(doc: &Document, offset: usize, line: &str) -> Vec<CompletionItem> {
     let body = line.strip_prefix('!').unwrap_or(line);
-    if body.starts_with(|c: char| c.is_whitespace() || c == '#') || body.contains(['*', '?', '[', '\\']) {
+    if body.starts_with(|c: char| c.is_whitespace() || c == '#') || body.contains(['*', '?', '[', '{', '\\']) {
         return Vec::new();
     }
     let Some((project, root, relative)) = project_of(&doc.path) else {
@@ -320,11 +347,15 @@ fn path_completions(doc: &Document, offset: usize, line: &str) -> Vec<Completion
 
     let own_dir = relative.rsplit_once('/').map_or("", |(dir, _)| dir);
     let base = [own_dir, typed_dir].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("/");
-    let (glob, prefix) =
-        if base.is_empty() { ("**/*".to_owned(), format!("{root}/")) } else { (format!("{base}/**/*"), format!("{root}/{base}/")) };
-    let Ok(files) = project.find_files(&glob, 2000) else {
-        return Vec::new();
-    };
+    let (stem, prefix) =
+        if base.is_empty() { (String::new(), format!("{root}/")) } else { (format!("{base}/"), format!("{root}/{base}/")) };
+    let mut files = Vec::new();
+    for glob in [format!("{stem}{partial}*"), format!("{stem}{partial}*/**")] {
+        let Ok(found) = project.find_files(&glob, 500) else {
+            return Vec::new();
+        };
+        files.extend(found);
+    }
 
     let mut names: std::collections::BTreeMap<&str, bool> = std::collections::BTreeMap::new();
     for file in &files {
@@ -442,13 +473,36 @@ struct IgnorePlugin {
     inventory: git_inventory::State,
     unused: unused::State,
     directories: decorations::Directories,
-    checked_paths: HashSet<String>,
-    cached_checks: HashMap<String,(String,Vec<Diagnostic>)>,
+    cached_checks: Vec<(String,String,Vec<check::Problem>)>,
     selected: Option<String>,
     expanded: HashSet<String>,
 }
 
 impl IgnorePlugin {
+    /// The problems of `text`, checked once per path and text (diagnostics and quick fixes share them).
+    fn problems_for(&mut self, path: &str, text: &str, dialect: check::Dialect) -> Vec<check::Problem> {
+        if text.len() > 128 << 10 {
+            return Vec::new();
+        }
+
+        if let Some((_, _, items)) = self.cached_checks.iter().find(|(p, t, _)| p == path && t == text) {
+            return items.clone();
+        }
+
+        let items = check(text, dialect);
+        self.cached_checks.retain(|(p, _, _)| p != path);
+        if self.cached_checks.len() >= 8 {
+            self.cached_checks.remove(0);
+        }
+        self.cached_checks.push((path.to_owned(), text.to_owned(), items.clone()));
+        items
+    }
+
+    fn checks_for(&mut self, path: &str, text: &str, dialect: check::Dialect) -> Vec<Diagnostic> {
+        let problems = self.problems_for(path, text, dialect);
+        diagnostics(text, &problems)
+    }
+
     fn selected_user_template(&self) -> Option<&str> {
         self.selected_template().and_then(|k| k.strip_prefix("u:"))
     }
@@ -544,7 +598,7 @@ impl openidea_plugin::Plugin for IgnorePlugin {
             }
             "add-selected" => add_selected(ctx, false).map(|()| None),
             "unignore-selected" => add_selected(ctx, true).map(|()| None),
-            "new-file" => new_ignore_file(ctx).map(|()| None),
+            "new-file" => new_ignore_file(self, ctx).map(|()| None),
             _ => Err(Error::NotFound(format!("command {id}"))),
         }
     }
@@ -577,26 +631,14 @@ impl openidea_plugin::Plugin for IgnorePlugin {
                     let Some(dialect) = dialect(path).filter(|_| checked.insert(path)) else {
                         continue;
                     };
-                    if self.checked_paths.len() >= 256 {
-                        self.checked_paths.clear();
-                    }
-                    self.checked_paths.insert(path.clone());
                     let Ok(text) = project.read_file(path) else {
                         continue;
                     };
                     self.directories.admit(path, &text, ctx);
                     if !preferences::checks(path) {
-                        let _ = host::publish_diagnostics(path, &[]);
                         continue;
                     }
-                    let items=diagnostics(&text,dialect);
-                    if self.cached_checks.len()>=8 {self.cached_checks.clear();}
-                    if text.len()<=64<<10&&text.lines().count()<=512 {
-                        self.cached_checks.insert(path.clone(),(text.clone(),items.clone()));
-                    }
-                    if let Err(e) = host::publish_diagnostics(path, &items) {
-                        host::log(LogLevel::Warn, &format!("{path}: {e}"));
-                    }
+                    self.problems_for(path, &text, dialect);
                 }
                 Event::EditorFocused(path) => show_ignored_status(path.as_deref()),
                 _ => {}
@@ -644,8 +686,11 @@ impl Providers for IgnorePlugin {
         if !preferences::checks(&doc.path) {
             return Vec::new();
         }
-        let mut actions=match dialect(&doc.path) {
-            Some(dialect) => quick_fixes(doc, selection.start.line, dialect),
+        let mut actions=match dialect(&doc.path).filter(|_| doc.text.len()<=128<<10) {
+            Some(dialect) => {
+                let problems = self.problems_for(&doc.path, &doc.text, dialect);
+                quick_fixes(doc, selection.start.line, problems)
+            }
             None => Vec::new(),
         };
         actions.extend(self.unused.actions(doc,selection));actions
@@ -785,10 +830,8 @@ impl Views for IgnorePlugin {
 impl openidea_plugin::diagnostics::DiagnosticsProvider for IgnorePlugin {
     fn diagnostics(&mut self,doc:&Document)->Vec<Diagnostic> {
         if doc.text.len()>128<<10||!preferences::checks(&doc.path){return Vec::new();}
-        if dialect(&doc.path).is_none(){return Vec::new();}
-        // The legacy coverage matcher is potentially expensive. Events warm
-        // source-identical checks; live providers only clone bounded cached facts.
-        let mut diagnostics=self.cached_checks.get(&doc.path).filter(|(text,_)|text==&doc.text).map(|(_,items)|items.clone()).unwrap_or_default();
+        let Some(dialect)=dialect(&doc.path) else{return Vec::new();};
+        let mut diagnostics=self.checks_for(&doc.path,&doc.text,dialect);
         diagnostics.extend(self.unused.diagnostics(doc));diagnostics
     }
 }

@@ -10,7 +10,7 @@
   const $ = id => document.getElementById(id);
   const tr=(key,fallback,args)=>window.uiKitI18n?.t(key,fallback,args)??fallback;
   const columnLabel=label=>tr(`column.${String(label).toLowerCase().replaceAll(" ","_")}`,label);
-  const state = { sequence: 0, project: null, model: null, activeView: "", groupFocus: null, generation: 0, cleanup: null, navigationCleaned: false, section: "", pages: new Map(), selected: null, sort: null, busy: false, refreshPending: false, sectionFocus: null, listeners: [], contextPending: null, contextActionsKey: null, contextApproved: false };
+  const state = { sequence: 0, project: null, model: null, activeView: "", groupFocus: null, generation: 0, cleanup: null, navigationCleaned: false, section: "", pages: new Map(), selected: null, sort: null, busy: false, refreshPending: false, sectionFocus: null, listeners: [], contextPending: null, contextActionsKey: null, contextApproved: false, requestOp: null, loadFailed: false, sectionTabs: new Map(), statusDelay: 0 };
   const element = (tag, text, className) => { const node = document.createElement(tag); if (text != null) node.textContent = text; if (className) node.className = className; const control={button:"ui-button",input:"ui-input",select:"ui-select",textarea:"ui-textarea",output:"ui-output",table:"ui-table"}[tag]; if(control) node.classList.add(control); return node; };
   const contentScope = () => JSON.stringify([state.project,state.activeView]);
   const pageScope = () => `${state.activeView}\0${state.section}`;
@@ -30,7 +30,8 @@
     if($("request-progress")) $("request-progress").hidden = false;
     // A text-field blur can flush its draft before the user's button click.
     // Keep navigation clickable for field syncs; the following action owns busy state.
-    if(!(op.op === "event" && op.event?.kind === "field")) document.querySelectorAll("#toolbar button, #view-tabs button, #sections button, .field-controls>[data-inline-action]").forEach(b => b.disabled = true);
+    if(!(op.op === "event" && op.event?.kind === "field")) {document.querySelectorAll("#toolbar button, #view-tabs button, #sections button, .field-controls>[data-inline-action]").forEach(b => b.disabled = true);$("view-sections").disabled = true;}
+    state.requestOp = op.op;
     openidea.postMessage(JSON.stringify({ targetView: state.activeView || undefined, ...op, channel: "ui-kit", frameId, clientLocale:window.uiKitI18n?.locale, sequence: ++state.sequence, project: state.project }));
     return state.sequence;
   }
@@ -156,14 +157,25 @@
     if(viewTabs.length > 1) {panel.id=`view-panel-${encodeURIComponent(state.activeView)}`;panel.setAttribute("role","tabpanel");panel.setAttribute("aria-labelledby",`view-tab-${encodeURIComponent(state.activeView)}`);}
     else {panel.removeAttribute("id");panel.removeAttribute("role");panel.removeAttribute("aria-labelledby");}
     $("view-tabs").hidden = viewTabs.length < 2;
-    $("view-tabs").replaceChildren(...viewTabs.map(tab => {
+    // Optional packaged sections show one cluster of tabs at a time behind a compact picker.
+    const viewGroups = viewSections(viewTabs), activeSection = viewGroups?.find(section => section.tabs.includes(state.activeView));
+    if(activeSection) state.sectionTabs.set(activeSection.id, state.activeView);
+    const picker = $("view-sections");
+    picker.closest("label").hidden = !activeSection || viewTabs.length < 2;
+    picker.disabled = false;
+    if(activeSection) {
+      picker.replaceChildren(...viewGroups.map(section => {const option = element("option", tr(`viewSection.${section.id}`, section.label));option.value = section.id;return option;}));
+      picker.value = activeSection.id;
+      picker.closest("label").querySelector("[role=combobox]")?.setAttribute("aria-label", tr("shared.viewGroup", "View group"));
+    }
+    $("view-tabs").replaceChildren(...viewTabs.filter(tab => !activeSection || activeSection.tabs.includes(tab.id)).map(tab => {
       const button=element("button",tab.label);button.type="button";button.dataset.viewKey=tab.id;
       const packagedTab=Array.isArray(window.uiKitViewTabs) ? window.uiKitViewTabs.find(item=>item.id === tab.id) : null;
       const icon=viewIcon(tab.icon || packagedTab?.icon);if(icon)button.prepend(icon);
       if(Number.isSafeInteger(tab.count) && tab.count >= 0)button.append(element("span",String(tab.count),"tab-count"));
       button.id=`view-tab-${encodeURIComponent(tab.id)}`;button.setAttribute("aria-controls",`view-panel-${encodeURIComponent(tab.id)}`);button.title=tab.label;button.setAttribute("aria-label",Number.isSafeInteger(tab.count) && tab.count >= 0 ? `${tab.label} (${tab.count})` : tab.label);button.setAttribute("role","tab");
       const active=tab.id === state.activeView;button.setAttribute("aria-selected",String(active));button.tabIndex=active ? 0:-1;
-      button.addEventListener("click",()=>{if(tab.id !== state.activeView){stopBackgroundPoll();flushForm();if(state.cleanup){state.cleanup();state.cleanup=null;state.navigationCleaned=true;}send({op:"select-view",target:tab.id});}});
+      button.addEventListener("click",()=>selectView(tab.id));
       return button;
     }));
     if(focusedView) [...$("view-tabs").children].find(node=>node.dataset.viewKey === focusedView)?.focus({preventScroll:true});
@@ -197,6 +209,20 @@
     if(emittedGroups.size)window.uiKitWidgets?.enhance($("toolbar"));
     $("search").value = queryState().query;
     $("search").placeholder = typeof model.body.searchPlaceholder === "string" ? tr(`search.${state.activeView}`,model.body.searchPlaceholder) : tr("shared.searchPlaceholder","Search…");
+  }
+  function selectView(id) {
+    if(id === state.activeView) return;
+    stopBackgroundPoll();flushForm();
+    if(state.cleanup){state.cleanup();state.cleanup=null;state.navigationCleaned=true;}
+    send({op:"select-view",target:id});
+  }
+  // Sections come from the packaged group (sync-plugin-ui.py) and must cover each tab exactly once.
+  function viewSections(viewTabs) {
+    const sections = window.uiKitViewSections;
+    if(!Array.isArray(sections) || sections.length < 2) return null;
+    const ids = viewTabs.map(tab => tab.id), covered = sections.flatMap(section => section.tabs || []);
+    if(covered.length !== ids.length || !ids.every(id => covered.includes(id))) return null;
+    return sections;
   }
   function rowModel(body) {
     if (body.kind === "resources") {
@@ -252,7 +278,7 @@
   function rowMenu(row, body, id) {
     const targetView=state.activeView,generation=state.generation;
     const menu = element("div"); menu.id = id; menu.dataset.uiMenu = ""; menu.setAttribute("popover","manual");
-    menu.setAttribute("aria-label", `Actions for ${row.label || row.cells[0]}`);
+    menu.setAttribute("aria-label", tr("shared.actionsFor","Actions for {name}",{name:row.label || row.cells[0]}));
     const labels=new Set();
     const item = (label, action, icon) => {
       if(labels.has(label)) return;labels.add(label);
@@ -263,7 +289,7 @@
     };
     const kind = row.key.split(":")[0];
     const actions=(state.model.actions || []).filter(action=>action.enabled !== false && (!action.kind || action.kind === kind) && (!action.keys || action.keys.includes(row.key)));
-    if(row.activationEnabled !== false && !actions.some(action=>action.replacesOpen)) item(row.activationLabel || (row.expandable ? (row.expanded ? "Collapse":"Expand") : "Open"),()=>activate(row,body),row.activationIcon || (row.expandable ? (row.expanded ? "chevron-up":"chevron-down") : "file"));
+    if(row.activationEnabled !== false && !actions.some(action=>action.replacesOpen)) item(row.activationLabel || (row.expandable ? (row.expanded ? tr("shared.collapse","Collapse"):tr("shared.expand","Expand")) : tr("shared.open","Open")),()=>activate(row,body),row.activationIcon || (row.expandable ? (row.expanded ? "chevron-up":"chevron-down") : "file"));
     for (const action of actions) {
       item(action.label,()=>send({op:"command",id:action.id,key:row.key}),action.icon);
     }
@@ -312,7 +338,7 @@
       const label = element("label", null, "ui-field"); label.append(element("span", columnLabel(columns[column]), "ui-visually-hidden")); const select = element("select"); select.setAttribute("aria-label", columnLabel(columns[column]));
       const values = [...new Set(rows.map(r => r.cells[column]).filter(Boolean))].sort();
       const facetLabel=typeof body.facetLabels?.[column] === "string" ? tr(`facet.${state.activeView}.${column}`,body.facetLabels[column]) : `${columnLabel(columns[column])}: ${tr("shared.all","All")}`;
-      const all = element("option", `${facetLabel} (${values.length})`); all.value = ""; select.append(all);
+      const all = element("option", `${facetLabel} (${rows.length})`); all.value = ""; select.append(all);
       for (const value of values) { const option = element("option", value); option.value = value; select.append(option); }
       if (!values.includes(q.facets[column])) delete q.facets[column];
       select.value = q.facets[column] || ""; select.addEventListener("change", () => { q.facets[column] = select.value; q.page = 0; renderBody(); });
@@ -380,6 +406,7 @@
       for(const weight of weights){const col=element("col");col.style.width=`${weight/total*100}%`;group.append(col);}table.append(group);
     }
     head.append(headings); table.append(head); const tbody = element("tbody"); let rowIndex=0;
+    table.setAttribute("role",body.kind === "tree" ? "treegrid" : "grid");table.setAttribute("aria-label",state.model.title);
     if(body.kind === "tree") {table.classList.add("resource-tree");if(columns.length === 1)table.classList.add("resource-tree--plain");}
     const pageRows=body.kind === "tree" ? visible : visible.slice(q.page*100,(q.page+1)*100);
     const collapsed=q.collapsed || (q.collapsed=new Set()), groupCounts=new Map();
@@ -406,9 +433,10 @@
         }
         if(collapsed.has(group)) continue;
       }
-      const tr = element("tr"); tr.tabIndex = row.key === tabStop ? 0:-1; tr.setAttribute("aria-selected",String(row.key === q.selected));
+      const rowNode = element("tr"); rowNode.tabIndex = row.key === tabStop ? 0:-1; rowNode.setAttribute("aria-selected",String(row.key === q.selected));
+      if(body.kind === "tree") {rowNode.setAttribute("aria-level",String((treeDepths.get(row.key)||0)+1));if(row.expandable)rowNode.setAttribute("aria-expanded",String(!!row.expanded));}
       const menuId = `resource-menu-${rowIndex++}`;
-      tr.dataset.resourceKey = row.key; tr.dataset.uiContext = menuId; tr.setAttribute("aria-haspopup","menu");
+      rowNode.dataset.resourceKey = row.key; rowNode.dataset.uiContext = menuId; rowNode.setAttribute("aria-haspopup","menu");
       const contextSelect=e=>{
         if(!current())return;
         selectVisible(row,true);
@@ -419,9 +447,9 @@
         }
         $(menuId)?.remove();const menu=rowMenu(row,body,menuId);$("content").append(menu);window.uiKitWidgets?.enhance(menu);
       };
-      tr.addEventListener("contextmenu",contextSelect);
-      tr.addEventListener("keydown",e=>{if(e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) contextSelect(e);});
-      row.cells.forEach((cell,i) => { if(displayed && !displayed.has(i)) return; const td = element("td", cell); if (body.kind === "resources") { const badge = groupBy === null ? cellBadge(columns[i],cell) : null; if (badge) td.replaceChildren(badge); else td.className = "mono"; }
+      rowNode.addEventListener("contextmenu",contextSelect);
+      rowNode.addEventListener("keydown",e=>{if(e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) contextSelect(e);});
+      row.cells.forEach((cell,i) => { if(displayed && !displayed.has(i)) return; const td = element("td", cell); if (body.kind === "resources") { const badge = groupBy === null ? cellBadge(columns[i],cell) : null; if (badge) td.replaceChildren(badge); else {td.className = "mono";td.title = String(cell);} }
         else if (["tree","list"].includes(body.kind) && i === 1 && row.method) { const badges = methodBadges(row.method); if (badges) td.replaceChildren(badges, document.createTextNode(cell ? ` ${cell}` : "")); else td.textContent = `${row.method} ${cell}`; }
         const style=groupBy !== null && i > 0 ? "muted" : body.columnStyles?.[i];
         if(groupBy !== null && i === 0) td.classList.add("resource-grouped");
@@ -440,19 +468,26 @@
           let toggle=element("span",null,"tree-node-slot");toggle.setAttribute("aria-hidden","true");
           if(row.expandable) {
             toggle=element("button",null,"tree-toggle");toggle.tabIndex=-1;toggle.append(viewIcon(row.expanded ? "chevron-down" : "chevron-right"));
-            toggle.setAttribute("aria-label",`${row.expanded ? "Collapse":"Expand"} ${row.label}`);toggle.setAttribute("aria-expanded",String(!!row.expanded));
+            toggle.setAttribute("aria-label",row.expanded ? tr("shared.collapseItem","Collapse {name}",{name:row.label}) : tr("shared.expandItem","Expand {name}",{name:row.label}));
             toggle.addEventListener("click",e=>{e.stopPropagation();rowEvent({kind:row.expanded ? "collapse":"expand",key:row.key});});
           }
           const icon=viewIcon(row.icon)||element("span",null,"view-icon");icon.setAttribute("aria-hidden","true");
           line.append(toggle,icon,label);td.replaceChildren(line);
         }
-        if(body.editable) { td.contentEditable = "true"; td.addEventListener("blur",() => { if(td.textContent !== cell) rowEvent({kind:"cell",row:row.row,column:i,value:td.textContent}); }); }
-        tr.append(td);
+        if(body.editable) {
+          const original=td.cloneNode(true);td.contentEditable = "true";td.setAttribute("aria-label",columnLabel(columns[i]));
+          td.addEventListener("keydown",e => {
+            if(e.key === "Enter") {e.preventDefault();td.blur();}
+            else if(e.key === "Escape") {e.preventDefault();td.replaceChildren(...original.cloneNode(true).childNodes);td.blur();}
+          });
+          td.addEventListener("blur",() => { if(td.textContent !== String(cell)) rowEvent({kind:"cell",row:row.row,column:i,value:td.textContent}); });
+        }
+        rowNode.append(td);
       });
-      tr.addEventListener("click", () => { if(!current())return;selectVisible(row);rowEvent(body.kind === "table" ? {kind:"table-select",row:row.row} : {kind:"select",key:row.key}); });
-      tr.addEventListener("dblclick",() => {if(current())activate(row,body);});
-      tr.addEventListener("keydown",e => {
-        if(e.target !== tr || !current() || e.ctrlKey || e.metaKey || e.altKey) return;
+      rowNode.addEventListener("click", () => { if(!current())return;selectVisible(row);rowEvent(body.kind === "table" ? {kind:"table-select",row:row.row} : {kind:"select",key:row.key}); });
+      rowNode.addEventListener("dblclick",() => {if(current())activate(row,body);});
+      rowNode.addEventListener("keydown",e => {
+        if(e.target !== rowNode || !current() || e.ctrlKey || e.metaKey || e.altKey) return;
         if(e.key === "Enter") {e.preventDefault();activate(row,body);return;}
         if(e.key === " ") {e.preventDefault();selectVisible(row);rowEvent(body.kind === "table" ? {kind:"table-select",row:row.row}:{kind:"select",key:row.key});return;}
         const at=shownRows.indexOf(row);
@@ -469,15 +504,14 @@
         }
         if(next) {e.preventDefault();if(next !== row){selectVisible(next,true,true);rowEvent(body.kind === "table" ? {kind:"table-select",row:next.row}:{kind:"select",key:next.key});}}
       });
-      tbody.append(tr);
+      tbody.append(rowNode);
     }
     table.append(tbody); const content = $("content");
     if(visible.length) content.replaceChildren(table);
+    else if(rows.length) content.replaceChildren(emptyState("no-match",tr("shared.noMatching","No matching resources"),tr("shared.trySearch","Try a different search or clear the filters."),tr("shared.resetFilters","Reset filters"),()=>$("clear").click()));
     else {
-      const empty = element("div", null, "empty ui-empty");
-      empty.append(element("strong", rows.length ? tr("shared.noMatching","No matching resources") : tr("shared.noResources","No resources found")), element("p", rows.length ? tr("shared.trySearch","Try a different search or clear the filters.") : tr("shared.resourcesAppear","Resources appear here when available.")));
-      if(rows.length) {const reset=element("button",tr("shared.resetFilters","Reset filters"));reset.addEventListener("click",()=>$("clear").click());empty.append(reset);}
-      content.replaceChildren(empty);
+      const emptyAction=state.model.toolbar.find(button=>button.key === body.emptyAction && button.enabled);
+      content.replaceChildren(emptyState("empty",typeof body.emptyTitle === "string" ? body.emptyTitle : tr("shared.noResources","No resources found"),typeof body.emptyText === "string" ? body.emptyText : tr("shared.resourcesAppear","Resources appear here when available."),emptyAction?.label,emptyAction && (()=>rowEvent({kind:"button",key:emptyAction.key}))));
     }
     if (pages > 1) { const pager=element("div",null,"pager"); const prev=element("button",tr("shared.previous","Previous")), next=element("button",tr("shared.next","Next")); prev.hidden=q.page===0;next.hidden=q.page===pages-1;prev.addEventListener("click",()=>{q.page--;renderBody();});next.addEventListener("click",()=>{q.page++;renderBody();});pager.append(prev,element("span",`${q.page+1} / ${pages}`),next);content.append(pager); }
     const selected = rows.find(r=>r.key===q.selected); if(selected) select(selected,body); else {$("details").close();q.selected=null;state.selected=null;}
@@ -485,7 +519,7 @@
       const nodes=[...tbody.querySelectorAll('tr')],next=nodes.find(node=>node.dataset.resourceKey === focusedKey) || nodes.find(node=>node.dataset.resourceKey === q.selected) || nodes.find(node=>node.tabIndex === 0);
       next?.focus({preventScroll:true});
     }
-    $("status").textContent = tr("shared.resourceCount","{visible} of {total} resources",body.kind === "tree" ? {visible:visible.filter(row=>!row.parent).length,total:rows.filter(row=>!row.parent).length} : {visible:visible.length,total:rows.length})+(body.totalRows>rows.length?" "+tr("shared.availableCount","({count} available)",{count:body.totalRows}):"")+(state.model.status?` · ${state.model.status}`:"");
+    setStatus(tr("shared.resourceCount","{visible} of {total} resources",body.kind === "tree" ? {visible:visible.filter(row=>!row.parent).length,total:rows.filter(row=>!row.parent).length} : {visible:visible.length,total:rows.length})+(body.totalRows>rows.length?" "+tr("shared.availableCount","({count} available)",{count:body.totalRows}):"")+(state.model.status?` · ${state.model.status}`:""),state.statusDelay);
   }
   function inlineActionState(model) {
     const keys=Object.values(model?.fieldActions || {}).map(action=>action.button);
@@ -589,9 +623,34 @@
     state.cleanup=()=>{adapterCleanup?.();localeCleanup?.();};
     state.listeners.push(message=>{if(message === "end") $("content").scrollTop=$("content").scrollHeight;});
   }
+  // Shared empty state: empty, no-match (reset), error (retry) and denied (permission + retry).
+  function emptyState(variant,title,text,actionLabel,action) {
+    const empty=element("div",null,"empty ui-empty");empty.dataset.state=variant;
+    const heading=element("strong",title),iconName={error:"error",denied:"lock"}[variant],icon=iconName ? viewIcon(iconName) : null;
+    if(icon){icon.setAttribute("aria-hidden","true");heading.prepend(icon);heading.classList.add("empty-title");}
+    empty.append(heading,element("p",text));
+    if(action){const button=element("button",actionLabel);button.type="button";button.addEventListener("click",action);empty.append(button);}
+    return empty;
+  }
+  function renderLoadFailure(message) {
+    state.cleanup?.();state.cleanup=null;state.generation++;state.listeners=[];state.loadFailed=true;
+    $("filters").hidden=true;$("details").close();setStatus("");
+    const retry=()=>send({op:"render"}),permission=typeof message.denied === "string" ? message.denied.trim() : null;
+    const capability=permission && /^[a-z][a-z0-9-]*(?:[.:][a-z0-9_-]+)+$/i.test(permission),plugin=String(message.plugin || state.model?.plugin || "");
+    const empty=permission
+      ? emptyState("denied",tr("shared.permissionNeeded","Permission needed"),capability ? tr("shared.deniedCapability","This view needs the {permission} permission. Allow it in Settings › Plugins › {plugin}, then retry.",{permission,plugin}) : `${permission}\n${tr("shared.deniedHint","Review this plugin's permissions in Settings › Plugins › {plugin}, then retry.",{plugin})}`,tr("shared.retry","Retry"),retry)
+      : emptyState("error",tr("shared.loadFailed","Couldn't load this view"),String(message.error || ""),tr("shared.retry","Retry"),retry);
+    $("content").replaceChildren(empty);$("content").dataset.ownerScope=contentScope();
+  }
+  let statusTimer=0;
+  function setStatus(text,delay=0) {
+    clearTimeout(statusTimer);
+    if(delay) statusTimer=setTimeout(()=>{$("status").textContent=text;},delay);
+    else $("status").textContent=text;
+  }
   function renderBody() {
-    state.cleanup?.();state.cleanup=null;
-    const body=state.model.body;state.generation++;state.listeners=[];$("filters").hidden=["form","html","message"].includes(body.kind);$("status").textContent=state.model.status || "";
+    state.cleanup?.();state.cleanup=null;state.loadFailed=false;
+    const body=state.model.body;state.generation++;state.listeners=[];$("filters").hidden=["form","html","message"].includes(body.kind);if(["form","html","message"].includes(body.kind))setStatus(state.model.status || "");
     if(body.kind === "form") renderForm(body);
     else if(body.kind === "html") renderHtml(body);
     else if(body.kind === "message") {$("content").replaceChildren(element("div",body.text,"empty ui-empty"));$("details").close();}
@@ -605,8 +664,13 @@
     const next = e.key === "ArrowRight" ? items[(index + 1) % items.length] : e.key === "ArrowLeft" ? items[(index + items.length - 1) % items.length] : e.key === "Home" ? items[0] : e.key === "End" ? items.at(-1) : null;
     if (next) {e.preventDefault(); next.focus(); next.scrollIntoView({block:"nearest",inline:"nearest"});}
   });
+  $("view-sections").addEventListener("change",()=>{
+    const section=window.uiKitViewSections?.find(item=>item.id === $("view-sections").value);if(!section)return;
+    const remembered=state.sectionTabs.get(section.id);
+    selectView(section.tabs.includes(remembered) ? remembered : section.tabs[0]);
+  });
   $("details").addEventListener("close",()=>{const row=[...document.querySelectorAll("tbody tr")].find(n=>n.dataset.resourceKey === state.selected?.key);row?.focus({preventScroll:true});});
-  $("search").addEventListener("input",()=>{const q=queryState();q.query=$("search").value;q.page=0;renderBody();});
+  $("search").addEventListener("input",()=>{const q=queryState();q.query=$("search").value;q.page=0;state.statusDelay=400;try{renderBody();}finally{state.statusDelay=0;}});
   $("clear").addEventListener("click",()=>{const q=queryState();q.query="";q.facets={};q.page=0;$("search").value="";renderBody();});
   window.openidea?.onMessage(text=>{
     let message;try{message=JSON.parse(text);}catch{state.listeners.forEach(callback=>callback(text));return;}
@@ -627,11 +691,13 @@
     if(message.sequence !== state.sequence) return;
     const context=state.contextPending?.sequence === message.sequence ? state.contextPending : null;
     state.contextPending=null;
+    const requestOp=state.requestOp;state.requestOp=null;
     document.querySelectorAll('[data-context-loading]').forEach(node=>node.remove());
     state.busy=false;$("content").setAttribute("aria-busy","false");
     if($("request-progress")) $("request-progress").hidden = true;
     if(state.refreshPending) queueMicrotask(drainRefresh);
     if(message.notified) return;
+    if(message.error && requestOp === "render") {if(state.model){header();restoreInlineActions();}renderLoadFailure(message);return;}
     if(message.error) {if(state.model) {header();restoreInlineActions();if(state.navigationCleaned){state.navigationCleaned=false;renderBody();}if(state.selected) select(state.selected,state.model.body);}return;}
     const previousLanguage=window.uiKitI18n?.locale;
     window.uiKitI18n?.setLocale(message.model.uiLanguage || "auto");
@@ -664,8 +730,8 @@
       const field=state.model.body.fields.find(f=>f.key === draft.fieldKey && ["text","multiline"].includes(f.value.kind));
       if(!field || (draft.sequence <= message.sequence && draft.sentValue === draft.value)) {if(field && field.value.text !== draft.value) formRefresh=true;clearTimeout(draft.timer);formDrafts.delete(key);}
     }
-    if(!sameBody || previousSection !== state.section || formRefresh) renderBody();
-    else {$("status").textContent=state.model.status || $("status").textContent;if(state.selected) select(state.selected,state.model.body);}
+    if(!sameBody || previousSection !== state.section || formRefresh || state.loadFailed) renderBody();
+    else {if(state.model.status)setStatus(state.model.status);if(state.selected) select(state.selected,state.model.body);}
     if(viewChanged) {const current=queryState();$("content").scrollTop=current.scrollTop || 0;$("content").scrollLeft=current.scrollLeft || 0;}
     restoreInlineActions();
     if(context && context.project === state.project) {

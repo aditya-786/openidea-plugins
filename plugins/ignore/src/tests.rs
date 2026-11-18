@@ -26,18 +26,18 @@ fn add_actions(plugin:&mut IgnorePlugin,host:&MockHost,doc:&Document)->Vec<FileA
 #[test]
 fn removing_a_duplicate_deletes_its_line() {
     let text = "a\nb\na";
-    let fixes = quick_fixes(&doc("/p/.gitignore", text), 2, GIT);
+    let fixes = quick_fixes(&doc("/p/.gitignore", text), 2, check(text, GIT));
     assert_eq!(fixes[0].title, "Remove entry");
     assert_eq!(apply(text, &fixes[0].edits[0].1[0]), "a\nb");
     let text = "a\na\nb\n";
-    let fixes = quick_fixes(&doc("/p/.gitignore", text), 1, GIT);
+    let fixes = quick_fixes(&doc("/p/.gitignore", text), 1, check(text, GIT));
     assert_eq!(apply(text, &fixes[0].edits[0].1[0]), "a\nb\n");
 }
 
 #[test]
 fn invalid_syntax_values_offer_both_syntaxes() {
     let titles: Vec<String> =
-        quick_fixes(&doc("/p/.hgignore", "syntax: perl\n"), 0, HG).into_iter().map(|a| a.title).collect();
+        quick_fixes(&doc("/p/.hgignore", "syntax: perl\n"), 0, check("syntax: perl\n", HG)).into_iter().map(|a| a.title).collect();
     assert_eq!(titles, ["Use glob syntax", "Use regexp syntax"]);
 }
 
@@ -52,19 +52,123 @@ fn completes_syntax_values_in_hgignore_only() {
 }
 
 #[test]
-fn publishes_problems_of_opened_ignore_files() {
+fn ignore_problem_reported_once() {
     let host = MockHost::install();
-    host.add_file(".gitignore", "a\na\n*.log\n/debug.log\n");
-    host.add_file("src/a.rs", "a\na\n");
-    IgnorePlugin::default().handle_events(
-        &[Event::FileOpened("/project/.gitignore".into()), Event::FileSaved("/project/src/a.rs".into())],
-        &host.invocation(),
-    );
-    let diagnostics = host.diagnostics();
-    assert_eq!(diagnostics.len(), 1);
+    let text = "a\na\n*.log\n/debug.log\n";
+    host.add_file(".gitignore", text);
+    host.open_editor("/project/.gitignore", "ignore", text, &[]);
+    let mut plugin = IgnorePlugin::default();
+    plugin.handle_events(&[Event::FileOpened("/project/.gitignore".into())], &host.invocation());
+    host.refresh_diagnostics(&mut plugin);
+
+    assert!(host.diagnostics().is_empty());
     let severities: Vec<(u32, Severity)> =
-        diagnostics["/project/.gitignore"].iter().map(|d| (d.range.start.line, d.severity)).collect();
+        host.provider_diagnostics()["/project/.gitignore"].iter().map(|d| (d.range.start.line, d.severity)).collect();
     assert_eq!(severities, [(1, Severity::Error), (3, Severity::Warning)]);
+}
+
+fn provider_lines(host: &MockHost, plugin: &mut IgnorePlugin, path: &str, text: &str) -> Vec<(u32, Option<String>)> {
+    host.open_editor(path, "ignore", text, &[]);
+    host.refresh_diagnostics(plugin);
+    host.provider_diagnostics().get(path).map(|d| d.iter().map(|d| (d.range.start.line, d.code.clone())).collect()).unwrap_or_default()
+}
+
+#[test]
+fn large_gitignore_shows_duplicates_through_the_provider() {
+    let host = MockHost::install();
+    let text = format!("{}a\na\n", (0..600).map(|i| format!("f{i}\n")).collect::<String>());
+    let found = provider_lines(&host, &mut IgnorePlugin::default(), "/project/.gitignore", &text);
+    assert!(found.contains(&(601, Some("duplicate-entry".into()))));
+}
+
+#[test]
+fn unsaved_edit_introducing_a_duplicate_shows_it() {
+    let host = MockHost::install();
+    host.add_file(".gitignore", "a\nb\n");
+    let mut plugin = IgnorePlugin::default();
+    plugin.handle_events(&[Event::FileOpened("/project/.gitignore".into())], &host.invocation());
+    let found = provider_lines(&host, &mut plugin, "/project/.gitignore", "a\nb\na\n");
+    assert!(found.contains(&(2, Some("duplicate-entry".into()))));
+}
+
+#[test]
+fn opening_nine_ignore_files_still_serves_the_first() {
+    let host = MockHost::install();
+    let mut plugin = IgnorePlugin::default();
+    for i in 0..9 {
+        host.add_file(&format!("d{i}/.gitignore"), "a\na\n");
+        plugin.handle_events(&[Event::FileOpened(format!("/project/d{i}/.gitignore"))], &host.invocation());
+    }
+    assert_eq!(plugin.cached_checks.len(), 8);
+    assert!(plugin.cached_checks.iter().all(|(p, _, _)| p != "/project/d0/.gitignore"));
+    assert!(plugin.cached_checks.iter().any(|(p, _, _)| p == "/project/d8/.gitignore"));
+    let found = provider_lines(&host, &mut plugin, "/project/d0/.gitignore", "a\na\n");
+    assert_eq!(plugin.cached_checks.len(), 8);
+    assert!(found.contains(&(1, Some("duplicate-entry".into()))));
+}
+
+#[test]
+fn huge_ignore_file_event_is_not_cached_and_has_no_checks() {
+    let host = MockHost::install();
+    let text = "a\n".repeat(70_000);
+    host.add_file(".gitignore", &text);
+    let mut plugin = IgnorePlugin::default();
+    plugin.handle_events(&[Event::FileOpened("/project/.gitignore".into())], &host.invocation());
+    assert!(plugin.cached_checks.is_empty());
+    assert!(provider_lines(&host, &mut plugin, "/project/.gitignore", &text).is_empty());
+}
+
+#[test]
+fn hgignore_same_text_different_syntax_not_duplicate() {
+    let problems = check::check("syntax: glob\nfoo\nsyntax: regexp\nfoo\nfoo\n", HG);
+    let duplicates: Vec<usize> = problems.iter().filter(|p| p.code == "duplicate-entry").map(|p| p.start).collect();
+    assert_eq!(duplicates.len(), 1);
+    assert!(duplicates[0] > "syntax: glob\nfoo\nsyntax: regexp\nfoo\n".len() - 1);
+}
+
+#[test]
+fn completion_finds_late_top_level_dir() {
+    let host = MockHost::install();
+    host.set_project_root(Some("/project"));
+    host.add_file("/project/.gitignore", "");
+    for i in 0..2500 {
+        host.add_file(&format!("/project/a{i:04}/f.txt"), "");
+    }
+    host.add_file("/project/zdir/x.js", "");
+    host.add_file("/project/zfile.md", "");
+    let mut plugin = IgnorePlugin::default();
+
+    let labels: Vec<String> =
+        plugin.completion(&doc("/project/.gitignore", "z"), Position::new(0, 1), None).into_iter().map(|i| i.label).collect();
+
+    assert_eq!(labels, ["zdir/", "zfile.md"]);
+}
+
+#[test]
+fn providers_survive_every_offset() {
+    let seeds = ["{{ x }}{#}", "café", "<?php\nuse $😀", "é::class", "<!-- Paramètres --><a/>", "!café/\n日本*\n/😀/x", "syntax: re\né\\"];
+    let host = MockHost::install();
+    host.set_project_root(Some("/project"));
+    host.add_file("/project/café/a.txt", "");
+    for path in ["/project/.gitignore", "/project/.hgignore", "/project/.dockerignore"] {
+        for seed in seeds {
+            let document = doc(path, seed);
+            host.open_editor(path, "ignore", seed, &[]);
+            let mut plugin = IgnorePlugin::default();
+            let mut boundaries: Vec<usize> = seed.char_indices().map(|(i, _)| i).collect();
+            boundaries.push(seed.len());
+            for offset in boundaries {
+                let at = text::position(seed, offset);
+                plugin.completion(&document, at, None);
+                plugin.definition(&document, at);
+                plugin.code_actions(&document, Range::new(at, at));
+                plugin.file_actions(&document, Range::new(at, at));
+            }
+            plugin.line_markers(&document);
+            openidea_plugin::semantic_tokens::SemanticTokens::semantic_tokens(&mut plugin, &document);
+            openidea_plugin::diagnostics::DiagnosticsProvider::diagnostics(&mut plugin, &document);
+        }
+    }
 }
 
 #[test]
@@ -451,17 +555,40 @@ fn selected_paths_need_an_open_ignore_file() {
 
 #[test]
 fn selected_paths_go_to_the_picked_root_ignore_file() {
-    let host = MockHost::install();
+    let host = new_file_host();
     host.open_editor("/project/.dockerignore", "ignore", "/dist\n", &[(0, 0, 0, 0)]);
-    host.add_file("/project/.gitignore", "");
+    host.add_file("/project/.gitignore", "/out");
     host.select_paths(&["/project/build"]);
     host.answer_next_prompt(Some(&["/project/.gitignore"]));
 
     IgnorePlugin::default().run_command("add-selected", &host.invocation(), None).unwrap();
 
+    assert_eq!(host.invocation().project().unwrap().read_file("/project/.gitignore").unwrap(), "/out\n/build\n");
     assert_eq!(host.opened_locations(), [("/project/.gitignore".to_owned(), 0, 0)]);
-    assert!(host.notifications()[0].body.starts_with("Opened /project/.gitignore"));
+    assert_eq!(host.notifications()[0].body, "Added 1 to .gitignore.");
     assert_eq!(host.editor_text(), "/dist\n");
+}
+
+#[test]
+fn adding_to_a_closed_ignore_file_without_project_write_explains_the_permission() {
+    let host = MockHost::install();
+    host.add_file("/project/.gitignore", "");
+    host.select_paths(&["/project/build"]);
+
+    let error = IgnorePlugin::default().run_command("add-selected", &host.invocation(), None).unwrap_err().to_string();
+
+    assert!(error.contains("project.write permission"), "{error}");
+    assert_eq!(host.invocation().project().unwrap().read_file("/project/.gitignore").unwrap(), "");
+}
+
+#[test]
+fn adding_without_a_selection_asks_for_one() {
+    let host = new_file_host();
+    host.add_file("/project/.gitignore", "");
+
+    let error = IgnorePlugin::default().run_command("add-selected", &host.invocation(), None).unwrap_err().to_string();
+
+    assert!(error.contains("Select files or folders"), "{error}");
 }
 
 #[test]
@@ -541,22 +668,87 @@ fn unignore_selected_adds_negated_entries() {
 
 #[test]
 fn the_editor_menu_adds_the_current_file_when_nothing_is_selected() {
-    let host = MockHost::install();
+    let host = new_file_host();
     host.open_editor("/project/src/a.rs", "rust", "", &[(0, 0, 0, 0)]);
     host.add_file("/project/.gitignore", "");
     host.answer_next_prompt(Some(&["/project/.gitignore"]));
 
     IgnorePlugin::default().run_command("add-selected", &host.invocation(), None).unwrap();
 
+    assert_eq!(host.invocation().project().unwrap().read_file("/project/.gitignore").unwrap(), "/src/a.rs\n");
     assert_eq!(host.opened_locations(), [("/project/.gitignore".to_owned(), 0, 0)]);
 }
 
+fn new_file_host() -> MockHost {
+    MockHost::install().with_capabilities(&["project.read", "project.write", "editor.read", "editor.write", "storage"])
+}
+
 #[test]
-fn legacy_new_file_command_guides_to_atomic_native_creation_without_process(){
-    let host=MockHost::install().with_capabilities(&["project.read"]);
-    IgnorePlugin::default().run_command("new-file",&host.invocation(),None).unwrap();
+fn new_ignore_file_command_creates_from_editor() {
+    let host = new_file_host();
+    host.add_file("src/a.rs", "");
+    host.open_editor("/project/src/a.rs", "rust", "", &[]);
+    host.answer_next_prompt(Some(&[".dockerignore"]));
+    host.answer_next_prompt(Some(&[""]));
+    host.answer_next_prompt(Some(&[]));
+
+    IgnorePlugin::default().run_command("new-file", &host.invocation(), None).unwrap();
+
+    assert_eq!(host.invocation().project().unwrap().read_file(".dockerignore").unwrap(), "# .dockerignore\n");
+    assert_eq!(host.opened_locations(), [("/project/.dockerignore".to_owned(), 0, 0)]);
     assert!(host.process_runs().is_empty());
-    assert!(host.notifications()[0].body.contains("Create exact-name ignore file"));
+}
+
+#[test]
+fn new_ignore_file_without_editor_picks_type() {
+    let host = new_file_host();
+    host.answer_next_prompt(Some(&[".npmignore"]));
+    host.answer_next_prompt(Some(&[]));
+
+    IgnorePlugin::default().run_command("new-file", &host.invocation(), None).unwrap();
+
+    assert_eq!(host.invocation().project().unwrap().read_file(".npmignore").unwrap(), "");
+    assert_eq!(host.opened_locations(), [("/project/.npmignore".to_owned(), 0, 0)]);
+}
+
+#[test]
+fn new_ignore_file_goes_in_the_selected_folder() {
+    let host = new_file_host();
+    host.add_file("web/src/a.rs", "");
+    host.open_editor("/project/web/src/a.rs", "rust", "", &[]);
+    host.add_dir("web");
+    host.select_paths(&["/project/web"]);
+    host.answer_next_prompt(Some(&[".npmignore"]));
+    host.answer_next_prompt(Some(&[]));
+
+    IgnorePlugin::default().run_command("new-file", &host.invocation(), None).unwrap();
+
+    assert_eq!(host.invocation().project().unwrap().read_file("web/.npmignore").unwrap(), "");
+}
+
+#[test]
+fn new_ignore_file_next_to_a_selected_file_goes_in_its_folder() {
+    let host = new_file_host();
+    host.add_file("web/package.json", "{}");
+    host.select_paths(&["/project/web/package.json"]);
+    host.answer_next_prompt(Some(&[".npmignore"]));
+    host.answer_next_prompt(Some(&[]));
+
+    IgnorePlugin::default().run_command("new-file", &host.invocation(), None).unwrap();
+
+    assert_eq!(host.invocation().project().unwrap().read_file("web/.npmignore").unwrap(), "");
+}
+
+#[test]
+fn new_ignore_file_refuses_existing() {
+    let host = new_file_host();
+    host.add_file(".gitignore", "old\n");
+    host.answer_next_prompt(Some(&[".gitignore"]));
+
+    let error = IgnorePlugin::default().run_command("new-file", &host.invocation(), None).unwrap_err().to_string();
+
+    assert!(error.contains("already exists"), "{error}");
+    assert_eq!(host.invocation().project().unwrap().read_file(".gitignore").unwrap(), "old\n");
 }
 
 #[test]
@@ -603,4 +795,29 @@ fn pattern_inspections_preserve_significant_gitignore_spaces() {
     assert!(!checks.iter().any(|p| p.code == "duplicate-entry" || p.code == "cover-entry"), "{checks:?}");
     let checks = crate::check::check("name   \nname\n", dialect);
     assert!(checks.iter().any(|p| p.code == "duplicate-entry"));
+}
+
+#[test]
+fn covered_entries_are_found_below_the_cap_and_skipped_above_it() {
+    let entries = |n: usize| (0..n).map(|i| format!("dir{i}/file{i}.txt\n")).collect::<String>();
+    let small = format!("build/\n{}build/out.o\n", entries(400));
+    assert!(check(&small, GIT).iter().any(|p| p.code == "cover-entry"));
+    let large = format!("build/\n{}build/out.o\n", entries(1000));
+    let started = std::time::Instant::now();
+    let problems = check(&large, GIT);
+    assert!(started.elapsed() < std::time::Duration::from_millis(200), "{:?}", started.elapsed());
+    assert!(!problems.iter().any(|p| p.code == "cover-entry"), "above 512 entries redundancy is not checked");
+}
+
+#[test]
+fn code_actions_reuse_the_checked_problems() {
+    let _host = MockHost::install();
+    let mut plugin = IgnorePlugin::default();
+    let text = "a\nb\na\n";
+    let document = doc("/project/.gitignore", text);
+    openidea_plugin::diagnostics::DiagnosticsProvider::diagnostics(&mut plugin, &document);
+    assert_eq!(plugin.cached_checks.len(), 1);
+    plugin.cached_checks[0].2.clear();
+    let line = Range::new(Position::new(2, 0), Position::new(2, 0));
+    assert!(plugin.code_actions(&document, line).iter().all(|a| a.title != "Remove entry"), "served from the cache");
 }

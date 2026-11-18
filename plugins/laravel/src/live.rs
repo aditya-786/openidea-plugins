@@ -24,13 +24,10 @@ impl DiagnosticsProvider for Main {
         if language=="blade" {if let Some(project)=project_for(&doc.path){current.extend(livewire_method_problems(&project,index,&doc.path,language,&doc.text));}}
         current.into_iter().take(200)
             .map(|mut diagnostic| {
-                // Index completeness is source scan completeness, not a resolved runtime model.
                 let mut chars = diagnostic.message.chars();
-                let bounded: String = chars.by_ref().take(512).collect();
-                let truncated = chars.next().is_some();
-                diagnostic.message = crate::ui_text::format("final.live.prefix", "Cached source inventory: {bounded}", &[("bounded", &bounded)]);
-                if truncated { diagnostic.message.push('…'); }
-                diagnostic.message.push_str(crate::ui_text::text("final.live.note", " Save/reindex changed definitions. Runtime registrations and unsaved target changes are not resolved."));
+                let mut bounded: String = chars.by_ref().take(512).collect();
+                if chars.next().is_some() { bounded.push('…'); }
+                diagnostic.message = bounded;
                 diagnostic
             }).collect()
     }
@@ -52,7 +49,7 @@ mod tests {
         let d = &found["/project/test.php"][0];
         assert_eq!(d.code.as_deref(), Some("missing-view"));
         assert_eq!(d.range.start, Position::new(0, 21));
-        assert!(d.message.contains("Cached source inventory:"));
+        assert!(!d.message.contains("Cached source inventory"));
         host.open_editor("/project/test.php", "php", "<?php view('welcome');", &[]);
         host.refresh_diagnostics(&mut plugin);
         assert!(host.provider_diagnostics().get("/project/test.php").is_none_or(Vec::is_empty));

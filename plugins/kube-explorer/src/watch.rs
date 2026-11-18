@@ -6,12 +6,12 @@ use openidea_plugin::{Error, Invocation, PickItem, host};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::hash::BuildHasher;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 pub(crate) const VIEW: &str = "resource-watch";
 const MAX_EVENT: usize = 64 << 10;
 const MAX_PENDING: usize = 128 << 10;
+const MAX_POLLS: usize = 256;
 const MAX_RESOURCES: usize = 128;
-const TTL: Duration = Duration::from_secs(60);
 const KINDS: &[(&str, &str, &str)] = &[
     ("pods", "Pod", "v1"),
     ("services", "Service", "v1"),
@@ -23,10 +23,7 @@ fn choices(context: &Option<String>, namespace: &Option<String>) -> Choices {
 }
 fn capture(ctx: &Invocation, context: Option<&str>, namespace: Option<&str>) -> Result<forward::Scope, Error> {
     let (project, _) = forward::owner(Some(ctx))?;
-    forward::Scope::capture_for_project(context, namespace, &project).map_err(|error| match error {
-        Error::Denied(_) | Error::Cancelled => error,
-        _ => Error::Failed("Selected Kubernetes scope could not be inspected; raw tool errors are withheld.".into()),
-    })
+    forward::Scope::capture_for_project(context, namespace, &project)
 }
 #[derive(Clone)]
 struct Spec {
@@ -51,10 +48,6 @@ impl Spec {
         format!("{} · {}", self.scope.label(), KINDS[self.kind].0)
     }
 }
-struct Pending {
-    spec: Spec,
-    at: Instant,
-}
 struct History {
     label: String,
     names: Vec<String>,
@@ -68,56 +61,82 @@ struct Session {
     history: Option<History>,
     status: String,
     events: u64,
+    skipped: u64,
+    skipping: bool,
+    at_line_start: bool,
     started: Instant,
     exit: Option<i32>,
     stderr_seen: bool,
 }
 impl Session {
+    /// Drops the current event and everything up to the next line that starts a new one.
+    fn skip_event(&mut self, at_line_start: bool) {
+        self.skipped = self.skipped.saturating_add(1);
+        self.skipping = true;
+        self.at_line_start = at_line_start;
+        self.drop_until_event_start();
+    }
+    fn drop_until_event_start(&mut self) {
+        let mut at_line_start = self.at_line_start;
+        loop {
+            if at_line_start && self.pending.starts_with('{') {
+                self.skipping = false;
+                return;
+            }
+            let Some(end_of_line) = self.pending.find('\n') else {
+                self.at_line_start = at_line_start && self.pending.is_empty();
+                self.pending.clear();
+                return;
+            };
+            self.pending.drain(..=end_of_line);
+            at_line_start = true;
+        }
+    }
     fn retire(&mut self, status: &str) {
         self.child = None;
         self.pending.clear();
-        self.status = format!("{status} Last accepted metadata is historical, not a completeness/absence proof.");
+        self.status = status.to_owned();
     }
     fn apply(&mut self, value: &Value) -> Result<(), &'static str> {
         let event = value
             .get("type")
             .and_then(Value::as_str)
-            .ok_or("Unsupported watch envelope; last accepted observations retained.")?;
+            .ok_or("Watching stopped because kubectl sent an unexpected message.")?;
         if event == "ERROR" {
             return Err(if value["object"]["code"] == 410 {
-                "Watch history expired (410); historical observations retained. Restart must re-LIST; no automatic reconnect."
+                "Watching stopped because the cluster no longer has the history it needs (410). Restart to list again."
             } else {
-                "Watch server error; historical observations retained. Restart requires fresh review."
+                "Watching stopped because the cluster reported an error. Restart to try again."
             });
         }
         let object = &value["object"];
         let (_, kind, api) = KINDS[self.spec.kind];
         if object["kind"] != kind || object["apiVersion"] != api {
-            return Err("Watch object kind/API mismatch; observations retained.");
+            return Err("Watching stopped because an object had an unexpected kind.");
         }
         let version = object["metadata"]["resourceVersion"]
             .as_str()
             .filter(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control));
         if version.is_none() {
-            return Err("Missing/bounded opaque resourceVersion required; observations retained.");
+            return Err("Watching stopped because an object had no usable resource version.");
         }
         if event == "BOOKMARK" {
             self.events = self.events.saturating_add(1);
             return Ok(());
         }
         if !["ADDED", "MODIFIED", "DELETED"].contains(&event) {
-            return Err("Unknown watch event type; observations retained.");
+            return Err("Watching stopped because of an unknown event type.");
         }
         let name = object["metadata"]["name"]
             .as_str()
             .filter(|n| crate::is_dns_subdomain(n))
-            .ok_or("Invalid watch resource name; observations retained.")?;
+            .ok_or("Watching stopped because an object had an invalid name.")?;
         let uid = object["metadata"]["uid"]
             .as_str()
             .filter(|s| !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
-            .ok_or("Invalid watch UID; observations retained.")?;
+            .ok_or("Watching stopped because an object had an invalid UID.")?;
         if object["metadata"]["namespace"].as_str() != self.spec.args().iter().find_map(|arg| arg.strip_prefix("--namespace=")) {
-            return Err("Watch namespace mismatch; observations retained.");
+            return Err("Watching stopped because an object was in another namespace.");
         }
         if event == "DELETED" {
             if self.names.get(name).is_some_and(|known| known == uid) {
@@ -125,7 +144,7 @@ impl Session {
             }
         } else {
             if !self.names.contains_key(name) && self.names.len() >= MAX_RESOURCES {
-                return Err("128-resource observation cap reached; historical observations retained.");
+                return Err("Watching stopped after 128 names; the names seen so far are kept.");
             }
             self.names.insert(name.into(), uid.into());
         }
@@ -134,14 +153,15 @@ impl Session {
     }
     fn ingest(&mut self, chunk: Chunk) -> Result<bool, &'static str> {
         self.stderr_seen |= !chunk.stderr.is_empty();
-        if self.pending.len().saturating_add(chunk.stdout.len()) > MAX_PENDING {
-            return Err("Watch pending JSON cap reached; observations retained.");
-        }
         self.pending.push_str(&chunk.stdout);
-        if !stream_depth(&self.pending) {
-            return Err("Watch JSON nesting exceeds the structural limit; observations retained.");
+        if self.skipping {
+            self.drop_until_event_start();
         }
-        loop {
+        if self.pending.len() > MAX_PENDING {
+            self.pending.clear();
+            self.skip_event(false);
+        }
+        while !self.skipping {
             let trimmed = self.pending.trim_start();
             if trimmed.len() != self.pending.len() {
                 self.pending = trimmed.to_owned();
@@ -149,41 +169,46 @@ impl Session {
             if self.pending.is_empty() {
                 break;
             }
+            if !stream_depth(&self.pending) {
+                self.skip_event(false);
+                continue;
+            }
             let mut stream = serde_json::Deserializer::from_str(&self.pending).into_iter::<Value>();
             match stream.next() {
                 Some(Ok(value)) => {
                     let used = stream.byte_offset();
                     drop(stream);
-                    if used > MAX_EVENT {
-                        return Err("Watch event exceeds 64 KiB; observations retained.");
-                    }
                     // Reuse bounded duplicate/alias/tag/depth/node rejection; JSON
                     // syntax was established above. Never display raw object data.
-                    crate::kubeconfig_import::bounded_structure(&self.pending[..used])
-                        .map_err(|_| "Watch event has duplicate/unsupported/bounded structure; observations retained.")?;
+                    let acceptable = used <= MAX_EVENT && crate::kubeconfig_import::bounded_structure(&self.pending[..used]).is_ok();
                     self.pending.drain(..used);
+                    if !acceptable {
+                        self.skipped = self.skipped.saturating_add(1);
+                        continue;
+                    }
                     self.apply(&value)?;
                 }
                 Some(Err(error)) if error.is_eof() => break,
-                Some(Err(_)) => return Err("Malformed watch JSON; observations retained."),
+                Some(Err(_)) => self.skip_event(false),
                 None => break,
             }
         }
-        if self.pending.len() > MAX_EVENT {
-            return Err("Incomplete watch event exceeds 64 KiB; observations retained.");
+        if !self.skipping && self.pending.len() > MAX_EVENT {
+            self.pending.clear();
+            self.skip_event(false);
         }
         if let Some(exit) = chunk.status {
             self.exit = Some(exit);
-            self.status = format!("Exited {exit}; draining available output manually. Initial completeness remains unknown.");
+            self.status = format!("The process exited with status {exit}; reading its remaining output.");
         }
         if self.exit.is_some() && chunk.stdout.is_empty() && chunk.stderr.is_empty() {
             self.status = if self.pending.is_empty() {
                 format!(
-                    "Exited {}; observations are historical, not complete inventory.",
+                    "The process exited with status {}. The names seen are not a full list.",
                     self.exit.unwrap()
                 )
             } else {
-                "Exited with incomplete JSON; last accepted observations are historical.".into()
+                "The process exited in the middle of an event. The names seen are not a full list.".into()
             };
             self.child = None;
             self.pending.clear();
@@ -191,13 +216,14 @@ impl Session {
         }
         Ok(false)
     }
+    /// Reads until the child has no more output, so a busy namespace never overflows the host's buffer.
     fn poll(&mut self) {
-        for _ in 0..4 {
+        for _ in 0..MAX_POLLS {
             let Some(child) = self.child.as_ref() else { return };
             let chunk = match child.poll(16 << 10) {
                 Ok(chunk) => chunk,
                 Err(_) => {
-                    self.retire("Watch polling failed; owned handle released; observations historical.");
+                    self.retire("Watching stopped because the process could not be read.");
                     return;
                 }
             };
@@ -213,9 +239,6 @@ impl Session {
             if empty {
                 return;
             }
-        }
-        if self.exit.is_none() {
-            self.status = "Running; bounded manual drain reached. More output may remain; no loss-free backpressure claim.".into();
         }
     }
 }
@@ -253,7 +276,6 @@ fn stream_depth(text: &str) -> bool {
 }
 #[derive(Default)]
 pub(crate) struct Watch {
-    pending: Option<Pending>,
     session: Option<Session>,
     token: String,
     serial: u64,
@@ -269,20 +291,15 @@ impl Watch {
         );
     }
     pub(crate) fn clear(&mut self) {
-        self.pending = None;
         self.session = None;
         self.rotate();
     }
     pub(crate) fn settings_changed(&mut self, context: &Option<String>, namespace: &Option<String>) {
         let current = choices(context, namespace);
         let mut changed = false;
-        if self.pending.as_ref().is_some_and(|p| p.spec.choices != current) {
-            self.pending = None;
-            changed = true;
-        }
         if let Some(session) = &mut self.session {
             if session.spec.choices != current && session.child.is_some() {
-                session.retire("Scope/settings changed; handle released, observations historical. Restart requires fresh review.");
+                session.retire("Watching stopped because the context, namespace or kubeconfig changed.");
                 changed = true;
             }
         }
@@ -292,7 +309,7 @@ impl Watch {
         }
     }
     pub(crate) fn closed_roots(&mut self) {
-        if self.pending.is_none() && self.session.is_none() {
+        if self.session.is_none() {
             return;
         }
         let Ok(projects) = host::projects() else {
@@ -302,10 +319,6 @@ impl Watch {
         };
         let open = |root: &str| projects.iter().any(|p| p.root().ok().as_deref() == Some(root));
         let mut changed = false;
-        if self.pending.as_ref().is_some_and(|p| !open(&p.spec.root)) {
-            self.pending = None;
-            changed = true;
-        }
         if self.session.as_ref().is_some_and(|s| !open(&s.spec.root)) {
             self.session = None;
             changed = true;
@@ -331,7 +344,6 @@ impl Watch {
             return Err("An owned watch is running in another project; stop it from that project first.".into());
         }
         self.settings_changed(context, namespace);
-        self.pending = None;
         self.rotate();
         let kind = if restart {
             self.session.as_ref().filter(|s| s.spec.root == root).ok_or(Error::Stale)?.spec.kind
@@ -356,25 +368,65 @@ impl Watch {
             choices: choices(context, namespace),
         };
         let preview = format!(
-            "Project: {}\nScope: {}\nProgram: kubectl\nExact argv: {:?}\n\nApproval only prepares; separate Launch Reviewed Watch uses a fresh project invocation. This read-only command may authenticate/connect. kubectl owns LIST→WATCH. Initial completeness is UNKNOWN; only positive name/UID observations are kept, never authoritative Services inventory or absence. Manual bounded polling, 128 observations/64 KiB event; caps/errors preserve dated accepted metadata. Raw object/stderr values are not displayed. Stop releases only its Child; Restart re-LISTs after new review. Instance idle reclaim (~5 minutes), window/plugin stop may terminate it before the 10-minute request timeout. No durable job, automatic reconnect, keepalive or loss-free buffering claim.",
+            "Watch {} in {}?\n\nProject: {}\nCommand: kubectl {:?}\n\nThe watch only reads from the cluster. It lists the names it sees (up to {MAX_RESOURCES}) and keeps running until you stop it.",
+            KINDS[spec.kind].0,
+            spec.scope.label(),
             spec.root,
-            spec.label(),
             spec.args()
         );
-        if !ui_kit::prompts::confirm_exact("Review managed resource watch?", &preview)? {
+        if !ui_kit::prompts::confirm_exact("Start resource watch?", &preview)? {
             crate::ui_group::refresh_view(VIEW);
             return Ok(());
         }
-        if forward::owner(Some(ctx))?.1 != spec.root
+        let result = self.launch(ctx, context, namespace, spec);
+        self.rotate();
+        crate::ui_group::refresh_view(VIEW);
+        result?;
+        crate::ui_group::reveal_view(VIEW)
+    }
+    fn launch(&mut self, ctx: &Invocation, context: &Option<String>, namespace: &Option<String>, spec: Spec) -> Result<(), Error> {
+        let (project, root) = forward::owner(Some(ctx))?;
+        if root != spec.root
             || choices(context, namespace) != spec.choices
             || capture(ctx, context.as_deref(), namespace.as_deref())? != spec.scope
+            || !spec.scope.configuration_current()
+            || self.session.as_ref().is_some_and(|s| s.child.is_some() && s.spec.root != root)
         {
             return Err(Error::Stale);
         }
-        self.pending = Some(Pending { spec, at: Instant::now() });
-        self.rotate();
-        crate::ui_group::refresh_view(VIEW);
-        crate::ui_group::reveal_view(VIEW)
+        let child = host::start(&Command::new("kubectl").args(&spec.args()), Some(&project))?;
+        child.close_stdin()?;
+        let history = self.session.as_ref().filter(|s| s.spec.root == root).and_then(|s| {
+            if s.names.is_empty() {
+                s.history.as_ref().map(|h| History {
+                    label: h.label.clone(),
+                    names: h.names.clone(),
+                    since: h.since,
+                })
+            } else {
+                Some(History {
+                    label: format!("{}; previous watch", s.spec.label()),
+                    names: s.names.keys().cloned().collect(),
+                    since: s.started,
+                })
+            }
+        });
+        self.session = Some(Session {
+            spec,
+            child: Some(child),
+            pending: String::new(),
+            names: BTreeMap::new(),
+            history,
+            status: "Watching. Use Refresh Watch Status to read new changes.".into(),
+            events: 0,
+            skipped: 0,
+            skipping: false,
+            at_line_start: true,
+            started: Instant::now(),
+            exit: None,
+            stderr_seen: false,
+        });
+        Ok(())
     }
     pub(crate) fn view(&mut self, ctx: &Invocation, context: &Option<String>, namespace: &Option<String>) -> Result<View, Error> {
         self.closed_roots();
@@ -383,42 +435,29 @@ impl Watch {
                 "Open the owning project with project.read to inspect its resource watch.",
             ));
         };
-        let belongs =
-            self.pending.as_ref().is_some_and(|p| p.spec.root == root) || self.session.as_ref().is_some_and(|s| s.spec.root == root);
-        if !belongs {
+        if !self.session.as_ref().is_some_and(|s| s.spec.root == root) {
             return Ok(View::message(
-                "No resource watch for this project. Run Kube Explorer: Review Managed Resource Watch… explicitly.",
+                "No resource watch for this project. Run Kube Explorer: Start Resource Watch… explicitly.",
             ));
         }
         self.settings_changed(context, namespace);
+        if let Some(s) = self.session.as_mut().filter(|s| s.spec.root == root) {
+            s.poll();
+        }
         let key = |name: &str| format!("{name}@{}", self.token);
         let mut fields = vec![];
         let mut view = View::new(Body::Message(String::new()));
-        if let Some(p) = self.pending.as_ref().filter(|p| p.spec.root == root) {
-            fields.push(Field::new(
-                "prepared",
-                "Reviewed watch",
-                FieldValue::readonly_text(
-                    &format!(
-                        "{}\n{}\n{:?}\nApproval expires after 60 seconds; no process started by approval.",
-                        p.spec.root,
-                        p.spec.label(),
-                        p.spec.args()
-                    ),
-                    true,
-                ),
-            ));
-            view = view
-                .button(Button::new(&key("launch"), "Launch Reviewed Watch").enabled(p.at.elapsed() < TTL))
-                .button(Button::new(&key("cancel"), "Cancel Review"));
-        }
         if let Some(s) = self.session.as_ref().filter(|s| s.spec.root == root) {
+            let skipped = match s.skipped {
+                0 => String::new(),
+                count => format!("; {count} unreadable or oversized events skipped"),
+            };
             fields.push(Field::new(
                 "scope",
-                "Captured scope",
+                "Watching",
                 FieldValue::readonly_text(
                     &format!(
-                        "{}\n{}\n{}s old; events accepted {}",
+                        "{}\n{}\nrunning for {}s; {} events read{skipped}",
                         s.spec.root,
                         s.spec.label(),
                         s.started.elapsed().as_secs(),
@@ -435,7 +474,7 @@ impl Watch {
                         "{}{}",
                         s.status,
                         if s.stderr_seen {
-                            "\nStderr received; raw values withheld."
+                            "\nThe command also wrote to stderr; it is not shown."
                         } else {
                             ""
                         }
@@ -446,10 +485,10 @@ impl Watch {
             let names = s.names.keys().take(32).cloned().collect::<Vec<_>>().join("\n");
             fields.push(Field::new(
                 "observed",
-                "Positive observed names (initial completeness UNKNOWN)",
+                "Names seen so far",
                 FieldValue::readonly_text(
                     &format!(
-                        "Showing up to 32 of {} observed names, cap 128. Never an absence proof.\n{names}",
+                        "Showing up to 32 of {} names seen (up to {MAX_RESOURCES} are kept). A name that is not listed may still exist.\n{names}",
                         s.names.len()
                     ),
                     true,
@@ -458,10 +497,10 @@ impl Watch {
             if let Some(h) = &s.history {
                 fields.push(Field::new(
                     "history",
-                    "Previous session historical observations (not merged)",
+                    "Names from the previous watch",
                     FieldValue::readonly_text(
                         &format!(
-                            "{} · {}s since prior watch start\n{}",
+                            "{} · started {}s before this watch\n{}",
                             h.label,
                             h.since.elapsed().as_secs(),
                             h.names.iter().take(16).cloned().collect::<Vec<_>>().join("\n")
@@ -472,11 +511,11 @@ impl Watch {
             }
             view = view
                 .button(Button::new(&key("poll"), "Refresh Watch Status").enabled(s.child.is_some()))
-                .button(Button::new(&key("stop"), "Stop Owned Watch").enabled(s.child.is_some()))
-                .button(Button::new(&key("restart"), "Review Restart…"));
+                .button(Button::new(&key("stop"), "Stop Watch").enabled(s.child.is_some()))
+                .button(Button::new(&key("restart"), "Restart…"));
         }
         view.body = Body::Form(fields);
-        Ok(view.status("Instance-owned read-only watch · initial completeness unknown · manual polling · no background durability"))
+        Ok(view.status("Read-only watch of the selected namespace"))
     }
     pub(crate) fn handle(
         &mut self,
@@ -489,9 +528,7 @@ impl Watch {
         let ViewEvent::Button(id) = event else { return Err(Error::Stale) };
         let (action, token) = id.rsplit_once('@').ok_or(Error::Stale)?;
         let (_, root) = forward::owner(Some(ctx))?;
-        if token != self.token
-            || !(self.pending.as_ref().is_some_and(|p| p.spec.root == root) || self.session.as_ref().is_some_and(|s| s.spec.root == root))
-        {
+        if token != self.token || !self.session.as_ref().is_some_and(|s| s.spec.root == root) {
             return Err(Error::Stale);
         }
         self.settings_changed(context, namespace);
@@ -500,59 +537,10 @@ impl Watch {
         }
         let result = (|| {
             match action {
-                "cancel" => self.pending = None,
-                "launch" => {
-                    let p = self.pending.take().ok_or(Error::Stale)?;
-                    if p.at.elapsed() >= TTL
-                        || p.spec.root != root
-                        || p.spec.choices != choices(context, namespace)
-                        || capture(ctx, context.as_deref(), namespace.as_deref())? != p.spec.scope
-                    {
-                        return Err(Error::Stale);
-                    }
-                    let (project, fresh_root) = forward::owner(Some(ctx))?;
-                    if fresh_root != root
-                        || p.at.elapsed() >= TTL
-                        || !p.spec.scope.configuration_current()
-                        || p.spec.choices != choices(context, namespace)
-                        || self.session.as_ref().is_some_and(|s| s.child.is_some() && s.spec.root != root)
-                    {
-                        return Err(Error::Stale);
-                    }
-                    let child = host::start(&Command::new("kubectl").args(&p.spec.args()), Some(&project))?;
-                    child.close_stdin()?;
-                    let history = self.session.as_ref().filter(|s| s.spec.root == root).and_then(|s| {
-                        if s.names.is_empty() {
-                            s.history.as_ref().map(|h| History {
-                                label: h.label.clone(),
-                                names: h.names.clone(),
-                                since: h.since,
-                            })
-                        } else {
-                            Some(History {
-                                label: format!("{}; previous session, historical only", s.spec.label()),
-                                names: s.names.keys().cloned().collect(),
-                                since: s.started,
-                            })
-                        }
-                    });
-                    self.session = Some(Session {
-                        spec: p.spec,
-                        child: Some(child),
-                        pending: String::new(),
-                        names: BTreeMap::new(),
-                        history,
-                        status: "Running; refresh manually. Initial completeness UNKNOWN.".into(),
-                        events: 0,
-                        started: Instant::now(),
-                        exit: None,
-                        stderr_seen: false,
-                    });
-                }
                 "poll" => {
                     let s = self.session.as_mut().filter(|s| s.spec.root == root).ok_or(Error::Stale)?;
                     if capture(ctx, context.as_deref(), namespace.as_deref()).ok().as_ref() != Some(&s.spec.scope) {
-                        s.retire("Scope could not be revalidated; handle released, observations historical.");
+                        s.retire("Watching stopped because the cluster settings could not be checked again.");
                         return Err(Error::Stale);
                     }
                     s.poll();
@@ -562,8 +550,7 @@ impl Watch {
                     if let Some(child) = &s.child {
                         child.kill()?;
                     }
-                    s.retire("Stopped owned watch; pending output discarded; accepted observations historical.");
-                    self.pending = None;
+                    s.retire("Watch stopped.");
                 }
                 "restart" => return self.prepare(ctx, context, namespace, true),
                 _ => return Err(Error::Stale),
@@ -597,18 +584,17 @@ mod tests {
             },
         )
     }
-    fn prepare(k: &mut KubeExplorer, h: &MockHost) {
+    fn start(k: &mut KubeExplorer, h: &MockHost) -> Result<Option<String>, Error> {
         h.answer_next_prompt(Some(&["0"]));
         h.answer_next_prompt(Some(&[]));
-        k.run_command("watch-resources", &h.invocation(), None).unwrap();
+        k.run_command("watch-resources", &h.invocation(), None)
     }
     fn press(k: &mut KubeExplorer, h: &MockHost, action: &str) -> Result<(), Error> {
         let id = format!("{action}@{}", k.watch.token);
         k.handle(VIEW, ViewEvent::Button(id), &h.invocation())
     }
     fn launch(k: &mut KubeExplorer, h: &MockHost) {
-        prepare(k, h);
-        press(k, h, "launch").unwrap();
+        start(k, h).unwrap();
     }
     fn event(kind: &str, name: &str, uid: &str) -> String {
         json!({"type":kind,"object":{"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"uid":uid,"namespace":"shop","resourceVersion":"opaque/rv-1"},"spec":{"ignoredFloat":0.5,"sensitive":"must-not-display"}}}).to_string()
@@ -620,16 +606,12 @@ mod tests {
         })
     }
     #[test]
-    fn public_review_is_inert_launch_is_fresh_scoped_single_use_and_render_never_polls() {
+    fn watch_starts_after_one_confirm_and_render_never_spawns() {
         let (h, mut k) = setup();
-        prepare(&mut k, &h);
-        assert!(k.watch.session.is_none());
-        assert!(k.watch.pending.is_some());
-        let token = k.watch.token.clone();
-        let before = h.process_runs().len();
-        k.render(VIEW, None, &h.invocation()).unwrap();
-        assert_eq!(h.process_runs().len(), before);
-        assert!(k.watch.pending.as_ref().unwrap().spec.args().ends_with(&[
+        launch(&mut k, &h);
+        let session = k.watch.session.as_ref().unwrap();
+        assert!(session.child.is_some());
+        assert!(session.spec.args().ends_with(&[
             "get".into(),
             "pods".into(),
             "--watch".into(),
@@ -638,57 +620,26 @@ mod tests {
             "json".into(),
             "--request-timeout=10m".into()
         ]));
-        assert!(k.watch.pending.as_ref().unwrap().spec.args().contains(&"--namespace=shop".into()));
-        assert!(
-            !k.watch
-                .pending
-                .as_ref()
-                .unwrap()
-                .spec
-                .args()
-                .iter()
-                .any(|a| a.starts_with("--resource-version"))
-        );
-        press(&mut k, &h, "launch").unwrap();
-        assert!(k.watch.pending.is_none());
-        let session = k.watch.session.as_ref().unwrap();
-        assert!(session.child.is_some());
-        assert!(
-            session.child.as_ref().unwrap().write("not accepted").is_err(),
-            "managed stdin is closed"
-        );
+        assert!(session.spec.args().contains(&"--namespace=shop".into()));
+        assert!(!session.spec.args().iter().any(|a| a.starts_with("--resource-version")));
+        assert!(session.child.as_ref().unwrap().write("not accepted").is_err(), "managed stdin is closed");
         let before = h.process_runs().len();
         k.render(VIEW, None, &h.invocation()).unwrap();
         assert_eq!(h.process_runs().len(), before);
-        assert!(
-            k.handle(VIEW, ViewEvent::Button(format!("launch@{token}")), &h.invocation())
-                .is_err()
-        );
     }
     #[test]
-    fn cancel_expiry_foreign_root_and_changed_local_identity_cannot_launch() {
+    fn declined_confirm_foreign_root_and_changed_cluster_identity_start_nothing() {
         let (h, mut k) = setup();
         h.answer_next_prompt(Some(&["0"]));
         h.answer_next_prompt(None);
         k.run_command("watch-resources", &h.invocation(), None).unwrap();
-        assert!(k.watch.pending.is_none());
-        prepare(&mut k, &h);
+        assert!(k.watch.session.is_none());
+        h.on_process("kubectl",|_,_|Ok(ProcessOutput{status:Some(0),stdout:r#"{"contexts":[{"name":"dev","context":{"cluster":"local","namespace":"shop"}}],"clusters":[{"name":"local","cluster":{"server":"https://changed.invalid"}}]}"#.into(),stderr:String::new()}));
+        launch(&mut k, &h);
         let token = k.watch.token.clone();
         h.add_project("/project");
         h.set_project_root(Some("/other"));
-        assert!(
-            k.handle(VIEW, ViewEvent::Button(format!("launch@{token}")), &h.invocation())
-                .is_err()
-        );
-        assert!(k.watch.session.is_none());
-        h.set_project_root(Some("/project"));
-        k.watch.pending.as_mut().unwrap().at = Instant::now() - TTL;
-        assert!(press(&mut k, &h, "launch").is_err());
-        assert!(k.watch.pending.is_none());
-        prepare(&mut k, &h);
-        h.on_process("kubectl",|_,_|Ok(ProcessOutput{status:Some(0),stdout:r#"{"contexts":[{"name":"dev","context":{"cluster":"local","namespace":"shop"}}],"clusters":[{"name":"local","cluster":{"server":"https://changed.invalid"}}]}"#.into(),stderr:String::new()}));
-        assert!(press(&mut k, &h, "launch").is_err());
-        assert!(k.watch.session.is_none());
+        assert!(k.handle(VIEW, ViewEvent::Button(format!("poll@{token}")), &h.invocation()).is_err());
     }
     #[test]
     fn fragmented_concatenated_events_keep_only_metadata_and_uid_deletion_is_safe() {
@@ -709,7 +660,7 @@ mod tests {
         let view = k.render(VIEW, None, &h.invocation()).unwrap();
         let text = format!("{:?}", view.body);
         assert!(!text.contains("must-not-display"));
-        assert!(text.contains("UNKNOWN"));
+        assert!(text.contains("may still exist"));
         ingest(&mut k, &event("DELETED", "web", "uid-new")).unwrap();
         assert!(!k.watch.session.as_ref().unwrap().names.contains_key("web"));
     }
@@ -721,15 +672,19 @@ mod tests {
         for raw in [
             event("ADDED", "bad", "uid-b").replace("\"shop\"", "\"foreign\""),
             event("ADDED", "bad", "uid-b").replace("\"Pod\"", "\"Service\""),
-            event("ADDED", "bad", "uid-b").replace("\"type\":\"ADDED\"", "\"type\":\"ADDED\",\"type\":\"DELETED\""),
         ] {
             k.watch.session.as_mut().unwrap().pending.clear();
             assert!(ingest(&mut k, &raw).is_err());
             assert!(k.watch.session.as_ref().unwrap().names.contains_key("good"));
         }
+        let duplicate = event("ADDED", "bad", "uid-b").replace("\"type\":\"ADDED\"", "\"type\":\"ADDED\",\"type\":\"DELETED\"");
+        assert!(ingest(&mut k, &duplicate).is_ok());
+        assert_eq!(k.watch.session.as_ref().unwrap().skipped, 1);
+        assert!(!k.watch.session.as_ref().unwrap().names.contains_key("bad"));
         k.watch.session.as_mut().unwrap().pending.clear();
-        assert!(ingest(&mut k, &"x".repeat(MAX_PENDING + 1)).is_err());
-        k.watch.session.as_mut().unwrap().pending.clear();
+        assert!(ingest(&mut k, &"x".repeat(MAX_PENDING + 1)).is_ok());
+        assert_eq!(k.watch.session.as_ref().unwrap().skipped, 2);
+        ingest(&mut k, "\n").unwrap();
         for n in 1..MAX_RESOURCES {
             ingest(&mut k, &event("ADDED", &format!("pod-{n}"), &format!("uid-{n}"))).unwrap();
         }
@@ -774,11 +729,11 @@ mod tests {
             .unwrap()
         );
         assert!(s.child.is_none());
-        assert!(s.status.contains("historical"));
+        assert!(s.status.contains("not a full list"));
         assert!(!format!("{:?}", k.render(VIEW, None, &h.invocation()).unwrap().body).contains("private-server-message"));
     }
     #[test]
-    fn stop_releases_only_owned_child_restart_requires_new_review_and_preserves_separate_history() {
+    fn stop_releases_only_owned_child_and_restart_keeps_separate_history() {
         let (h, mut k) = setup();
         launch(&mut k, &h);
         ingest(&mut k, &event("ADDED", "old", "uid-old")).unwrap();
@@ -788,13 +743,11 @@ mod tests {
         assert!(spare.poll(4096).unwrap().status.is_none());
         h.answer_next_prompt(None);
         press(&mut k, &h, "restart").unwrap();
-        assert!(k.watch.pending.is_none());
+        assert!(k.watch.session.as_ref().unwrap().child.is_none());
         h.answer_next_prompt(Some(&[]));
         press(&mut k, &h, "restart").unwrap();
-        assert!(k.watch.session.as_ref().unwrap().child.is_none());
-        assert!(k.watch.pending.is_some());
-        press(&mut k, &h, "launch").unwrap();
         let s = k.watch.session.as_ref().unwrap();
+        assert!(s.child.is_some());
         assert!(s.names.is_empty());
         assert_eq!(s.history.as_ref().unwrap().names, ["old"]);
     }
@@ -805,12 +758,10 @@ mod tests {
         ingest(&mut k, &event("ADDED", "old", "uid-old")).unwrap();
         let spare: Vec<_> = (0..7).map(|_| host::start(&Command::new("kubectl"), None).unwrap()).collect();
         h.answer_next_prompt(Some(&[]));
-        press(&mut k, &h, "restart").unwrap();
-        assert!(press(&mut k, &h, "launch").is_err());
+        assert!(press(&mut k, &h, "restart").is_err());
         let s = k.watch.session.as_ref().unwrap();
         assert!(s.child.is_some());
         assert!(s.names.contains_key("old"));
-        assert!(k.watch.pending.is_none());
         assert!(spare[0].poll(4096).unwrap().status.is_none());
     }
     #[test]
@@ -833,30 +784,27 @@ mod tests {
         assert!(k.watch.session.is_none());
     }
     #[test]
-    fn deep_or_node_heavy_json_is_rejected_before_observations_change() {
+    fn deep_or_node_heavy_json_is_skipped_before_observations_change() {
         let (h, mut k) = setup();
         launch(&mut k, &h);
         ingest(&mut k, &event("ADDED", "good", "uid-a")).unwrap();
         let deep = format!("{{\"type\":\"ADDED\",\"object\":{}0{}}}", "[".repeat(40), "]".repeat(40));
-        assert!(ingest(&mut k, &deep).is_err());
+        assert!(ingest(&mut k, &format!("{deep}\n")).is_ok());
+        assert_eq!(k.watch.session.as_ref().unwrap().skipped, 1);
         assert!(k.watch.session.as_ref().unwrap().names.contains_key("good"));
         k.watch.session.as_mut().unwrap().pending.clear();
         let many=json!({"type":"ADDED","object":{"apiVersion":"v1","kind":"Pod","metadata":{"name":"extra","uid":"uid-b","namespace":"shop","resourceVersion":"rv"},"ignored":vec![0;5000]}}).to_string();
-        assert!(ingest(&mut k, &many).is_err());
+        assert!(ingest(&mut k, &many).is_ok());
+        assert_eq!(k.watch.session.as_ref().unwrap().skipped, 2);
         assert!(!k.watch.session.as_ref().unwrap().names.contains_key("extra"));
         assert!(stream_depth(r#"{"text":"escaped \" }[[["}"#));
     }
     #[test]
-    fn all_namespace_and_changed_review_choices_refuse_without_watch_start() {
+    fn all_namespaces_refuse_without_watch_start() {
         let (h, mut k) = setup();
         k.namespace = Some(ALL_NAMESPACES.into());
         assert!(k.run_command("watch-resources", &h.invocation(), None).is_err());
         assert!(h.process_runs().is_empty());
-        k.namespace = Some("shop".into());
-        prepare(&mut k, &h);
-        k.namespace = Some("other".into());
-        assert!(press(&mut k, &h, "launch").is_err());
-        assert!(k.watch.pending.is_none());
         assert!(k.watch.session.is_none());
     }
     #[test]
@@ -872,25 +820,15 @@ mod tests {
         h.answer_next_prompt(Some(&["0"]));
         let error = k.run_command("watch-resources", &h.invocation(), None).unwrap_err().to_string();
         assert!(!error.contains("secret-token-value") && !error.contains("auth-url-value"));
-        assert!(k.watch.pending.is_none() && k.watch.session.is_none());
+        assert!(k.watch.session.is_none());
     }
     #[test]
     fn relative_kubeconfig_inspection_uses_the_same_project_cwd_as_watch_spawn() {
         let (h, mut k) = setup();
         h.set_setting("kubeconfig", "\"configs/relative-kubeconfig\"");
-        prepare(&mut k, &h);
+        launch(&mut k, &h);
         assert!(h.process_runs().iter().all(|r| r.cwd.as_deref() == Some("/project")));
-        assert!(
-            k.watch
-                .pending
-                .as_ref()
-                .unwrap()
-                .spec
-                .args()
-                .contains(&"--kubeconfig=configs/relative-kubeconfig".into())
-        );
-        press(&mut k, &h, "launch").unwrap();
-        assert!(h.process_runs().iter().all(|r| r.cwd.as_deref() == Some("/project")));
+        assert!(k.watch.session.as_ref().unwrap().spec.args().contains(&"--kubeconfig=configs/relative-kubeconfig".into()));
         assert_eq!(k.watch.session.as_ref().unwrap().spec.root, "/project");
     }
     #[test]
@@ -902,25 +840,47 @@ mod tests {
         h.set_project_root(None);
         assert!(matches!(k.render(VIEW, None, &h.invocation()).unwrap().body, Body::Message(_)));
         assert!(k.watch.session.is_none());
-        assert!(k.watch.pending.is_none());
         assert_eq!(h.process_runs().len(), before);
     }
     #[test]
-    fn actual_mock_child_malformed_output_and_revoked_scope_keep_dated_last_good() {
+    fn actual_mock_child_banner_is_skipped_and_revoked_scope_keeps_last_good() {
         let (h, mut k) = setup();
         launch(&mut k, &h);
         ingest(&mut k, &event("ADDED", "good", "uid-a")).unwrap();
-        // SDK start's real mock resource emits a synthetic startup banner; the
-        // public manual poll must reject it rather than overwrite useful data.
         press(&mut k, &h, "poll").unwrap();
         let s = k.watch.session.as_ref().unwrap();
-        assert!(s.child.is_none());
+        assert!(s.child.is_some(), "a banner line no longer ends the watch");
         assert!(s.names.contains_key("good"));
-        assert!(s.status.contains("Malformed"));
-        prepare(&mut k, &h);
-        press(&mut k, &h, "launch").unwrap();
         let h = h.with_capabilities(&["project.read", "storage"]);
         assert!(press(&mut k, &h, "poll").is_err());
         assert!(k.watch.session.as_ref().unwrap().child.is_none());
+    }
+    #[test]
+    fn malformed_watch_line_resyncs() {
+        let (h, mut k) = setup();
+        launch(&mut k, &h);
+        let input = format!("not json at all\n{}\n{{\"type\": broken}}\n{}\n", event("ADDED", "first", "uid-1"), event("ADDED", "second", "uid-2"));
+        ingest(&mut k, &input).unwrap();
+        let s = k.watch.session.as_ref().unwrap();
+        assert!(s.child.is_some());
+        assert_eq!(s.names.keys().collect::<Vec<_>>(), ["first", "second"]);
+        assert_eq!(s.skipped, 2);
+        ingest(&mut k, "{\"type\":\"ADD").unwrap();
+        ingest(&mut k, &format!("garbage tail\n{}\n", event("ADDED", "third", "uid-3"))).unwrap();
+        assert!(k.watch.session.as_ref().unwrap().names.contains_key("third"));
+    }
+    #[test]
+    fn oversized_watch_event_skipped() {
+        let (h, mut k) = setup();
+        launch(&mut k, &h);
+        let big = event("ADDED", "big", "uid-big").replace("must-not-display", &"x".repeat(MAX_EVENT));
+        let input = format!("{big}\n{}\n", event("ADDED", "small", "uid-small"));
+        for piece in input.as_bytes().chunks(16 << 10) {
+            ingest(&mut k, std::str::from_utf8(piece).unwrap()).unwrap();
+        }
+        let s = k.watch.session.as_ref().unwrap();
+        assert!(s.child.is_some());
+        assert_eq!(s.names.keys().collect::<Vec<_>>(), ["small"]);
+        assert_eq!(s.skipped, 1);
     }
 }

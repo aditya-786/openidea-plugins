@@ -145,7 +145,9 @@ impl Launcher {
         if !refresh && self.metadata.is_some() {
             return;
         }
-        let result = starters::get("/metadata/client").and_then(|metadata| {
+        let result = starters::get("/metadata/client")
+            .map_err(|e| ui_kit::denied::map(e, "Refreshing the catalogue", "net:start.spring.io", "Spring Initializr Launcher"))
+            .and_then(|metadata| {
             if !valid_metadata(&metadata) {
                 return Err(Error::Invalid("Server metadata is invalid or exceeds catalogue limits; previous catalogue retained.".into()));
             }
@@ -217,6 +219,16 @@ impl Launcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn refreshing_the_catalogue_denied_names_permission() {
+        let host = openidea_plugin::mock::MockHost::install().with_capabilities(&["project.read"]);
+        let mut launcher = Launcher::default();
+        launcher.bind(&host.invocation()).unwrap();
+        launcher.load_metadata(true);
+        let status = launcher.catalog_status.unwrap();
+        assert!(status.contains("needs the net:start.spring.io permission"), "{status}");
+        assert!(status.contains("Settings › Plugins › Spring Initializr Launcher"), "{status}");
+    }
     #[test]
     fn current_version_ranges_are_validated_and_conflicting_legacy_aliases_are_rejected() {
         use serde_json::json;

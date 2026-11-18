@@ -2,12 +2,11 @@
 //! participate; providers re-read definitions and never query a cluster.
 use openidea_plugin::providers::{CompletionItem, CompletionKind, Document};
 use openidea_plugin::{Position, Range, host, text};
-use std::collections::BTreeMap;
 use yaml_rust2::Yaml;
 const MAX_TEXT: usize = 128 << 10;
 #[derive(Default)]
 pub(crate) struct Cache {
-    files: BTreeMap<(String, String), (String, Vec<Definition>)>,
+    files: crate::lru::Lru<(String, String), (String, Vec<Definition>)>,
 }
 #[derive(Clone)]
 struct Definition {
@@ -104,7 +103,7 @@ fn cursor(source: &str, at: Position) -> Option<Cursor> {
             let tail = &source[value_start..end];
             let lead = tail.len() - tail.trim_start().len();
             let stop = tail.find(" #").unwrap_or(tail.len());
-            if caret > value_start + stop {
+            if caret > value_start + stop || stop < lead {
                 return None;
             }
             return Some(Cursor {
@@ -133,6 +132,9 @@ impl Cache {
     pub(crate) fn clear(&mut self) {
         self.files.clear();
     }
+    pub(crate) fn evict(&mut self, path: &str) {
+        self.files.retain(|(_, p), _| p != path);
+    }
     pub(crate) fn warm(&mut self, path: &str, source: &str) {
         self.files.retain(|(_, p), _| p != path);
         if source.len() > MAX_TEXT || definitions(source, path).is_empty() {
@@ -144,12 +146,10 @@ impl Cache {
         let Ok(root) = project.root() else {
             return;
         };
-        if self.files.len() >= 64 {
-            self.files.clear();
-        }
         self.files.insert(
             (root, path.into()),
             (source.into(), definitions(source, path)),
+            64,
         );
     }
     pub(crate) fn warm_file(&mut self, path: &str) {
@@ -593,6 +593,13 @@ mod tests {
     }
     fn end(d: &Document) -> Position {
         text::position(&d.text, d.text.len())
+    }
+    #[test]
+    fn crd_completion_between_spaces_no_inverted_range() {
+        let source = "key:  # c";
+        assert!(cursor(source, Position::new(0, 5)).is_none());
+        let spaced = cursor("key: va", Position::new(0, 7)).unwrap();
+        assert!(spaced.start <= spaced.end);
     }
     #[test]
     fn scalar_collection_and_read_only_constraints_are_enforced_without_claiming_cel() {

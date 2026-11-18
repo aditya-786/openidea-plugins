@@ -4,10 +4,13 @@ version = "0.3.0" # x-release-please-version
 description = "Browse a Kubernetes cluster with kubectl. Switch context and namespace, list workloads, services, config, storage, events and nodes, then describe a resource, edit its YAML with schema completion and explicit reviewed apply, stream its logs, open a shell, attach, forward ports or delete it. Commands on the open file apply, validate (server dry run), diff or delete a manifest, render or apply a Kustomization, and run helm template, lint and dependency update. Never changes your kubeconfig."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Gutter markers use package icons. Unreleased: local CRD schema validation now reports unknown fields the API server would prune (respecting x-kubernetes-preserve-unknown-fields, additionalProperties and embedded resources), validates x-kubernetes-int-or-string, reports null on a non-nullable field as Info (dropped, or replaced by its default; nullable: true keeps null) and flags metadata.namespace on cluster-scoped CRDs; ambiguous versions and composition keywords stay quiet. Unreleased: Helm include/template navigation to define/block names, with/range scope awareness for .Values and $.Values navigation, unresolved includes reported as Info. Unreleased: Kustomization inline patches/replacements target and select selectors (kind, name, namespace, group, version, plain labelSelector/annotationSelector) link to resources listed in the same kustomization, replacement fieldPath(s) link to literal keys, selectors matching none of fully local parsable resources show an Info, local resources/bases/components directories report a missing kustomization or a bounded-depth cycle, and helmCharts valuesFile navigates to the local file; regex, remote, generated, indexed and dynamic forms stay quiet. Unreleased: label-key Rename now edits single-line quoted YAML keys with '' or basic double-quote escapes when the scanned text round-trips to the parsed value; multiline, block, anchored, tagged and \\u-escaped scalars stay refused. Unreleased: Kustomize configMapGenerator/secretGenerator files, envs and env plus replacements path references and Helm template .Values.a.b literal paths navigate to exact local files and values.yaml keys; remote, dynamic, quoted-key, flow and merge forms stay unlinked. Unreleased: label graph links exact node affinity (matchExpressions), pod affinity/anti-affinity and topology spread labelSelector terms; namespaces, namespaceSelector, matchLabelKeys, matchFields and Gt/Lt terms stay unmodeled. Unreleased: disconnected private kubeconfig import admits bracketed HTTPS IPv6 server literals without auth execution or activation; Unreleased: explicitly cached namespace/kind-scoped cluster resource reference completion without provider kubectl; Unreleased: numbered native-bounded parts for large revealed Secret display values; Unreleased: parsed schema modeline scalars, bounded ambiguity guards and source CRLF retention; Unreleased: preserve parsed item values in List/document refactors and withhold discarded wrapper metadata; Unreleased: parsed Chart.yaml source scopes and validated dependency insertion eligibility; Unreleased: preserve comments after plain Helm repository URLs with literal quotes; Unreleased: coherent successful panel mode replacement and retained unsaved Secret form navigation; Unreleased: owned structural tree callbacks and forwarding-intent epoch retirement; owner-bound context/namespace choices and bounded native field/tree control identities; per-instance rich form, preview, selection and delete-confirmation callback correlation; strict Secret response/base64 and failed-diagnostic handling; Helm release/alias value integrity; invocation-scoped process cwd with RAII restoration, editor-owner checks and opaque resource row epochs; malformed discovery cannot become CLI options. Unreleased: project-owned rich log capture/read/refresh share the project cwd and withhold raw failure output. Unreleased: bounded UTC log time-prefix validation preserves accepted filters and avoids Unicode slicing panics. Unreleased: owned forwarding scope/discovery/revalidation now share the project cwd with managed launch; closed-owner metadata reads refuse global fallback. Unreleased ownership audit: automatic resource Rename graph gated until reference closure/deployment identity are proved; exact resource associations now use bounded private read-only definition/gutter providers, including Ingress TLS Secrets and metadata namespaces. Unreleased: owned loopback port-forward start/status/stop/restart, pinned context/namespace and validated port mappings. Resource browser moved to Services with selected-resource metadata and managed log tabs.  Fixed: YAML of a Secret opens in the panel and is never written to a temp file (tee created it readable by every local user). YAML opens in the panel by default; yamlInEditor optionally uses private SDK-storage copies for supported built-ins, local-only Save and explicit Review then fresh Apply Reviewed commands. UID/resourceVersion are retained; process:tee and background autosave replacement are removed. Download Logs no longer suggests a path in /tmp. Reload Manifest from Cluster (command, optional editor.write), Log Viewer: Until, Time and Source fields, Scroll to end, Clear and Download (optional project.write), missing-key and invalid-value hints (required keys, enums, integer and boolean fields, switches checkRequiredKeys and checkFieldValues), more kinds and groups known, non-editable and deprecated kinds, and gutter markers cover the whole project and need the optional project.read (none without it or in an untrusted project). Helm repo alias quick fixes stay empty until Read Helm Repositories has run once. Earlier in this release: Edit Secret (a form of the decoded keys, saved with kubectl replace), Log Viewer (a filtered snapshot of kubectl logs: text or regex, case, start time, wrap, copy), k* manifest abbreviations and Helm .Values and include completion, problems for unknown or deprecated keys, unknown kinds and server-owned fields of core, apps, batch, networking and rbac kinds, hints for .Values paths and includes that the chart does not define, Chart.yaml quick fixes (add a dependency, repository URL or alias), several kubeconfig files with Choose Kubeconfig, notifySuccess and nonKubernetesGlobs settings, Telepresence Connect and Quit, and gutter markers between a resource and the manifests that use it. Also: Create Helm Chart, Configure Helm Parameters (release, values file, --set for template and lint), Customize Namespaces, Select Log Sources (pick pods or containers), a Debug image prompt with recent images (Edit Recent Debug Images), and Go to Declaration between manifests (names of ConfigMaps, Secrets, Services, claims and service accounts). 0.2.0: right-click a resource in the tree for describe, YAML, logs, shell, attach, debug, port forward, show secret and delete (asks to confirm); needs OpenIDEA 1.2. 0.1.0: first release. Cluster tree; describe; YAML in an editor that applies on save, with the Kubernetes schema; logs (pods and workloads), shell, attach, port forward; delete; apply, dry run, diff and delete of the open manifest; Kustomize render and apply; Helm template, lint and dependency update."
+change-notes = """\
+Next release: The status bar shows the current context and namespace, Diff Manifest with Cluster compares live objects with a server dry run, Apply success offers Show in Kube Explorer, and Open Shell and Attach reuse the pod's open terminal; Apply, Delete, Delete Manifest Resources, panel YAML Apply and Secret Save ask first and name the context, namespace and target, and Apply can show the diff and then apply; kubectl failures name the context and a reason (expired login, unreachable, forbidden, not found), and a missing current context offers Choose Kubeconfig; validation reports unknown fields in custom resources, manifest problems stay in place while you type, Helm and Kustomize navigation improved, label gutter icons with several matches open a chooser, imported kubeconfigs can be used and deleted, and watch survives malformed events; port forward and watch start after one confirmation, Reload from Cluster keeps Secret values out unless Show Secret is allowed, and messages, the Kube Explorer Details panel and setting titles use plain, consistent names. \
+0.3.0: consolidated panels, label graph and native service actions. \
+0.2.0: plugin icon and window consolidation."""
 categories = ["tools"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-view:kube", "on-view:resource-details", "on-event:file-opened", "on-event:file-saved", "on-event:files-changed"]
 
@@ -26,19 +29,29 @@ location = "services"
 
 [[contributes.views]]
 id = "resource-details"
-title = "Kubernetes"
+title = "Kube Explorer Details"
 icon = "icons/kubernetes.svg"
 location = "right"
 web = "web/resources/hub.html"
 
 [[contributes.commands]]
 id = "import-pasted-kubeconfig"
-title = "Kube Explorer: Import Pasted Kubeconfig (Private, No Connection)"
+title = "Kube Explorer: Import Pasted Kubeconfig…"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "review-imported-kubeconfigs"
-title = "Kube Explorer: Review Imported Kubeconfigs (Redacted)"
+title = "Kube Explorer: Show Imported Kubeconfigs"
+category = "Kube Explorer"
+
+[[contributes.commands]]
+id = "use-imported-kubeconfig"
+title = "Kube Explorer: Use Imported Kubeconfig"
+category = "Kube Explorer"
+
+[[contributes.commands]]
+id = "delete-imported-kubeconfig"
+title = "Kube Explorer: Delete Imported Kubeconfig"
 category = "Kube Explorer"
 
 [[contributes.menus]]
@@ -48,6 +61,14 @@ command = "import-pasted-kubeconfig"
 [[contributes.menus]]
 menu = "tools"
 command = "review-imported-kubeconfigs"
+
+[[contributes.menus]]
+menu = "tools"
+command = "use-imported-kubeconfig"
+
+[[contributes.menus]]
+menu = "tools"
+command = "delete-imported-kubeconfig"
 
 [[contributes.commands]]
 id = "apply"
@@ -67,6 +88,11 @@ category = "Kube Explorer"
 [[contributes.commands]]
 id = "diff"
 title = "Kube Explorer: Diff Manifest with Cluster"
+category = "Kube Explorer"
+
+[[contributes.commands]]
+id = "show-tree"
+title = "Kube Explorer: Show Cluster Tree"
 category = "Kube Explorer"
 
 [[contributes.commands]]
@@ -151,73 +177,73 @@ category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-log-sources"
-title = "Select Log Sources…"
+title = "Kube Explorer: Follow Logs from Selected Sources…"
 icon = "settings"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-log-view"
-title = "View Log Snapshot…"
+title = "Kube Explorer: Log Snapshot…"
 icon = "filter"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-describe"
-title = "Describe"
+title = "Kube Explorer: Describe Resource"
 icon = "info"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-yaml"
-title = "Edit YAML…"
+title = "Kube Explorer: Edit YAML…"
 icon = "file-yaml"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-logs"
-title = "Follow Logs"
+title = "Kube Explorer: Follow Logs (Terminal)"
 icon = "file-log"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-shell"
-title = "Open Shell"
+title = "Kube Explorer: Open Shell"
 icon = "terminal"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-attach"
-title = "Attach"
+title = "Kube Explorer: Attach to Pod"
 icon = "attach-to-process"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-debug"
-title = "Debug…"
+title = "Kube Explorer: Debug Pod…"
 icon = "debug"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-port-forward"
-title = "Port Forward…"
+title = "Kube Explorer: Port Forward…"
 icon = "external-link"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-show-secret"
-title = "Show Secret…"
+title = "Kube Explorer: Show Secret…"
 icon = "eye"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-edit-secret"
-title = "Edit Secret…"
+title = "Kube Explorer: Edit Secret…"
 icon = "edit"
 category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "resource-delete"
-title = "Delete…"
+title = "Kube Explorer: Delete Resource…"
 icon = "trash"
 category = "Kube Explorer"
 
@@ -231,12 +257,6 @@ icon = "icons/marker-kustomize.svg"
 id = "label"
 icon = "icons/marker-label.svg"
 
-[[contributes.markerIcons]]
-id = "users"
-icon = "icons/marker-users.svg"
-markers = ["kube-users:"]
-tooltip = "Manifests using this resource"
-
 [[contributes.providers]]
 kinds = ["code-actions", "completion", "definition", "line-markers", "diagnostics"]
 languages = ["yaml", "json", "jsonc"]
@@ -244,10 +264,17 @@ languages = ["yaml", "json", "jsonc"]
 [[contributes.menus]]
 menu = "editor.context"
 command = "apply"
+when = "editorLangId == yaml"
 
 [[contributes.menus]]
 menu = "editor.context"
 command = "reload-from-cluster"
+when = "editorLangId == yaml"
+
+[[contributes.menus]]
+menu = "editor.context"
+command = "diff"
+when = "editorLangId == yaml"
 
 
 
@@ -534,41 +561,41 @@ when = "viewItemKind == svc-pod || viewItemKind == svc-workload || viewItemKind 
 [[contributes.commands]]
 id = "cache-cluster-namespaces"
 title = "Kube Explorer: Read Cluster Namespaces for Completion"
-category = "Kubernetes"
+category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "watch-resources"
-title = "Kube Explorer: Review Managed Resource Watch…"
-category = "Kubernetes"
+title = "Kube Explorer: Start Resource Watch…"
+category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "open-resource-watch"
-title = "Kube Explorer: Open Resource Watch Status"
-category = "Kubernetes"
+title = "Kube Explorer: Show Resource Watch"
+category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "review-private-yaml"
 title = "Kube Explorer: Review Private YAML Apply…"
-category = "Kubernetes"
+category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "apply-reviewed-private-yaml"
-title = "Kube Explorer: Apply Reviewed Private YAML"
-category = "Kubernetes"
+title = "Kube Explorer: Apply Private YAML"
+category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "retire-private-yaml"
-title = "Kube Explorer: Retire Private YAML Editor"
-category = "Kubernetes"
+title = "Kube Explorer: End Private YAML Editing Session"
+category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "cache-cluster-resources"
-title = "Kube Explorer: Read Cluster Resource Names for Completion…"
-category = "Kubernetes"
+title = "Kube Explorer: Load Resource Names from Cluster for Completion…"
+category = "Kube Explorer"
 
 [[contributes.commands]]
 id = "tree-switch"
-title = "Switch"
+title = "Kube Explorer: Switch Context or Namespace"
 icon = "check"
 category = "Kube Explorer"
 
@@ -580,7 +607,7 @@ when = "viewItemKind == svc-context || viewItemKind == svc-namespace"
 
 [[contributes.commands]]
 id = "tree-expand"
-title = "Expand"
+title = "Kube Explorer: Expand Group"
 icon = "chevron-down"
 category = "Kube Explorer"
 
@@ -592,7 +619,7 @@ when = "viewItemKind == svc-group || viewItemKind == svc-secrets || viewItemKind
 
 [[contributes.commands]]
 id = "tree-collapse"
-title = "Collapse"
+title = "Kube Explorer: Collapse Group"
 icon = "chevron-up"
 category = "Kube Explorer"
 
@@ -604,7 +631,7 @@ when = "viewItemKind == svc-group-open || viewItemKind == svc-secrets-open || vi
 
 [[contributes.commands]]
 id = "tree-refresh"
-title = "Refresh"
+title = "Kube Explorer: Refresh Group"
 icon = "refresh"
 category = "Kube Explorer"
 
@@ -616,7 +643,7 @@ when = "viewItemKind == svc-group || viewItemKind == svc-secrets || viewItemKind
 
 [[contributes.commands]]
 id = "tree-create-secret"
-title = "Create Secret…"
+title = "Kube Explorer: Create Secret…"
 icon = "plus"
 category = "Kube Explorer"
 
@@ -628,7 +655,7 @@ when = "viewItemKind == svc-secrets || viewItemKind == svc-secrets-open"
 
 [[contributes.commands]]
 id = "tree-watch"
-title = "Watch Resources…"
+title = "Kube Explorer: Watch Resources…"
 icon = "eye"
 category = "Kube Explorer"
 
@@ -641,7 +668,7 @@ submenu = "Watch"
 
 [[contributes.commands]]
 id = "tree-open-watch"
-title = "Open Resource Watch"
+title = "Kube Explorer: Open Resource Watch"
 icon = "list"
 category = "Kube Explorer"
 
@@ -654,7 +681,7 @@ submenu = "Watch"
 
 [[contributes.commands]]
 id = "tree-kubeconfig"
-title = "Choose Kubeconfig…"
+title = "Kube Explorer: Choose Kubeconfig…"
 icon = "folder-open"
 category = "Kube Explorer"
 
@@ -667,7 +694,7 @@ submenu = "Kubeconfig"
 
 [[contributes.commands]]
 id = "tree-import-config"
-title = "Import Kubeconfig Privately…"
+title = "Kube Explorer: Import Kubeconfig Privately…"
 icon = "paste"
 category = "Kube Explorer"
 
@@ -680,7 +707,7 @@ submenu = "Kubeconfig"
 
 [[contributes.commands]]
 id = "tree-review-config"
-title = "Review Imported Kubeconfigs…"
+title = "Kube Explorer: Review Imported Kubeconfigs…"
 icon = "list"
 category = "Kube Explorer"
 

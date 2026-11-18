@@ -339,28 +339,28 @@ impl Main {
                 "binary-help",
                 "DDEV executable",
                 FieldValue::readonly_text(
-                    "Settings > Plugins > DDEV Integration > process:ddev lets you choose and approve the executable globally or for this project. All DDEV commands, logs and execution targets use that host-approved choice.",
+                    "Settings › Plugins › DDEV Integration › process:ddev lets you choose and approve the executable globally or for this project. All DDEV commands, logs and execution targets use that host-approved choice.",
                     true,
                 ),
             ),
             Field::new(
                 "watchDdev",
-                "Refresh status every minute",
+                "Refresh DDEV status every minute",
                 FieldValue::Checkbox(draft.watch),
             ),
             Field::new(
                 "checkForUpdates",
-                "Check for updates automatically",
+                "Check for DDEV updates automatically",
                 FieldValue::Checkbox(draft.updates),
             ),
             Field::new(
                 "autoConfigureDataSource",
-                "Maintain database connection configuration",
+                "Keep a Database connection for the DDEV database",
                 FieldValue::Checkbox(draft.database),
             ),
             Field::new(
                 "phpVersion",
-                "PHP version override (optional)",
+                "PHP version for Configure Project (optional)",
                 FieldValue::Text(draft.php.clone()),
             ),
             Field::new(
@@ -382,10 +382,11 @@ impl Main {
                 ),
             ),
         ];
-        // Keep actionable preferences above the longer setup/help text at
-        // ordinary dock heights. Field ids preserve draft and Save behavior.
+        // The setup checklist and configuration status come first, then the
+        // preferences, then the longer help text. Field ids preserve draft and Save behavior.
         let order = [
             "project",
+            "steps",
             "config-status",
             "watchDdev",
             "checkForUpdates",
@@ -396,7 +397,6 @@ impl Main {
             "execution-help",
             "diagnostics",
             "binary-help",
-            "steps",
         ];
         fields.sort_by_key(|field| {
             order
@@ -520,7 +520,8 @@ impl Main {
                 lines.join("\n")
             }
             Err(error) => format!(
-                "Cannot run the DDEV environment check: {error}\nAllow process:ddev in Settings > Plugins and verify that DDEV is installed."
+                "Cannot run the DDEV environment check: {error}\n{} Also verify that DDEV is installed.",
+                ui_kit::denied::message("The DDEV environment check", "process:ddev", "DDEV Integration")
             ),
         };
         self.diagnostics = Some((project.root()?, text));

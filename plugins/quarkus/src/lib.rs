@@ -364,11 +364,9 @@ impl Providers for QuarkusTools {
         if !qute.is_empty() {return qute;}
         self.source_definition(doc, at)
     }
-    /// Editor diagnostics have their own versioned provider; markers only update cached current text.
+    /// Editor diagnostics have their own versioned provider; markers link exact config keys from cached facts only.
     fn line_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
-        let _ = self.sources.for_cached_document(&doc.path, &doc.text);
-        let _ = self.configs.for_cached_document(&doc.path, &doc.text);
-        Vec::new()
+        self.source_markers(doc)
     }
 
     fn code_actions(&mut self, doc: &Document, selection: Range) -> Vec<CodeAction> {

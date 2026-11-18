@@ -675,7 +675,7 @@ fn proof(project: &Project, module: &str) -> Result<Proof, Error> {
     let text = project.read_file(&path)?;
     if !qute_pom(&text) {
         return Err(Error::Invalid(
-            "A direct literal Maven Quarkus Qute dependency is required for this module.".into(),
+            "This module's pom.xml must list the io.quarkus:quarkus-qute dependency directly.".into(),
         ));
     }
     Ok(Proof {
@@ -1173,7 +1173,7 @@ impl QuarkusTools {
         let target = format!("{}/src/main/resources/templates/{template}", pending.module);
         collision(&project, &pending.root, &target)?;
         let body = format!(
-            "Create only: {target}\nModule: {}\nBuild proof: {} (direct literal Qute dependency)\nSource: {}\nSource version: {}\n\nExact new content: empty file (0 bytes).\n\nThe host creates and opens one non-overwriting file as an undoable workspace edit. Template parameters, bindings and runtime lookup are unresolved.",
+            "Create only: {target}\nModule: {}\nBuild file: {} (lists quarkus-qute)\nSource: {}\nSource version: {}\n\nExact new content: empty file (0 bytes).\n\nThe host creates and opens one non-overwriting file as an undoable workspace edit. Template parameters, bindings and runtime lookup are unresolved.",
             pending.module, build.path, doc.path, doc.version
         );
         if !ui_kit::prompts::confirm_exact("Create empty Qute template?", &body)? {

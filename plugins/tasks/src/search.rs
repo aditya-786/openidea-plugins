@@ -50,7 +50,7 @@ fn contextual_query(target:&SearchTarget,current:&str)->Result<Option<String>,Er
     let title=if target.tracker=="redmine" {"Redmine filters (project_id, issue_id, assigned_to_id, status_id)"} else {"Mantis filters (required project_id, optional filter_id)"};
     let initial=if current.contains('=') {current.to_owned()} else if target.tracker=="redmine"&&current.bytes().all(|b|b.is_ascii_digit())&&!current.is_empty(){format!("issue_id={current}")} else if target.tracker=="redmine" {"assigned_to_id=me&status_id=open".into()}else{"project_id=1".into()};
     let Some(value)=host::input(title,Some(&initial))? else{return Ok(None);};
-    if value.trim().is_empty(){return Ok(None);}if value.len()>256||value.chars().any(char::is_control){return Err(invalid("Use at most256bytes of documented tracker filter parameters without controls."));}Ok(Some(value))
+    if value.trim().is_empty(){return Ok(None);}if value.len()>256||value.chars().any(char::is_control){return Err(invalid("Use at most 256 bytes of documented tracker filter parameters without controls."));}Ok(Some(value))
 }
 fn choose(targets: &[SearchTarget]) -> Result<Option<usize>, Error> {
     if targets.len() == 1 {

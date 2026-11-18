@@ -5,6 +5,10 @@ use openidea_plugin::hover::{Hover, HoverProvider};
 use openidea_plugin::inlay_hints::{InlayHint, InlayHints, InlayKind};
 use openidea_plugin::{Event, EventKind};
 use std::collections::{BTreeMap, BTreeSet};
+use spring_text::index::{Index, Indexes, project_of};
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 const MAX_TEXT: usize = 128 << 10;
 const GLOBS: &[&str] = &[
@@ -61,7 +65,7 @@ fn read(path: &str, text: &str) -> Option<File> {
         && checks::sets_autowire_mode(path, text).is_some();
     Some(File {
         complete: (!local_meta::is_metadata_file(path) || meta.is_some())
-            && !(path.ends_with(".java")
+            && !(source
                 && text.contains("ConfigurationProperties")
                 && meta.is_none()),
         meta,
@@ -71,22 +75,37 @@ fn read(path: &str, text: &str) -> Option<File> {
         locations: fileset::read(path, text),
     })
 }
-pub(crate) struct State {
-    files: Indexes<File>,
+#[derive(PartialEq)]
+struct Key {
+    generation: u64,
+    roots: Vec<String>,
+    fresh: bool,
     watching: bool,
+}
+pub(crate) struct State {
+    pub(super) files: Indexes<File>,
+    watching: bool,
+    snapshots: BTreeMap<String, (Key, Arc<Shared>)>,
+    applied: BTreeMap<String, (u64, u64)>,
+    events_notice: std::sync::atomic::AtomicBool,
 }
 impl Default for State {
     fn default() -> Self {
         Self {
             files: Indexes::new(GLOBS, read),
             watching: false,
+            snapshots: BTreeMap::new(),
+            applied: BTreeMap::new(),
+            events_notice: Default::default(),
         }
     }
 }
 impl BootTools {
     pub(crate) fn activate_live(&mut self) {
         self.live.watching = host::subscribe_paths("files-changed", GLOBS).is_ok();
-        let _ = host::subscribe(EventKind::FileOpened);
+        if matches!(host::subscribe(EventKind::FileOpened), Err(Error::Denied(_))) {
+            ui_kit::denied::notify_once(&self.live.events_notice, "Checking the whole project (unknown keys, test constructors)", "events", "Spring Boot Tools");
+        }
         let _ = host::subscribe(EventKind::FileSaved);
         let deadline = Instant::now() + Duration::from_secs(3);
         for project in host::projects().unwrap_or_default() {
@@ -111,96 +130,110 @@ impl BootTools {
     }
     pub(crate) fn live_events(&mut self, events: &[Event]) {
         let deadline = Instant::now() + Duration::from_secs(3);
-        for event in events {
-            match event {
-                Event::FileOpened(p) | Event::FileSaved(p) => self.jars.invalidate(p),
-                Event::FilesChanged(b) => {
-                    for p in b.created.iter().chain(&b.modified).chain(&b.removed) {
-                        self.jars.invalidate(p);
-                    }
-                }
-                _ => {}
+        for (path, removed) in event_paths(events) {
+            self.jars.source_changed(path, removed);
+        }
+        self.live.files.on_events(events, deadline);
+        let mut warmed = BTreeSet::new();
+        for (path, _) in event_paths(events) {
+            if !GLOBS
+                .iter()
+                .any(|glob| spring_text::index::glob_matches(glob, path))
+            {
+                continue;
             }
-            let paths: Vec<_> = match event {
-                Event::FileOpened(path) | Event::FileSaved(path) => vec![(path, false)],
-                Event::FilesChanged(files) => files
-                    .removed
-                    .iter()
-                    .map(|path| (path, true))
-                    .chain(
-                        files
-                            .created
-                            .iter()
-                            .chain(&files.modified)
-                            .map(|path| (path, false)),
-                    )
-                    .collect(),
-                _ => Vec::new(),
+            let Some(project) = project_of(path) else {
+                continue;
             };
-            for (path, removed) in paths {
-                if Instant::now() >= deadline {
-                    return;
-                }
-                if !GLOBS
-                    .iter()
-                    .any(|glob| spring_text::index::glob_matches(glob, path))
-                {
-                    continue;
-                }
-                let Some(project) = project_of(path) else {
-                    continue;
-                };
-                if removed {
-                    self.live.files.update_existing(&project, path, None);
-                } else {
-                    match project.read_file(path) {
-                        Ok(text) => {
-                            self.live.files.update_existing(&project, path, Some(&text));
-                        }
-                        Err(_) => {
-                            self.live.files.reset();
-                            continue;
-                        }
-                    }
-                }
-                let budget = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(250));
-                if !budget.is_zero() {
-                    self.live.files.get(&project, budget);
-                }
+            let Ok(root) = project.root() else {
+                continue;
+            };
+            let budget = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(250));
+            if budget.is_zero() {
+                return;
+            }
+            if warmed.insert(root) {
+                self.live.files.get(&project, budget);
             }
         }
     }
-    pub(super) fn live_index(&mut self, doc: &Document) -> Option<&Index<File>> {
+    pub(super) fn live_snapshot(&mut self, doc: &Document) -> Option<Snapshot> {
         if doc.text.len() > MAX_TEXT {
             return None;
         }
         let root = project_of(&doc.path)?.root().ok()?;
         let roots = current_roots()?;
-        if current_owner(&roots, &doc.path) != Some(root.as_str()) {
+        if spring_text::scope::current_owner(&doc.path, &roots).as_deref() != Some(root.as_str()) {
             return None;
         }
-        self.live
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        doc.text.hash(&mut hasher);
+        let hash = hasher.finish();
+        let live = &mut self.live;
+        let applied = live.applied.get(&doc.path).copied();
+        let unchanged = live
             .files
-            .for_cached_document(&doc.path, &doc.text)
-            .map(|index| &*index)
+            .cached(&doc.path)
+            .is_some_and(|index| applied == Some((hash, index.generation())));
+        let index = if unchanged {
+            live.files.cached(&doc.path)?
+        } else {
+            let index = live.files.for_cached_document(&doc.path, &doc.text)?;
+            if live.applied.len() >= 64 {
+                live.applied.clear();
+            }
+            live.applied
+                .insert(doc.path.clone(), (hash, index.generation()));
+            &*index
+        };
+        let key = Key {
+            generation: index.generation(),
+            roots,
+            fresh: index.fresh(),
+            watching: live.watching,
+        };
+        let shared = match live.snapshots.get(&root) {
+            Some((known, shared)) if *known == key => shared.clone(),
+            _ => {
+                let shared = Arc::new(shared_of(index, &key.roots, &root, live.watching));
+                live.snapshots
+                    .retain(|known, _| key.roots.contains(known));
+                live.snapshots
+                    .insert(root, (key, shared.clone()));
+                shared
+            }
+        };
+        let is_config = is_config_file(&doc.path)
+            || fileset::is_configuration(
+                &doc.path,
+                shared.locations.iter().map(|(path, l)| (path.as_str(), l)),
+            );
+        Some(Snapshot { shared, is_config })
     }
 }
-// Bounded current ownership inventory; unknown or malformed scope fails closed.
-fn scope_path(path: &str) -> bool {
-    (path.starts_with('/')
-        || path.as_bytes().get(1) == Some(&b':')
-            && path.as_bytes().get(2) == Some(&b'/')
-            && path.as_bytes()[0].is_ascii_alphabetic())
-        && path.len() <= 4096
-        && !path.contains('\\')
-        && !path.chars().any(char::is_control)
-        && !path
-            .split('/')
-            .skip(usize::from(path.starts_with('/')))
-            .any(|part| matches!(part, "" | "." | ".."))
+fn event_paths(events: &[Event]) -> Vec<(&str, bool)> {
+    let mut paths = Vec::new();
+    for event in events {
+        match event {
+            Event::FileOpened(path) | Event::FileSaved(path) => paths.push((path.as_str(), false)),
+            Event::FilesChanged(files) => {
+                paths.extend(files.removed.iter().map(|path| (path.as_str(), true)));
+                paths.extend(
+                    files
+                        .created
+                        .iter()
+                        .chain(&files.modified)
+                        .map(|path| (path.as_str(), false)),
+                );
+            }
+            _ => {}
+        }
+    }
+    paths
 }
+// Bounded current ownership inventory; unknown or malformed scope fails closed.
 pub(super) fn current_roots() -> Option<Vec<String>> {
     let projects = host::projects().ok()?;
     if projects.len() > 64 {
@@ -210,48 +243,37 @@ pub(super) fn current_roots() -> Option<Vec<String>> {
         .into_iter()
         .map(|project| {
             let root = project.root().ok()?;
-            scope_path(&root).then_some(root)
+            spring_text::scope::scope_path(&root).map(|_| root)
         })
         .collect()
 }
-pub(super) fn current_owner<'a>(roots: &'a [String], path: &str) -> Option<&'a str> {
-    if !scope_path(path) {
-        return None;
+pub(super) struct Shared {
+    pub(super) catalog: Catalog,
+    pub(super) complete: bool,
+    pub(super) ambiguous: BTreeSet<String>,
+    pub(super) facts: Summary,
+    pub(super) build: Option<build::Summary>,
+    pub(super) mode: Option<bool>,
+    pub(super) profiles: Vec<String>,
+    pub(super) locations: Vec<(String, fileset::Locations)>,
+}
+pub(super) struct Snapshot {
+    shared: Arc<Shared>,
+    pub(super) is_config: bool,
+}
+impl Deref for Snapshot {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        &self.shared
     }
-    roots
-        .iter()
-        .filter(|root| {
-            path.strip_prefix(root.as_str())
-                .is_some_and(|tail| tail.starts_with('/'))
-        })
-        .max_by_key(|root| root.len())
-        .map(String::as_str)
 }
-struct Snapshot {
-    catalog: Catalog,
-    complete: bool,
-    ambiguous: BTreeSet<String>,
-    facts: Summary,
-    build: Option<build::Summary>,
-    mode: Option<bool>,
-    is_config: bool,
-}
-fn snapshot(index: &Index<File>, doc: &Document, watching: bool) -> Snapshot {
-    // Project metadata only: never discover/read source during a provider call.
-    // An outer index can predate the opening of an independently owned inner project.
-    let roots = current_roots();
-    let owner = roots
-        .as_ref()
-        .and_then(|roots| current_owner(roots, &doc.path));
+pub(super) fn shared_of(index: &Index<File>, roots: &[String], owner: &str, watching: bool) -> Shared {
     let owned: Vec<_> = index
         .iter()
-        .filter(|(path, _)| {
-            owner.is_some() && roots.as_ref().and_then(|roots| current_owner(roots, path)) == owner
-        })
+        .filter(|(path, _)| spring_text::scope::current_owner(path, roots).as_deref() == Some(owner))
         .collect();
     let files: Vec<_> = owned.iter().map(|(_, file)| *file).collect();
-    let complete = owner.is_some()
-        && index.fresh()
+    let complete = index.fresh()
         && files.len() == index.files().len()
         && files.iter().all(|file| file.complete)
         && watching;
@@ -284,30 +306,35 @@ fn snapshot(index: &Index<File>, doc: &Document, watching: bool) -> Snapshot {
     let build = (complete && files.iter().any(|file| file.build.is_some()))
         .then(|| build::Summary::merge(files.iter().filter_map(|file| file.build.as_ref())));
     let mode = complete.then(|| files.iter().any(|file| file.mode));
-    let is_config = is_config_file(&doc.path)
-        || fileset::is_configuration(
-            &doc.path,
-            owned
-                .iter()
-                .filter_map(|(path, file)| file.locations.as_ref().map(|l| (*path, l))),
-        );
-    Snapshot {
+    let profiles: BTreeSet<String> = owned
+        .iter()
+        .filter(|(path, _)| {
+            path.rsplit('/')
+                .next()
+                .is_some_and(|name| name.starts_with("application-"))
+        })
+        .filter_map(|(path, _)| nav::profile_of(path))
+        .collect();
+    let locations = owned
+        .iter()
+        .filter_map(|(path, file)| Some(((*path).to_owned(), file.locations.clone()?)))
+        .collect();
+    Shared {
         catalog,
         complete: complete && ambiguous.is_empty(),
         ambiguous,
         facts,
         build,
         mode,
-        is_config,
+        profiles: profiles.into_iter().collect(),
+        locations,
     }
 }
 impl DiagnosticsProvider for BootTools {
     fn diagnostics(&mut self, doc: &Document) -> Vec<Diagnostic> {
-        let watching = self.live.watching;
-        let Some(index) = self.live_index(doc) else {
+        let Some(cached) = self.live_snapshot(doc) else {
             return Vec::new();
         };
-        let cached = snapshot(index, doc, watching);
         let jars = self.jars.catalog(&doc.path);
         let lookup = Lookup(vec![&cached.catalog, &jars, self.jars.bundled(&doc.path)]);
         let found = if doc.language == "java" && doc.path.ends_with(".java") {
@@ -410,8 +437,7 @@ impl HoverProvider for BootTools {
         if !matches!(doc.language.as_str(), "properties" | "yaml") {
             return None;
         }
-        let watching = self.live.watching;
-        let cached = snapshot(self.live_index(doc)?, doc, watching);
+        let cached = self.live_snapshot(doc)?;
         if !cached.is_config {
             return None;
         }
@@ -464,11 +490,9 @@ impl InlayHints for BootTools {
         if !matches!(doc.language.as_str(), "properties" | "yaml") {
             return Vec::new();
         }
-        let watching = self.live.watching;
-        let Some(index) = self.live_index(doc) else {
+        let Some(cached) = self.live_snapshot(doc) else {
             return Vec::new();
         };
-        let cached = snapshot(index, doc, watching);
         if !cached.is_config {
             return Vec::new();
         }
@@ -538,6 +562,16 @@ mod tests {
     }
     fn all() -> Range {
         Range::new(Position::new(0, 0), Position::new(u32::MAX, u32::MAX))
+    }
+    #[test]
+    fn missing_events_permission_is_explained_once() {
+        let host = MockHost::install().with_capabilities(&["project.read"]);
+        let mut tools = BootTools::default();
+        tools.activate_live();
+        tools.activate_live();
+        let notes = host.notifications();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].body, "Checking the whole project (unknown keys, test constructors) needs the events permission. Allow it in Settings › Plugins › Spring Boot Tools.");
     }
     #[test]
     fn registered_metadata_hover_does_not_expand_foreign_qualified_field_by_simple_name() {
@@ -907,6 +941,57 @@ mod tests {
                 .diagnostics(&doc(PROPS, "spring.datasource.urll=x\n"))
                 .iter()
                 .any(|finding| finding.code.as_deref() == Some("unknown-property"))
+        );
+    }
+    #[test]
+    fn read_error_does_not_reset_live_cache() {
+        let (host, mut tools) = setup();
+        let current = doc(PROPS, "app.greeting=hello\n");
+        assert!(tools.hover(&current, Position::new(0, 4)).is_some());
+        host.add_file_bytes("src/main/java/Binary.java", &[0xff, 0xfe, 0x00]);
+        tools.live_events(&[Event::FileSaved("/project/src/main/java/Binary.java".into())]);
+        assert!(tools.hover(&current, Position::new(0, 4)).is_some());
+    }
+    #[test]
+    fn snapshot_is_reused_until_the_index_changes() {
+        let (host, mut tools) = setup();
+        let current = doc(PROPS, "app.greeting=hello\n");
+        let first = tools.live_snapshot(&current).unwrap();
+        let second = tools.live_snapshot(&current).unwrap();
+        assert!(Arc::ptr_eq(&first.shared, &second.shared));
+        host.add_file("src/main/resources/META-INF/other-spring-configuration-metadata.json", JSON);
+        tools.live_events(&[Event::FileSaved(
+            "/project/src/main/resources/META-INF/other-spring-configuration-metadata.json".into(),
+        )]);
+        let third = tools.live_snapshot(&current).unwrap();
+        assert!(!Arc::ptr_eq(&first.shared, &third.shared));
+    }
+    #[test]
+    fn kotlin_config_props_suppresses_unknown_key() {
+        let host = MockHost::install();
+        host.add_file("src/main/resources/application.properties", "app.name=x\n");
+        let mut control = BootTools::default();
+        control.activate_live();
+        assert!(control.live_snapshot(&doc(PROPS, "app.name=x\n")).unwrap().complete);
+        host.add_file(
+            "src/main/kotlin/App.kt",
+            "import org.springframework.boot.context.properties.ConfigurationProperties\n@ConfigurationProperties(prefix = \"app\")\nclass App(val name: String)\n",
+        );
+        let mut tools = BootTools::default();
+        tools.activate_live();
+        let current = doc(PROPS, "app.name=x\n");
+        let shared = tools.live_snapshot(&current).unwrap();
+        assert!(!shared.complete);
+    }
+    #[test]
+    fn drive_letter_roots_are_inventoried() {
+        let host = MockHost::install();
+        host.add_project("C:/work/app");
+        let roots = current_roots().unwrap();
+        assert!(roots.iter().any(|root| root == "C:/work/app"));
+        assert_eq!(
+            spring_text::scope::current_owner("c:/work/app/src/A.java", &["C:/work/app".to_owned()]).as_deref(),
+            Some("C:/work/app")
         );
     }
 }

@@ -7,28 +7,33 @@
     },
     "springSecurity.checkPathPatterns": {
       "type": "boolean",
-      "title": "Check explicit PathPatternRequestMatcher factory path syntax (implicit matcher strategy stays unresolved)",
+      "title": "Check PathPatternRequestMatcher path syntax",
+      "description": "Checks paths passed to PathPatternRequestMatcher factory methods. Plain requestMatchers(String) calls aren't checked, because their matcher type depends on the configuration.",
       "default": true
     },
     "springSecurity.checkDebug": {
       "type": "boolean",
-      "title": "Warn when security debug logging is enabled (@EnableWebSecurity(debug = true), WebSecurity.debug(true), <debug/>)",
+      "title": "Warn when security debug logging is enabled",
+      "description": "Flags @EnableWebSecurity(debug = true), WebSecurity.debug(true) and <debug/>.",
       "default": true
     },
     "springSecurity.checkBeanReferences": {
+      "title": "Report bean references no bean answers",
       "type": "boolean",
-      "title": "Report bean references (userDetailsServiceBeanName, @bean in security expressions, ref attributes of the security namespace) that no bean of the project answers (Info)",
-      "default": true
+      "default": true,
+      "description": "Report bean references (userDetailsServiceBeanName, @bean in security expressions, ref attributes of the security namespace) that no bean of the project answers (Info)"
     },
     "springSecurity.checkSelfInvocation": {
+      "title": "Warn about calls to secured methods in the same class",
       "type": "boolean",
-      "title": "Warn when a method protected by @PreAuthorize, @PostAuthorize, @PreFilter or @PostFilter is called from the same class (skips the proxy; wrong when method security uses AspectJ mode)",
-      "default": false
+      "default": false,
+      "description": "Warn when a method protected by @PreAuthorize, @PostAuthorize, @PreFilter or @PostFilter is called from the same class (skips the proxy; wrong when method security uses AspectJ mode)"
     },
     "springSecurity.matcherHover": {
+      "title": "Show hover for matcher declarations",
       "type": "boolean",
-      "title": "Show source hover for explicit known matcher declarations",
-      "default": true
+      "default": true,
+      "description": "Show source hover for explicit known matcher declarations"
     },
     "springSecurity.matcherInlays": {
       "type": "boolean",
@@ -36,13 +41,15 @@
       "default": true
     },
     "springSecurity.checkMigration": {
+      "title": "Warn about removed Spring Security 6 APIs",
       "type": "boolean",
-      "title": "Warn about source declarations of removed or deprecated Security configuration APIs (source advisories, framework version unresolved)",
-      "default": true
+      "default": true,
+      "description": "Warn about removed or deprecated Security configuration APIs in your sources, whatever Spring Security version the project uses."
     },
     "springSecurity.checkRolePrefixes": {
       "type": "boolean",
-      "title": "Warn about explicit ROLE_ prefixes in role-check literals (receiver and custom prefix semantics unresolved)",
+      "title": "Warn about ROLE_ prefixes in role checks",
+      "description": "Flags role names such as ROLE_ADMIN passed to hasRole and similar checks. A custom role prefix isn't taken into account.",
       "default": true
     },
     "springSecurity.checkPasswords": {
@@ -51,9 +58,10 @@
       "default": true
     },
     "springSecurity.checkExpressions": {
+      "title": "Check access expression syntax",
       "type": "boolean",
-      "title": "Check source-local Security XML access expression syntax and known function names (custom expression roots unresolved)",
-      "default": true
+      "default": true,
+      "description": "Check the syntax and function names of Security XML access expressions. Functions from custom expression roots aren't known."
     },
     "springSecurity.checkXmlAttributes": {
       "type": "boolean",

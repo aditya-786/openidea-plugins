@@ -89,6 +89,37 @@
         "label": "Processes",
         "icon": "run"
       }
+    ],
+    "sections": [
+      {
+        "id": "browse",
+        "label": "Browse",
+        "tabs": [
+          "symfony-about",
+          "symfony",
+          "symfony-templates",
+          "symfony-services",
+          "symfony-config",
+          "symfony-env",
+          "symfony-translations",
+          "twig-paths"
+        ]
+      },
+      {
+        "id": "data",
+        "label": "Data",
+        "tabs": [
+          "symfony-entities"
+        ]
+      },
+      {
+        "id": "run",
+        "label": "Run",
+        "tabs": [
+          "symfony-profiler",
+          "symfony-processes"
+        ]
+      }
     ]
   },
   "context_buttons": {

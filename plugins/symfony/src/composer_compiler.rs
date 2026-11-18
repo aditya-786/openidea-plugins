@@ -41,7 +41,7 @@ pub(crate) fn actions(owner: &mut Main, doc: &Document) -> Vec<FileAction> {
         },
     );
     vec![FileAction {
-        title: "Create reviewed compiler-pass class from Composer PSR4…".into(),
+        title: "Create Compiler Pass Class…".into(),
         kind: Some("refactor.rewrite".into()),
         data: Some(key),
         ..FileAction::default()
@@ -138,7 +138,7 @@ pub(crate) fn resolve(
         .get(&pending.root)
         .is_some_and(|i| i.classes.keys().any(|c| c.eq_ignore_ascii_case(&fqcn)))
     {
-        return Err("A cached class already owns this name.".into());
+        return Err("A class with this name already exists. Choose another name.".into());
     }
     let target = format!("{}/{directory}/{name}.php", pending.root);
     crate::file_actions::vacant(&project, &target, &pending.root)?;
@@ -151,10 +151,9 @@ pub(crate) fn resolve(
         .replace("$END$", "")
         .replace('\n', intentions::eol_of(&doc.text));
     let preview = format!(
-        "Source: {}\nVersion: {}\nTarget: {target}\nClass: {fqcn}\n\nExact compiler-pass file:\n{text}\nOne atomic non-overwriting Create/Open. No fabricated services, automatic Kernel registration or framework/runtime resolution.",
-        doc.path, doc.version
+        "Creates {target} (class {fqcn}) and opens it.\nRegister the pass in your Kernel yourself; this doesn't.\nDelete the file to undo.\n\n{text}"
     );
-    if !ui_kit::prompts::confirm_exact("Create compiler-pass class?", &preview)? {
+    if !ui_kit::prompts::confirm_exact(&format!("Create compiler pass {name}?"), &preview)? {
         return Err(Error::Cancelled);
     }
     current(owner, &pending, doc)?;

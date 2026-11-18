@@ -55,26 +55,6 @@ fn path(value: &str) -> Option<String> {
 fn inside(root: &str, file: &str) -> bool {
     file.starts_with(&format!("{}/", root.trim_end_matches('/')))
 }
-fn balanced(text: &str) -> bool {
-    let mut stack = Vec::new();
-    for token in java::tokens(text) {
-        if token.s.starts_with('"') && (!token.s.ends_with('"') || token.s.len() < 2) {
-            return false;
-        }
-        match token.s {
-            "(" => stack.push(")"),
-            "[" => stack.push("]"),
-            "{" => stack.push("}"),
-            ")" | "]" | "}" => {
-                if stack.pop() != Some(token.s) {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    stack.is_empty()
-}
 fn annotation_namespace(file: &JavaFile, text: &str, annotation: &java::Annotation) -> Option<String> {
     let tokens = java::tokens(&text[annotation.at..annotation.name_at + annotation.name.len()]);
     let mut names = &tokens[1..];
@@ -265,7 +245,7 @@ fn graph_fields(file:&JavaFile,ty:&java::TypeDecl,text:&str,namespace:&str,kotli
 }
 
 fn entity(doc: &Document, selection: Range) -> Option<Entity> {
-    if doc.text.len() > MAX_TEXT || !matches!(doc.language.as_str(), "java" | "kotlin") || !balanced(&doc.text) {
+    if doc.text.len() > MAX_TEXT || !matches!(doc.language.as_str(), "java" | "kotlin") || !spring_text::text::balanced(&doc.text, is_kotlin(&doc.path)) {
         return None;
     }
     let kotlin = is_kotlin(&doc.path);
@@ -410,7 +390,7 @@ fn insert_finder(project:&openidea_plugin::Project,pending:&Pending,directory:&s
     let name=name.trim();if !identifier(name)||name==pending.entity.name{return Err("Choose an existing repository type name in this source package.".into());}
     let kotlin=is_kotlin(&doc.path);let target=format!("{directory}/{name}.{}",if kotlin{"kt"}else{"java"});
     let text=project.read_file(&target)?;
-    if text.len()>MAX_TEXT||!balanced(&text){return Err("Existing repository is oversized or structurally incomplete.".into());}
+    if text.len()>MAX_TEXT||!spring_text::text::balanced(&text, kotlin){return Err("Existing repository is oversized or structurally incomplete.".into());}
     if kotlin && java::tokens(&text).windows(2).any(|tokens|tokens[0].s=="as"&&tokens[1].is_ident()){return Err("Aliased or transformed Kotlin repository identities require explicit semantic ownership; no method was inserted.".into());}
     let file=parse_source(&target,&text);
     let [repository]=file.types.as_slice() else{return Err("Existing-repository insertion requires one directly declared interface.".into());};
@@ -424,7 +404,7 @@ fn insert_finder(project:&openidea_plugin::Project,pending:&Pending,directory:&s
     let header=&text[repository.at+repository.name.len()..close];
     if header.trim_start().starts_with('<')||file.types.iter().any(|t|matches!(t.name.as_str(),"org"|"java"|"kotlin")){return Err("Generic or namespace-shadowed repository declarations are outside insertion scope.".into());}
     let options=pending.entity.projection.iter().filter(|(name,_)|finder_method(name).is_some()).map(|(name,_)|name.as_str()).collect::<Vec<_>>().join(", ");
-    let Some(selected)=host::input(&format!("Finder criteria (property[:Operator], at most8; source properties: {options})"),None)? else{return Err(Error::Cancelled);};
+    let Some(selected)=host::input(&format!("Finder criteria: property or property:Operator (up to 8). Properties: {options}"),None)? else{return Err(Error::Cancelled);};
     let(method,params)=predicate_finder(&pending.entity.projection,&selected,kotlin)?;
     if repository.members.iter().any(|m|m.name==method){return Err("This repository already declares a method with that name; no overload is inserted.".into());}
     let params=params.iter().map(|(name,ty)|if kotlin{format!("{name}: {ty}")}else{format!("{ty} {name}")}).collect::<Vec<_>>().join(", ");
@@ -468,7 +448,7 @@ impl FileActions for DataTools {
         kinds.into_iter().map(|(label, repository)| {
             let token = format!("repository:{next}:{label}:{}:{}:{}", doc.version, entity.at, entity.name);
             self.generation.pending.insert(token.clone(), Pending { root: root.clone(), doc: doc.clone(), entity: entity.clone(), repository: repository.into() });
-            FileAction { title: if repository=="insert-finder"{format!("Add finder to existing JpaRepository for {}…",entity.name)}else{format!("Generate {label} for {}…", entity.name)}, kind: Some("refactor.rewrite".into()), data: Some(token), ..FileAction::default() }
+            FileAction { title: if repository=="insert-finder"{format!("Add finder to existing JpaRepository for {}…",entity.name)}else{format!("Generate {} for {}…", plain_kind(label), entity.name)}, kind: Some("refactor.rewrite".into()), data: Some(token), ..FileAction::default() }
         }).collect()
     }
 
@@ -517,7 +497,7 @@ impl FileActions for DataTools {
             else {format!("package {};\n\npublic interface {name} extends org.springframework.data.jpa.repository.JpaRepository<{domain}, {id}>, org.springframework.data.jpa.repository.JpaSpecificationExecutor<{domain}> {{\n}}\n",pending.entity.package)}
         } else if matches!(pending.repository.as_str(), "finder-repository"|"paged-finder-repository"|"sorted-finder-repository") {
             let options=pending.entity.projection.iter().filter(|(name,_)|finder_method(name).is_some()).map(|(name,_)|name.as_str()).collect::<Vec<_>>().join(", ");
-            let Some(selected)=host::input(&format!("Finder criteria (property or property:Operator; comma-separated, at most 8; choose from: {options}). Operators: Equals/Not/In/NotIn/IsNull/IsNotNull; String Like/Containing/StartingWith/EndingWith; numeric comparisons/Between; Boolean True/False.",),None)? else{return Err(Error::Cancelled);};
+            let Some(selected)=host::input(&format!("Finder criteria: property or property:Operator, separated by commas (up to 8). Properties: {options}",),None)? else{return Err(Error::Cancelled);};
             let (method,fields)=predicate_finder(&pending.entity.projection,&selected,kotlin)?;
             let mut params=fields.iter().map(|(property,ty)|if kotlin{format!("{property}: {ty}")}else{format!("{ty} {property}")}).collect::<Vec<_>>().join(", ");
             let domain=&pending.entity.name;let id=&pending.entity.id;
@@ -601,6 +581,21 @@ impl FileActions for DataTools {
     }
 }
 
+fn plain_kind(label: &str) -> &str {
+    match label {
+        "CrudRepository" => "CRUD repository",
+        "JpaRepository" => "JPA repository",
+        "JpaRepositoryWithSpecifications" => "repository with specifications",
+        "JpaRepositoryWithFinder" => "repository with finder",
+        "JpaRepositoryWithPagedFinder" => "repository with paged finder",
+        "JpaRepositoryWithSortedFinder" => "repository with sorted finder",
+        "JpaRepositoryWithEntityGraph" => "repository with entity graph",
+        "IdentifierProjection" => "ID projection",
+        "InterfaceProjection" => "interface projection",
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,7 +644,7 @@ mod tests {
 
     #[test]
     fn specification_repository_is_a_reviewed_jpa_only_parent_variant(){
-        let(host,mut plugin,doc)=setup(SOURCE);let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate JpaRepositoryWithSpecifications")).unwrap();approve(&host,"UserSpecifications");let resolved=plugin.resolve_file_action(&doc,pending).unwrap();assert!(created(&resolved).1.contains("JpaRepository<User, java.lang.Long>, org.springframework.data.jpa.repository.JpaSpecificationExecutor<User>"));
+        let(host,mut plugin,doc)=setup(SOURCE);let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate repository with specifications")).unwrap();approve(&host,"UserSpecifications");let resolved=plugin.resolve_file_action(&doc,pending).unwrap();assert!(created(&resolved).1.contains("JpaRepository<User, java.lang.Long>, org.springframework.data.jpa.repository.JpaSpecificationExecutor<User>"));
     }
 
     #[test]
@@ -664,10 +659,10 @@ mod tests {
     #[test]
     fn derived_finder_repository_uses_one_known_scalar_property_without_path_transformation() {
         let text=SOURCE.replace("private long id;","private long id; String name; String postal_code;");let(host,mut plugin,doc)=setup(&text);
-        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate JpaRepositoryWithFinder")).unwrap();
+        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate repository with finder")).unwrap();
         host.answer_next_prompt(Some(&["UserFinder"]));host.answer_next_prompt(Some(&["name"]));host.answer_next_prompt(Some(&[]));let resolved=plugin.resolve_file_action(&doc,pending).unwrap();
         assert!(created(&resolved).1.contains("java.util.List<User> findByName(java.lang.String name);"));
-        for selected in ["other","postal_code","name.other"] {let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate JpaRepositoryWithFinder")).unwrap();host.answer_next_prompt(Some(&["UserFinder"]));host.answer_next_prompt(Some(&[selected]));assert!(plugin.resolve_file_action(&doc,pending).is_err());}
+        for selected in ["other","postal_code","name.other"] {let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate repository with finder")).unwrap();host.answer_next_prompt(Some(&["UserFinder"]));host.answer_next_prompt(Some(&[selected]));assert!(plugin.resolve_file_action(&doc,pending).is_err());}
     }
 
     #[test]
@@ -676,11 +671,11 @@ mod tests {
         assert_eq!(predicate_finder(&properties,"id,ageGreaterThan",false).unwrap().0,"findByIdIsAndAgeGreaterThanIs");
         assert!(predicate_finder(&properties,"firstAndLast,name",false).is_err());
         let text=SOURCE.replace("private long id;","private long id; String name; int age;");let(host,mut plugin,doc)=setup(&text);
-        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate JpaRepositoryWithFinder")).unwrap();
+        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate repository with finder")).unwrap();
         host.answer_next_prompt(Some(&["UserFinder"]));host.answer_next_prompt(Some(&["name,age"]));host.answer_next_prompt(Some(&[]));
         let resolved=plugin.resolve_file_action(&doc,pending).unwrap();
         assert!(created(&resolved).1.contains("findByNameAndAge(java.lang.String name, java.lang.Integer age)"));
-        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate JpaRepositoryWithFinder")).unwrap();
+        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate repository with finder")).unwrap();
         host.answer_next_prompt(Some(&["UserFinder"]));host.answer_next_prompt(Some(&["name,name"]));assert!(plugin.resolve_file_action(&doc,pending).is_err());
     }
     #[test]
@@ -691,7 +686,7 @@ mod tests {
             ("JpaRepositoryWithSortedFinder", "sort", "java.util.List<User> findBySort(java.lang.String sort, org.springframework.data.domain.Sort sort_);"),
         ] {
             let(host,mut plugin,doc)=setup(&text);
-            let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with(&format!("Generate {kind}"))).unwrap();
+            let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with(&format!("Generate {} for", plain_kind(kind)))).unwrap();
             host.answer_next_prompt(Some(&["UserFinder"]));host.answer_next_prompt(Some(&[selected]));host.answer_next_prompt(Some(&[]));
             let resolved=plugin.resolve_file_action(&doc,pending).unwrap();assert!(created(&resolved).1.contains(expected));
         }
@@ -706,7 +701,7 @@ mod tests {
         assert_eq!(predicate_finder(&fields,"name:IsNull",false).unwrap().1.len(),0);
         for criteria in ["name:Between","age:Containing","name:True","age:Regex","age:Equals,age:Not","foreign:Equals"]{assert!(predicate_finder(&fields,criteria,false).is_err(),"{criteria}");}
         let(host,mut plugin,doc)=setup(&SOURCE.replace("private long id;","private long id; int age; String name;"));
-        let action=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate JpaRepositoryWithFinder")).unwrap();
+        let action=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate repository with finder")).unwrap();
         host.answer_next_prompt(Some(&["UserFinder"]));host.answer_next_prompt(Some(&["age:Between,name:Containing"]));host.answer_next_prompt(Some(&[]));
         assert!(created(&plugin.resolve_file_action(&doc,action).unwrap()).1.contains("findByAgeBetweenAndNameContaining(java.lang.Integer ageLower, java.lang.Integer ageUpper, java.lang.String name)"));
     }
@@ -753,13 +748,13 @@ mod tests {
     fn entity_graph_repository_uses_only_selected_direct_source_associations() {
         let text=SOURCE.replace("private long id;","private long id; @jakarta.persistence.OneToMany java.util.List<Order> orders; @vendor.OneToOne Object foreign;");
         let (host,mut plugin,doc)=setup(&text);
-        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate JpaRepositoryWithEntityGraph")).unwrap();
+        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate repository with entity graph")).unwrap();
         host.answer_next_prompt(Some(&["UserGraphRepository"]));host.answer_next_prompt(Some(&["orders"]));host.answer_next_prompt(Some(&[]));
         let resolved=plugin.resolve_file_action(&doc,pending).unwrap();let (_,generated)=created(&resolved);
         assert!(generated.contains("@org.springframework.data.jpa.repository.EntityGraph(attributePaths = {\"orders\"})"));
         assert!(generated.contains("java.util.Optional<User> findById(java.lang.Long id);"));assert!(!generated.contains("foreign"));
         for selected in ["foreign","orders,orders","orders.nested"] {
-            let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate JpaRepositoryWithEntityGraph")).unwrap();
+            let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate repository with entity graph")).unwrap();
             host.answer_next_prompt(Some(&["UserGraphRepository"]));host.answer_next_prompt(Some(&[selected]));assert!(plugin.resolve_file_action(&doc,pending).is_err());
         }
     }
@@ -768,12 +763,12 @@ mod tests {
     fn chosen_interface_projection_uses_only_admitted_source_properties() {
         let text=SOURCE.replace("private long id;","private long id; private String name; private boolean active; @jakarta.persistence.Transient String secret; Object unknown;");
         let (host,mut plugin,doc)=setup(&text);
-        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate InterfaceProjection")).unwrap();
+        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate interface projection")).unwrap();
         host.answer_next_prompt(Some(&["UserSummary"]));host.answer_next_prompt(Some(&["name, active"]));host.answer_next_prompt(Some(&[]));
         let resolved=plugin.resolve_file_action(&doc,pending).unwrap();
         assert_eq!(created(&resolved).1,"package com.acme;\n\npublic interface UserSummary {\n    java.lang.String getName();\n    java.lang.Boolean getActive();\n}\n");
         for selection in ["secret","unknown","name,name","name,other"] {
-            let pending=plugin.file_actions(&doc,self::selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate InterfaceProjection")).unwrap();
+            let pending=plugin.file_actions(&doc,self::selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate interface projection")).unwrap();
             host.answer_next_prompt(Some(&["UserSummary"]));host.answer_next_prompt(Some(&[selection]));
             assert!(plugin.resolve_file_action(&doc,pending).is_err());
         }
@@ -783,7 +778,7 @@ mod tests {
         let host=MockHost::install().with_capabilities(&["project.read"]);
         let text="package com.acme\n@jakarta.persistence.Entity class User(@field:jakarta.persistence.Id val id: Long?, val name: String?)\n";
         let doc=Document {path:"/project/src/main/kotlin/com/acme/User.kt".into(),language:"kotlin".into(),text:text.into(),version:1};host.add_file("src/main/kotlin/com/acme/User.kt",text);
-        let mut plugin=DataTools::default();let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate InterfaceProjection")).unwrap();
+        let mut plugin=DataTools::default();let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate interface projection")).unwrap();
         host.answer_next_prompt(Some(&["UserSummary"]));host.answer_next_prompt(Some(&["name"]));host.answer_next_prompt(Some(&[]));
         let resolved=plugin.resolve_file_action(&doc,pending).unwrap();assert!(created(&resolved).1.contains("val name: kotlin.String?"));
     }
@@ -791,7 +786,7 @@ mod tests {
     #[test]
     fn identifier_projection_uses_proved_source_name_and_boxed_type() {
         let (host,mut plugin,doc)=setup(&SOURCE.replace("long id;","long accountKey;"));
-        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate IdentifierProjection")).unwrap();
+        let pending=plugin.file_actions(&doc,selection(&doc)).into_iter().find(|a|a.title.starts_with("Generate ID projection")).unwrap();
         approve(&host,"UserIdentifier");let resolved=plugin.resolve_file_action(&doc,pending).unwrap();
         assert_eq!(created(&resolved).1,"package com.acme;\n\npublic interface UserIdentifier {\n    java.lang.Long getAccountKey();\n}\n");
     }
@@ -803,7 +798,7 @@ mod tests {
         let source=Document {path:"/project/src/main/kotlin/com/acme/User.kt".into(),language:"kotlin".into(),text:text.into(),version:1};
         host.add_file("src/main/kotlin/com/acme/User.kt",text);
         let mut plugin=DataTools::default();
-        let pending=plugin.file_actions(&source,selection(&source)).into_iter().find(|a|a.title.starts_with("Generate IdentifierProjection")).unwrap();
+        let pending=plugin.file_actions(&source,selection(&source)).into_iter().find(|a|a.title.starts_with("Generate ID projection")).unwrap();
         approve(&host,"UserIdentifier");let resolved=plugin.resolve_file_action(&source,pending).unwrap();
         assert_eq!(created(&resolved).1,"package com.acme\n\ninterface UserIdentifier {\n    val key: kotlin.Long\n}\n");
         let java="package com.acme; @jakarta.persistence.Entity class User { @jakarta.persistence.Id public java.lang.String getURL(){return null;} }";
@@ -815,7 +810,7 @@ mod tests {
         let (host, mut plugin, doc) = setup(SOURCE);
         let actions = plugin.file_actions(&doc, selection(&doc));
         assert_eq!(actions.len(), 9);
-        let pending = actions.into_iter().find(|a| a.title.starts_with("Generate JpaRepository")).unwrap();
+        let pending = actions.into_iter().find(|a| a.title.starts_with("Generate JPA repository")).unwrap();
         approve(&host,"UserJpaRepository");
         let resolved = plugin.resolve_file_action(&doc,pending).unwrap();
         let (target,text) = created(&resolved);

@@ -946,7 +946,7 @@ pub fn run(ctx: &Invocation, arg: Option<&str>) -> Result<(), Error> {
         let choices = lenses(&doc);
         if choices.is_empty() {
             return Err(Error::Failed(
-                "No admitted literal Feign client request is declared in this source.".into(),
+                "No Feign client request found in this file. Put the cursor in an @FeignClient interface with a mapped method.".into(),
             ));
         }
         if choices.len() == 1 {
@@ -969,7 +969,7 @@ pub fn run(ctx: &Invocation, arg: Option<&str>) -> Result<(), Error> {
     let value = serde_json::from_str::<serde_json::Value>(&argument).map_err(|_| Error::Stale)?;
     let (doc, request, root) = current(ctx, &value)?;
     let Some(base) = host::input(
-        "Reviewed Feign target origin",
+        "Feign target URL (scheme, host and port)",
         Some(request.origin.as_deref().unwrap_or(crate::DEFAULT_BASE_URL)),
     )?
     else {
@@ -986,7 +986,7 @@ pub fn run(ctx: &Invocation, arg: Option<&str>) -> Result<(), Error> {
     let mut headers = request.headers.clone();
     let mut body = None;
     for binding in &request.bindings {
-        let title = format!("Reviewed Feign {} sample: {}", binding.kind, binding.name);
+        let title = format!("Sample {} value for {}", binding.kind, binding.name);
         let default = if binding.kind == "body" {
             "{}"
         } else {
@@ -1059,7 +1059,7 @@ pub fn run(ctx: &Invocation, arg: Option<&str>) -> Result<(), Error> {
             && serde_json::from_str::<serde_json::Value>(body.as_ref().unwrap()).is_err()
         {
             return Err(Error::Invalid(
-                "The reviewed JSON body sample is not valid JSON.".into(),
+                "The sample body is not valid JSON.".into(),
             ));
         }
         headers.insert("content-type".into(), ("Content-Type".into(), content_type));
@@ -1128,7 +1128,7 @@ pub fn run(ctx: &Invocation, arg: Option<&str>) -> Result<(), Error> {
     }
     match project.write_file(&path, &content) {
         Ok(()) => host::open_location(&path, 0, 0),
-        Err(Error::Denied(_)) => host::copy_to_clipboard(&content),
+        Err(Error::Denied(_)) => crate::copy_after_write_denied(&content),
         Err(error) => Err(error),
     }
 }

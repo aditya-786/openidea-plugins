@@ -227,7 +227,7 @@ fn directive_opens(text: &str, directive: &Directive) -> Result<Option<&'static 
     let parts=argument_parts(text,args).ok_or(())?;
     if first_string(text,args).is_none() || !(1..=2).contains(&parts.len()) {return Err(());}
     let captures=if parts.len()==1 {true} else {
-        let part=&parts[1];let lexer=Lexer{text,bytes:text.as_bytes(),out:Lexed::default()};
+        let part=&parts[1];let lexer=Lexer{text,bytes:text.as_bytes(),out:Lexed::default(),in_tag:false};
         let from=argument_trivia_end(&lexer,part.start,part.end).ok_or(())?;
         let null_end=from+4;
         if text.get(from..null_end).is_some_and(|s|s.eq_ignore_ascii_case("null"))
@@ -283,6 +283,7 @@ struct Lexer<'a> {
     text: &'a str,
     bytes: &'a [u8],
     out: Lexed,
+    in_tag: bool,
 }
 
 fn is_identifier_start(b: u8) -> bool {
@@ -299,7 +300,7 @@ fn is_php_identifier_start(byte: u8) -> bool {is_identifier_start(byte) || byte>
 fn is_php_identifier(byte: u8) -> bool {is_identifier(byte) || byte>=0x80}
 
 fn lex(text: &str) -> Lexed {
-    let mut lexer = Lexer { text, bytes: text.as_bytes(), out: Lexed::default() };
+    let mut lexer = Lexer { text, bytes: text.as_bytes(), out: Lexed::default(), in_tag: false };
     lexer.markup();
     lexer.out
 }
@@ -345,6 +346,13 @@ impl Lexer<'_> {
 
     /// `<name attr="value" …>`, with Blade anywhere in it.
     fn element(&mut self, start: usize) -> usize {
+        self.in_tag = true;
+        let end = self.element_body(start);
+        self.in_tag = false;
+        end
+    }
+
+    fn element_body(&mut self, start: usize) -> usize {
         let mut i = start + 1;
         while i < self.bytes.len() && (is_identifier(self.bytes[i]) || matches!(self.bytes[i], b'/' | b'!' | b'-' | b':' | b'.')) {
             i += 1;
@@ -514,8 +522,7 @@ impl Lexer<'_> {
 
         if !is_directive(name) {
             let tail=self.text[name_end..].trim_start();
-            let in_tag=self.text[..at].rfind('<').is_some_and(|open|self.text[..at].rfind('>').is_none_or(|close|open>close));
-            if tail.starts_with(['=','.',':']) || in_tag&&!tail.starts_with('(') {return None;}
+                        if tail.starts_with(['=','.',':']) || self.in_tag&&!tail.starts_with('(') {return None;}
         }
 
         // CSS/Tailwind at-rules share Blade's @ spelling and remain CSS text.
@@ -722,13 +729,13 @@ impl Lexer<'_> {
     }
 }
 
-fn line_of(text: &str, at: usize) -> u32 {
-    text[..at].bytes().filter(|b| *b == b'\n').count() as u32
+fn line_of(line_starts: &[usize], at: usize) -> u32 {
+    line_starts.partition_point(|start| *start <= at) as u32 - 1
 }
 
 // Split only top-level commas; PHP comments/strings cannot invent argument roles.
 fn argument_parts(text: &str, arguments: &Range<usize>) -> Option<Vec<Range<usize>>> {
-    let lexer=Lexer{text,bytes:text.as_bytes(),out:Lexed::default()};
+    let lexer=Lexer{text,bytes:text.as_bytes(),out:Lexed::default(),in_tag:false};
     let mut parts=Vec::new();let mut stack=Vec::new();let mut from=arguments.start;let mut i=from;
     while i<arguments.end {
         if let Some(end)=lexer.argument_atom_end(i,arguments.end).ok()? {i=end;continue;}
@@ -759,7 +766,7 @@ fn argument_trivia_end(lexer: &Lexer<'_>, mut at: usize, limit: usize) -> Option
 /// One complete ordinary literal first argument, with an exact source span.
 fn first_string(text: &str, arguments: &Range<usize>) -> Option<Range<usize>> {
     let parts=argument_parts(text,arguments)?;let first=parts.first()?;
-    let lexer=Lexer{text,bytes:text.as_bytes(),out:Lexed::default()};
+    let lexer=Lexer{text,bytes:text.as_bytes(),out:Lexed::default(),in_tag:false};
     let from=argument_trivia_end(&lexer,first.start,first.end)?;
     if !matches!(lexer.bytes.get(from),Some(b'\''|b'"')) {return None;}
     let end=lexer.argument_atom_end(from,first.end).ok()??;
@@ -783,6 +790,7 @@ struct Open {
 /// Structure-view symbols (sections, pushes) and folds (directive pairs, comments).
 fn structure(text: &str) -> (Vec<Symbol>, Vec<Fold>) {
     let lexed = lex(text);
+    let line_starts: Vec<usize> = std::iter::once(0).chain(text.match_indices('\n').map(|(at, _)| at + 1)).collect();
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut folds = Vec::new();
     let mut open: Vec<Open> = Vec::new();
@@ -795,7 +803,7 @@ fn structure(text: &str) -> (Vec<Symbol>, Vec<Fold>) {
             let opened = open.remove(at);
             open.truncate(at);
 
-            let (start_line, end_line) = (line_of(text, opened.start), line_of(text, directive.range.start));
+            let (start_line, end_line) = (line_of(&line_starts, opened.start), line_of(&line_starts, directive.range.start));
             if end_line > start_line {
                 folds.push(Fold { start_line, end_line, kind: FoldKind::Region });
             }
@@ -825,7 +833,7 @@ fn structure(text: &str) -> (Vec<Symbol>, Vec<Fold>) {
     }
 
     for comment in &lexed.comments {
-        let (start_line, end_line) = (line_of(text, comment.start), line_of(text, comment.end));
+        let (start_line, end_line) = (line_of(&line_starts, comment.start), line_of(&line_starts, comment.end));
         if end_line > start_line {
             folds.push(Fold { start_line, end_line, kind: FoldKind::Comment });
         }
@@ -849,8 +857,6 @@ mod tests {
     }
 
     fn publish(host: &MockHost, event: Event) {
-        Blade.handle_events(std::slice::from_ref(&event), &host.invocation());
-
         if let Event::FileOpened(path) | Event::FileSaved(path) = event {
             let project = host::project_of(&path).unwrap();
             let text = project.read_file(&path).unwrap();

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Log Levels</title>
+    <link rel="stylesheet" href="./resources/tokens.css" />
+    <link rel="stylesheet" href="./resources/components.css" />
+    <link rel="stylesheet" href="./levels.css" />
+  </head>
+  <body class="ui-embedded-panel">
+    <header class="levels-format ui-toolbar">
+      <span id="format" role="status" aria-live="polite"></span>
+      <button id="patterns" type="button" class="ui-link">Formats and Highlighting</button>
+    </header>
+    <p id="empty" class="ui-empty" hidden></p>
+    <table id="levels" class="levels" aria-label="Log events by level">
+      <tbody>
+        <tr data-level="error"><th scope="row"><span data-ui-icon="error" data-ui-icon-size="16"></span>Errors</th><td data-count></td><td><button type="button" class="ui-button ui-icon-button" data-forward="false" aria-label="Previous error"><span data-ui-icon="chevron-up" data-ui-icon-size="16"></span></button><button type="button" class="ui-button ui-icon-button" data-forward="true" aria-label="Next error"><span data-ui-icon="chevron-down" data-ui-icon-size="16"></span></button></td></tr>
+        <tr data-level="warning"><th scope="row"><span data-ui-icon="warning" data-ui-icon-size="16"></span>Warnings</th><td data-count></td><td><button type="button" class="ui-button ui-icon-button" data-forward="false" aria-label="Previous warning"><span data-ui-icon="chevron-up" data-ui-icon-size="16"></span></button><button type="button" class="ui-button ui-icon-button" data-forward="true" aria-label="Next warning"><span data-ui-icon="chevron-down" data-ui-icon-size="16"></span></button></td></tr>
+        <tr data-level="exception"><th scope="row"><span data-ui-icon="exception" data-ui-icon-size="16"></span>Exceptions</th><td data-count></td><td><button type="button" class="ui-button ui-icon-button" data-forward="false" aria-label="Previous exception"><span data-ui-icon="chevron-up" data-ui-icon-size="16"></span></button><button type="button" class="ui-button ui-icon-button" data-forward="true" aria-label="Next exception"><span data-ui-icon="chevron-down" data-ui-icon-size="16"></span></button></td></tr>
+        <tr data-level="info"><th scope="row"><span data-ui-icon="info" data-ui-icon-size="16"></span>Info</th><td data-count></td><td><button type="button" class="ui-button ui-icon-button" data-forward="false" aria-label="Previous info entry"><span data-ui-icon="chevron-up" data-ui-icon-size="16"></span></button><button type="button" class="ui-button ui-icon-button" data-forward="true" aria-label="Next info entry"><span data-ui-icon="chevron-down" data-ui-icon-size="16"></span></button></td></tr>
+        <tr data-level="debug"><th scope="row"><span data-ui-icon="bug" data-ui-icon-size="16"></span>Debug</th><td data-count></td><td><button type="button" class="ui-button ui-icon-button" data-forward="false" aria-label="Previous debug entry"><span data-ui-icon="chevron-up" data-ui-icon-size="16"></span></button><button type="button" class="ui-button ui-icon-button" data-forward="true" aria-label="Next debug entry"><span data-ui-icon="chevron-down" data-ui-icon-size="16"></span></button></td></tr>
+        <tr data-level="trace"><th scope="row"><span data-ui-icon="eye" data-ui-icon-size="16"></span>Trace</th><td data-count></td><td><button type="button" class="ui-button ui-icon-button" data-forward="false" aria-label="Previous trace entry"><span data-ui-icon="chevron-up" data-ui-icon-size="16"></span></button><button type="button" class="ui-button ui-icon-button" data-forward="true" aria-label="Next trace entry"><span data-ui-icon="chevron-down" data-ui-icon-size="16"></span></button></td></tr>
+        <tr data-level="entry"><th scope="row"><span data-ui-icon="file-log" data-ui-icon-size="16"></span>All entries</th><td data-count></td><td><button type="button" class="ui-button ui-icon-button" data-forward="false" aria-label="Previous entry"><span data-ui-icon="chevron-up" data-ui-icon-size="16"></span></button><button type="button" class="ui-button ui-icon-button" data-forward="true" aria-label="Next entry"><span data-ui-icon="chevron-down" data-ui-icon-size="16"></span></button></td></tr>
+      </tbody>
+    </table>
+    <p id="capped" class="levels-note" hidden></p>
+    <footer id="filter" class="levels-filter">
+      <label class="ui-field"><span>Show level</span>
+        <select id="level" class="ui-select">
+          <option value="">All levels</option>
+          <option value="error">Errors</option>
+          <option value="warning">Warnings</option>
+          <option value="info">Info</option>
+          <option value="debug">Debug</option>
+          <option value="trace">Trace</option>
+        </select>
+      </label>
+      <button id="snapshot" type="button" class="ui-link">Filter in snapshot</button>
+      <p class="levels-note">The editor cannot hide entries; the Log Snapshot table lists only the chosen level (logs up to 256 KiB).</p>
+    </footer>
+    <script src="./resources/native-icons.js"></script><script src="./resources/icons.js"></script><script src="./resources/widgets.js"></script><script src="./resources/controls.js"></script>
+    <script src="./levels.js"></script>
+  </body>
+</html>

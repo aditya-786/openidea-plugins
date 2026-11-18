@@ -1,7 +1,6 @@
 //! Reviewed API1.4 Run Targets. Distinct root-relative and experimental mapped project-root modes.
-use openidea_plugin::{
-    Error, FileKind, FileStat, Invocation, PickItem, PluginRunTarget, Project, host,
-};
+use openidea_plugin::host::storage;
+use openidea_plugin::{Error, FileKind, FileStat, Invocation, PickItem, PluginRunTarget, Project, host};
 use serde::{
     Deserialize,
     de::{self, MapAccess, SeqAccess, Visitor},
@@ -40,7 +39,7 @@ fn full_id(id: &str) -> bool {
 fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> {
     value[field]
         .as_str()
-        .ok_or_else(|| invalid("Required Docker identity field is missing or not text."))
+        .ok_or_else(|| invalid("Docker returned container details in an unexpected format."))
 }
 // Docker output is not trusted to select an owner through last-key-wins JSON semantics.
 struct Strict(Value);
@@ -99,21 +98,21 @@ impl<'de> Deserialize<'de> for Strict {
 }
 fn json(input: &str) -> Result<Value, Error> {
     if input.len() > MAX_OUTPUT {
-        return Err(invalid("Docker identity output exceeds 128 KiB."));
+        return Err(invalid("Docker returned more than 128 KiB of container details."));
     }
     serde_json::from_str::<Strict>(input)
         .map(|v| v.0)
-        .map_err(|_| invalid("Docker identity output must be valid, duplicate-free JSON."))
+        .map_err(|_| invalid("Docker returned container details that are not valid JSON."))
 }
 fn run(project: &Project, args: &[String]) -> Result<String, Error> {
     let out = project.run_process("docker", args, None)?;
     if out.status != Some(0) {
         return Err(invalid(
-            "Docker identity inspection failed; no Run Target registered.",
+            "Docker could not read the container, so nothing was registered. Check that Docker is running, then try again.",
         ));
     }
     if out.stdout.len() > MAX_OUTPUT {
-        return Err(invalid("Docker identity output exceeds 128 KiB."));
+        return Err(invalid("Docker returned more than 128 KiB of container details."));
     }
     Ok(out.stdout)
 }
@@ -136,14 +135,14 @@ fn endpoint(project: &Project) -> Result<String, Error> {
     let list = value
         .as_array()
         .filter(|a| a.len() == 1)
-        .ok_or_else(|| invalid("Exactly one Docker context is required."))?;
+        .ok_or_else(|| invalid("Docker did not report exactly one current context. Check docker context ls, then try again."))?;
     if list[0]["Name"].as_str() != Some(name) {
-        return Err(invalid("Docker context identity changed."));
+        return Err(invalid("The current Docker context changed while checking. Try again."));
     }
     let endpoint = text(&list[0]["Endpoints"]["docker"], "Host")?;
     if !endpoint.strip_prefix("unix://").is_some_and(absolute) {
         return Err(invalid(
-            "This prototype supports an explicit local Unix Docker endpoint only.",
+            "Run targets need a local Docker socket (unix://). Switch to a local context with docker context use, then try again.",
         ));
     }
     Ok(endpoint.into())
@@ -176,7 +175,7 @@ fn candidates(project: &Project, root: &str, endpoint: &str) -> Result<Vec<Strin
         let id = text(&value, "ID")?;
         if !full_id(id) || !ids.insert(id.to_owned()) || ids.len() > 256 {
             return Err(invalid(
-                "Docker candidate IDs are malformed, duplicate or exceed 256.",
+                "Docker listed unexpected container IDs, or more than 256 containers. Refresh and try again.",
             ));
         }
     }
@@ -204,14 +203,14 @@ fn identity(input: &str, root: &str, config: &str, id: &str) -> Result<Identity,
         || c["State"]["Dead"] != false
     {
         return Err(invalid(
-            "Container identity is not the selected, running stable container.",
+            "The selected container is not running, or is paused or restarting. Start it, then try again.",
         ));
     }
     if c["Config"]["Labels"]["devcontainer.local_folder"].as_str() != Some(root)
         || c["Config"]["Labels"]["devcontainer.config_file"].as_str() != Some(config)
     {
         return Err(invalid(
-            "Container labels do not exactly own this project and configuration.",
+            "This container was started for another project folder or configuration. Start the container from this project, then try again.",
         ));
     }
     let mounts = c["Mounts"]
@@ -223,13 +222,13 @@ fn identity(input: &str, root: &str, config: &str, id: &str) -> Result<Identity,
         .collect();
     if matches.len() != 1 {
         return Err(invalid(
-            "One exact read-write project bind mount is required.",
+            "The container must mount the project folder exactly once, read-write.",
         ));
     }
     let mount = text(matches[0], "Destination")?;
     if !absolute(mount) {
         return Err(invalid(
-            "The project bind destination is not an unambiguous absolute path.",
+            "The project folder is mounted at an unsupported path in the container.",
         ));
     }
     for other in mounts {
@@ -237,14 +236,13 @@ fn identity(input: &str, root: &str, config: &str, id: &str) -> Result<Identity,
             continue;
         }
         let destination = text(other, "Destination")?;
-        if !absolute(destination)
-            || destination == mount
-            || destination.starts_with(&format!("{mount}/"))
-            || mount.starts_with(&format!("{destination}/"))
-        {
-            return Err(invalid(
-                "Overlapping or unknown mounts mask the project bind.",
-            ));
+        if destination.starts_with(&format!("{mount}/")) && absolute(destination) {
+            continue;
+        }
+        if !absolute(destination) || destination == mount || mount.starts_with(&format!("{destination}/")) {
+            return Err(Error::Invalid(format!(
+                "The mount at {destination} hides the project folder {mount}. Remove that mount or move it below the project folder."
+            )));
         }
     }
     let user = text(&c["Config"], "User")?;
@@ -256,7 +254,7 @@ fn identity(input: &str, root: &str, config: &str, id: &str) -> Result<Identity,
         || started.chars().any(char::is_control)
     {
         return Err(invalid(
-            "Container default user/start identity is unsupported.",
+            "The container user or start time could not be read.",
         ));
     }
     Ok(Identity {
@@ -323,19 +321,19 @@ impl State {
         if let Some(prepared) = &self.prepared {
             if root.as_deref() != Some(prepared.plan.root.as_str()) {
                 return View::message(
-                    "Prepared target belongs to another project. No registration was changed.",
+                    "This registration belongs to another project. Nothing was changed.",
                 );
             }
             if prepared.at.elapsed() >= EXPIRY {
                 return View::message(
-                    "Prepared target expired. Prepare it again; no registration was changed.",
+                    "This registration expired. Prepare it again; nothing was changed.",
                 );
             }
             return View::new(Body::Form(vec![Field {
-                key: "review".into(), label: "Read-only prepared registration".into(),
+                key: "review".into(), label: "Registration to review".into(),
                 value: FieldValue::readonly_text(&prepared.plan.preview(), true),
-            }])).status("Prepared only; not registered. Register once checks this fresh view event's project, config and container.")
-                .button(Button::new(&format!("register:{}", prepared.nonce), "Register once"));
+            }])).status("Not registered yet. Registering checks the project, configuration and container again.")
+                .button(Button::new(&format!("register:{}", prepared.nonce), "Register"));
         }
         if let Some((owner, message)) = &self.status {
             if root.as_deref() == Some(owner.as_str()) {
@@ -343,7 +341,7 @@ impl State {
             }
             return View::message("Target status belongs to another project.");
         }
-        View::message("No prepared target. Prepare a reviewed root-relative Run Target first.")
+        View::message("Nothing to review. Run Dev Container: Register Container as Run Target first.")
     }
     pub(crate) fn commit(&mut self, ctx: &Invocation, key: &str) -> Result<(), Error> {
         let nonce = key.strip_prefix("register:").ok_or(Error::Stale)?;
@@ -365,20 +363,24 @@ impl State {
             }
             // This event has no second modal. The API does not atomically bind its
             // project snapshot through inspection/registration; no stronger claim.
+            remember(&prepared.plan)?;
             host::unregister_run_target(&project, prepared.plan.mode.id());
             withdrawn = true;
             host::register_run_target(&project, &prepared.plan.target())
         })();
         let message = match &result {
             Ok(()) => match prepared.plan.mode {
-                Mode::RootRelative => "Registered root-relative target snapshot. Select it explicitly in Run on; no container command has run.",
-                Mode::MappedProjectRoot => "Registered experimental mapped project-root tooling snapshot. On latest main eb72 or later, select it manually in project Language server targets. No selection changed and no container command has run.",
+                Mode::RootRelative => "Registered the Run target. Select it in Run on to use it; no container command has run.",
+                Mode::MappedProjectRoot => "Registered project-root tooling. Select it in the project's Language server targets to use it. Nothing was selected for you and no container command has run.",
+            }
+            Err(Error::Invalid(message)) if message == STORAGE_DENIED => {
+                "Not registered: run target registration needs the storage permission. Allow it in Settings › Plugins › Dev Container CLI."
             }
             Err(_) if withdrawn => {
-                "Registration failed after the prior slot was withdrawn. Prepare again; there is no target fallback."
+                "Registration failed after the previous target was removed. Prepare it again."
             }
             Err(_) => {
-                "Not registered: the prepared target no longer validates. The previous slot was left unchanged."
+                "Not registered: the container or configuration changed. The previous target is unchanged."
             }
         };
         self.status = Some((prepared.plan.root, message));
@@ -400,7 +402,7 @@ impl Plan {
     fn target(&self) -> PluginRunTarget {
         PluginRunTarget {
             id: self.mode.id().into(),
-            name: format!("Dev Container ({}, {})", match self.mode { Mode::RootRelative => "root-relative argv", Mode::MappedProjectRoot => "experimental mapped project-root tooling" }, &self.identity.id[..12]),
+            name: format!("Dev Container ({}, {})", match self.mode { Mode::RootRelative => "Run target", Mode::MappedProjectRoot => "project-root tooling" }, &self.identity.id[..12]),
             program: "docker".into(),
             args: prefixed(
                 &self.endpoint,
@@ -415,15 +417,18 @@ impl Plan {
         }
     }
     fn preview(&self) -> String {
-        if self.mode == Mode::MappedProjectRoot {
-            return format!("EXPERIMENTAL MAPPED PROJECT-ROOT TOOLING — separate target, fixed cwd.\n{}\nProject: {}\nConfiguration: {}\nExplicit endpoint: {}\nFull container ID: {}\nVerified RW bind: {} -> {}\nDefault User: {}\nStartedAt: {}\nProgram alias: docker (host checks current approved pin)\nExact argv prefix:\n{}\ncontainer_root: {}\nworkdir_args: []\ncommands: []\n\nDocker options precede the full container ID. stdin stays open (-i); no TTY or shell. Container cwd is ALWAYS the verified project bind root, even if a Run configuration requests another cwd. Outside/subdirectory cwd is NOT rejected. Host mapping translates project paths/argv; this is not general cwd parity or an execution sandbox.\n\nLSP requires latest upstream main eb72 or later: manually select this opaque target in PROJECT Language server targets and choose a server already installed inside this container. Registration NEVER changes languageServerTargets, run defaults or interpreter settings. Host may independently offer a recommendation; do not use its generic Use flow unless you intend its setting changes. Frozen main958 can register/link but does not implement this LSP route.\n\nNo automatic tool installation, env forwarding, remoteUser/session setup, general debugger or IDE backend claim. No per-launch Docker identity check. Remove/re-register after endpoint/container/config changes. Same-project windows share each mode slot; fresh-event inspection/registration is not atomic against window changes.",
-                "Modal approval PREPARES ONLY. Use fresh native Register once within 120 seconds. Cancel, foreign/replayed/expired event or failed validation preserves the prior mode slot; successful validation withdraws ONLY this mode's previous slot before registration, so host refusal then leaves no fallback.",
-                serde_json::to_string(&self.root).unwrap(), serde_json::to_string(&self.config).unwrap(), serde_json::to_string(&self.endpoint).unwrap(), self.identity.id,
-                serde_json::to_string(&self.root).unwrap(), serde_json::to_string(&self.identity.mount).unwrap(), serde_json::to_string(&self.identity.user).unwrap(), self.identity.started,
-                serde_json::to_string_pretty(&self.target().args).unwrap(), serde_json::to_string(&self.identity.mount).unwrap());
-        }
+        let (heading, ending) = match self.mode {
+            Mode::RootRelative => (
+                "Register this container as a Run target.",
+                "Run and Test commands will run inside the container from the project bind folder, with project-relative arguments and no shell. Select the target in Run on to use it.",
+            ),
+            Mode::MappedProjectRoot => (
+                "Register this container as project-root tooling.",
+                "Language servers and tools you select this target for will run inside the container from the project bind folder, with project paths mapped. Select the target in the project's Language server targets to use it.",
+            ),
+        };
         format!(
-            "Prepared review only; modal approval does NOT register or replace a target.\nRegister once in the native review view is a separate single-use action (expires after 120 seconds).\nPrevious slot stays unchanged on cancel, foreign/replayed/expired controls or failed validation. After successful validation, replacement withdraws the old slot first; host rejection then leaves no slot/fallback.\nProject: {}\nConfiguration label: {}\nExplicit Docker endpoint: {}\nFull container ID: {}\nVerified bind: {} -> {} (RW)\nContainer default User field: {}\nStartedAt: {}\nProgram alias: docker (host must verify its current approved executable pin)\nNative target argv prefix:\n{}\n\nSupported: command names and project-root-relative arguments; container working directory is ALWAYS the verified bind root. No shell is inserted. Native Run requires selecting this target explicitly.\n\nNOT supported: non-root cwd semantics, absolute host paths/classpaths, environment forwarding, remoteUser/session setup, debug, language servers or IDE backend. Host API cannot reject future unsupported arguments or re-inspect identity at every launch. Review each run configuration; remove/re-register after external container/endpoint changes. This is a registration snapshot, not a container trust sandbox. A fresh Register view event checks its issuing window project; later inspection/registration is not atomically guarded against window changes. Same-project windows share the target slot.",
+            "{heading}\n\nProject: {}\nConfiguration: {}\nDocker endpoint: {}\nContainer ID: {}\nProject bind: {} -> {} (read-write)\nContainer user: {}\nStarted at: {}\nCommand prefix:\n{}\n\n{ending}\n\nNothing runs now. If the container or its configuration changes, remove the target and register it again.",
             serde_json::to_string(&self.root).unwrap(),
             serde_json::to_string(&self.config).unwrap(),
             serde_json::to_string(&self.endpoint).unwrap(),
@@ -456,21 +461,53 @@ impl Plan {
         Ok(project)
     }
 }
-pub(crate) fn validate_running(root: &str) -> Result<(), String> {
+fn registration_key(root: &str, target_id: &str) -> String {
+    format!("run-target:{target_id}:{root}")
+}
+const STORAGE_DENIED: &str = "Run target registration needs the storage permission. Allow it in Settings › Plugins › Dev Container CLI.";
+fn remember(plan: &Plan) -> Result<(), Error> {
+    let value = serde_json::json!({"id": plan.identity.id, "endpoint": plan.endpoint, "config": plan.config}).to_string();
+    match storage::set(&registration_key(&plan.root, plan.mode.id()), &value) {
+        Err(Error::Denied(_)) => {
+            host::notify(openidea_plugin::NotificationLevel::Warning, "Dev Container", STORAGE_DENIED);
+            Err(Error::Invalid(STORAGE_DENIED.into()))
+        }
+        other => other,
+    }
+}
+fn stored_registration(saved: &str) -> Option<(String, String, String)> {
+    let value: Value = serde_json::from_str(saved).ok()?;
+    let id = value["id"].as_str()?;
+    let endpoint = value["endpoint"].as_str()?;
+    let config = value["config"].as_str()?;
+    let valid = full_id(id)
+        && endpoint.strip_prefix("unix://").is_some_and(absolute)
+        && absolute(config)
+        && !endpoint.starts_with('-')
+        && !config.starts_with('-');
+    valid.then(|| (id.into(), endpoint.into(), config.into()))
+}
+pub(crate) fn validate_running(root: &str, target_id: &str) -> Result<(), String> {
+    let refuse = |why: &str| format!("{why} Start the container, then register the target again.");
     let Some(project) = host::projects()
         .unwrap_or_default()
         .into_iter()
         .find(|p| p.root().is_ok_and(|r| r == root))
     else {
-        return Ok(());
+        return Err(refuse("The project is not open."));
     };
-    let Ok(containers) = endpoint(&project).and_then(|e| candidates(&project, root, &e)) else {
-        return Ok(());
+    let saved = match storage::get(&registration_key(root, target_id)) {
+        Ok(Some(saved)) => saved,
+        Ok(None) => return Err("Register the target again.".into()),
+        Err(Error::Denied(_)) => return Err(STORAGE_DENIED.into()),
+        Err(_) => return Err(refuse("The registered container could not be read.")),
     };
-    if containers.is_empty() {
-        return Err("The dev container is not running. Start it with Dev Container: Start first.".into());
-    }
-    Ok(())
+    let Some((id, endpoint, config)) = stored_registration(&saved) else {
+        return Err("Register the target again.".into());
+    };
+    inspect(&project, root, &config, &endpoint, &id)
+        .map(|_| ())
+        .map_err(|_| refuse("The registered container is not running, or Docker is not reachable."))
 }
 pub(crate) fn prepare(state: &mut State, ctx: &Invocation) -> Result<Option<String>, Error> {
     prepare_mode(state, ctx, Mode::RootRelative)
@@ -482,11 +519,11 @@ fn prepare_mode(state: &mut State, ctx: &Invocation, mode: Mode) -> Result<Optio
     let nonce = state.begin()?;
     let project = ctx
         .project()
-        .ok_or_else(|| invalid("Open an owned project before registering a target."))?;
+        .ok_or_else(|| invalid("Open a project before registering a target."))?;
     let root = project.root()?;
     if !absolute(&root) {
         return Err(invalid(
-            "Only an unambiguous absolute POSIX project root is supported.",
+            "Run targets need a project on a local Unix path (macOS or Linux).",
         ));
     }
     let Some(relative) = crate::configs::choose(&project, false)? else {
@@ -495,7 +532,7 @@ fn prepare_mode(state: &mut State, ctx: &Invocation, mode: Mode) -> Result<Optio
     let config = format!("{root}/{relative}");
     let stat = project.stat(&config)?;
     if stat.kind != FileKind::File || stat.size > crate::MAX_BYTES as u64 {
-        return Err(invalid("Configuration must be a bounded project file."));
+        return Err(invalid("The configuration must be a project file up to 256 KiB."));
     }
     let source = project.read_file(&config)?;
     if source.len() > crate::MAX_BYTES {
@@ -505,7 +542,7 @@ fn prepare_mode(state: &mut State, ctx: &Invocation, mode: Mode) -> Result<Optio
     let ids = candidates(&project, &root, &endpoint)?;
     if ids.is_empty() {
         return Err(invalid(
-            "No running full-ID container was found for this project.",
+            "No running dev container for this project. Start it with Dev Container: Start Container, then try again.",
         ));
     }
     let choices: Vec<_> = ids
@@ -513,11 +550,11 @@ fn prepare_mode(state: &mut State, ctx: &Invocation, mode: Mode) -> Result<Optio
         .map(|id| PickItem {
             key: id.clone(),
             label: format!("Container {}", &id[..12]),
-            description: Some("Candidate only; labels and exact mount are inspected next.".into()),
+            description: Some("Its labels and project folder mount are checked next.".into()),
         })
         .collect();
     let Some(id) = host::pick(
-        match mode { Mode::RootRelative => "Select project container for root-relative Run Target", Mode::MappedProjectRoot => "Select container for experimental mapped project-root tooling" },
+        match mode { Mode::RootRelative => "Select the container for the Run target", Mode::MappedProjectRoot => "Select the container for project-root tooling" },
         &choices,
     )?
     else {
@@ -540,11 +577,11 @@ fn prepare_mode(state: &mut State, ctx: &Invocation, mode: Mode) -> Result<Optio
     let preview = plan.preview();
     if preview.len() > 16 * 1024 {
         return Err(invalid(
-            "Exact target preview exceeds the host 16 KiB confirmation limit.",
+            "The registration details exceed the 16 KiB confirmation limit.",
         ));
     }
     if !host::confirm(
-        match mode { Mode::RootRelative => "Prepare root-relative Dev Container target review (not registration)", Mode::MappedProjectRoot => "Prepare experimental mapped project-root tooling (not registration)" },
+        match mode { Mode::RootRelative => "Review Run target registration", Mode::MappedProjectRoot => "Review project-root tooling registration" },
         &preview,
     )? {
         return Ok(None);
@@ -558,7 +595,7 @@ fn prepare_mode(state: &mut State, ctx: &Invocation, mode: Mode) -> Result<Optio
     }
     host::refresh_view(REVIEW);
     Ok(Some(
-        "Prepared only; no target was registered. Review it and use Register once.".into(),
+        "Nothing is registered yet. Review it and choose Register.".into(),
     ))
 }
 
@@ -619,16 +656,70 @@ mod tests {
         main.run_command("register-mapped-tooling-target", &host.invocation(), None).unwrap();
         format!("register:{}", main.run_target.prepared.as_ref().unwrap().nonce)
     }
+    const RUNNING_ROW: &str = r#"{"ID":"CID","Names":"app","State":"running"}"#;
+    fn registered(host: &MockHost) {
+        remember(&plan(host)).unwrap();
+    }
     #[test]
-    fn validation_refuses_when_no_running_container_and_allows_otherwise() {
+    fn validate_accepts_the_registered_running_container() {
         let host = setup();
-        assert!(validate_running("/work/app").is_ok());
-        host.on_process("docker",|args,_|match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice(){
-            ["context","show"]=>ok("desktop-linux\n"),
-            ["context","inspect","desktop-linux"]=>ok(r#"[{"Name":"desktop-linux","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]"#),
-            _=>ok(""),
-        });
-        assert!(validate_running("/work/app").unwrap_err().contains("not running"));
+        registered(&host);
+        validate_running("/work/app", ID).unwrap();
+        assert_eq!(host.process_runs().len(), 1);
+    }
+    #[test]
+    fn validate_refuses_stale_container_id() {
+        let host = setup();
+        registered(&host);
+        host.on_process("docker", |_, _| Ok(ProcessOutput { status: Some(1), stdout: String::new(), stderr: "No such container".into() }));
+        assert!(validate_running("/work/app", ID).is_err());
+    }
+    #[test]
+    fn validate_refuses_when_docker_down() {
+        let host = setup();
+        registered(&host);
+        host.on_process("docker", |_, _| Err(Error::Invalid("cannot connect to the Docker daemon".into())));
+        assert!(validate_running("/work/app", ID).is_err());
+    }
+    #[test]
+    fn validate_refuses_without_a_registration() {
+        let host = setup();
+        assert!(validate_running("/work/app", ID).is_err());
+        assert!(host.process_runs().is_empty());
+    }
+    #[test]
+    fn denied_storage_fails_registration_and_validation_clearly() {
+        let host = setup();
+        let mut main = crate::Main::default();
+        let key = draft(&host, &mut main);
+        let host = host.with_capabilities(&["project.read", "process:docker"]);
+        assert!(main.handle(REVIEW, ViewEvent::Button(key), &host.invocation()).is_err());
+        assert!(main.run_target.status.as_ref().unwrap().1.contains("needs the storage permission"));
+        assert_eq!(STORAGE_DENIED, ui_kit::denied::message("Run target registration", "storage", "Dev Container CLI"));
+        assert!(host.run_targets().is_empty());
+        assert!(host.notifications().iter().any(|n| n.body == STORAGE_DENIED));
+        assert!(validate_running("/work/app", ID).unwrap_err() == STORAGE_DENIED);
+    }
+    #[test]
+    fn validate_refuses_malformed_stored_registration() {
+        let host = setup();
+        for value in [
+            "{\"id\":\"-x\",\"endpoint\":\"unix:///var/run/docker.sock\",\"config\":\"/work/app/c.json\"}".to_string(),
+            format!("{{\"id\":\"{CID}\",\"endpoint\":\"unix:///a\\n--x\",\"config\":\"/work/app/c.json\"}}"),
+            "legacy".to_string(),
+        ] {
+            storage::set(&registration_key("/work/app", ID), &value).unwrap();
+            assert_eq!(validate_running("/work/app", ID).unwrap_err(), "Register the target again.");
+        }
+        assert!(host.process_runs().is_empty());
+    }
+    #[test]
+    fn commit_remembers_the_registered_container() {
+        let host = setup();
+        let mut main = crate::Main::default();
+        let key = draft(&host, &mut main);
+        main.handle(REVIEW, ViewEvent::Button(key), &host.invocation()).unwrap();
+        validate_running("/work/app", ID).unwrap();
     }
     fn register_both(host: &MockHost) {
         let project = host.invocation().project().unwrap();
@@ -646,9 +737,8 @@ mod tests {
         let key = mapped_draft(&host, &mut main);
         assert_eq!(host.run_targets().len(), 1, "modal prepares only");
         let preview = main.run_target.prepared.as_ref().unwrap().plan.preview();
-        assert!(preview.contains("Outside/subdirectory cwd is NOT rejected"));
-        assert!(preview.contains("manually select") && preview.contains("eb72"));
-        assert!(preview.contains("ALWAYS") && preview.contains("NEVER changes"));
+        assert!(preview.contains("Language server targets") && !preview.contains("eb72"));
+        assert!(preview.contains("project bind folder"));
         assert!(preview.len() < 16384 && !preview.contains("DO_NOT_DISPLAY"));
         main.render(REVIEW, None, &host.invocation()).unwrap();
         assert_eq!(host.process_runs().len(), 4, "render is inspection-free");
@@ -723,11 +813,12 @@ mod tests {
         assert_eq!(host.process_runs().len(),0);
     }
     #[test]
-    fn container_stop_withdraws_both_mode_slots_before_mutation() {
+    fn container_stop_withdraws_both_mode_slots_after_stopping() {
         let host=setup();register_both(&host);
         host.on_process("docker", |args,_| {
-            match args.first().map(String::as_str) { Some("ps") => ok(CID), Some("stop") => ok(CID), _ => panic!("unexpected {args:?}") }
+            match args.first().map(String::as_str) { Some("ps") => ok(&RUNNING_ROW.replace("CID", CID)), Some("stop") => ok(CID), _ => panic!("unexpected {args:?}") }
         });
+        host.answer_next_prompt(Some(&[]));
         crate::Main::default().run_command("stop",&host.invocation(),None).unwrap();
         assert!(host.run_targets().is_empty());
     }
@@ -750,7 +841,7 @@ mod tests {
             .run_command("register-run-target", &host.invocation(), None)
             .unwrap()
             .unwrap();
-        assert!(prepared.contains("Prepared only"));
+        assert!(prepared.contains("Nothing is registered yet"));
         assert!(host.run_targets().is_empty());
         assert_eq!(host.process_runs().len(), 4);
         let key = format!(
@@ -869,11 +960,7 @@ mod tests {
     }
     #[test]
     fn nested_overlapping_and_ambiguous_mounts_refuse() {
-        for destination in [
-            "/workspace/app/node_modules",
-            "/workspace",
-            "/workspace/app",
-        ] {
+        for destination in ["/workspace", "/workspace/app"] {
             let mut f = fixture();
             f[0]["Mounts"]
                 .as_array_mut()
@@ -901,6 +988,19 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn nested_node_modules_mount_allowed() {
+        let mut f = fixture();
+        f[0]["Mounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"Type":"volume","Destination":"/workspace/app/node_modules"}));
+        let identity = identity(&f.to_string(), "/work/app", "/work/app/.devcontainer/devcontainer.json", CID).unwrap();
+        assert_eq!(identity.mount, "/workspace/app");
+        f[0]["Mounts"].as_array_mut().unwrap().push(serde_json::json!({"Type":"volume","Destination":"/workspace"}));
+        let error = super::identity(&f.to_string(), "/work/app", "/work/app/.devcontainer/devcontainer.json", CID).unwrap_err();
+        assert!(error.to_string().contains("/workspace"));
     }
     #[test]
     fn strict_json_rejects_duplicates_trailing_text_and_oversize() {
@@ -965,7 +1065,7 @@ mod tests {
             preview.contains(CID)
                 && preview.contains("unix:///var/run/docker.sock")
                 && preview.contains("--workdir")
-                && preview.contains("ALWAYS")
+                && preview.contains("project bind folder")
         );
         assert!(!preview.contains("DO_NOT_DISPLAY"));
         assert!(preview.len() < 16 * 1024);
@@ -1010,7 +1110,7 @@ mod tests {
             if action == "stop" {
                 host.on_process("docker", |args, _| {
                     if args[0] == "ps" {
-                        ok(CID)
+                        ok(&RUNNING_ROW.replace("CID", CID))
                     } else if args[0] == "stop" {
                         ok(CID)
                     } else {
@@ -1073,7 +1173,7 @@ mod tests {
             .run_command("register-run-target", &host.invocation(), None)
             .unwrap()
             .unwrap();
-        assert!(status.starts_with("Prepared only"));
+        assert!(status.starts_with("Nothing is registered yet"));
         format!(
             "register:{}",
             main.run_target.prepared.as_ref().unwrap().nonce

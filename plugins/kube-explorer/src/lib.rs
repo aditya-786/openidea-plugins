@@ -22,6 +22,7 @@ mod crd_export;
 mod helm_assistance;
 mod json_assistance;
 mod label_refs;
+mod lru;
 mod cluster_completion;
 mod watch;
 mod process_scope;
@@ -49,7 +50,7 @@ use std::path::Path;
 
 use openidea_plugin::providers::{CodeAction, CompletionItem, Document, Providers};
 use openidea_plugin::views::{Body, Button, Field, FieldValue, TreeItem, View, ViewEvent, Viewport, Views};
-use openidea_plugin::{Context, Error, Event, EventKind, Invocation, LogLevel, NotificationLevel, Plugin, Position, Range, host};
+use openidea_plugin::{Context, Error, Event, EventKind, FileDiff, Invocation, LogLevel, NotificationAction, NotificationLevel, PickItem, Plugin, Position, Range, StatusItem, host};
 
 pub const TREE: &str = "kube";
 const PANEL: &str = "resource-details";
@@ -65,6 +66,14 @@ fn refresh_views() {
 }
 
 const KUBECTL: &str = "kubectl";
+/// Status bar item naming the context and namespace kubectl calls go to.
+const CONTEXT_STATUS: &str = "kube-context";
+/// Reveals the cluster tree: the status item's and Apply notification's action.
+const SHOW_TREE: &str = "show-tree";
+/// The context shown when kubectl runs but no current context is set.
+const NO_CONTEXT: &str = "(no current context)";
+const KUBECTL_UNAVAILABLE: &str = "(kubectl unavailable)";
+const POD_SHELL: &str = "command -v bash >/dev/null && exec bash || exec sh";
 const HELM: &str = "helm";
 const DEFAULT_DEBUG_IMAGE: &str = "busybox:stable";
 /// Keeps reads under the 5 s call budget on an unreachable cluster.
@@ -73,7 +82,7 @@ const REQUEST_TIMEOUT: &str = "--request-timeout=4s";
 const PAGE: &str = include_str!("page.html");
 /// Shown in the YAML panel when the IDE blocks the page's script, which Apply and Save to File need.
 const NO_SCRIPTS: &str = "<p id=\"nojs\">Apply and Save to File don't work in this panel: this version of the IDE blocks scripts in plugin pages. \
-    For supported built-ins, enable YAML in Editor and use the explicit Review Private YAML Apply and Apply Reviewed Private YAML commands. Saving is local only.</p>";
+    For supported built-ins, enable YAML in Editor and use the explicit Review Private YAML Apply and Apply Private YAML commands. Saving is local only.</p>";
 
 /// A Kubernetes icon of the package (a `fileIcons` entry of `plugin.toml`).
 macro_rules! k8s {
@@ -146,6 +155,7 @@ pub struct KubeExplorer {
     navigation: navigation::Cache,
     label_refs: label_refs::Cache,
     kustomize_paths: kustomize::Cache,
+    kustomize_graph: kustomize_graph::Cache,
     crd_schema: crd_schema::Cache,
     helm_assistance: helm_assistance::Cache,
     cluster_completion: cluster_completion::Cache,
@@ -176,8 +186,6 @@ pub struct KubeExplorer {
     /// Port forward being set up (shown instead of the tree): namespace, target and ports.
     forward: Option<forward::Draft>,
     forward_session: Option<forward::Session>,
-    prepared_forward: Option<forward::Prepared>,
-    forward_nonce: u64,
     show_forward_session: bool,
     /// The manifest whose resources the shown dry run would delete.
     pending_delete: Option<String>,
@@ -245,7 +253,7 @@ impl KubeExplorer {
     fn split_scope(&self, kind: &str, row: &str) -> Result<(Option<String>, String), Error> {
         if !self.all_namespaces() {
             if row.is_empty() || row.starts_with('-') || matches!(row,"."|"..") || row.chars().any(|c|c.is_control()||c.is_whitespace()||matches!(c,'/'|'%'|',')) {
-                return Err(format!("Refusing the name \"{row}\": it is not one literal resource name.").into());
+                return Err(format!("Refusing the name \"{row}\": it is not a single resource name.").into());
             }
             return Ok((self.namespace.clone(), row.to_owned()));
         }
@@ -312,7 +320,7 @@ impl KubeExplorer {
         host::notify(
             NotificationLevel::Warning,
             "Secret values are hidden",
-            "To show them, turn on \"Allow Show Secret\" (allowRevealSecrets) in Settings › Plugins › Kube Explorer.",
+            "To show them, turn on \"Allow Show Secret and YAML on a secret\" in Settings › Plugins › Kube Explorer.",
         );
         false
     }
@@ -341,7 +349,7 @@ impl KubeExplorer {
     }
     pub(crate) fn begin_panel(&mut self)->Result<String,Error> {
         self.ensure_panel_replace()?;
-        self.clear_panel_data();self.forward=None;self.prepared_forward=None;
+        self.clear_panel_data();self.forward=None;
         self.show_forward_session=false;Ok(self.new_rich_callback())
     }
 
@@ -511,31 +519,154 @@ impl KubeExplorer {
         Ok(custom_resource_names(names))
     }
 
-    /// Drops cached children and reloads those of expanded nodes.
+    /// Drops cached children and reloads those of expanded nodes; only an unreachable cluster stops the rest.
     fn reload(&mut self) {
         self.watch.settings_changed(&self.context,&self.namespace);
         self.cluster_completion.clear();
         self.children.clear();
         self.current_context = None;
         self.kubectl_failed = false;
+        self.update_context_status();
+        let mut first_failure: Option<String> = None;
         for key in self.expanded.clone() {
-            let loaded = self.load(&key);
+            let loaded = match &first_failure {
+                Some(failure) => Err(failure.clone()),
+                None => self.load(&key),
+            };
+            if let Err(failure) = &loaded {
+                if connection_failure(failure) {
+                    first_failure.get_or_insert_with(|| failure.clone());
+                }
+            }
             self.children.insert(key, loaded);
         }
         crate::refresh_views();
     }
 
-    /// `context/namespace` the cluster calls go to, for messages.
-    fn target(&self) -> String {
-        let current = || self.kubectl(&["config", "current-context"], None).ok().map(|out| out.trim().to_owned());
-        let context = self.context.clone().or_else(|| self.current_context.clone()).or_else(current);
-        let context = context.unwrap_or_else(|| "(kubectl unavailable)".into());
+    fn confirm_apply(&self, what: &str) -> Result<(), Error> {
+        if host::confirm("Apply to the cluster", &self.apply_question(what))? {
+            return Ok(());
+        }
+        Err(Error::Cancelled)
+    }
+
+    /// Shows `⎈ context / namespace` in the status bar, or nothing while the context is unknown.
+    fn update_context_status(&self) {
+        let context = self.context.as_deref().or(self.current_context.as_deref())
+            .filter(|context| !context.is_empty() && ![NO_CONTEXT, KUBECTL_UNAVAILABLE].contains(context));
+        let Some(context) = context else {
+            host::remove_status_item(CONTEXT_STATUS);
+            return;
+        };
         let namespace = match self.namespace.as_deref() {
             Some(ALL_NAMESPACES) => "(all namespaces)",
             Some(namespace) => namespace,
             None => "(default)",
         };
+        host::set_status_item(CONTEXT_STATUS, &StatusItem {
+            text: format!("⎈ {context} / {namespace}"),
+            tooltip: Some(format!("Kube Explorer runs kubectl against context {context}, namespace {namespace}. Click to show the cluster tree and switch.")),
+            command: Some(SHOW_TREE.into()),
+        });
+    }
+
+    /// One terminal per action and target: running it again focuses the open one.
+    fn open_pod_terminal(&self, action: &str, title: &str, args: Vec<String>) -> Result<(), Error> {
+        let context = self.context.as_deref().or(self.current_context.as_deref()).unwrap_or_default();
+        let key = terminal_key(action, context, &args);
+        let command = host::Command::new(KUBECTL).args(&args);
+        // A window without a project may have no keyed terminal; fall back to a plain one.
+        host::open_terminal_session(&key, title, &command).map(drop).or_else(|_| host::open_terminal(title, KUBECTL, &args))
+    }
+
+    #[cfg(test)]
+    fn shell_terminal_key(&self, namespace: Option<&str>, pod: &str) -> String {
+        let context = self.context.as_deref().or(self.current_context.as_deref()).unwrap_or_default();
+        terminal_key("shell", context, &self.args_in(namespace, &["exec", "-it", pod, "--", "sh", "-c", POD_SHELL]))
+    }
+
+    /// Opens the live objects next to the open manifest; Secrets stay masked unless Show Secret is allowed.
+    fn diff_manifest(&mut self, manifest: &str, path: &str) -> Result<String, Error> {
+        if !Self::reveal_allowed() && !secret_free(manifest) {
+            let out = self.process(KUBECTL, &self.args(&["diff", "-f", "-"]), Some(manifest))?;
+            return match out.status {
+                Some(0) => Ok("No differences with the cluster.".into()),
+                Some(1) => {
+                    self.show(format!("Diff: {path}"), out.stdout, "diff")?;
+                    Ok("The differences are shown in Kube Explorer Details (Secret values masked).".into())
+                }
+                status => Err(failure(KUBECTL, &out.stderr, status)),
+            };
+        }
+        let live = self.kubectl(&["get", "-f", "-", "-o", "yaml", "--ignore-not-found", REQUEST_TIMEOUT], Some(manifest))?;
+        let planned = self.process(KUBECTL, &self.args(&DIFF_DRY_RUN), Some(manifest))?;
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let new = live.trim().is_empty();
+        let (right, right_label, fallback) = match planned.status {
+            Some(0) => (cluster_objects(&planned.stdout).unwrap_or(planned.stdout), format!("After apply, server dry run ({name})"), String::new()),
+            // Validation, an admission webhook or read-only RBAC can refuse the dry run; the file still compares.
+            _ => {
+                let local = convert::source_documents(manifest).and_then(normalized_objects).unwrap_or_else(|| manifest.to_owned());
+                let reason = planned.stderr.lines().find(|line| !line.trim().is_empty()).unwrap_or("no details").trim().to_owned();
+                (local, format!("Local ({name})"), format!(" The server dry run failed ({reason}), so the file is shown as written."))
+            }
+        };
+        let diff = FileDiff {
+            left: (!new).then(|| cluster_objects(&live).unwrap_or(live)),
+            right: Some(right),
+            left_label: Some(format!("Cluster ({})", self.target())),
+            right_label: Some(right_label),
+            title: Some(format!("{name}: cluster and local")),
+        };
+        host::open_file_diff(&diff, Some(name))?;
+        let opened = if new { "These resources are not in the cluster yet." } else { "The diff with the cluster is open." };
+        Ok(format!("{opened}{fallback}"))
+    }
+
+    /// `context/namespace` the cluster calls go to, for messages.
+    fn target(&self) -> String {
+        let (context, namespace) = self.target_parts();
         format!("{context}/{namespace}")
+    }
+
+    fn target_parts(&self) -> (String, &str) {
+        let current = || self.kubectl(&["config", "current-context"], None).ok().map(|out| out.trim().to_owned());
+        let context = self.context.clone().or_else(|| self.current_context.clone()).or_else(current);
+        let context = context.unwrap_or_else(|| KUBECTL_UNAVAILABLE.into());
+        let namespace = match self.namespace.as_deref() {
+            Some(ALL_NAMESPACES) => "(all namespaces)",
+            Some(namespace) => namespace,
+            None => "(default)",
+        };
+        (context, namespace)
+    }
+
+    /// The question asked before applying `what` (a file or Kustomization directory).
+    fn apply_question(&self, what: &str) -> String {
+        let (context, namespace) = self.target_parts();
+        format!("Apply {what} to context {context}, namespace {namespace}?")
+    }
+
+    /// The question asked before deleting a resource row: kind, name, namespace and context.
+    fn delete_question(&self, kind: &str, row: &str) -> Result<String, Error> {
+        let (namespace, name) = self.split_scope(kind, row)?;
+        let context = self.context.as_ref().or(self.current_context.as_ref()).map_or("the current context", String::as_str);
+        let scope = match namespace.as_deref() {
+            _ if CLUSTER_SCOPED.contains(&kind) => String::new(),
+            Some(namespace) => format!(" in namespace {namespace}"),
+            None => " in the default namespace".into(),
+        };
+        Ok(format!("Delete {kind}/{name}{scope} on context {context}?"))
+    }
+
+    /// Asks before `kubectl replace` overwrites the live object; the body names kind, name, namespace and context.
+    fn confirm_replace(&self, kind: &str, row: &str) -> Result<(), Error> {
+        let question = self.delete_question(kind, row)?.replacen("Delete ", "Replace the live ", 1);
+        let (_, name) = self.split_scope(kind, row)?;
+        if host::confirm(&format!("Replace {kind}/{name}?"), &format!("{question}\nYour edits overwrite the object in the cluster; the previous version is not kept."))? {
+            return Ok(());
+        }
+        Err(Error::Cancelled)
     }
 
     fn save(&self) {
@@ -571,7 +702,7 @@ impl KubeExplorer {
             if let Some(root) = self.rich_owner.clone() {
                 match self.yaml_editors.open(&root,self.context.as_deref(),namespace.as_deref(),kind,&name) {
                     Ok(()) => return Ok(()),
-                    Err(_) => host::notify(NotificationLevel::Info,"Private YAML editor","Private source-owned editor unavailable for this resource/scope; using the panel. No private copy was applied."),
+                    Err(_) => host::notify(NotificationLevel::Info,"Edit YAML","This resource can't be edited in the editor, so it opens in Kube Explorer Details. Nothing was applied."),
                 }
             }
         }
@@ -614,6 +745,7 @@ impl KubeExplorer {
         };
         if kind=="secrets"&&!Self::reveal_allowed(){self.expire_secret_visibility();return Err(Error::Stale);}
         let (namespace, _) = self.split_scope(&kind, &row)?;
+        self.confirm_replace(&kind, &row)?;
         let _task = host::begin_task(&format!("Applying {kind}/{row}"), false);
         let result=self.kubectl_in(namespace.as_deref(), &["replace", "-f", "-"], Some(yaml));
         let result=if kind=="secrets" {result.map_err(|error|secrets::command_error("save",error))}else{result};
@@ -624,14 +756,18 @@ impl KubeExplorer {
     }
 
     fn render_details(&self, details: &Details) -> View {
-        let page = PAGE
-            .replace("{{callback}}", &details.callback)
-            .replace("{{lang}}", details.lang)
-            .replace("{{name}}", &escape_html(&details.title.replace('/', "-")))
-            .replace("{{readonly}}", if details.editing.is_some() { "" } else { "readonly" })
-            .replace("{{nojs}}", if details.editing.is_some() { NO_SCRIPTS } else { "" })
-            .replace("{{highlighted}}", &highlight(&details.text, details.lang))
-            .replace("{{text}}", &escape_html(&details.text));
+        let page = fill(
+            PAGE,
+            &[
+                ("callback", &details.callback),
+                ("lang", details.lang),
+                ("name", &escape_html(&details.title.replace('/', "-"))),
+                ("readonly", if details.editing.is_some() { "" } else { "readonly" }),
+                ("nojs", if details.editing.is_some() { NO_SCRIPTS } else { "" }),
+                ("highlighted", &highlight(&details.text, details.lang)),
+                ("text", &escape_html(&details.text)),
+            ],
+        );
         let status = match &details.note {
             Some(note) => format!("{} · {note}", details.title),
             None => details.title.clone(),
@@ -676,13 +812,14 @@ impl KubeExplorer {
     fn render_forward(&self, target: &str, ports: &str) -> View {
         let field = Field::new("ports", "Ports (local:remote, separated by spaces)", FieldValue::Text(ports.into()));
         let owner = self.forward.as_ref().and_then(|draft| draft.owner_root.as_deref());
+        let managed = match owner {
+            Some(root) => format!("Start Managed Session runs it for the project {root} and stops it when you switch project, context, namespace or resource, after about five idle minutes, or when the window closes."),
+            None => "Start Managed Session needs an open project and the project.read permission.".to_owned(),
+        };
         let lifetime = Field::new(
             "forward-lifetime",
-            "Session lifetime",
-            FieldValue::readonly_text(
-                &format!("Managed project owner: {}. Start in Terminal is the durable option. Managed Stop/Restart needs an open project and project.read permission; project/scope/selection changes retire it. Idle reclamation (about five idle minutes), window close or plugin stop also ends it.", owner.unwrap_or("unavailable; grant project.read or open a project")),
-                true,
-            ),
+            "How long it runs",
+            FieldValue::readonly_text(&format!("Start in Terminal keeps forwarding until you close the terminal. {managed}"), true),
         );
         View::new(Body::Form(vec![field, lifetime]))
             .status(&format!("Port forward to {target}"))
@@ -692,7 +829,6 @@ impl KubeExplorer {
     }
 
     fn render_tree_in(&mut self, ctx: Option<&Invocation>) -> Result<View, Error> {
-        if let Some(view) = self.prepared_forward_view() { return Ok(self.protect_rich_view(view)); }
         if self.show_forward_session {
             let view=self.forward_status(ctx);return Ok(self.protect_rich_view(view));
         }
@@ -724,20 +860,22 @@ impl KubeExplorer {
             // failed spawn offers the install hint.
             self.current_context = match self.process(KUBECTL, &self.args(&["config", "current-context"]), None) {
                 Ok(out) if out.status == Some(0) => Some(out.stdout.trim().to_owned()),
-                Ok(_) => Some("(kubectl unavailable)".into()),
+                Ok(_) => Some(NO_CONTEXT.into()),
                 Err(Error::Denied(_)) => {
+                    host::remove_status_item(CONTEXT_STATUS);
                     return Ok(View::new(Body::Tree(vec![
                         TreeItem::new("kube:status", "Kubernetes — permission required")
                             .icon(k8s!("cluster"))
-                            .detail("Allow kubectl in Settings › Plugins to browse. Private import/review needs no connection."),
+                            .detail(&format!("{} Private import/review needs no connection.", ui_kit::denied::message("Browsing Kubernetes", "process:kubectl", "Kube Explorer"))),
                     ])));
                 }
                 Err(_) => {
                     self.kubectl_failed = true;
-                    Some("(kubectl unavailable)".into())
+                    Some(KUBECTL_UNAVAILABLE.into())
                 }
             };
         }
+        self.update_context_status();
         let context = self.context.as_ref().or(self.current_context.as_ref()).cloned().unwrap_or_default();
         let namespace = match self.namespace.as_deref() {
             Some(ALL_NAMESPACES) => "All namespaces",
@@ -746,7 +884,8 @@ impl KubeExplorer {
         };
 
         let mut items = Vec::new();
-        self.push_node(&mut items, "ctx", &format!("Context: {context}"), k8s!("cluster"), Some(&context));
+        let imported = kubeconfig_import::selected_name().map(|name| format!(" · imported kubeconfig {name}")).unwrap_or_default();
+        self.push_node(&mut items, "ctx", &format!("Context: {context}{imported}"), k8s!("cluster"), Some(&context));
         let at = items.len();
         self.push_node(&mut items, "ns", &format!("Namespace: {namespace}"), k8s!("ns"), self.namespace.as_ref());
         if self.expanded.contains("ns") {
@@ -761,7 +900,7 @@ impl KubeExplorer {
 
         // Group only former roots; keep all existing child/resource keys and owners.
         let parent = TreeItem::new("kube:cluster", &format!("Kubernetes — {context}"))
-            .icon(k8s!("cluster")).detail(&format!("Selected context · namespace {namespace}; cached CLI view"))
+            .icon(k8s!("cluster")).detail(&format!("Current context · namespace {namespace}. Refresh to update."))
             .expandable(!self.cluster_collapsed);
         if self.cluster_collapsed { items.clear(); }
         else {
@@ -778,6 +917,9 @@ impl KubeExplorer {
         view = view.button(Button::new("refresh", "Refresh").icon("refresh"));
         if self.kubectl_failed {
             view = view.button(Button::new("how-to-install-kubectl", "How to Install kubectl").icon("help"));
+        }
+        if context == NO_CONTEXT {
+            view = view.button(Button::new("choose-kubeconfig", "Choose Kubeconfig…").icon("folder-open"));
         }
         Ok(self.actions(view))
     }
@@ -833,8 +975,8 @@ impl KubeExplorer {
         };
         self.protect_rich_view(view.button(Button::new("describe", "Describe").icon("info").enabled(self.selected.is_some()))
             .button(Button::new("yaml", "YAML").icon("file-yaml").enabled(self.selected.is_some()))
-            .button(Button::new("logs", "Logs").icon("file-log").enabled(logs))
-            .button(Button::new("log-view", "Log Viewer").icon("list-filter").enabled(logs))
+            .button(Button::new("logs", "Follow Logs (Terminal)").icon("file-log").enabled(logs))
+            .button(Button::new("log-view", "Log Snapshot…").icon("list-filter").enabled(logs))
             .button(Button::new("shell", "Shell").icon("terminal").enabled(pod_selected))
             .button(Button::new("attach", "Attach").icon("attach-to-process").enabled(pod_selected))
             .button(Button::new("show-secret", "Show Secret").icon("eye").enabled(kind == "secrets"))
@@ -927,7 +1069,7 @@ impl KubeExplorer {
                 }
                 _ => {
                     if let Some((kind, name)) = self.checked_resource(&key)? {
-                        if self.rich_owner.is_none() { return Err(Error::Denied("project.read: open a project and allow project.read for cached rich details.".into())); }
+                        if self.rich_owner.is_none() { return Err(rich_details_unavailable()); }
                         self.describe(&kind, &name)?;
                     }
                 }
@@ -946,7 +1088,6 @@ impl KubeExplorer {
                 crate::refresh_panel();
             }
             ViewEvent::Field(key, value) if key == "ports" => {
-                self.prepared_forward = None;
                 if let Some(draft) = &mut self.forward {
                     draft.ports = value;
                 }
@@ -983,7 +1124,7 @@ impl KubeExplorer {
         if ctx.is_some() {
             self.expire_rich_context(ctx);
             if matches!(button, "show-secret" | "edit-secret" | "create-secret" | "describe" | "yaml") && self.rich_owner.is_none() {
-                return Err(Error::Denied("project.read: open a project and allow project.read to own cached rich details and Secret plaintext.".into()));
+                return Err(rich_details_unavailable());
             }
             let missing = match button {
                 "add-secret-key" | "submit-secret" => self.draft.is_none(),
@@ -997,7 +1138,6 @@ impl KubeExplorer {
         if self.forward_button(button, ctx)? {
             return Ok(());
         }
-        self.prepared_forward = None;
         if button != "refresh" {
             self.show_forward_session = false;
         }
@@ -1009,12 +1149,14 @@ impl KubeExplorer {
             notify_install_hint();
             return Ok(());
         }
+        if button == "choose-kubeconfig" {
+            return self.choose_kubeconfig();
+        }
         if button.starts_with("log-") && button != "log-view" {
             return self.log_button(button, ctx);
         }
         match button {
             "back" => {
-                self.prepared_forward = None;
                 self.show_forward_session = false;
                 self.details = None;
                 self.forward = None;
@@ -1052,6 +1194,15 @@ impl KubeExplorer {
             "start-managed-forward" => return self.start_managed_forward(ctx.ok_or_else(|| Error::Invalid("Managed forwarding needs a project invocation.".into()))?),
             "confirm-delete-manifest" => {
                 self.single_namespace_gate("Delete Manifest Resources")?;
+                if self.pending_delete.is_none() {
+                    return Ok(());
+                }
+                let listed = self.details.as_ref().map_or(0, |d| d.text.lines().filter(|line| !line.trim().is_empty()).count());
+                let (context, namespace) = self.target_parts();
+                let body = format!("Context: {context}\nNamespace: {namespace}\n{listed} resource(s) listed in the preview are deleted from the cluster. This cannot be undone.");
+                if !host::confirm(&format!("Delete {listed} resource(s) on {context}/{namespace}?"), &body)? {
+                    return Err(Error::Cancelled);
+                }
                 let Some(manifest) = self.pending_delete.take() else {
                     return Ok(());
                 };
@@ -1086,16 +1237,16 @@ impl KubeExplorer {
                 KUBECTL,
                 &args(&["logs", "-f", &target, "--all-pods=true", "--all-containers", "--max-log-requests=20", "--tail=200"]),
             )?,
-            "attach" => host::open_terminal(&format!("Attach: {row}"), KUBECTL, &args(&["attach", "-it", &name]))?,
+            "attach" => self.open_pod_terminal("attach", &format!("Attach: {row}"), args(&["attach", "-it", &name]))?,
             "debug" => self.debug_pod(&row)?,
             "show-secret" if kind == "secrets" => self.show_secret(&row)?,
             "edit-secret" if kind == "secrets" => self.edit_secret(&row)?,
             "log-view" => self.open_log_view(&kind, &row, ctx)?,
             "port-forward" => self.start_port_forward(&kind, &row, ctx)?,
-            "shell" => host::open_terminal(
+            "shell" => self.open_pod_terminal(
+                "shell",
                 &format!("Shell: {row}"),
-                KUBECTL,
-                &args(&["exec", "-it", &name, "--", "sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"]),
+                args(&["exec", "-it", &name, "--", "sh", "-c", POD_SHELL]),
             )?,
             "delete" if !self.confirm_delete => {
                 self.new_rich_callback();
@@ -1121,6 +1272,12 @@ impl KubeExplorer {
 fn resource_type_name(value:&str)->bool {
     let (plural,group)=value.split_once('.').map_or((value,None),|(plural,group)|(plural,Some(group)));
     is_dns_label(plural)&&group.is_none_or(is_dns_subdomain)
+}
+
+/// kubectl could not reach the cluster at all, so every further call would fail the same way.
+fn connection_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    ["unable to connect", "connection refused", "i/o timeout", "dial tcp", "no such host", "context deadline exceeded"].iter().any(|m| message.contains(m))
 }
 
 /// Sorted `kind.group` names without the core and built-in groups, deduplicated.
@@ -1200,7 +1357,7 @@ fn helm_repo_update() -> Result<(), Error> {
             host::notify(
                 NotificationLevel::Warning,
                 "Helm repositories not updated",
-                "Kube Explorer is not allowed to run helm. Allow it in Settings › Plugins.",
+                &ui_kit::denied::message("Updating Helm repositories", "process:helm", "Kube Explorer"),
             );
             return Ok(());
         }
@@ -1222,6 +1379,42 @@ fn output_tail(text: &str) -> String {
     let tail = lines[lines.len().saturating_sub(20)..].join("\n");
     let extra = tail.chars().count().saturating_sub(2000);
     tail.chars().skip(extra).collect()
+}
+
+/// A kubectl failure users can act on: a denial becomes the permission message; anything else a
+/// classified reason naming the context, plus a next step.
+pub(crate) fn tool_error(feature: &str, context: Option<&str>, error: Error) -> Error {
+    match error {
+        Error::Cancelled => Error::Cancelled,
+        Error::Denied(capability) => Error::Invalid(ui_kit::denied::message(feature, &capability, "Kube Explorer")),
+        other => Error::Failed(failure_reason(feature, context, &other.to_string())),
+    }
+}
+
+pub(crate) fn failure_reason(feature: &str, context: Option<&str>, detail: &str) -> String {
+    let on = context.filter(|context| !context.is_empty()).map_or_else(|| "the current context".to_owned(), |context| format!("context {context}"));
+    let lower = detail.to_ascii_lowercase();
+    if ["unauthorized", "expired", "must be logged in", "invalid_grant", "getting credentials", "exec plugin"].iter().any(|m| lower.contains(m)) {
+        return format!("{feature} failed: the login for {on} has expired or was rejected. Sign in to the cluster again, then retry.");
+    }
+    if connection_failure(detail) {
+        return format!("{feature} failed: {on} cannot be reached. Check the network or VPN, then retry.");
+    }
+    if lower.contains("forbidden") {
+        return format!("{feature} failed: your account on {on} is not allowed to do this. Ask for access or switch context.");
+    }
+    if lower.contains("has been modified") || lower.contains("conflict") {
+        return format!("{feature} failed: the object changed on {on} since it was opened. Reopen it, then retry.");
+    }
+    if lower.contains("notfound") || lower.contains("not found") {
+        return format!("{feature} failed: not found on {on}. Refresh Kube Explorer, then retry.");
+    }
+    // Unclassified output is not echoed: kubeconfig and auth-plugin errors can carry credentials.
+    format!("{feature} failed on {on}. Run kubectl with that context in a terminal to see why, or pick another context with Kube Explorer: Choose Kubeconfig.")
+}
+
+fn rich_details_unavailable() -> Error {
+    Error::Invalid(format!("{} Open a project first if none is open.", ui_kit::denied::message("Resource details", "project.read", "Kube Explorer")))
 }
 
 fn failure(program: &str, stderr: &str, status: Option<i32>) -> Error {
@@ -1260,14 +1453,107 @@ fn parent(path: &str) -> &str {
 /// The innermost Helm chart (a directory with `Chart.yaml`) holding `file`.
 fn chart_dir(ctx: &Invocation, file: &str) -> Result<String, Error> {
     let project = ctx.project().ok_or("No project is open.")?;
-    let charts = project.find_files("**/Chart.yaml", 1000)?;
-    charts
-        .iter()
-        .filter_map(|chart| chart.strip_suffix("/Chart.yaml"))
-        .filter(|dir| file.starts_with(&format!("{dir}/")))
-        .max_by_key(|dir| dir.len())
-        .map(str::to_owned)
-        .ok_or_else(|| "The open file is not in a Helm chart (no Chart.yaml in its folder or above).".into())
+    let root = project.root()?;
+    let root = root.trim_end_matches('/');
+    let mut directory = file.rsplit_once('/').map(|(directory, _)| directory);
+    while let Some(candidate) = directory.filter(|candidate| candidate.starts_with(root)) {
+        if project.exists(&format!("{candidate}/Chart.yaml")).unwrap_or(false) {
+            return Ok(candidate.to_owned());
+        }
+        directory = candidate.rsplit_once('/').map(|(parent, _)| parent);
+    }
+    Err("The open file is not in a Helm chart (no Chart.yaml in its folder or above).".into())
+}
+
+/// True when every document names a kind and none is a Secret or a List (which could hold one).
+fn secret_free(manifest: &str) -> bool {
+    manifest::documents(manifest).iter().all(|doc| doc.kind.as_ref().is_some_and(|kind| kind.text != "Secret" && !kind.text.ends_with("List")))
+}
+
+/// What `kubectl apply` would store, computed by the server and never persisted.
+const DIFF_DRY_RUN: [&str; 7] = ["apply", "--dry-run=server", "-f", "-", "-o", "yaml", REQUEST_TIMEOUT];
+
+const SERVER_FIELDS: [&str; 6] = ["managedFields", "resourceVersion", "uid", "creationTimestamp", "generation", "selfLink"];
+
+/// kubectl `-o yaml` output (one object or a List) as [`normalized_objects`].
+fn cluster_objects(text: &str) -> Option<String> {
+    if text.len() > 16 * MAX_BYTES {
+        return None;
+    }
+
+    normalized_objects(yaml_rust2::YamlLoader::load_from_str(text).ok()?)
+}
+
+/// One document per object (List items flattened) ordered by kind, namespace and name, keys sorted,
+/// without status and server bookkeeping, so the cluster and the file line up field by field.
+fn normalized_objects(docs: Vec<yaml_rust2::Yaml>) -> Option<String> {
+    use yaml_rust2::Yaml;
+    let mut objects = Vec::new();
+    for doc in docs {
+        let list = doc["kind"].as_str().is_some_and(|kind| kind.ends_with("List"));
+        match doc {
+            Yaml::Null => {}
+            Yaml::Hash(mut fields) if list => objects.extend(fields.remove(&Yaml::String("items".into()))?.into_vec()?),
+            Yaml::Hash(_) => objects.push(doc),
+            _ => return None,
+        }
+    }
+    let sort_key = |object: &Yaml| [&object["kind"], &object["metadata"]["namespace"], &object["metadata"]["name"]].map(|v| v.as_str().unwrap_or_default().to_owned());
+    objects.sort_by_cached_key(sort_key);
+    let mut out = String::new();
+    for object in objects {
+        let mut emitter = yaml_rust2::YamlEmitter::new(&mut out);
+        emitter.multiline_strings(true);
+        emitter.dump(&sorted_keys(without_server_fields(object)?, 0)?).ok()?;
+        out.push('\n');
+    }
+    Some(out.strip_prefix("---\n").unwrap_or(&out).to_owned())
+}
+
+fn without_server_fields(object: yaml_rust2::Yaml) -> Option<yaml_rust2::Yaml> {
+    use yaml_rust2::Yaml;
+    let key = |name: &str| Yaml::String(name.into());
+    let Yaml::Hash(mut fields) = object else { return None };
+    fields.remove(&key("status"));
+    if let Some(Yaml::Hash(metadata)) = fields.get_mut(&key("metadata")) {
+        for field in SERVER_FIELDS {
+            metadata.remove(&key(field));
+        }
+        let mut no_annotations = false;
+        if let Some(Yaml::Hash(annotations)) = metadata.get_mut(&key("annotations")) {
+            annotations.remove(&key("kubectl.kubernetes.io/last-applied-configuration"));
+            no_annotations = annotations.is_empty();
+        }
+        if no_annotations {
+            metadata.remove(&key("annotations"));
+        }
+    }
+    Some(Yaml::Hash(fields))
+}
+
+fn sorted_keys(value: yaml_rust2::Yaml, depth: usize) -> Option<yaml_rust2::Yaml> {
+    use yaml_rust2::Yaml;
+    if depth > 64 {
+        return None;
+    }
+
+    Some(match value {
+        Yaml::Hash(fields) => {
+            let mut entries: Vec<_> = fields.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Yaml::Hash(entries.into_iter().map(|(k, v)| Some((k, sorted_keys(v, depth + 1)?))).collect::<Option<_>>()?)
+        }
+        Yaml::Array(items) => Yaml::Array(items.into_iter().map(|v| sorted_keys(v, depth + 1)).collect::<Option<_>>()?),
+        other => other,
+    })
+}
+
+/// A terminal session key (at most 128 bytes) for an action, context and argv.
+fn terminal_key(action: &str, context: &str, args: &[String]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (context, args).hash(&mut hasher);
+    format!("{action}-{:016x}", hasher.finish())
 }
 
 fn file_safe(s: &str) -> String {
@@ -1374,12 +1660,21 @@ fn project_of(path: &str) -> Option<(String, openidea_plugin::Project)> {
         .max_by_key(|(root, _)| root.len())
 }
 
-/// Publishes the manifest problems of an opened or saved YAML file of an open project.
-fn inspect_text(path: &str, text: &str, cache: &crd_schema::Cache, crossfile:bool) -> Vec<openidea_plugin::Diagnostic> {
-    if !(path.ends_with(".yaml") || path.ends_with(".yml") || path.ends_with(".tpl")) || config::is_non_kubernetes(path) {
+fn manifest_file(path: &str) -> bool {
+    (path.ends_with(".yaml") || path.ends_with(".yml") || path.ends_with(".tpl")) && !config::is_non_kubernetes(path)
+}
+
+fn check_enabled(code: &str) -> bool {
+    let setting = checks::SETTINGS.iter().find(|(c, _)| *c == code).map(|(_, s)| *s);
+    setting.and_then(host::setting_bool) != Some(false)
+}
+
+/// The manifest problems the diagnostics provider returns while the user types.
+fn inspect_text(path: &str, text: &str, crd: &crd_schema::Cache, graph: &kustomize_graph::Cache) -> Vec<openidea_plugin::Diagnostic> {
+    if !manifest_file(path) {
         return Vec::new();
     }
-    let Some((root, project)) = project_of(path) else {
+    let Some((_, project)) = project_of(path) else {
         return Vec::new();
     };
     if text.len() > MAX_BYTES {
@@ -1390,23 +1685,36 @@ fn inspect_text(path: &str, text: &str, cache: &crd_schema::Cache, crossfile:boo
     let patch_context = ["kustomization.yaml", "kustomization.yml", "Kustomization"]
         .iter()
         .any(|name| project.read_file(&format!("{directory}/{name}")).is_ok());
-    let enabled = |code: &str| {
-        let setting = checks::SETTINGS.iter().find(|(c, _)| *c == code).map(|(_, s)| *s);
-        setting.and_then(host::setting_bool) != Some(false)
-    };
-    let mut findings = checks::for_file(path, &text, in_chart, patch_context);
-    if crossfile && in_chart && chart_file(path).is_some_and(|chart| chart.ends_with("/Chart.yaml")) {
-        let chart_dir = chart_file(path).map(|chart| chart.trim_end_matches("/Chart.yaml").to_owned()).unwrap_or_default();
-        findings.extend(helm::check(&text, &helm::Chart::load(&project, &root, &chart_dir, &text)));
-    }
-    let mut diagnostics: Vec<_> = findings.iter().filter(|finding| enabled(finding.code)).map(|finding| finding.diagnostic(&text)).collect();
-    diagnostics.extend(cache.diagnostics(&Document {path:path.into(),language:"yaml".into(),version:0,text:text.into()}));
-    diagnostics.extend(kustomize_graph::diagnostics(&Document {path:path.into(),language:"yaml".into(),version:0,text:text.into()}));
+    let findings = checks::for_file(path, text, in_chart, patch_context);
+    let mut diagnostics: Vec<_> = findings.iter().filter(|finding| check_enabled(finding.code)).map(|finding| finding.diagnostic(text)).collect();
+    let doc = Document { path: path.into(), language: "yaml".into(), version: 0, text: text.into() };
+    diagnostics.extend(crd.diagnostics(&doc));
+    diagnostics.extend(kustomize_graph::diagnostics(&doc, graph));
     diagnostics
 }
-fn inspect(path: &str, cache:&crd_schema::Cache) {
-    if let Some(project)=host::project_of(path) && let Ok(text)=project.read_file(path) {
-        let _=host::publish_diagnostics(path,&inspect_text(path,&text,cache,true));
+
+/// The problems of a chart template that need the chart's `Chart.yaml`, which a provider must not read.
+fn chart_diagnostics(path: &str, text: &str) -> Vec<openidea_plugin::Diagnostic> {
+    if !manifest_file(path) || text.len() > MAX_BYTES {
+        return Vec::new();
+    }
+    let Some((root, project)) = project_of(path) else {
+        return Vec::new();
+    };
+    let Some(chart) = chart_file(path).filter(|chart| project.read_file(chart).is_ok()) else {
+        return Vec::new();
+    };
+    let chart_dir = chart.trim_end_matches("/Chart.yaml");
+    let findings = helm::check(text, &helm::Chart::load(&project, &root, chart_dir, text));
+    findings.iter().filter(|finding| check_enabled(finding.code)).map(|finding| finding.diagnostic(text)).collect()
+}
+
+/// Publishes only what the provider cannot compute; the provider reports everything else.
+fn inspect(path: &str) {
+    if let Some(project) = host::project_of(path)
+        && let Ok(text) = project.read_file(path)
+    {
+        let _ = host::publish_diagnostics(path, &chart_diagnostics(path, &text));
     }
 }
 impl openidea_plugin::diagnostics::DiagnosticsProvider for KubeExplorer {
@@ -1414,13 +1722,73 @@ impl openidea_plugin::diagnostics::DiagnosticsProvider for KubeExplorer {
         if matches!(doc.language.as_str(),"json"|"jsonc"){
             let mut found=json_assistance::diagnostics(doc);found.extend(self.crd_schema.diagnostics(doc));return found;
         }
-        let mut found=inspect_text(&doc.path,&doc.text,&self.crd_schema,false);
+        let mut found=inspect_text(&doc.path,&doc.text,&self.crd_schema,&self.kustomize_graph);
         found.extend(self.helm_assistance.diagnostics(doc));found
     }
 }
 
+/// Replaces each `{{name}}` of `template` once, so a value that itself contains a placeholder stays literal.
+fn fill(template: &str, values: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        let Some(close) = rest[open..].find("}}") else {
+            break;
+        };
+        let name = &rest[open + 2..open + close];
+        out.push_str(&rest[..open]);
+        match values.iter().find(|(key, _)| *key == name) {
+            Some((_, value)) => out.push_str(value),
+            None => out.push_str(&rest[open..open + close + 2]),
+        }
+        rest = &rest[open + close + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Files a single change batch re-reads; the rest are evicted and warm again when opened or saved.
+const MAX_WARMED_PER_CHANGE: usize = 32;
+
+impl KubeExplorer {
+    fn warm_path(&mut self, path: &str) {
+        self.navigation.warm_file(path);
+        self.label_refs.warm_file(path);
+        self.kustomize_paths.warm(path);
+        self.crd_schema.warm_file(path);
+        self.helm_assistance.warm_file(path);
+        self.kustomize_graph.warm_file(path);
+    }
+
+    fn evict_path(&mut self, path: &str) {
+        self.navigation.evict(path);
+        self.label_refs.evict(path);
+        self.kustomize_paths.evict(path);
+        self.crd_schema.evict(path);
+        self.helm_assistance.evict(path);
+        self.kustomize_graph.evict(path);
+    }
+
+    fn files_changed(&mut self, changed: &openidea_plugin::FilesChanged) {
+        let all: Vec<&str> = changed.created.iter().chain(&changed.modified).chain(&changed.removed).map(String::as_str).collect();
+        let stale_kustomizations = self.kustomize_graph.affected_by(&all);
+        if changed.created.iter().chain(&changed.removed).any(|path| indexer::transformer_marker(path)) {
+            self.navigation.forget_transformers();
+        }
+        for path in &all {
+            self.evict_path(path);
+        }
+        for path in changed.created.iter().chain(&changed.modified).take(MAX_WARMED_PER_CHANGE) {
+            self.warm_path(path);
+        }
+        for path in stale_kustomizations.iter().take(MAX_WARMED_PER_CHANGE) {
+            self.kustomize_graph.warm_file(path);
+        }
+    }
 }
 
 impl Plugin for KubeExplorer {
@@ -1432,6 +1800,9 @@ impl Plugin for KubeExplorer {
         }
         self.context = host::storage::get("context").ok().flatten();
         self.namespace = host::storage::get("namespace").ok().flatten();
+        if self.context.is_some() {
+            self.update_context_status();
+        }
         Ok(())
     }
 
@@ -1439,7 +1810,8 @@ impl Plugin for KubeExplorer {
         self.yaml_editors.clear();
         self.watch.clear();
         self.cluster_completion.clear();
-        self.crd_schema.clear(); self.helm_assistance.clear(); self.label_refs.clear(); self.kustomize_paths.clear();
+        self.navigation.clear();
+        self.crd_schema.clear(); self.helm_assistance.clear(); self.label_refs.clear(); self.kustomize_paths.clear(); self.kustomize_graph.clear();
         self.retire_forward("Plugin instance deactivated"); self.log_view = None;
         self.details = None; self.revealed = None; self.editing_secret = None; self.draft = None; self.pending_delete = None; self.rich_owner = None;
     }
@@ -1448,22 +1820,10 @@ impl Plugin for KubeExplorer {
         self.watch.closed_roots();
         for event in events {
             match event {
-                Event::FilesChanged(_) => {self.navigation.clear(); self.crd_schema.clear(); self.helm_assistance.clear(); self.label_refs.clear(); self.kustomize_paths.clear();},
-                Event::FileSaved(path) => {
-                    self.navigation.warm_file(path);
-                    self.label_refs.warm_file(path);
-                    self.kustomize_paths.warm(path);
-                    self.crd_schema.warm_file(path);
-                    self.helm_assistance.warm_file(path);
-                    inspect(path, &self.crd_schema);
-                }
-                Event::FileOpened(path) => {
-                    self.navigation.warm_file(path);
-                    self.label_refs.warm_file(path);
-                    self.kustomize_paths.warm(path);
-                    self.crd_schema.warm_file(path);
-                    self.helm_assistance.warm_file(path);
-                    inspect(path, &self.crd_schema);
+                Event::FilesChanged(changed) => self.files_changed(changed),
+                Event::FileSaved(path) | Event::FileOpened(path) => {
+                    self.warm_path(path);
+                    inspect(path);
                 }
                 _ => {}
             }
@@ -1472,6 +1832,7 @@ impl Plugin for KubeExplorer {
 
     /// The IDE drops a command's result text: it is shown in a notification.
     fn run_command(&mut self,id:&str,ctx:&Invocation,arg:Option<&str>)->Result<Option<String>,Error>{
+        if id==SHOW_TREE {host::reveal_view(TREE)?;return Ok(None);}
         if id=="source-occurrences" {return self.label_refs.show_occurrences(ctx);}
         if id=="helm-refresh-dependency-catalog" {
             let count=self.helm_assistance.refresh_dependency_catalog(ctx)?;
@@ -1480,7 +1841,7 @@ impl Plugin for KubeExplorer {
         }
         // These explicit global/disconnected operations do not consume a project
         // process binding or require a usable source/workspace identity.
-        if matches!(id,"helm-repo-update"|"helm-repo-cache"|"import-pasted-kubeconfig"|"review-imported-kubeconfigs"|"how-to-install-kubectl"|"helm-parameters"|"edit-debug-images"|"telepresence-connect"|"telepresence-quit"|"open-resource-watch") {
+        if matches!(id,"helm-repo-update"|"helm-repo-cache"|"import-pasted-kubeconfig"|"review-imported-kubeconfigs"|"use-imported-kubeconfig"|"delete-imported-kubeconfig"|"how-to-install-kubectl"|"helm-parameters"|"edit-debug-images"|"telepresence-connect"|"telepresence-quit"|"open-resource-watch") {
             return self.with_global_process_scope(|this|this.run_command_in(id,ctx,arg));
         }
         self.with_process_scope(ctx,|this|this.run_command_in(id,ctx,arg))
@@ -1507,16 +1868,18 @@ impl KubeExplorer {
             "open-resource-watch" => { crate::ui_group::reveal_view(watch::VIEW)?; return Ok(None); }
             "cache-cluster-resources" => {
                 let count=self.cluster_completion.read_resources(ctx,self.context.as_deref(),self.namespace.as_deref())?;
-                host::notify(NotificationLevel::Info,"Resource completion snapshot",&format!("Captured {count} resource names for60 seconds. Providers do not query kubectl; source deployment target remains unresolved."));
+                host::notify(NotificationLevel::Info,"Resource completion snapshot",&format!("Completion now offers {count} resource names from the cluster for the next 60 seconds."));
                 return Ok(None);
             }
             "cache-cluster-namespaces" => {
                 let count = self.cluster_completion.read(ctx, self.context.as_deref(), self.namespace.as_deref())?;
-                host::notify(NotificationLevel::Info, "Namespace completion snapshot", &format!("Captured {count} namespace names for 60 seconds. Providers do not query kubectl; source deployment target is unresolved."));
+                host::notify(NotificationLevel::Info, "Namespace completion snapshot", &format!("Completion now offers {count} namespace names from the cluster for the next 60 seconds."));
                 return Ok(None);
             }
             "import-pasted-kubeconfig" => return kubeconfig_import::import().map(|()| None),
             "review-imported-kubeconfigs" => return kubeconfig_import::review().map(|()| None),
+            "use-imported-kubeconfig" => return self.use_imported_kubeconfig().map(|()| None),
+            "delete-imported-kubeconfig" => return self.delete_imported_kubeconfig().map(|()| None),
             "choose-kubeconfig" => return self.choose_kubeconfig().map(|()| None),
             "telepresence-connect" => return self.telepresence("connect").map(|()| None),
             "telepresence-quit" => return self.telepresence("quit").map(|()| None),
@@ -1543,14 +1906,17 @@ impl KubeExplorer {
         };
         let _task = host::begin_task(working, false);
         let text = self.command(id, ctx)?;
-        config::notify_success(done, &text);
+        match id {
+            "apply" | "kustomize-apply" => config::notify_success_with(done, &text, &[NotificationAction::new("Show in Kube Explorer", SHOW_TREE)]),
+            _ => config::notify_success(done, &text),
+        }
         Ok(None)
     }
 }
 
 impl KubeExplorer {
     fn resource_command(&mut self, action: &str, key: Option<&str>, ctx: &Invocation) -> Result<(), Error> {
-        let (kind,row)=self.checked_resource(key.ok_or("Right-click a resource in Kube Explorer.")?)?.ok_or("Right-click a resource in Kube Explorer.")?;
+        let (kind,row)=self.checked_resource(key.ok_or_else(||Error::Invalid("Select a resource in the Kube Explorer window first.".into()))?)?.ok_or_else(||Error::Invalid("Select a resource in the Kube Explorer window first.".into()))?;
         let applies = match action {
             "logs" | "log-sources" | "log-view" => kind == "pods" || WORKLOADS.contains(&kind.as_str()),
             "shell" | "attach" | "debug" => kind == "pods",
@@ -1562,7 +1928,7 @@ impl KubeExplorer {
         if !applies {
             return Err(format!("{action} does not apply to {kind}.").into());
         }
-        if action == "delete" && !host::confirm("Delete resource", &format!("Delete {kind}/{row}?"))? {
+        if action == "delete" && !host::confirm("Delete Resource", &self.delete_question(&kind, &row)?)? {
             return Ok(());
         }
         if action == "log-sources" {
@@ -1606,17 +1972,18 @@ impl KubeExplorer {
         match id {
             "delete-manifest" => {
                 let out = self.kubectl(&["delete", "--dry-run=server", "-f", "-"], Some(&manifest))?;
-                self.show("Delete these resources?".into(), out, "text")?;
+                self.show(format!("Delete these resources from {}?", self.target()), out, "text")?;
                 self.pending_delete = Some(manifest);
-                Ok("Review the resources in Kube Explorer, then click Confirm Delete.".into())
+                Ok("Review the resources in Kube Explorer Details, then click Confirm Delete.".into())
             }
             "kustomize-render" => {
                 let dir = parent(&path);
                 let out = self.kubectl(&["kustomize", dir], None)?;
                 self.show(format!("Kustomize: {dir}"), out, "yaml")?;
-                Ok("The rendered YAML is shown in Kube Explorer.".into())
+                Ok("The rendered YAML is shown in Kube Explorer Details.".into())
             }
             "kustomize-apply" => {
+                self.confirm_apply(&format!("the kustomization in {}", parent(&path)))?;
                 let out = self.kubectl(&["apply", "-k", parent(&path)], None)?;
                 let target = self.target();
                 self.reload();
@@ -1641,9 +2008,9 @@ impl KubeExplorer {
                 if id == "helm-lint" {
                     self.show(format!("Helm lint: {release}"), format!("{}{}", out.stdout, out.stderr), "text")?;
                     return Ok(if out.status == Some(0) {
-                        "The chart passed lint. The output is shown in Kube Explorer."
+                        "The chart passed lint. The output is shown in Kube Explorer Details."
                     } else {
-                        "The chart has lint errors. The output is shown in Kube Explorer."
+                        "The chart has lint errors. The output is shown in Kube Explorer Details."
                     }
                     .into());
                 }
@@ -1652,11 +2019,23 @@ impl KubeExplorer {
                 }
                 if id == "helm-template" {
                     self.show(format!("Helm template: {release}"), out.stdout, "yaml")?;
-                    return Ok("The rendered YAML is shown in Kube Explorer.".into());
+                    return Ok("The rendered YAML is shown in Kube Explorer Details.".into());
                 }
                 Ok(out.stdout.trim().to_owned())
             }
             "apply" => {
+                let choices = [PickItem::new("apply", "Apply"), PickItem::new("diff", "Show Diff with Cluster First")];
+                match host::pick(&self.apply_question(&path), &choices)?.as_deref() {
+                    Some("apply") => {}
+                    Some("diff") => {
+                        let shown = self.diff_manifest(&manifest, &path)?;
+                        let name = path.rsplit('/').next().unwrap_or(&path);
+                        if !host::confirm(&format!("Apply {name}?"), &format!("{shown}\n{}", self.apply_question(&path)))? {
+                            return Err(Error::Cancelled);
+                        }
+                    }
+                    _ => return Err(Error::Cancelled),
+                }
                 let out = self.kubectl(&["apply", "-f", "-"], Some(&manifest))?;
                 let target = self.target();
                 self.reload();
@@ -1666,17 +2045,7 @@ impl KubeExplorer {
                 let out = self.kubectl(&["apply", "--dry-run=server", "-f", "-"], Some(&manifest))?;
                 Ok(out.trim().to_owned())
             }
-            "diff" => {
-                let out = self.process(KUBECTL, &self.args(&["diff", "-f", "-"]), Some(&manifest))?;
-                match out.status {
-                    Some(0) => Ok("No differences with the cluster.".into()),
-                    Some(1) => {
-                        self.show(format!("Diff: {}", editor.path()), out.stdout, "diff")?;
-                        Ok("The differences are shown in Kube Explorer.".into())
-                    }
-                    status => Err(failure(KUBECTL, &out.stderr, status)),
-                }
-            }
+            "diff" => self.diff_manifest(&manifest, &path),
             _ => Err(Error::NotFound(format!("command {id}"))),
         }
     }
@@ -1732,12 +2101,17 @@ impl Views for KubeExplorer {
                 Ok(rendered)
             })
         })().or_else(|error| match error {
+            Error::Denied(capability) if capability.starts_with("project.read") && view == TREE => Ok(View::new(Body::Tree(vec![
+                TreeItem::new("kube:status", "Kubernetes — project access needed")
+                    .icon(k8s!("cluster"))
+                    .detail("Allow project.read for Kube Explorer in Settings › Plugins."),
+            ]))),
             Error::Denied(capability) if capability.starts_with("project.read") => {
                 // A concrete invoking project must never silently downgrade to
                 // global CLI execution when its optional read grant is absent.
                 // Rendering remains usable as an inert explanation; events and
                 // commands retain their existing strict ownership checks.
-                Ok(View::message("Project access is unavailable. Allow the optional project.read permission in plugin settings to use Kubernetes for this project. Kubernetes can also run in a window with no open project.")
+                Ok(View::message(&format!("{} Kubernetes can also run in a window with no open project.", ui_kit::denied::message("Kubernetes for this project", "project.read", "Kube Explorer")))
                     .status("Project access unavailable"))
             }
             error => Err(error),
@@ -1818,6 +2192,106 @@ mod tests {
 
     fn ok(stdout: &str) -> Result<ProcessOutput, Error> {
         Ok(ProcessOutput { status: Some(0), stdout: stdout.into(), stderr: String::new() })
+    }
+
+    #[test]
+    fn yaml_providers_do_not_panic_at_any_offset() {
+        use openidea_plugin::diagnostics::DiagnosticsProvider;
+        let host = MockHost::install().with_capabilities(&["project.read", "storage", "process:kubectl"]);
+        host.set_project_root(Some("/p"));
+        let seeds = [
+            "{{ x }}{#}",
+            "café",
+            "<?php\nuse $😀",
+            "é::class",
+            "<!-- Paramètres --><a/>",
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: café\n  namespace: app\n  labels: {app: 😀}\nspec:\n  containers:\n  - name: é\n    env:\n    - name: X\n      valueFrom:\n        configMapKeyRef: {name: 😀cfg, key: é}\n",
+            "key:  # c\n- 😀: é\n---\n--- !tag\nresources:\n- ../é\n",
+            "apiVersion: v1\nkind: Service\nmetadata: {name: web, namespace: app}\nspec:\n  selector: {app: é😀}\n",
+        ];
+        let mut kube = KubeExplorer::default();
+        for (n, seed) in seeds.iter().enumerate() {
+            let path = format!("/p/{n}.yaml");
+            host.add_file(&format!("{n}.yaml"), seed);
+            kube.warm_path(&path);
+            let kustomization = format!("/p/k{n}/kustomization.yaml");
+            host.add_file(&format!("k{n}/kustomization.yaml"), seed);
+            kube.warm_path(&kustomization);
+            for path in [path, kustomization] {
+                let doc = Document { path, language: "yaml".into(), version: 1, text: (*seed).into() };
+                for offset in (0..=seed.len()).filter(|at| seed.is_char_boundary(*at)) {
+                    let at = openidea_plugin::text::position(seed, offset);
+                    kube.definition(&doc, at);
+                    kube.completion(&doc, at, None);
+                    kube.code_actions(&doc, Range::new(at, at));
+                }
+                kube.line_markers(&doc);
+                kube.diagnostics(&doc);
+            }
+        }
+    }
+
+    #[test]
+    fn chart_dir_walks_up_to_the_nearest_chart_without_searching() {
+        let host = MockHost::install().with_capabilities(&["project.read"]);
+        host.set_project_root(Some("/project"));
+        host.add_file("charts/app/Chart.yaml", "name: app\n");
+        host.add_file("charts/app/charts/sub/Chart.yaml", "name: sub\n");
+        let ctx = host.invocation();
+        assert_eq!(chart_dir(&ctx, "/project/charts/app/templates/a.yaml").unwrap(), "/project/charts/app");
+        assert_eq!(chart_dir(&ctx, "/project/charts/app/charts/sub/templates/a.yaml").unwrap(), "/project/charts/app/charts/sub");
+        assert!(chart_dir(&ctx, "/project/other/a.yaml").is_err());
+    }
+
+    #[test]
+    fn reload_continues_past_a_forbidden_kind() {
+        let host = MockHost::install().with_capabilities(&["process:kubectl", "storage"]);
+        host.on_process(KUBECTL, |args, _| match args.iter().any(|a| a == "nodes") {
+            true => Ok(ProcessOutput { status: Some(1), stdout: String::new(), stderr: "Error from server (Forbidden): nodes is forbidden\n".into() }),
+            false => ok("pod/web-1\n"),
+        });
+        let mut kube = KubeExplorer { context: Some("c".into()), ..Default::default() };
+        for key in ["kind:nodes", "kind:pods"] {
+            kube.expanded.insert(key.into());
+        }
+        kube.reload();
+        assert_eq!(host.process_runs().len(), 2);
+        assert!(kube.children["kind:nodes"].is_err());
+        assert!(kube.children["kind:pods"].is_ok());
+    }
+
+    #[test]
+    fn reload_stops_after_first_failure() {
+        let host = MockHost::install().with_capabilities(&["process:kubectl", "storage"]);
+        host.on_process(KUBECTL, |_, _| {
+            Ok(ProcessOutput { status: Some(1), stdout: String::new(), stderr: "Unable to connect to the server\n".into() })
+        });
+        let mut kube = KubeExplorer { context: Some("c".into()), ..Default::default() };
+        for key in ["kind:pods", "kind:services", "kind:nodes"] {
+            kube.expanded.insert(key.into());
+        }
+        kube.reload();
+        assert_eq!(host.process_runs().len(), 1);
+        assert_eq!(kube.children.len(), 3);
+        assert!(kube.children.values().all(Result::is_err));
+    }
+
+    #[test]
+    fn literal_placeholder_text_not_substituted() {
+        let _host = host();
+        let details = Details {
+            callback: String::new(),
+            title: "cm/x".into(),
+            text: "SENTINEL {{text}} {{callback}}".into(),
+            lang: "yaml",
+            editing: None,
+            note: None,
+        };
+        let Body::Html(page) = KubeExplorer::default().render_details(&details).body else {
+            panic!("expected html");
+        };
+        assert_eq!(page.matches("SENTINEL").count(), 2);
+        assert!(page.contains("{{callback}}"));
     }
 
     fn host() -> MockHost {
@@ -1939,10 +2413,38 @@ mod tests {
         kube.handle(TREE, ViewEvent::Select(kube.test_resource_key("res:pods/web-1", &host.invocation())), &host.invocation()).unwrap();
         kube.handle(TREE, ViewEvent::Button(kube.test_control_key("yaml")), &host.invocation()).unwrap();
 
+        host.answer_next_prompt(Some(&[]));
         kube.handle(TREE, ViewEvent::Message(kube.test_apply_message("kind: Pod # edited")), &host.invocation()).unwrap();
 
         assert!(host.process_runs().iter().any(|r| r.args.ends_with(&["replace".into(), "-f".into(), "-".into()])));
         assert!(page(&mut kube, &host).contains("name: web-1"));
+    }
+
+    #[test]
+    fn tool_failures_name_the_context_and_a_reason_without_raw_output() {
+        let reason = |detail: &str| failure_reason("Reading logs", Some("prod"), detail);
+        assert!(reason("error: You must be logged in to the server (Unauthorized)").contains("login for context prod has expired"));
+        assert!(reason("dial tcp 10.0.0.1:443: connect: connection refused").contains("context prod cannot be reached"));
+        assert!(reason("Error from server (Forbidden): pods is forbidden").contains("not allowed"));
+        assert!(reason("Error from server (NotFound): pods \"web\" not found").contains("not found on context prod"));
+        let other = reason("token=abc123 parser failure");
+        assert!(other.contains("context prod") && !other.contains("abc123"), "{other}");
+        assert!(matches!(tool_error("Reading logs", None, Error::Denied("process:kubectl".into())), Error::Invalid(m) if m == ui_kit::denied::message("Reading logs", "process:kubectl", "Kube Explorer")));
+    }
+
+    #[test]
+    fn declining_the_replace_confirm_runs_nothing() {
+        let host = host();
+        let mut kube = KubeExplorer::default();
+        kube.handle(TREE, ViewEvent::Select(kube.test_resource_key("res:pods/web-1", &host.invocation())), &host.invocation()).unwrap();
+        kube.handle(TREE, ViewEvent::Button(kube.test_control_key("yaml")), &host.invocation()).unwrap();
+
+        host.answer_next_prompt(None);
+        let result = kube.handle(TREE, ViewEvent::Message(kube.test_apply_message("kind: Pod # edited")), &host.invocation());
+
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(!host.process_runs().iter().any(|r| r.args.iter().any(|a| a == "replace")));
+        assert!(kube.details.is_some());
     }
 
     #[test]
@@ -1953,6 +2455,7 @@ mod tests {
         kube.handle(TREE, ViewEvent::Button(kube.test_control_key("yaml")), &host.invocation()).unwrap();
         let refreshes = host.refreshed_views().len();
 
+        host.answer_next_prompt(Some(&[]));
         kube.handle(TREE, ViewEvent::Message(kube.test_apply_message("kind: Pod # conflict")), &host.invocation()).unwrap();
 
         let reply:serde_json::Value=serde_json::from_str(&host.view_messages().last().unwrap().1).unwrap();
@@ -2059,7 +2562,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_port_forward_previews_ports_then_starts_an_owned_process() {
+    fn managed_port_forward_starts_an_owned_process_after_one_confirm() {
         let host = host().with_capabilities(&["process:kubectl", "project.read", "editor.read", "storage"]);
         let mut kube = KubeExplorer::default();
         kube.handle(TREE, ViewEvent::Select(kube.test_resource_key("res:pods/web-1", &host.invocation())), &host.invocation()).unwrap();
@@ -2069,10 +2572,6 @@ mod tests {
         kube.handle(TREE, ViewEvent::Field(kube.test_control_key("ports"), "8080:80".into()), &host.invocation()).unwrap();
         host.answer_next_prompt(Some(&[]));
         kube.handle(TREE, ViewEvent::Button(kube.test_control_key("start-managed-forward")), &host.invocation()).unwrap();
-        assert!(kube.forward_session.is_none(), "approval must return without spawning");
-        let prepared = kube.render(PANEL, None, &host.invocation()).unwrap();
-        let token = prepared.toolbar.iter().find(|b| b.id.starts_with("launch-reviewed-forward-")).unwrap().id.clone();
-        kube.handle(TREE, ViewEvent::Button(token), &host.invocation()).unwrap();
 
         assert!(matches!(form, Body::Form(fields) if fields[0].value == FieldValue::Text("80:80 443:443".into())));
         assert!(host.terminals().is_empty());
@@ -2090,7 +2589,8 @@ mod tests {
         kube.handle(TREE, ViewEvent::Button(kube.test_control_key("attach")), &host.invocation()).unwrap();
 
         assert!(host.terminals()[0].args.starts_with(&["logs".into(), "-f".into(), "deployments/web".into(), "--all-pods=true".into()]));
-        assert_eq!(host.terminals()[1].args, ["attach", "-it", "web-1"]);
+        let attach = ["attach", "-it", "web-1"].map(str::to_owned);
+        assert!(host.finish_terminal(&terminal_key("attach", "", &attach)).is_some());
     }
 
     #[test]
@@ -2103,8 +2603,24 @@ mod tests {
         let deletes = || host.process_runs().into_iter().filter(|r| r.args.contains(&"delete".to_owned())).collect::<Vec<_>>();
         assert!(deletes()[0].args.contains(&"--dry-run=server".to_owned()));
 
+        host.answer_next_prompt(Some(&[]));
         kube.handle(TREE, ViewEvent::Button(kube.test_control_key("confirm-delete-manifest")), &host.invocation()).unwrap();
         assert!(deletes()[1].args.ends_with(&["delete".into(), "-f".into(), "-".into()]));
+    }
+
+    #[test]
+    fn declining_the_manifest_delete_confirm_deletes_nothing() {
+        let host = host();
+        host.open_editor("/project/web.yaml", "yaml", "kind: Deployment", &[]);
+        let mut kube = KubeExplorer { namespace: Some("shop".into()), current_context: Some("minikube".into()), ..Default::default() };
+        kube.run_command("delete-manifest", &host.invocation(), None).unwrap();
+        assert!(kube.details.as_ref().unwrap().title.contains("minikube/shop"));
+
+        host.answer_next_prompt(None);
+        assert!(matches!(kube.button("confirm-delete-manifest"), Err(Error::Cancelled)));
+
+        assert!(!host.process_runs().iter().any(|r| r.args.contains(&"delete".to_owned()) && !r.args.contains(&"--dry-run=server".to_owned())));
+        assert!(kube.pending_delete.is_some());
     }
 
     #[test]
@@ -2301,6 +2817,9 @@ mod tests {
         let view = KubeExplorer::default().render_tree().unwrap();
 
         assert!(!toolbar(&view).contains(&"how-to-install-kubectl".to_owned()));
+        assert!(toolbar(&view).contains(&"choose-kubeconfig".to_owned()));
+        let Body::Tree(items) = &view.body else { panic!("tree") };
+        assert!(items.iter().any(|item| item.label == "Context: (no current context)"));
     }
 
     #[test]
@@ -2539,10 +3058,185 @@ mod tests {
     fn apply_sends_the_open_manifest() {
         let host = host();
         host.open_editor("/project/web.yaml", "yaml", "kind: Deployment", &[]);
+        host.answer_next_prompt(None);
 
+        assert_eq!(KubeExplorer::default().run_command("apply", &host.invocation(), None), Err(Error::Cancelled));
+        assert!(!host.process_runs().iter().any(|r| r.args.contains(&"apply".to_owned())));
+
+        host.answer_next_prompt(Some(&["apply"]));
         KubeExplorer::default().run_command("apply", &host.invocation(), None).unwrap();
 
         assert_eq!(host.notifications()[0].body, "minikube/(default): deployment.apps/web configured");
+        assert_eq!(host.notifications_with_actions()[0].actions, [NotificationAction::new("Show in Kube Explorer", SHOW_TREE)]);
+        assert_eq!(KubeExplorer::default().apply_question("/project/web.yaml"), "Apply /project/web.yaml to context minikube, namespace (default)?");
+    }
+
+    #[test]
+    fn apply_can_show_the_diff_first_without_applying() {
+        let host = host();
+        host.open_editor("/project/web.yaml", "yaml", "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web-1\n", &[]);
+
+        host.answer_next_prompt(Some(&["diff"]));
+        host.answer_next_prompt(None);
+        assert_eq!(KubeExplorer::default().run_command("apply", &host.invocation(), None), Err(Error::Cancelled));
+
+        assert!(!kubectl_calls(&host).iter().any(|args| args.contains(&"apply".to_owned()) && !args.contains(&"--dry-run=server".to_owned())));
+        let (diff, name) = &host.opened_diffs()[0];
+        assert_eq!(diff.left.as_deref(), Some("apiVersion: v1\nkind: Pod\nmetadata:\n  name: web-1\n"));
+        assert_eq!(diff.left_label.as_deref(), Some("Cluster (minikube/(default))"));
+        assert_eq!(name.as_deref(), Some("web.yaml"));
+    }
+
+    #[test]
+    fn apply_after_the_diff_asks_once_more_and_then_applies() {
+        let host = host();
+        host.open_editor("/project/web.yaml", "yaml", "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web-1\n", &[]);
+
+        host.answer_next_prompt(Some(&["diff"]));
+        host.answer_next_prompt(Some(&[]));
+        KubeExplorer::default().run_command("apply", &host.invocation(), None).unwrap();
+
+        assert_eq!(host.opened_diffs().len(), 1);
+        assert!(kubectl_calls(&host).iter().any(|args| args.ends_with(&["apply".into(), "-f".into(), "-".into()])));
+    }
+
+    #[test]
+    fn diff_shows_a_new_resource_alone_and_keeps_secrets_masked() {
+        let host = host();
+        host.on_process(KUBECTL, |args, stdin| {
+            if args.contains(&"diff".to_owned()) {
+                return Ok(ProcessOutput { status: Some(1), stdout: "+ data: ***\n".into(), stderr: String::new() });
+            }
+            if args.contains(&"--dry-run=server".to_owned()) {
+                return ok(stdin.unwrap_or_default());
+            }
+            ok(if args.contains(&"current-context".to_owned()) { "minikube\n" } else { "" })
+        });
+        host.open_editor("/project/new.yaml", "yaml", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: new\n", &[]);
+        KubeExplorer::default().run_command("diff", &host.invocation(), None).unwrap();
+        let (diff, _) = &host.opened_diffs()[0];
+        assert!(diff.left.is_none() && diff.right.as_deref().is_some_and(|r| r.contains("ConfigMap")));
+
+        host.open_editor("/project/secret.yaml", "yaml", "apiVersion: v1\nkind: Secret\nmetadata:\n  name: s\n", &[]);
+        let before = kubectl_calls(&host).len();
+        KubeExplorer::default().run_command("diff", &host.invocation(), None).unwrap();
+        assert_eq!(host.opened_diffs().len(), 1);
+        let secret_calls = kubectl_calls(&host).split_off(before);
+        assert_eq!(secret_calls.len(), 1, "{secret_calls:?}");
+        assert!(secret_calls[0].contains(&"diff".to_owned()));
+    }
+
+    const LIVE_LIST: &str = "apiVersion: v1\nkind: List\nitems:\n- apiVersion: v1\n  kind: Service\n  metadata:\n    name: web\n    namespace: shop\n    uid: 1\n    resourceVersion: \"9\"\n    creationTimestamp: \"2026-01-01T00:00:00Z\"\n    annotations:\n      kubectl.kubernetes.io/last-applied-configuration: '{}'\n    managedFields:\n    - manager: kubectl\n  spec:\n    ports:\n    - port: 80\n  status:\n    loadBalancer: {}\n- apiVersion: v1\n  kind: ConfigMap\n  metadata:\n    name: web\n    namespace: shop\n    generation: 2\n    annotations:\n      team: a\n      kubectl.kubernetes.io/last-applied-configuration: '{}'\n  data:\n    b: \"2\"\n    a: \"1\"\n";
+
+    #[test]
+    fn cluster_objects_drop_server_fields_and_order_documents_by_kind_namespace_and_name() {
+        let normalized = cluster_objects(LIVE_LIST).unwrap();
+
+        assert_eq!(
+            normalized,
+            "apiVersion: v1\ndata:\n  a: \"1\"\n  b: \"2\"\nkind: ConfigMap\nmetadata:\n  annotations:\n    team: a\n  name: web\n  namespace: shop\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: shop\nspec:\n  ports:\n    - port: 80\n"
+        );
+        let local = "kind: Service\napiVersion: v1\nmetadata:\n  namespace: shop\n  name: web\nspec:\n  ports:\n  - port: 80\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: web\n  namespace: shop\n  annotations:\n    team: a\ndata:\n  a: \"1\"\n  b: \"2\"\n";
+        assert_eq!(convert::source_documents(local).and_then(normalized_objects).unwrap(), normalized);
+        assert_eq!(cluster_objects("apiVersion: v1\nkind: List\nitems: []\n").as_deref(), Some(""));
+        assert!(cluster_objects("not: [valid").is_none());
+    }
+
+    #[test]
+    fn diff_compares_live_objects_with_the_server_dry_run_both_normalized() {
+        let host = host();
+        host.on_process(KUBECTL, |args, _| match args.iter().find(|a| !a.starts_with("--")).map(String::as_str) {
+            Some("config") => ok("minikube\n"),
+            Some("get") => ok(LIVE_LIST),
+            Some("apply") => ok(&LIVE_LIST.replace("port: 80", "port: 8080").replace("uid: 1", "uid: 2")),
+            _ => ok(""),
+        });
+        host.open_editor("/project/web.yaml", "yaml", "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n", &[]);
+        let mut kube = KubeExplorer { namespace: Some("shop".into()), ..Default::default() };
+
+        kube.run_command("diff", &host.invocation(), None).unwrap();
+
+        let calls = kubectl_calls(&host);
+        let dry_run = calls.iter().find(|args| args.contains(&"apply".to_owned())).unwrap();
+        assert_eq!(dry_run, &["--namespace=shop", "apply", "--dry-run=server", "-f", "-", "-o", "yaml", "--request-timeout=4s"]);
+        assert_eq!(calls.iter().filter(|args| args.contains(&"apply".to_owned())).count(), 1);
+        let (diff, _) = &host.opened_diffs()[0];
+        let (left, right) = (diff.left.as_deref().unwrap(), diff.right.as_deref().unwrap());
+        assert_eq!(left, cluster_objects(LIVE_LIST).unwrap());
+        assert_eq!(right, left.replace("port: 80", "port: 8080"));
+        assert_eq!(diff.right_label.as_deref(), Some("After apply, server dry run (web.yaml)"));
+    }
+
+    #[test]
+    fn a_refused_dry_run_compares_the_normalized_file_and_says_why() {
+        let host = host();
+        host.on_process(KUBECTL, |args, _| match args.iter().find(|a| !a.starts_with("--")).map(String::as_str) {
+            Some("config") => ok("minikube\n"),
+            Some("apply") => Ok(ProcessOutput { status: Some(1), stdout: String::new(), stderr: "\nError: forbidden: cannot patch\n".into() }),
+            _ => ok(""),
+        });
+        let shown = KubeExplorer::default().diff_manifest("metadata:\n  name: new\nkind: ConfigMap\napiVersion: v1\n", "/project/new.yaml").unwrap();
+
+        assert_eq!(shown, "These resources are not in the cluster yet. The server dry run failed (Error: forbidden: cannot patch), so the file is shown as written.");
+        let (diff, _) = &host.opened_diffs()[0];
+        assert!(diff.left.is_none());
+        assert_eq!(diff.right.as_deref(), Some("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: new\n"));
+        assert_eq!(diff.right_label.as_deref(), Some("Local (new.yaml)"));
+    }
+
+    #[test]
+    fn status_bar_names_the_context_and_namespace_and_hides_without_one() {
+        let host = host();
+        let mut kube = KubeExplorer { namespace: Some("shop".into()), ..Default::default() };
+        kube.render(TREE, None, &host.invocation()).unwrap();
+        let item = &host.status_items()[CONTEXT_STATUS];
+        assert_eq!(item.text, "⎈ minikube / shop");
+        assert_eq!(item.command.as_deref(), Some(SHOW_TREE));
+
+        kube.current_context = Some(NO_CONTEXT.into());
+        kube.update_context_status();
+        assert!(!host.status_items().contains_key(CONTEXT_STATUS));
+    }
+
+    #[test]
+    fn repeating_open_shell_focuses_the_same_terminal() {
+        let host = host();
+        let mut kube = KubeExplorer { current_context: Some("minikube".into()), ..Default::default() };
+        kube.handle(TREE, ViewEvent::Select(kube.test_resource_key("res:pods/web-1", &host.invocation())), &host.invocation()).unwrap();
+        kube.handle(TREE, ViewEvent::Button(kube.test_control_key("shell")), &host.invocation()).unwrap();
+        kube.handle(TREE, ViewEvent::Button(kube.test_control_key("shell")), &host.invocation()).unwrap();
+
+        assert!(host.terminals().is_empty());
+        let key = kube.shell_terminal_key(None, "web-1");
+        assert!(host.finish_terminal(&key).is_some());
+        assert!(host.finish_terminal(&key).is_none());
+    }
+
+    #[test]
+    fn delete_question_names_kind_name_namespace_and_context() {
+        let _host = host();
+        let kube = KubeExplorer { context: Some("prod-eu".into()), namespace: Some("shop".into()), ..Default::default() };
+        assert_eq!(kube.delete_question("pods", "web-1").unwrap(), "Delete pods/web-1 in namespace shop on context prod-eu?");
+        assert_eq!(kube.delete_question("nodes", "node-a").unwrap(), "Delete nodes/node-a on context prod-eu?");
+        let all = KubeExplorer { namespace: Some(ALL_NAMESPACES.into()), current_context: Some("minikube".into()), ..Default::default() };
+        assert_eq!(all.delete_question("pods", "shop/web-1").unwrap(), "Delete pods/web-1 in namespace shop on context minikube?");
+    }
+
+    #[test]
+    fn apply_confirms_target() {
+        for command in ["apply", "kustomize-apply"] {
+            let host = host();
+            host.open_editor("/project/k/web.yaml", "yaml", "kind: Deployment", &[]);
+            let mut kube = KubeExplorer { current_context: Some("minikube".into()), ..Default::default() };
+
+            host.answer_next_prompt(None);
+            assert!(matches!(kube.run_command(command, &host.invocation(), None), Err(Error::Cancelled)), "{command}");
+            assert!(kubectl_calls(&host).iter().all(|call| !call.contains(&"apply".to_owned())), "{command}");
+
+            host.answer_next_prompt(Some(&["apply"]));
+            kube.run_command(command, &host.invocation(), None).unwrap();
+            assert!(kubectl_calls(&host).iter().any(|call| call.contains(&"apply".to_owned())), "{command}");
+        }
     }
 
     fn registered_templates() -> Vec<(String, String, String)> {
@@ -2734,7 +3428,7 @@ mod tests {
         assert!(kube.revealed.is_none());
         let notes = host.notifications();
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].body.contains("allowRevealSecrets"));
+        assert!(notes[0].body.contains("Allow Show Secret and YAML on a secret"));
         assert!(runs.borrow().is_empty());
     }
 
@@ -2828,7 +3522,7 @@ mod tests {
         assert!(kube.details.is_none());
         let notes = host.notifications();
         assert_eq!(notes.len(), 2);
-        assert!(notes[0].body.contains("allowRevealSecrets"));
+        assert!(notes[0].body.contains("Allow Show Secret and YAML on a secret"));
     }
 
     #[test]
@@ -3031,6 +3725,7 @@ mod tests {
         let mut kube = all_mode();
         press(&mut kube, "pods", "team-a/web", "yaml", &host).unwrap();
 
+        host.answer_next_prompt(Some(&[]));
         kube.handle(TREE, ViewEvent::Message(kube.test_apply_message("kind: Pod")), &host.invocation()).unwrap();
         kube.button("reload-yaml").unwrap();
 
@@ -3158,8 +3853,8 @@ mod tests {
             all_mode().run_command(command, &host.invocation(), None).unwrap();
 
             let calls = kubectl_calls(&host);
-            assert_eq!(calls.len(), 1, "{command}");
-            assert!(!calls[0].iter().any(|a| a.starts_with("--namespace")), "{command}: {calls:?}");
+            assert_eq!(calls.len(), if command == "diff" { 2 } else { 1 }, "{command}");
+            assert!(!calls.iter().flatten().any(|a| a.starts_with("--namespace")), "{command}: {calls:?}");
         }
     }
 
@@ -3173,11 +3868,16 @@ mod tests {
             let host = host();
             host.open_editor("/project/k/web.yaml", "yaml", "kind: Deployment", &[]);
             let mut kube = KubeExplorer { namespace: Some("shop".into()), current_context: Some("minikube".into()), ..Default::default() };
+            if command != "delete-manifest" {
+                host.answer_next_prompt(Some(&["apply"]));
+            }
 
+            host.answer_next_prompt(Some(&["ok"]));
             kube.run_command(command, &host.invocation(), None).unwrap();
 
             assert_eq!(kubectl_calls(&host)[0], expected, "{command}");
             if command == "delete-manifest" {
+                host.answer_next_prompt(Some(&[]));
                 kube.button("confirm-delete-manifest").unwrap();
                 assert_eq!(kubectl_calls(&host).last().unwrap(), &["--namespace=shop", "delete", "-f", "-"]);
             }
@@ -3406,9 +4106,9 @@ mod rich_panel_owner_tests {
     fn absent_or_revoked_owner_refuses_plaintext_and_clears_existing_cache() {
         let (host,mut kube)=setup();host.set_project_root(None);
         kube.handle(TREE,ViewEvent::Select(kube.test_resource_key("res:secrets/demo", &host.invocation())),&host.invocation()).unwrap();
-        assert!(matches!(kube.handle(TREE,ViewEvent::Button(kube.test_control_key("show-secret")),&host.invocation()),Err(Error::Denied(_))));
+        assert!(matches!(kube.handle(TREE,ViewEvent::Button(kube.test_control_key("show-secret")),&host.invocation()),Err(Error::Invalid(m)) if m.starts_with("Resource details needs the project.read permission. Allow it in Settings › Plugins › Kube Explorer.")));
         assert!(host.process_runs().is_empty());
-        assert!(matches!(kube.handle(TREE,ViewEvent::Activate(kube.test_resource_key("res:pods/web", &host.invocation())),&host.invocation()),Err(Error::Denied(_))));
+        assert!(matches!(kube.handle(TREE,ViewEvent::Activate(kube.test_resource_key("res:pods/web", &host.invocation())),&host.invocation()),Err(Error::Invalid(m)) if m.contains("project.read")));
         assert!(host.process_runs().is_empty());host.set_project_root(Some("/project"));
         kube.render(TREE,None,&host.invocation()).unwrap();
         kube.handle(TREE,ViewEvent::Select(kube.test_resource_key("res:secrets/demo",&host.invocation())),&host.invocation()).unwrap();
@@ -3449,11 +4149,17 @@ mod marker_icon_tests {
     #[test]
     fn marker_icons_are_declared_and_packaged() {
         let manifest = include_str!("../plugin.toml");
-        for icon in [crate::KUSTOMIZE_MARKER, crate::LABEL_MARKER, "icons/marker-users.svg"] {
+        for icon in [crate::KUSTOMIZE_MARKER, crate::LABEL_MARKER] {
             assert!(manifest.contains(&format!("icon = \"{icon}\"")), "{icon}");
             assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(icon).is_file(), "{icon}");
         }
-        assert!(manifest.contains("markers = [\"kube-users:\"]"));
-        assert!(crate::indexer::users_key("kube:x").starts_with("kube-users:"));
+    }
+
+    #[test]
+    fn indexer_is_warm_only_and_declares_no_users_marker() {
+        let manifest = include_str!("../plugin.toml");
+        assert!(manifest.contains("[[contributes.documentIndexers]]"));
+        assert!(!manifest.contains("kube-users:"));
+        assert!(!manifest.contains("marker-users"));
     }
 }

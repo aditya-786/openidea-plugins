@@ -38,7 +38,7 @@ pub fn run(
     } else {
         if choices.is_empty() {
             return Err(Error::Invalid(
-                "No admitted subscription or explicit SchemaMapping source is selected.".into(),
+                "No GraphQL subscription handler found in this file. Use a @SubscriptionMapping method, or a @SchemaMapping method on the Subscription type.".into(),
             ));
         }
         if choices.len() == 1 {
@@ -111,7 +111,7 @@ pub fn run(
         .map(|l| format!("# {l}\n"))
         .collect::<String>();
     let content = format!(
-        "# Source-qualified subscription draft. Review selections and argument values.\n# Suggested variables for the separate Start Reviewed GraphQL Subscription command:\n{sample}# Replace null custom-input samples before connecting.\n# Endpoint and initialization payload are selected/reviewed separately; this action opens no connection.\n{}\n",
+        "# Source-qualified subscription draft. Review selections and argument values.\n# Suggested variables for the separate Start GraphQL Subscription command:\n{sample}# Replace null custom-input samples before connecting.\n# Endpoint and initialization payload are selected/reviewed separately; this action opens no connection.\n{}\n",
         draft.query
     );
     if current(ctx)? != doc {
@@ -124,7 +124,7 @@ pub fn run(
     }
     match project.write_file(&path, &content) {
         Ok(()) => host::open_location(&path, 0, 0),
-        Err(Error::Denied(_)) => host::copy_to_clipboard(&content),
+        Err(Error::Denied(_)) => crate::copy_after_write_denied(&content),
         Err(error) => Err(error),
     }
 }
@@ -148,6 +148,7 @@ mod tests {
         host.open_editor("/project/Events.java", "java", source, &[]);
         let doc = current(&host.invocation()).unwrap();
         let mut owner = crate::window::Endpoints::default();
+        owner.activate_live();
         let lens = owner
             .code_lenses(&doc)
             .into_iter()

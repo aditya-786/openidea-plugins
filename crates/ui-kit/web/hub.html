@@ -4,7 +4,7 @@
 <body class="ui-embedded-panel">
 
 <progress id="request-progress" class="ui-progress request-progress" aria-label="Loading resources" data-i18n-aria-label="shared.loading" hidden></progress>
-<div class="shell"><nav id="view-tabs" class="ui-tabs" role="tablist" aria-label="Plugin views" data-i18n-aria-label="shared.pluginViews" hidden></nav><nav id="sections" class="ui-tabs" aria-label="Sections" data-i18n-aria-label="shared.sections" hidden></nav><main>
+<div class="shell"><div class="view-nav"><label class="view-section-picker" hidden><span class="ui-visually-hidden" data-i18n="shared.viewGroup">View group</span><select id="view-sections"></select></label><nav id="view-tabs" class="ui-tabs" role="tablist" aria-label="Plugin views" data-i18n-aria-label="shared.pluginViews" hidden></nav></div><nav id="sections" class="ui-tabs" aria-label="Sections" data-i18n-aria-label="shared.sections" hidden></nav><main>
 <div class="bar"><div id="toolbar" class="toolbar ui-toolbar" role="toolbar" aria-label="Actions" data-i18n-aria-label="shared.actions"></div>
 <div id="filters" class="filters"><label class="search"><span class="ui-visually-hidden"><span data-i18n="shared.search">Search</span></span><span class="search-icon" data-ui-icon="search" aria-hidden="true"></span><input id="search" class="ui-input" type="search" placeholder="Search…" data-i18n-placeholder="shared.searchPlaceholder"></label><div id="facets"></div><button id="clear" type="button" hidden class="ui-button ui-icon-button" title="Clear filters" data-i18n-title="shared.clearFilters"><span data-ui-icon="close"></span><span class="ui-visually-hidden"><span data-i18n="shared.clearFilters">Clear filters</span></span></button></div>
 </div>

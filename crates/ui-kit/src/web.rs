@@ -193,7 +193,7 @@ pub fn refresh_view(view: &str, source: &str) {
                 let _ = host::post_view_message(physical, &json!({"channel":"ui-kit-refresh","targetView":view}).to_string());
             }
         }
-        Err(error) => notify_error("Plugin view", &error),
+        Err(error) => notify_error("Plugin view", "Plugin view", &error),
     }
 }
 
@@ -373,14 +373,26 @@ fn valid_frame_id(frame: &str) -> bool {
     frame.len() == 32 && frame.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn notify_error(title: &str, error: &Error) {
+/// User-facing text for a failed view action. The SDK's `Display` keeps developer
+/// prefixes ("invalid: …", "permission denied: … is not granted").
+fn error_message(error: &Error, feature: &str, plugin: &str) -> String {
+    match error {
+        Error::Denied(capability) if !capability.contains(char::is_whitespace) => crate::denied::message(feature, capability, plugin),
+        Error::NotFound(what) if !what.contains(char::is_whitespace) => format!("Not found: {what}"),
+        Error::Denied(text) | Error::Invalid(text) | Error::NotFound(text) | Error::Failed(text) => text.clone(),
+        Error::Stale => "This item changed. Refresh and try again.".into(),
+        Error::Cancelled => "Cancelled.".into(),
+    }
+}
+
+fn notify_error(title: &str, plugin: &str, error: &Error) {
     use openidea_plugin::NotificationLevel;
     let level = match error {
         Error::Cancelled => return,
         Error::Denied(_) | Error::Stale | Error::Invalid(_) | Error::NotFound(_) => NotificationLevel::Warning,
         _ => NotificationLevel::Error,
     };
-    host::notify(level, title, &error.to_string());
+    host::notify(level, title, &error_message(error, title, plugin));
 }
 
 /// Handles only the namespaced web protocol. Legacy messages and native events
@@ -420,10 +432,10 @@ pub fn handle_with_actions<T: Plugin + Views>(plugin: &mut T, view: &str, event:
     let (request, config) = match decode() {
         Ok(decoded) => decoded,
         Err(error) => {
-            notify_error("Plugin view", &error);
+            notify_error("Plugin view", "Plugin view", &error);
             host::post_view_message(
                 view,
-                &json!({"channel":"ui-kit","sequence":sequence,"frameId":frame_id,"project":null,"error":error.to_string()}).to_string(),
+                &json!({"channel":"ui-kit","sequence":sequence,"frameId":frame_id,"project":null,"error":error_message(&error, "Plugin view", "Plugin view")}).to_string(),
             )?;
             return Ok(true);
         }
@@ -575,9 +587,11 @@ pub fn handle_with_actions<T: Plugin + Views>(plugin: &mut T, view: &str, event:
         Err(error) => {
             // A rejected background poll is retried by its page; a notification per attempt would flood the user.
             if !(opaque && matches!(error, Error::Stale)) {
-                notify_error(title, &error);
+                notify_error(title, &config.title, &error);
             }
-            json!({"channel":request.channel,"sequence":sequence,"frameId":request.frame_id,"project":project,"error":error.to_string()})
+            // The page names a denied capability and the plugin's settings page in its empty state.
+            let denied = match &error { Error::Denied(capability) => Some(capability), _ => None };
+            json!({"channel":request.channel,"sequence":sequence,"frameId":request.frame_id,"project":project,"error":error_message(&error, title, &config.title),"denied":denied,"plugin":config.title})
         }
     };
     host::post_view_message(&physical, &answer.to_string())?;
@@ -621,10 +635,20 @@ mod tests {
         assert_eq!(notes[0].level, openidea_plugin::NotificationLevel::Warning);
         assert_eq!(notes[0].title, "Routes");
         assert!(demo.calls.is_empty());
-        notify_error("Laravel", &Error::Failed("artisan optimize:clear failed".into()));
+        notify_error("Laravel", "Laravel", &Error::Failed("artisan optimize:clear failed".into()));
         assert_eq!(mock.notifications()[1].level, openidea_plugin::NotificationLevel::Error);
-        notify_error("Laravel", &Error::Cancelled);
+        notify_error("Laravel", "Laravel", &Error::Cancelled);
         assert_eq!(mock.notifications().len(), 2, "cancelling is not an error");
+    }
+
+    #[test]
+    fn action_errors_use_plain_wording() {
+        assert_eq!(error_message(&Error::Denied("clipboard".into()), "Routes", "Laravel"),
+            "Routes needs the clipboard permission. Allow it in Settings › Plugins › Laravel.");
+        assert_eq!(error_message(&Error::Denied("Open a project first.".into()), "Routes", "Laravel"), "Open a project first.");
+        assert_eq!(error_message(&Error::Invalid("Select a route.".into()), "Routes", "Laravel"), "Select a route.");
+        assert_eq!(error_message(&Error::NotFound("routes/web.php".into()), "Routes", "Laravel"), "Not found: routes/web.php");
+        assert_eq!(error_message(&Error::Stale, "Routes", "Laravel"), "This item changed. Refresh and try again.");
     }
 
     #[test]
@@ -733,6 +757,7 @@ mod tests {
                     assert!(demo.calls.is_empty());
                     let answer: Value = serde_json::from_str(&mock.view_messages().last().unwrap().1).unwrap();
                     assert!(answer.get("error").is_some());
+                    assert!(answer["denied"].as_str().is_some_and(|denied| denied.contains("project.read")));
                 }
             }
             handle(

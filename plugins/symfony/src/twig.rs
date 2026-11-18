@@ -190,7 +190,7 @@ pub fn loop_source(text: &str, offset: usize, name: &str) -> Option<(String, usi
 
     while let Some(open) = head[at..].find("{%") {
         let start = at + open;
-        let Some(close) = head[start..].find("%}") else { break };
+        let Some(close) = head[start + 2..].find("%}").map(|c| c + 2) else { break };
         let tag = head[start + 2..start + close].trim_matches(['-', '~']).trim();
         if let Some(rest) = tag.strip_prefix("for ") {
             if let Some((variables, expression)) = rest.split_once(" in ") {
@@ -273,7 +273,7 @@ pub fn local_variables(text: &str, at: usize) -> Vec<Local> {
     let mut found: Vec<Local> = scopes.into_iter().flat_map(|(_, locals)| locals).collect();
 
     for region_start in text.match_indices("{#").map(|(open, _)| open) {
-        let Some(close) = text[region_start..].find("#}") else { continue };
+        let Some(close) = text[region_start + 2..].find("#}").map(|c| c + 2) else { continue };
         let comment = &text[region_start + 2..region_start + close];
         let Some(tail) = comment.trim().strip_prefix("@var") else { continue };
         let mut words = tail.split_whitespace();

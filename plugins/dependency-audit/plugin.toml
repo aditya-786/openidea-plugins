@@ -1,19 +1,22 @@
 id = "aritti.dependency-audit"
 name = "Dependency Audit"
 version = "0.3.0" # x-release-please-version
-description = "Checks Maven, Gradle, npm and Composer dependencies against the OSV.dev vulnerability database. Live editor diagnostics use cached results and show their query dates; fetching runs only on open/save or an explicit scan. Vulnerable dependencies are marked in pom.xml, build.gradle, build.gradle.kts, package.json, composer.json and their lockfiles when you open or save them, with a quick fix that upgrades to the nearest fixed version. Dependency Audit: Scan Project lists the project's vulnerable dependencies in the Vulnerable Dependencies tool window. Privacy: package names and versions (never source code) are sent to api.osv.dev, a free service run by Google. Turn off Check on open and save under Settings › Plugins › Dependency Audit to contact it only when you run a scan."
+description = "Checks Maven, Gradle, npm, yarn, pnpm, Composer, PyPI and Cargo dependencies against the OSV.dev vulnerability database. Live editor diagnostics use cached results and show their query dates; fetching runs only on open/save or an explicit scan. Vulnerable dependencies are marked in pom.xml, build.gradle, build.gradle.kts, package.json, composer.json, Python and Rust dependency files and their lockfiles when you open or save them, with a quick fix that upgrades to the nearest fixed version. Dependency Audit: Scan Project lists the project's vulnerable dependencies in the Dependency Audit tool window. Privacy: package names and versions (never source code) are sent to api.osv.dev, a free service run by Google. Turn off Check on open and save under Settings › Plugins › Dependency Audit to contact it only when you run a scan."
 authors = ["Arnaud Ritti <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Scan and sbt-resolution results notify the owning project's window only. Workspaces: a vulnerable coordinate in a root package-lock (following link: true members), yarn berry (workspace: entries) or pnpm (importers) lockfile binds to the declaring member's own package.json with a workspace a > dep > pkg chain, only when that member has exactly one literal declaration (else shown unbound with the reason); peerDependencies are chain edges only for package-lock v3 installed records. pnpm/yarn root-manifest chains and pnpm link: members stay unfollowed. Vulnerable-call analysis feasibility: OSV publishes no per-symbol data for PyPI/Maven (only Go), so PyPI/Maven report rows are annotated with import-level evidence from bounded .py/.java/.kt sources (package imported in source or no import found; groupId/module-name heuristic, annotation only, never suppresses, not call-level). Lockfile parsing checked against real npm/cli package-lock v3, Yarn v1 and berry, pnpm v9 files: fixes Yarn berry multi-spec headers (names kept a leading quote) and npm: aliases, pnpm v5 keys, aliased package-lock entries. Bind lockfile coordinates (package-lock, yarn.lock, pnpm-lock, uv.lock, poetry.lock) and resolved Maven/Gradle/sbt coordinates to their exact-name literal declaration in package.json, pyproject.toml, pom.xml, build.gradle(.kts) or build.sbt: findings list Declared in file:line with a Go to declaration action; transitive npm/uv/poetry findings show the bounded direct-dependency chain (depth 6, 2000 nodes); aliases and repeated declarations are refused. Scan pyproject.toml: exact == pins in PEP 621 dependencies/optional-dependencies and PEP 735 dependency-groups (include-group expanded, cycles skipped; other specifiers skipped); marker-guarded requirements are audited and shown as marker not evaluated. npm/yarn/pnpm workspaces: workspace:/link: specs, lockfile link entries and members of workspace globs are shown as local workspace package rows and never sent to OSV; installs nested under workspace members are audited. Report rows now list every exact ecosystem/name/version coordinate queried with no advisories, and dependency files that could not be read (bounded to 500 each; no new network). Scan PEP 751 pylock.toml packages from an explicit pypi.org index (VCS, directory, archive, other-index and unversioned entries stay unknown; markers not evaluated); audit exact npm: alias specs in package.json under the real package name with no editor upgrade, while ranges, tags, workspace: and link: stay unknown. Reviewed export/import of project-scoped ignores as .openidea/dependency-audit-ignores.json: strict schema and size limits, no overwrite of an existing file, confirmation listing every imported entry, existing entries kept. Reviewed sbt2.0.12 effective multi-module/configuration resolution and explicit completed-export OSV audit. Separately named source-built Mach-O/dSYM experimental Rust scanner profile, distinct from unchanged official binary. Known-malicious OpenSSF MAL package evidence from OSV.dev with reporter/date provenance and suppressed automatic upgrades. Reviewed official OSV-Scanner2.7.1 Go/Rust call-analysis command with managed poll/cancel, dated separate evidence and Unknown unsupported/failed facts. Reviewed managed Maven3.9.16 and Gradle9.9.1 effective dependency exports with poll/cancel, source checks and explicit OSV report import. Dependency chains follow uv.lock optional-dependencies and dev-dependencies edges and skip poetry.lock multi-line array entries (checked against real uv.lock and poetry.lock). Inspect source-bound npm physical dependency graph; scan canonical-PyPI Pipfile.lock records. Scan bounded npm v1 nested lock entries and uv canonical-PyPI resolved packages with source locations. Unreleased: Project/package/version/advisory scoped ignores with required reasons, confirmation and review/restore; retained evidence is filtered consistently across report/live fixes/commit review. Selected dependency upgrade previews require exact current source and confirmation before a versioned editor edit; selected advisories open validated OSV URLs. Versioned current-document diagnostics use dated cached OSV evidence without network calls; optional cached scan review in Commit Options. Typed dependency/advisory rows with filters and source/fix/severity details; persisted scan and failure provenance; failed rescans retain the previous report. 0.1.0: first release. OSV.dev checks of pom.xml, build.gradle, build.gradle.kts, package.json, package-lock.json, composer.json and composer.lock on open and save, an upgrade quick fix, and Scan Project with the Vulnerable Dependencies tool window. Unreleased: 12 manifest and lockfile formats are checked (also libs.versions.toml, yarn.lock, pnpm-lock.yaml, Cargo.lock, poetry.lock, requirements.txt) and the upgrade quick fix also works in libs.versions.toml and requirements.txt."
+change-notes = """\
+Next release: Files with findings show a vulnerability count in the project tree, vulnerable lines show the advisory and fixed version, and Preview Upgrade opens a diff first; Maven and Gradle versions come from the dependency graph the IDE already resolved, and mvn or gradle runs after a scan only when that setting is on and the IDE has none, and says once why it could not run; findings show where a dependency is declared, with Go to declaration and the chain for indirect ones, and a project without dependency files lists the supported ones; scans pyproject.toml, pylock.toml, uv.lock and poetry.lock, PyPI and Maven results show whether your code imports the package, and private-registry packages are never sent to OSV.dev; version parsing fixes for Yarn, pnpm, npm, Gradle and PyPI, quick fixes ask you to save first, palette row commands let you pick a dependency, messages name the permission to allow, ignored findings and window tabs have plainer names, and the npm lockfile graph size limit is a setting. \
+0.3.0: new hub window, dependency resolution and import-level evidence. \
+0.2.0: plugin icon, audit rows, and quick fix that audits every library sharing the bumped version."""
 categories = ["linters", "tools"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-event:file-opened", "on-event:file-saved", "on-view:vulnerabilities"]
 
 [capabilities]
 required = ["project.read", "storage"]
-optional = ["project.write", "process:sbt", "process:osv-scanner-macho", "process:osv-scanner", "process:mvn", "process:gradle", "editor.read", "editor.write", "events", "vcs.read", "net:api.osv.dev"]
+optional = ["project.write", "process:sbt", "process:osv-scanner-macho", "process:osv-scanner", "process:mvn", "process:gradle", "editor.read", "editor.write", "events", "vcs.read", "net:api.osv.dev", "build.read"]
 
 [[contributes.providers]]
 kinds = ["code-actions"]
@@ -34,37 +37,37 @@ category = "Dependency Audit"
 
 [[contributes.commands]]
 id = "preview-upgrade"
-title = "Preview upgrade in open declaration"
+title = "Dependency Audit: Preview Upgrade…"
 category = "Dependency Audit"
 
 [[contributes.commands]]
 id = "open-declaration"
-title = "Go to declaration"
+title = "Dependency Audit: Go to Declaration…"
 category = "Dependency Audit"
 
 [[contributes.commands]]
 id = "open-advisory"
-title = "Open advisory on OSV.dev"
+title = "Dependency Audit: Open Advisory on OSV.dev…"
 category = "Dependency Audit"
 
 [[contributes.commands]]
 id = "ignore-finding"
-title = "Ignore this exact finding with reason"
+title = "Dependency Audit: Ignore Finding with Reason…"
 category = "Dependency Audit"
 
 [[contributes.commands]]
 id = "review-ignores"
-title = "Dependency Audit: Review scoped ignores"
+title = "Dependency Audit: Review Ignored Findings…"
 category = "Dependency Audit"
 
 [[contributes.commands]]
 id = "export-ignores"
-title = "Dependency Audit: Export scoped ignores to project file"
+title = "Dependency Audit: Export Ignored Findings to Project File…"
 category = "Dependency Audit"
 
 [[contributes.commands]]
 id = "import-ignores"
-title = "Dependency Audit: Import scoped ignores from project file"
+title = "Dependency Audit: Import Ignored Findings from Project File…"
 category = "Dependency Audit"
 
 [[contributes.menus]]

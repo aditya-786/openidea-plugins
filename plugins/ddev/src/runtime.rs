@@ -14,20 +14,41 @@ pub fn enabled(key: &str) -> bool {
     host::setting_bool(key).unwrap_or(true)
 }
 
-/// Windowless scheduled events cannot ask the settings API for an arbitrary
-/// project. Read an explicit project override from the supported settings file.
-pub fn enabled_for(project: &Project, key: &str) -> bool {
-    if let Ok(text) = project.read_file(".openidea/settings.toml")
-        && let Ok(doc) = text.parse::<toml_edit::DocumentMut>()
-        && let Some(value) = doc
-            .get("plugins")
-            .and_then(|p| p.get("aritti.ddev"))
-            .and_then(|p| p.get(key))
-            .and_then(|v| v.as_bool())
-    {
-        return value;
+/// Project overrides parsed once per call. Windowless scheduled events cannot
+/// ask the settings API for an arbitrary project, so the supported settings
+/// file is read directly.
+pub struct Prefs(Option<toml_edit::DocumentMut>);
+
+impl Prefs {
+    pub fn load(project: &Project) -> Self {
+        Self(
+            project
+                .read_file(".openidea/settings.toml")
+                .ok()
+                .and_then(|text| text.parse().ok()),
+        )
     }
-    enabled(key)
+
+    fn item(&self, key: &str) -> Option<&toml_edit::Item> {
+        self.0.as_ref()?.get("plugins")?.get("aritti.ddev")?.get(key)
+    }
+
+    pub fn enabled(&self, key: &str) -> bool {
+        self.item(key)
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(|| enabled(key))
+    }
+
+    pub fn string(&self, key: &str, default: &str) -> String {
+        self.item(key)
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| host::setting_string(key).unwrap_or_else(|| default.into()))
+    }
+}
+
+pub fn enabled_for(project: &Project, key: &str) -> bool {
+    Prefs::load(project).enabled(key)
 }
 
 pub fn update_key(project: &Project) -> Result<String, Error> {
@@ -57,17 +78,11 @@ pub fn publish(desc: Option<&Description>, configured: bool) {
     let _ = host::set_context("running", running);
     let _ = host::set_context("can-restart-stop", running);
     let _ = host::set_context("can-start", desc.is_some_and(|d| allowed(d, "start")));
-    let label = desc.map_or_else(
-        || {
-            if configured {
-                "DDEV: unavailable"
-            } else {
-                "DDEV: not configured"
-            }
-            .into()
-        },
-        |d| format!("DDEV: {}", d.status),
-    );
+    if !configured && desc.is_none() {
+        let _ = host::remove_window_status_item("ddev-status");
+        return;
+    }
+    let label = desc.map_or_else(|| "DDEV: unavailable".into(), |d| format!("DDEV: {}", d.status));
     // API 1.4 overrides are window-scoped; never fall back to a global
     // project-specific value when invoked without a window.
     let _ = host::set_window_status_item(
@@ -114,8 +129,9 @@ impl Main {
         desc: &Description,
         interactive: bool,
     ) {
-        self.sync_target(project, Some(desc));
-        if !enabled_for(project, "autoConfigureDataSource")
+        let prefs = Prefs::load(project);
+        self.sync_target_with(project, Some(desc), &prefs);
+        if !prefs.enabled("autoConfigureDataSource")
             || desc.status != "running"
             || database::connection(desc).is_err()
         {
@@ -143,20 +159,24 @@ impl Main {
     }
 
     pub(crate) fn refresh_background(&mut self, project: &Project) {
-        self.check_target_preferences(project);
-        if let Ok(output) = crate::run_json(project, "describe")
-            && let Ok(desc) = Description::parse(&output)
-        {
-            self.clear_failure_notice(project);
-            self.integrations(project, &desc, false);
-            if let Ok(root) = project.root()
-                && self.current_root.as_deref() == Some(&root)
-            {
-                self.snapshot = Some((root, desc));
-                self.refreshed_at = now();
+        self.check_target_preferences(project, &Prefs::load(project));
+        let result = crate::run_json(project, "describe").and_then(|o| Description::parse(&o));
+        let desc = match result {
+            Ok(desc) => desc,
+            Err(error) => {
+                self.sync_target(project, None);
+                if let Ok(root) = project.root() {
+                    self.failure.insert(root, error.to_string());
+                }
+                return;
             }
-        } else {
-            self.sync_target(project, None);
+        };
+        self.clear_failure_notice(project);
+        self.integrations(project, &desc, false);
+        if let Ok(root) = project.root() {
+            self.failure.remove(&root);
+            self.refreshed_at.insert(root.clone(), now());
+            self.snapshots.insert(root, desc);
         }
     }
 
@@ -258,7 +278,7 @@ impl Main {
         let configured = project.exists(CONFIG)?;
         let mut items = vec![
             PickItem::new("refresh", "Refresh status"),
-            PickItem::new("help", "Help and diagnostics"),
+            PickItem::new("setup", "Guided Setup"),
         ];
         if configured {
             items.push(PickItem::new("open-config", "Open configuration"));
@@ -288,9 +308,9 @@ impl Main {
                 ("restart", "Restart project"),
                 ("stop", "Stop project"),
                 ("share", "Share project"),
-                ("shell", "Open web shell"),
+                ("shell", "Open shell"),
                 ("open-service", "Open service in browser"),
-                ("logs", "Open web logs"),
+                ("logs", "Open logs"),
                 ("composer", "Run Composer…"),
                 ("php", "Run PHP…"),
                 ("node", "Run Node.js…"),
@@ -381,4 +401,4 @@ fn is_runtime_input(path: &str, root: &str) -> bool {
                 || file.starts_with("docker-compose.") && file.ends_with(".yaml")))
 }
 
-pub const HELP: &str = "DDEV Integration\n\nOpen the folder containing .ddev/config.yaml. Allow process:ddev in Settings > Plugins. Start Docker, then use DDEV: Start. The host's process permission page also chooses an approved executable globally or for this project.\n\nServices shows project status, containers, browser links, configuration and streaming logs. Overview summarizes a selection; Inspect redacts credential fields. Right-click for project actions. The status-bar picker includes direct service links.\n\nStatus refreshes every minute when enabled, on configuration changes and when a plugin terminal exits or closes. Explicit refresh remains available. Native terminals add DDEV_NONINTERACTIVE=true; an inherited variable with that name cannot be overwritten by the host. Configure opens its YAML after successful completion.\n\nAllow database.sources for native Database setup, secure credential storage and connection/introspection requests. Windowless startup only maintains the source. Without that permission, project.write can maintain a non-secret legacy connection file with manual password entry.\n\nThe DDEV project run target supports host-selected PHP/Node/Composer runs and tests with path mapping. Registration never changes the selected target; accept the host prompt or choose DDEV in Run/Debug/interpreter settings. Guided Setup controls registration and the container project path (/var/www/html by default). Install language servers in the container before explicitly selecting a target LSP. Enable/configure Xdebug in DDEV for supported PHP debugging.\n\nProject-targeted background notifications require API 1.5; this component targets 1.4. Terminal profile-menu/typed-command interception and JetBrains-specific SDK objects are not reproduced.\n\nDDEV installation: https://docs.ddev.com/en/stable/users/install/\nOriginal plugin: https://github.com/ddev/ddev-intellij-plugin\n";
+pub const HELP: &str = "DDEV Integration\n\nOpen the folder containing .ddev/config.yaml. Allow process:ddev in Settings › Plugins › DDEV Integration. Start Docker, then use DDEV: Start. The host's process permission page also chooses an approved executable globally or for this project.\n\nServices shows project status, containers, browser links, configuration and streaming logs. Overview summarizes a selection; Inspect redacts credential fields. Right-click for project actions. The status-bar picker includes direct service links.\n\nStatus refreshes every minute when enabled, on configuration changes and when a plugin terminal exits or closes. Explicit refresh remains available. Native terminals add DDEV_NONINTERACTIVE=true; an inherited variable with that name cannot be overwritten by the host. Configure opens its YAML after successful completion.\n\nAllow database.sources for native Database setup, secure credential storage and connection/introspection requests. Windowless startup only maintains the source. Without that permission, project.write can maintain a non-secret legacy connection file with manual password entry.\n\nThe DDEV project run target supports host-selected PHP/Node/Composer runs and tests with path mapping. Registration never changes the selected target; accept the host prompt or choose DDEV in Run/Debug/interpreter settings. Guided Setup controls registration and the container project path (/var/www/html by default). Install language servers in the container before explicitly selecting a target LSP. Enable/configure Xdebug in DDEV for supported PHP debugging.\n\nTerminal profile-menu/typed-command interception and JetBrains-specific SDK objects are not reproduced.\n\nDDEV installation: https://docs.ddev.com/en/stable/users/install/\nOriginal plugin: https://github.com/ddev/ddev-intellij-plugin\n";

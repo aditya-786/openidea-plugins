@@ -28,7 +28,7 @@ fn prefix(value: &str) -> Option<(bool, &str)> {
     Some((slash, path))
 }
 pub(crate) fn completion(
-    nav: &WsTools,
+    nav: &mut WsTools,
     doc: &Document,
     at: Position,
 ) -> Option<Vec<CompletionItem>> {
@@ -64,6 +64,9 @@ pub(crate) fn completion(
     if root.is_empty() || root.chars().any(char::is_control) || !doc.path.starts_with(&root_prefix)
     {
         return empty();
+    }
+    if let Some(project) = project_of(&doc.path) {
+        nav.resource_paths.warm(&project, PROVIDER_BUDGET);
     }
     let Some(paths) = nav.resource_paths.paths(&root, site.extension) else {
         return empty();
@@ -288,5 +291,14 @@ mod tests {
         let items=p.completion(&d,end(&d,"classpath:a/re"),None);assert_eq!(items.len(),1);assert_eq!(items[0].insert_text,"classpath:a/resource.xslt");
         let from=d.text.find(value).unwrap();assert_eq!(items[0].replace,Some(spring_text::range(&d.text,from,from+value.len())));
     }
-
+    #[test]
+    fn resource_completion_after_ttl() {
+        let h = host();
+        let mut p = warm(&h);
+        p.resource_paths.expire();
+        h.add_file("src/main/resources/c/resource.xslt", "opaque");
+        let d = doc("classpath:c/re");
+        let items = p.completion(&d, end(&d, "classpath:c/re"), None);
+        assert_eq!(items.len(), 1);
+    }
 }

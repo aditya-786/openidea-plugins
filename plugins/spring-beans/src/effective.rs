@@ -2,7 +2,6 @@
 //! else (other conditions, missing, repeated or placeholder values) stays
 //! undecided and the bean keeps counting as a candidate.
 
-use crate::checks::same_scope;
 use crate::model::{Bean, Condition};
 use crate::World;
 use spring_text::config::canonical;
@@ -10,37 +9,14 @@ use spring_text::config::canonical;
 impl World<'_> {
     /// The value `key` has when exactly one base `application.*` entry sets it to a plain literal.
     fn literal(&self, key: &str) -> Option<String> {
-        if !self.complete {
+        if !self.complete || self.lookups.config_imports {
             return None;
         }
-        let wanted = canonical(key);
-        let imports = canonical("spring.config.import");
-        let mut found = None;
-        for config in self.files.values().filter_map(|m| m.config.as_ref()) {
-            for (k, v) in &config.keys {
-                let k = canonical(k);
-                if k == imports {
-                    return None;
-                }
-                if k != wanted {
-                    continue;
-                }
-                if found.is_some() || config.profile_scoped || v.is_empty() || v.contains("${") {
-                    return None;
-                }
-                found = Some(v.clone());
-            }
-        }
-        found
+        self.lookups.literals.get(&canonical(key)).cloned().flatten()
     }
 
     fn profile_names_set(&self) -> bool {
-        let names = [canonical("spring.profiles.include"), canonical("spring.profiles.group")];
-        self.files
-            .values()
-            .filter_map(|m| m.config.as_ref())
-            .flat_map(|c| &c.keys)
-            .any(|(k, _)| names.iter().any(|n| canonical(k).starts_with(n.as_str())))
+        self.lookups.profile_names_set
     }
 
     fn profiles_exclude(&self, profiles: &[String]) -> Option<String> {
@@ -87,7 +63,7 @@ impl World<'_> {
                 && !other.conditional
                 && other.profiles.is_empty()
                 && !other.ty.is_empty();
-            let present = plain && same_scope(path, other_path) && types.iter().any(|t| self.is_a(&other.ty, t));
+            let present = plain && types.iter().any(|t| self.is_a(&other.ty, t)) && self.same_scope(path, other_path);
             present.then(|| format!("{} already defines the type, so @ConditionalOnMissingBean fails", other.name))
         })
     }

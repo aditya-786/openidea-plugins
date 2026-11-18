@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>OpenAPI Operations</title>
+    <link rel="stylesheet" href="./resources/tokens.css" />
+    <link rel="stylesheet" href="./resources/components.css" />
+    <link rel="stylesheet" href="./operations.css" />
+  </head>
+  <body class="ui-embedded-panel">
+    <header class="ops-toolbar ui-toolbar">
+      <label class="ui-visually-hidden" for="filter">Filter operations</label>
+      <input id="filter" class="ui-input" type="search" placeholder="Filter by method, path or tag" autocomplete="off" spellcheck="false" />
+    </header>
+    <p id="status" class="ops-status" role="status" aria-live="polite"></p>
+    <nav id="list" aria-label="Operations"></nav>
+    <script src="./resources/native-icons.js"></script><script src="./resources/icons.js"></script><script src="./resources/widgets.js"></script><script src="./resources/controls.js"></script>
+    <script src="./operations.js"></script>
+  </body>
+</html>

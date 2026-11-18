@@ -191,7 +191,7 @@ pub(crate) fn choose(reference: &str) -> Result<Value, Error> {
         }
         if freeform && key=="custom" {
             let value=host::input(&format!("Value for feature option {id}"),option.get("default").and_then(Value::as_str))?.ok_or(Error::Cancelled)?;
-            if value.len()>4096 || value.contains('\0'){return Err("Feature option values must be at most4096 bytes and contain no NUL.".into());}
+            if value.len()>4096 || value.contains('\0'){return Err("Feature option values must be at most 4096 bytes and contain no NUL.".into());}
             selected.insert(id,Value::String(value));continue;
         }
         let n = key

@@ -117,6 +117,8 @@ pub struct Index {
     pub compiled_container: bool,
     /// Some files were skipped to stay within the call's time budget.
     pub partial: bool,
+    /// `src/` files that build a Twig Lexer: custom delimiters, which Symfony's own Twig checks do not read.
+    pub lexer_files: BTreeSet<String>,
 }
 
 /// Compiled files of `bin/console cache:warmup`, which also hold what bundles
@@ -238,7 +240,24 @@ fn cache_settings() -> Option<Vec<Option<String>>> {
         .into_iter().map(host::setting_string).collect();
     values.iter().all(|value|value.as_ref().is_none_or(|value|value.len()<=32<<10)).then_some(values)
 }
+/// A Twig Lexer, not Doctrine's or ExpressionLanguage's.
+fn declares_twig_lexer(text: &str) -> bool {
+    (text.contains("Twig\\Lexer") && text.contains("Lexer("))
+        || (text.contains("setLexer(") && text.contains("Twig"))
+}
+
 impl Index {
+    pub fn custom_twig_lexer(&self) -> bool {
+        !self.lexer_files.is_empty()
+    }
+
+    pub(crate) fn note_lexer(&mut self, path: &str, text: &str) {
+        match declares_twig_lexer(text) {
+            true => self.lexer_files.insert(path.to_owned()),
+            false => self.lexer_files.remove(path),
+        };
+    }
+
     pub(crate) fn settings_current(&self) -> bool {
         self.cache_settings.as_ref().is_none_or(|expected|cache_settings().as_ref()==Some(expected))
     }
@@ -250,9 +269,11 @@ impl Index {
         let relative = |path: &str| path.strip_prefix(&format!("{root}/")).unwrap_or(path).to_owned();
 
         let discovery_partial=Cell::new(root.is_empty());
+        let nested = crate::nested_roots(&root);
         let files = |globs: &[&str]| -> Vec<String> {
-            let (paths,partial)=discover(project,globs,MAX_FILES);
+            let (mut paths,partial)=discover(project,globs,MAX_FILES);
             if partial {discovery_partial.set(true);}
+            paths.retain(|path| !nested.iter().any(|inner| crate::under(path, inner)));
             paths
         };
 
@@ -322,7 +343,7 @@ impl Index {
                 }
                 index.templates.insert(
                     name,
-                    Entry { detail: Some("Plugin path hint · runtime loader unverified".into()), path, at: Position::new(0, 0) },
+                    Entry { detail: Some("Plugin path hint · may differ at runtime".into()), path, at: Position::new(0, 0) },
                 );
             }
         }
@@ -410,7 +431,9 @@ impl Index {
         let mut route_files_seen = false;
         let route_php = files(&["config/routes.php", "config/routes/**/*.php"]);
         routes_literal &= route_php.is_empty();
-        routes_literal &= optional_text(project, "src/Kernel.php", &mut index).find("outes").is_none();
+        let kernel = optional_text(project, "src/Kernel.php", &mut index);
+        routes_literal &= kernel.find("outes").is_none();
+        index.note_lexer(&format!("{root}/src/Kernel.php"), &kernel);
 
         for path in &config {
             let Some(text) = read(path, &mut index) else { continue };
@@ -471,6 +494,7 @@ impl Index {
 
         for path in &controllers {
             let Some(text) = read(path, &mut index) else { continue };
+            index.note_lexer(path, &text);
             routes_literal &= php_routes_literal(&text);
             php_routes(path, &text, &mut index.routes);
             index.route_defs.extend(route_defs::php_route_defs(path, &text));
@@ -480,7 +504,13 @@ impl Index {
 
         for path in &commands {
             let Some(text) = read(path, &mut index) else { continue };
+            index.note_lexer(path, &text);
             php_commands(path, &text, &mut index.commands);
+        }
+
+        for path in files(&["src/Twig/**/*.php"]) {
+            let Some(text) = read(&path, &mut index) else { continue };
+            index.note_lexer(&path, &text);
         }
 
         for path in &translations {
@@ -508,6 +538,7 @@ impl Index {
         let mut found_components: Vec<(crate::components::Component, String)> = Vec::new();
         for path in files(&["src/**/Components/**/*.php"]) {
             let Some(text) = read(&path, &mut index) else { continue };
+            index.note_lexer(&path, &text);
             if !text.contains("AsTwigComponent") && !text.contains("AsLiveComponent") {
                 continue;
             }
@@ -556,6 +587,7 @@ impl Index {
         let entity_globs: Vec<&str> = entity_globs.iter().map(String::as_str).collect();
         for path in files(&entity_globs) {
             let Some(text) = read(&path, &mut index) else { continue };
+            index.note_lexer(&path, &text);
             if !text.contains("Entity") {
                 continue;
             }
@@ -638,6 +670,70 @@ impl Index {
         index.partial |= discovery_partial.get() || started.elapsed()>BUDGET;
         index.template_scan_observed=!index.partial;
         index
+    }
+
+    /// Re-reads one modified file into the index. False when the change needs a full build.
+    pub fn update_file(&mut self, project: &Project, root: &str, relative: &str) -> bool {
+        let path = format!("{root}/{relative}");
+        let php = relative.starts_with("src/") && relative.ends_with(".php");
+        let template = relative.starts_with("templates/") && relative.ends_with(".twig");
+        let translation = relative.starts_with("translations/")
+            && [".yaml", ".yml", ".xlf", ".xliff"].iter().any(|extension| relative.ends_with(extension));
+        if !(php || template || translation) {
+            return false;
+        }
+        let Ok(text) = project.read_file(&path) else { return false };
+        let drop_path = |names: &mut Names| names.retain(|_, entry| entry.path != path);
+
+        if template {
+            let owns_component = self.component_info.values().any(|info| self.templates.get(&info.component.template).is_some_and(|entry| entry.path == path));
+            if owns_component {
+                return false;
+            }
+            self.includes.retain(|include| self.templates.get(&include.caller).is_none_or(|entry| entry.path != path));
+            let Some(caller) = self.templates.iter().find(|(_, entry)| entry.path == path).map(|(name, _)| name.clone()) else { return false };
+            for (target, variables) in crate::twig::includes(&text).into_iter().filter(|(_, variables)| !variables.is_empty()) {
+                self.includes.push(TemplateInclude { target, variables, caller: caller.clone() });
+            }
+            return true;
+        }
+
+        if translation {
+            let domain = translation_domain(&path).to_owned();
+            drop_path(self.translations.entry(domain.clone()).or_default());
+            translation_keys(&path, &text, self.translations.entry(domain).or_default());
+            return true;
+        }
+
+        let declares_component = text.contains("AsTwigComponent") || text.contains("AsLiveComponent");
+        if declares_component || text.contains("AsAlias") || self.components.values().any(|entry| entry.path == path) {
+            return false;
+        }
+        self.note_lexer(&path, &text);
+
+        drop_path(&mut self.routes);
+        drop_path(&mut self.roles);
+        drop_path(&mut self.commands);
+        self.route_defs.retain(|route| route.file != path);
+        self.renders.retain(|render| render.path != path);
+        self.entities.retain(|_, entity| entity.entry.path != path);
+
+        if relative.ends_with("Controller.php") || relative.starts_with("src/Controller/") {
+            self.routes_complete &= php_routes_literal(&text);
+            php_routes(&path, &text, &mut self.routes);
+            self.route_defs.extend(route_defs::php_route_defs(&path, &text));
+            roles(&path, &text, &mut self.roles);
+            self.renders.extend(php_renders(&path, &text));
+        }
+        if relative.starts_with("src/Command/") || relative.ends_with("Command.php") {
+            php_commands(&path, &text, &mut self.commands);
+        }
+        if text.contains("Entity") {
+            if let Some(entity) = crate::entities::parse(&path, &text) {
+                self.entities.insert(entity.class.clone(), entity);
+            }
+        }
+        true
     }
 
     /// The Twig name of a template file.

@@ -256,15 +256,7 @@ mod tests {
             !hover.markdown.contains("Explicit Ant")
                 && !hover.markdown.contains("Explicit PathPattern")
         );
-        let hints = tools.inlay_hints(&d, all());
-        assert_eq!(hints.len(), 2);
-        assert!(hints
-            .iter()
-            .all(|h| h.label == "declared pattern · strategy unresolved"));
-        assert_eq!(
-            hints[0].position,
-            openidea_plugin::text::position(&d.text, values[0].to)
-        );
+        assert!(tools.inlay_hints(&d, all()).is_empty());
     }
     #[test]
     fn parenthesized_and_block_lambdas_are_supported_and_unsaved_changes_do_not_cache() {
@@ -374,7 +366,8 @@ mod tests {
     fn settings_and_source_limits_apply_without_changing_explicit_matcher_contracts() {
         let h = MockHost::install();
         let mut tools = SecurityTools::default();
-        let d = doc("http.authorizeHttpRequests(auth -> auth.requestMatchers(\"/x\"));");
+        let mut d = doc("http.authorizeHttpRequests(auth -> auth.requestMatchers(HttpMethod.GET, \"/x\"));");
+        d.text = format!("import org.springframework.http.HttpMethod;\n{}", d.text);
         assert_eq!(tools.inlay_hints(&d, all()).len(), 1);
         h.set_setting("springSecurity.checkMatchers", "false");
         assert!(tools.inlay_hints(&d, all()).is_empty());

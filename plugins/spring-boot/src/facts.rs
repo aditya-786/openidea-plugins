@@ -180,7 +180,8 @@ pub struct Summary {
     pub complete: bool,
     pub types: BTreeSet<String>,
     pub packages: BTreeSet<String>,
-    enums: BTreeMap<String, Vec<String>>,
+    known: BTreeMap<String, Vec<String>>,
+    project: BTreeMap<String, Vec<(String, Vec<String>)>>,
 }
 
 pub fn dashed(constant: &str) -> String {
@@ -202,7 +203,7 @@ impl Summary {
             ..Summary::default()
         };
         for (name, values) in KNOWN {
-            s.enums.insert(
+            s.known.insert(
                 (*name).to_owned(),
                 values.iter().map(|v| (*v).to_owned()).collect(),
             );
@@ -213,20 +214,48 @@ impl Summary {
                 s.packages.insert(f.package.clone());
             }
             for (name, constants) in &f.enums {
-                s.enums
-                    .insert(name.clone(), constants.iter().map(|c| dashed(c)).collect());
+                let qualified = if f.package.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}.{name}", f.package)
+                };
+                s.project.entry(name.clone()).or_default().push((
+                    qualified,
+                    constants.iter().map(|c| dashed(c)).collect(),
+                ));
             }
         }
         s
     }
 
     /// The values of the enum named `ty` (`Mode`, `Outer.Mode`), as written in configuration.
+    /// Metadata types are simple names, so a project enum counts only when its
+    /// name is unique in the project and no Spring or library type shares it.
     pub fn enum_values(&self, ty: &str) -> Option<&Vec<String>> {
         let last = ty.rsplit('.').next().unwrap_or(ty);
-        self.enums
-            .get(last)
-            .or_else(|| self.enums.get(ty))
-            .filter(|v| !v.is_empty())
+        if ty != last
+            && let Some((_, values)) = self
+                .project
+                .get(last)
+                .and_then(|enums| enums.iter().find(|(qualified, _)| qualified == ty))
+        {
+            return Some(values).filter(|v| !v.is_empty());
+        }
+        if let Some(values) = self.known.get(last).or_else(|| self.known.get(ty)) {
+            return Some(values).filter(|v| !v.is_empty());
+        }
+        if crate::meta::library_type(last) {
+            return None;
+        }
+        // A package-qualified name (`org.vendor.Mode`) falls back only to the project enum it names;
+        // `Outer.Mode` (a nested type) may still mean the unique project `Mode`.
+        let package_qualified = ty != last && ty.starts_with(char::is_lowercase);
+        match self.project.get(last)?.as_slice() {
+            [(qualified, values)] if !package_qualified || qualified.ends_with(&format!(".{ty}")) => {
+                Some(values).filter(|v| !v.is_empty())
+            }
+            _ => None,
+        }
     }
 
     /// Whether `value` is one of the enum's constants under Spring's relaxed matching.
@@ -259,5 +288,27 @@ mod tests {
         assert_eq!(summary.accepts("Mode", "slow"), Some(false));
         assert_eq!(summary.accepts("Show", "WHEN_AUTHORIZED"), Some(true));
         assert_eq!(summary.accepts("Foreign", "x"), None);
+    }
+    #[test]
+    fn project_enums_never_override_known_or_library_names() {
+        let facts = |name: &str| {
+            read("A.java", &format!("package com.acme;\nenum {name} {{ ONLY }}\n")).unwrap()
+        };
+        let summary = |name: &str| Summary::merge([&facts(name)].into_iter(), true);
+        assert_eq!(summary("Show").accepts("Show", "always"), Some(true));
+        assert_eq!(summary("Database").accepts("Database", "postgresql"), None);
+        assert_eq!(summary("Mode").accepts("Mode", "only"), Some(true));
+        let twice = Summary::merge([&facts("Mode"), &read("B.java", "package other;\nenum Mode { X }\n").unwrap()].into_iter(), true);
+        assert_eq!(twice.accepts("Mode", "only"), None);
+        assert_eq!(twice.accepts("com.acme.Mode", "only"), Some(true));
+        assert_eq!(twice.accepts("other.Mode", "x"), Some(true));
+        assert_eq!(twice.accepts("other.Mode", "only"), Some(false));
+    }
+    #[test]
+    fn qualified_type_without_exact_match_skips_simple_name_fallback() {
+        let facts = read("A.java", "package com.acme;\nenum Mode { ONLY }\n").unwrap();
+        let summary = Summary::merge([&facts].into_iter(), true);
+        assert_eq!(summary.accepts("org.vendor.Mode", "anything"), None);
+        assert_eq!(summary.accepts("acme.Mode", "only"), Some(true));
     }
 }

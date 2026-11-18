@@ -56,7 +56,7 @@ impl Config {
         // The small configuration parser is not a YAML evaluator or a Spring
         // property-source resolver. Withhold narrowing for unsupported overlays.
         let unresolved = names.len() > 1
-            || keys.iter().any(|k| matches!(k.key.as_str(), "spring" | "spring.application") && !k.value.is_empty())
+            || keys.iter().any(|k| matches!(k.key.as_str(), "spring" | "spring.application" | "spring.config") && !k.value.is_empty())
             || keys.iter().any(|k| {
                 matches!(
                     k.key.as_str(),
@@ -97,6 +97,13 @@ mod tests {
                 .clients
                 .remove(0);
         assert!(Identities::new(&index).allows(&client, "/project/admin/src/main/java/Controller.java"));
+    }
+
+    #[test]
+    fn flow_style_spring_config_keeps_the_identity_unresolved() {
+        let keys = |text: &str| super::super::config::keys("/p/users/src/main/resources/application.yaml", text);
+        let text = "spring:\n  application:\n    name: users\n  config: {import: optional:other.yaml}\n";
+        assert!(Config::parse("/p/users/src/main/resources/application.yaml", text, &keys(text)).unresolved);
     }
 
     #[test]

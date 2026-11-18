@@ -5,7 +5,8 @@ use serde_json::{Value, json};
 
 const MAX_CACHE: usize = 5 * 1024 * 1024;
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
-const FORMAT: &str = r#"{"Id":{{json .Id}},"Image":{{json .Image}},"Running":{{json .State.Running}},"Paused":{{json .State.Paused}},"Restarting":{{json .State.Restarting}},"StartedAt":{{json .State.StartedAt}},"Mounts":{{json .Mounts}}}"#;
+const DDEV_WORKDIR: &str = "/var/www/html";
+const FORMAT: &str = r#"{"Id":{{json .Id}},"Image":{{json .Image}},"Running":{{json .State.Running}},"Paused":{{json .State.Paused}},"Restarting":{{json .State.Restarting}},"StartedAt":{{json .State.StartedAt}},"Mounts":{{json .Mounts}},"DdevRoot":{{json (index .Config.Labels "com.ddev.approot")}}}"#;
 #[path = "docker_discovery.rs"]
 mod discovery;
 pub(super) use discovery::{clear_discovered_target, discover};
@@ -177,14 +178,18 @@ fn inspect(raw: &str, identity: &Value) -> Result<Value, Error> {
             "Docker target has no verifiable bind mapping for this project directory.".into(),
         ));
     };
+    let bind_proof = kind == "bind"
+        && discovery::absolute(source)
+        && discovery::map_path(&target.workdir, destination, source).as_deref() == Some(root);
+    let ddev_volume = kind == "volume"
+        && target.workdir == DDEV_WORKDIR
+        && value["DdevRoot"].as_str() == Some(root);
     if covering
         .get(1)
         .is_some_and(|(other, _, _)| *other == destination)
-        || kind != "bind"
-        || !discovery::absolute(source)
-        || discovery::map_path(&target.workdir, destination, source).as_deref() != Some(root)
+        || !(bind_proof || ddev_volume)
     {
-        return Err(Error::Invalid("Docker project directory must map exactly to this project through its most-specific bind mount. Volume-only/Mutagen project roots cannot be verified from Docker metadata.".into()));
+        return Err(Error::Invalid("Docker project directory must map exactly to this project through its most-specific bind mount, or be a DDEV project (com.ddev.approot) on its synced project volume.".into()));
     }
     let mut destinations = std::collections::BTreeSet::new();
     for (destination, source, kind) in descendants {
@@ -198,10 +203,21 @@ fn inspect(raw: &str, identity: &Value) -> Result<Value, Error> {
             ));
         }
     }
+    // Docker lists mounts in a different order on each inspect, so the proof sorts them.
     // Persist only identity and mount proof. Environment/secrets are never requested by FORMAT.
-    Ok(
-        json!({"Id":target.container,"Image":image,"Running":true,"Paused":false,"Restarting":false,"StartedAt":started,"Mounts":mounts}),
-    )
+    let mut sorted_mounts = mounts.clone();
+    sorted_mounts.sort_by_key(|mount| {
+        (
+            mount["Destination"].as_str().unwrap_or_default().to_owned(),
+            mount["Source"].as_str().unwrap_or_default().to_owned(),
+            mount["Type"].as_str().unwrap_or_default().to_owned(),
+        )
+    });
+    let mut proof = json!({"Id":target.container,"Image":image,"Running":true,"Paused":false,"Restarting":false,"StartedAt":started,"Mounts":sorted_mounts});
+    if ddev_volume {
+        proof["DdevRoot"] = json!(root);
+    }
+    Ok(proof)
 }
 fn load(root: &str) -> Result<Option<Value>, Error> {
     let Some(raw) = host::storage::get(&key(root))? else {
@@ -229,7 +245,7 @@ fn load(root: &str) -> Result<Option<Value>, Error> {
 }
 fn run(project: &Project, args: &[String]) -> Result<String, Error> {
     let task = host::begin_task(crate::ui_text::text("native.artisan_docker.e4cbafe8e6", "Inspect/discover Docker Artisan metadata"), true);
-    let child = host::start(&host::Command::new("docker").args(args), Some(project))?;
+    let child = host::start(&host::Command::new("docker").args(args), Some(project)).map_err(|error| ui_kit::denied::map(error, "Running Artisan in Docker", "process:docker", "Laravel"))?;
     if let Err(error) = child.close_stdin() {
         let _ = child.kill();
         return Err(error);
@@ -244,6 +260,14 @@ fn run(project: &Project, args: &[String]) -> Result<String, Error> {
         let _ = child.kill();
     }
     result
+}
+fn stale_reason(reason: &str) -> Error {
+    host::notify(
+        NotificationLevel::Warning,
+        "Laravel",
+        &crate::ui_text::format("native.artisan_docker.70ad98e84b", "Docker metadata is out of date: {reason}.", &[("reason", reason)]),
+    );
+    Error::Stale
 }
 fn refresh_with(
     ctx: &Invocation,
@@ -272,20 +296,23 @@ fn refresh_with(
         )
     };
     if !current()? {
-        return Err(Error::Stale);
+        return Err(stale_reason(crate::ui_text::text("native.artisan_docker.6ebc5c3664", "the project, Docker target or saved metadata changed before the refresh started")));
     }
     let proof = inspect(&run(&project, &target.inspect())?, &before)?;
     if !current()? {
-        return Err(Error::Stale);
+        return Err(stale_reason(crate::ui_text::text("native.artisan_docker.5c2c4d8dac", "the project, Docker target or saved metadata changed while the container was inspected")));
     }
     let output = run(&project, &target.exec())?;
     let commands = metadata::parse(&output)?;
     if !current()? {
-        return Err(Error::Stale);
+        return Err(stale_reason(crate::ui_text::text("native.artisan_docker.90b1c1210d", "the project, Docker target or saved metadata changed while php artisan list ran")));
     }
     let after = inspect(&run(&project, &target.inspect())?, &before)?;
-    if proof != after || !current()? {
-        return Err(Error::Stale);
+    if proof != after {
+        return Err(stale_reason(crate::ui_text::text("native.artisan_docker.b491b31cd1", "the container was restarted or its image or mounts changed while php artisan list ran")));
+    }
+    if !current()? {
+        return Err(stale_reason(crate::ui_text::text("native.artisan_docker.5d348134a9", "the project, Docker target or saved metadata changed after php artisan list ran")));
     }
     let _ = load(root)?;
     let captured = std::time::SystemTime::now()
@@ -296,7 +323,7 @@ fn refresh_with(
     let raw = value.to_string();
     if raw.len() > MAX_CACHE {
         return Err(Error::Invalid(
-            crate::ui_text::text("native.artisan_docker.6ee56051a8", "Docker metadata envelope exceeds5MiB; previous snapshot retained.").into(),
+            crate::ui_text::text("native.artisan_docker.6ee56051a8", "Docker metadata envelope exceeds 5MiB; previous snapshot retained.").into(),
         ));
     }
     host::storage::set(&key(root), &raw)?;
@@ -370,8 +397,12 @@ fn verify_with(
     let before = snapshot(project)?;
     let target = Target::from_identity(&before["identity"])?;
     let proof = inspect(&run(project, &target.inspect())?, &before["identity"])?;
-    if proof != before["proof"] || snapshot(project)? != before {
-        return Err(Error::Stale);
+    let saved = inspect(&before["proof"].to_string(), &before["identity"])?;
+    if proof != saved {
+        return Err(stale_reason(crate::ui_text::text("native.artisan_docker.d6e64708d2", "the container's start time, image or mounts differ from the saved Docker metadata; refresh the Docker commands again")));
+    }
+    if snapshot(project)? != before {
+        return Err(stale_reason(crate::ui_text::text("native.artisan_docker.d92d98511b", "the saved Docker metadata changed while the container was verified")));
     }
     Ok(())
 }
@@ -386,7 +417,7 @@ fn browse_inner(ctx: &Invocation) -> Result<Option<String>, Error> {
         .ok_or(crate::ui_text::text("native.artisan_docker.7b35695466", "Open the owning Laravel project first."))?;
     let owner = identity(&project)?;
     let value = load(owner["root"].as_str().ok_or(Error::Stale)?)?.filter(|v| v["identity"] == owner)
-        .ok_or(crate::ui_text::text("native.artisan_docker.458437fcc2", "No accepted Docker metadata for this project/endpoint/container/source identity. Use the explicit Docker metadata refresh command."))?;
+        .ok_or(crate::ui_text::text("native.artisan_docker.noSavedCommands", "No Artisan commands are saved for this Docker container yet. Run Laravel: Refresh Docker Artisan Commands first."))?;
     let commands = metadata::parse(&json!({"commands":value["commands"]}).to_string())?;
     let commands = commands.as_array().ok_or(crate::ui_text::text("native.artisan_docker.92654a4c9d", "Unsupported cached commands."))?;
     let choices: Vec<PickItem> = commands
@@ -486,7 +517,7 @@ pub(super) fn ui_error(error:Error)->Error {
         "Docker mount source is unavailable." => crate::ui_text::t("native.artisan_docker.aacdd913eb",&message),
         "Docker mount type is unavailable." => crate::ui_text::t("native.artisan_docker.92c8419b6f",&message),
         "Docker project directory has an unverified or foreign shadowing mount." => crate::ui_text::t("native.artisan_docker.e7c08659a7",&message),
-        "Docker project directory must map exactly to this project through its most-specific bind mount. Volume-only/Mutagen project roots cannot be verified from Docker metadata." => crate::ui_text::t("native.artisan_docker.9e58d466b2",&message),
+        "Docker project directory must map exactly to this project through its most-specific bind mount, or be a DDEV project (com.ddev.approot) on its synced project volume." => crate::ui_text::t("native.artisan_docker.f2508eb86c",&message),
         "Docker start identity is unavailable." => crate::ui_text::t("native.artisan_docker.a155ecb69d",&message),
         "Docker target has no verifiable bind mapping for this project directory." => crate::ui_text::t("native.artisan_docker.1d49b5d402",&message),
         "Docker target is not the exact configured running, unpaused container." => crate::ui_text::t("native.artisan_docker.b71ac18ab8",&message),
@@ -510,6 +541,38 @@ mod tests {
     }
     fn proof() -> Value {
         json!({"Id":ID,"Image":format!("sha256:{}", "a".repeat(64)),"Running":true,"Paused":false,"Restarting":false,"StartedAt":"2026-11-09T12:00:00Z","Mounts":[{"Type":"bind","Source":"/project","Destination":"/workspace"}]})
+    }
+    #[test]
+    fn snapshot_saved_with_unsorted_mounts_still_verifies() {
+        let host = setup();
+        let project = host::projects().unwrap().remove(0);
+        let mut saved = proof();
+        saved["Mounts"] = json!([
+            {"Type":"volume","Source":"/var/lib/docker/volumes/z/_data","Destination":"/zcache"},
+            {"Type":"bind","Source":"/project","Destination":"/workspace"}
+        ]);
+        let commands = metadata::parse(&sample()).unwrap();
+        let envelope = json!({"schema":1,"identity":identity(&project).unwrap(),"capturedAt":1,"proof":saved.clone(),"commands":commands});
+        host::storage::set(&key("/project"), &envelope.to_string()).unwrap();
+        let mut reordered = saved;
+        reordered["Mounts"].as_array_mut().unwrap().reverse();
+        assert_eq!(verify_with(&project, |_, _| Ok(reordered.to_string())), Ok(()));
+    }
+    #[test]
+    fn mount_order_from_docker_does_not_change_the_proof() {
+        let _host = setup();
+        let identity = json!({"root":"/project","socket":"unix:///var/run/docker.sock","container":ID,"workdir":"/workspace"});
+        let mut first = proof();
+        first["Mounts"] = json!([
+            {"Type":"volume","Source":"/var/lib/docker/volumes/cache/_data","Destination":"/cache"},
+            {"Type":"bind","Source":"/project","Destination":"/workspace"}
+        ]);
+        let mut second = first.clone();
+        second["Mounts"].as_array_mut().unwrap().reverse();
+        assert_eq!(
+            inspect(&first.to_string(), &identity).unwrap(),
+            inspect(&second.to_string(), &identity).unwrap()
+        );
     }
     fn sample() -> String {
         json!({"commands":[{"name":"app:container","description":"Container command","definition":{"arguments":{"input":{"name":"input","description":"Input name","is_required":true}},"options":{"force":{"name":"--force","description":"Force","accept_value":false}}}}]}).to_string()
@@ -786,7 +849,7 @@ mod tests {
     fn explicit_docker_grant_is_required_after_review_and_duplicate_json_is_refused() {
         let host = setup().with_capabilities(&["project.read", "storage"]);
         host.answer_next_prompt(Some(&["ok"]));
-        assert!(matches!(refresh(&host.invocation()), Err(Error::Denied(_))));
+        assert!(matches!(refresh(&host.invocation()), Err(Error::Invalid(message)) if message.contains("process:docker permission")));
         assert!(host.storage().is_empty());
         let owner = identity(&host.invocation().project().unwrap()).unwrap();
         let bad = proof()

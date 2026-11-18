@@ -1,55 +1,64 @@
 id = "aritti.devcontainer"
 name = "Dev Container CLI"
 version = "0.3.0" # x-release-please-version
-description = "Creates Dev Container configurations from bundled image templates with optional cached feature selection, without running a CLI. Starts, rebuilds and stops the project's Dev Container (containers.dev) and opens a shell in it, using the devcontainer CLI. Adds a devcontainer.json template to the New menu. Requires the devcontainer CLI (npm i -g @devcontainers/cli) and Docker. The IDE itself keeps running on the host."
+description = "Starts, rebuilds and stops the project's Dev Container (containers.dev) and opens a shell in it, using the devcontainer CLI. Creates Dev Container configurations from bundled image templates with optional cached feature selection, without running a CLI. Adds a devcontainer.json template to the New menu. Requires the devcontainer CLI (npm i -g @devcontainers/cli) and Docker. The IDE itself keeps running on the host."
 authors = ["Arnaud Ritti <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Run and Test through a registered target are refused when no dev container is running. Unreleased: Compose files referenced by devcontainer.json are checked for services without image/build, depends_on targets, literal ports and volumes shapes, and missing env_file and extends.file paths; feature ids warn on provable OCI shape errors, and options of local ./feature folders are checked against their devcontainer-feature.json types and enums (remote and dynamic values stay quiet). Diagnostics check hostRequirements value types and warn when a literal dockerComposeFile entry is missing or the service is not declared in the referenced Compose files (quiet for ${...} values, include and unparsable files). Image-template creation can select one cached versioned GHCR feature with explicit default options in the exact JSON preview; no registry fetch or installation occurs during creation. Separate finite managed Start/Rebuild CLI commands expose owned state, bounded captured output and explicit cancellation in Services while preserving terminal commands. Exact confirmation bodies refuse truncation. Configuration choice, Start/Rebuild review and configuration creation reject paths owned by another open nested project; ownership is rechecked before launch/application preparation. Discover nested Dev Container configurations, remember choices per project, and expose Choose Configuration in Tools/Services; cancelled choices start nothing and missing overrides are reported.  Resource browser moved to Services with selected-resource metadata and managed log tabs.  Dev Containers view listing the project's containers, running and stopped (docker ps -a by the devcontainer.local_folder label), with Open Shell, Stop and Start. feature id completion in the features object from the public containers.dev index, kept in plugin storage and refreshed by Dev Container: Refresh Feature List (the list is empty until that command has run once, and needs the net:containers.dev and storage permissions). Dev Container: Clone Repository and Start… clones a URL next to the project (git) and starts its container. 0.2.0: pick a configuration when several default files exist, confirm before Rebuild. Needs OpenIDEA API 1.2. 0.1.0: first release. Start, Rebuild, Open Shell and Stop commands, and devcontainer.json templates."
+change-notes = """\
+Next release: Open Shell reuses the running terminal, starting from the Dev Containers view offers Open Shell, the empty view offers Create and Start and Rebuild and points to New › Dev Container Configuration when there is none, and Stop asks first, names the containers and removes the run target only once they stop. Run and Test tell you when no dev container is running, and refuse to launch when the registered container was rebuilt or Docker is not reachable; Compose services, ports, volumes and feature options in devcontainer.json are checked, with cached checks so typing stays fast, and gutter icons open its Compose files and Dockerfile; choose between several configurations, and extra volume mounts below the project folder no longer block registration; Start and Rebuild run as cancellable background runs, and Clone Repository and Start runs git in a terminal; clearer command names, messages and permission prompts, configuration commands are greyed out in projects without one, and the plugin no longer loads on every file open and save. \
+0.3.0: Compose and feature checks and a unified Services window. \
+0.2.0: plugin icon, container list with Open Shell, Stop and Start."""
 categories = ["tools"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
-activation = ["on-event:file-opened", "on-event:file-saved", "on-view:containers", "on-view:run-target-review"]
+activation = ["on-view:containers", "on-view:run-target-review"]
 
 [capabilities]
 required = ["project.read"]
 # git: Clone Repository and Start. storage: per-project configuration choices and feature cache. net:containers.dev: Refresh Feature List.
-optional = ["process:devcontainer", "process:docker", "process:git", "events", "storage", "net:containers.dev"]
+optional = ["process:devcontainer", "process:docker", "process:git", "storage", "net:containers.dev"]
 
 [[contributes.commands]]
 id = "up-managed"
-title = "Dev Container: Start Container (Finite Managed CLI)…"
+title = "Dev Container: Start Container in Background…"
 category = "Dev Container"
+when = "workspaceContains:.devcontainer || workspaceContains:.devcontainer.json"
 
 [[contributes.commands]]
 id = "rebuild-managed"
-title = "Dev Container: Rebuild Container (Finite Managed CLI)…"
+title = "Dev Container: Rebuild Container in Background…"
 category = "Dev Container"
+when = "workspaceContains:.devcontainer || workspaceContains:.devcontainer.json"
 
 [[contributes.commands]]
 id = "managed-output"
-title = "Dev Container: Show Finite CLI Output"
+title = "Dev Container: Show Background Runs"
 category = "Dev Container"
 
 [[contributes.commands]]
 id = "choose-configuration"
 title = "Dev Container: Choose Configuration…"
 category = "Dev Container"
+when = "workspaceContains:.devcontainer || workspaceContains:.devcontainer.json"
 
 [[contributes.commands]]
 id = "up"
 title = "Dev Container: Start Container"
 category = "Dev Container"
+when = "workspaceContains:.devcontainer || workspaceContains:.devcontainer.json"
 
 [[contributes.commands]]
 id = "rebuild"
 title = "Dev Container: Rebuild Container"
 category = "Dev Container"
+when = "workspaceContains:.devcontainer || workspaceContains:.devcontainer.json"
 
 [[contributes.commands]]
 id = "shell"
 title = "Dev Container: Open Shell in Container"
 category = "Dev Container"
+when = "workspaceContains:.devcontainer || workspaceContains:.devcontainer.json"
 
 [[contributes.commands]]
 id = "stop"
@@ -60,10 +69,16 @@ category = "Dev Container"
 id = "info"
 title = "Dev Container: Show Configuration"
 category = "Dev Container"
+when = "workspaceContains:.devcontainer || workspaceContains:.devcontainer.json"
 
 [[contributes.commands]]
 id = "clone"
 title = "Dev Container: Clone Repository and Start…"
+category = "Dev Container"
+
+[[contributes.commands]]
+id = "start-cloned"
+title = "Dev Container: Start Cloned Container…"
 category = "Dev Container"
 
 [[contributes.commands]]
@@ -133,14 +148,18 @@ location = "services"
 
 [[contributes.views]]
 id = "managed-cli"
-title = "Dev Container CLI Operations"
+title = "Dev Container Background Runs"
 icon = "icon.svg"
 location = "services"
 
 # The completion provider's language ids are json and jsonc; "jsonc" is unverified in the IDE.
 [[contributes.providers]]
-kinds = ["completion", "code-actions"]
+kinds = ["completion", "code-actions", "line-markers"]
 languages = ["json", "jsonc"]
+
+[[contributes.markerIcons]]
+id = "file"
+icon = "icons/devcontainer.svg"
 
 [contributes.settings]
 title = "Dev Container CLI"
@@ -153,12 +172,13 @@ languages = ["json", "jsonc"]
 
 [[contributes.commands]]
 id = "register-run-target"
-title = "Dev Container: Register Root-relative Run Target…"
+title = "Dev Container: Register Container as Run Target…"
 category = "Dev Container"
+when = "workspaceContains:.devcontainer || workspaceContains:.devcontainer.json"
 
 [[contributes.commands]]
 id = "unregister-run-target"
-title = "Dev Container: Remove Root-relative Run Target"
+title = "Dev Container: Remove Container Run Target"
 category = "Dev Container"
 
 [[contributes.menus]]
@@ -172,23 +192,16 @@ command = "unregister-run-target"
 [[contributes.views]]
 id = "run-target-review"
 title = "Dev Container Run Target Review"
-icon = "database"
+icon = "icon.svg"
 location = "bottom"
 
 [[contributes.commands]]
 id = "register-mapped-tooling-target"
-title = "Dev Container: Prepare Experimental Mapped Project-root Tooling…"
+title = "Dev Container: Run Language Servers in Container…"
 category = "Dev Container"
+when = "workspaceContains:.devcontainer || workspaceContains:.devcontainer.json"
 
 [[contributes.commands]]
 id = "unregister-mapped-tooling-target"
-title = "Dev Container: Remove Experimental Mapped Project-root Tooling Target"
+title = "Dev Container: Remove Language Server Container Target"
 category = "Dev Container"
-
-[[contributes.menus]]
-menu = "tools"
-command = "register-mapped-tooling-target"
-
-[[contributes.menus]]
-menu = "tools"
-command = "unregister-mapped-tooling-target"

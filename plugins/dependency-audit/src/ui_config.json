@@ -1,45 +1,45 @@
 {
   "title": "Dependency Audit",
   "views": {
-    "vulnerabilities": "Dependency Audit",
+    "vulnerabilities": "Vulnerabilities",
     "npm-dependency-graph": "npm Graph",
     "build-resolution": "Resolution",
-    "call-analysis": "Call Evidence",
+    "call-analysis": "Vulnerable Calls",
     "sbt-resolution": "sbt Resolution"
   },
   "actions": [
     {
       "view": "vulnerabilities",
       "id": "preview-upgrade",
-      "label": "Preview upgrade in open declaration",
+      "label": "Preview Upgrade…",
       "kind": "dep",
       "icon": "diff"
     },
     {
       "view": "vulnerabilities",
       "id": "open-declaration",
-      "label": "Go to declaration",
+      "label": "Go to Declaration…",
       "kind": "dep",
       "icon": "file"
     },
     {
       "view": "vulnerabilities",
       "id": "open-advisory",
-      "label": "Open advisory on OSV.dev",
+      "label": "Open Advisory on OSV.dev…",
       "kind": "dep",
       "icon": "external-link"
     },
     {
       "view": "vulnerabilities",
       "id": "ignore-finding",
-      "label": "Ignore this exact finding with reason",
+      "label": "Ignore Finding with Reason…",
       "kind": "dep",
       "icon": "hide"
     },
     {
       "view": "vulnerabilities",
       "id": "open-advisory",
-      "label": "Open advisory on OSV.dev",
+      "label": "Open Advisory on OSV.dev…",
       "kind": "advisory",
       "replaces_open": true,
       "icon": "external-link"
@@ -47,7 +47,7 @@
     {
       "view": "vulnerabilities",
       "id": "ignore-finding",
-      "label": "Ignore this exact finding with reason",
+      "label": "Ignore Finding with Reason…",
       "kind": "advisory",
       "icon": "hide"
     }
@@ -59,7 +59,7 @@
     "tabs": [
       {
         "id": "vulnerabilities",
-        "label": "Dependency Audit"
+        "label": "Vulnerabilities"
       },
       {
         "id": "npm-dependency-graph",
@@ -71,7 +71,7 @@
       },
       {
         "id": "call-analysis",
-        "label": "Call Evidence"
+        "label": "Vulnerable Calls"
       },
       {
         "id": "sbt-resolution",

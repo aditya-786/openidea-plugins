@@ -23,37 +23,45 @@ const TEMPLATE_GLOBS:&[&str]=&["**/*.html","**/*.jsp","**/*.ftlh","**/*.ftl","**
 fn bounded(path: &str, text: &str) -> Option<bool> {
     Some(
         text.len() <= MAX_TEXT
-            && (![".java", ".kt", ".graphql", ".graphqls"].iter().any(|extension| path.ends_with(extension)) || balanced(text)),
+            && (![".java", ".kt", ".graphql", ".graphqls"].iter().any(|extension| path.ends_with(extension)) || spring_text::text::balanced(text, path.ends_with(".kt"))),
     )
 }
-pub(super) fn balanced(text: &str) -> bool {
-    let mut stack = Vec::new();
-    for token in java::tokens(text) {
-        if token.s.starts_with('"') && (token.s.len() < 2 || !token.s.ends_with('"')) {
-            return false;
-        }
-        match token.s {
-            "(" => stack.push(")"),
-            "[" => stack.push("]"),
-            "{" => stack.push("}"),
-            ")" | "]" | "}" => {
-                if stack.pop() != Some(token.s) {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    stack.is_empty()
-}
+const WEB: usize = 0;
+const WEBSOCKET: usize = 1;
+const MESSAGING: usize = 2;
+const GRAPHQL: usize = 3;
+const WEBFLOW: usize = 4;
+const CLOUD: usize = 5;
+/// Per module, the files its absence claims depend on.
+const BOUND_GLOBS: [&[&str]; 6] = [
+    &["**/*.java", "**/*.kt"],
+    &["**/*.java", "**/*.kt", "**/*.xml"],
+    &["**/*.java", "**/*.kt", "**/*.xml"],
+    &["**/*.java", "**/*.kt", "**/*.graphql", "**/*.graphqls"],
+    &["**/*.java", "**/*.xml"],
+    &["**/*.java", "**/*.kt", "**/application*.properties", "**/application*.yml", "**/application*.yaml", "**/bootstrap*.properties", "**/bootstrap*.yml", "**/bootstrap*.yaml", "**/pom.xml", "**/*.gradle", "**/*.gradle.kts"],
+];
 pub(super) struct Live {
-    bounds: Indexes<bool>,
+    bounds: [Indexes<bool>; 6],
+    /// Which XML files import which resources, to tell whether another file may declare a bean.
+    imports: Indexes<Vec<String>>,
     watching: bool,
 }
 impl Default for Live {
     fn default() -> Self {
-        Self { bounds: Indexes::new(GLOBS, bounded), watching: false }
+        Self {
+            bounds: BOUND_GLOBS.map(|globs| Indexes::new(globs, bounded)),
+            imports: Indexes::new(&["**/*.xml"], xml_checks::imports),
+            watching: false,
+        }
     }
+}
+fn event_paths(events: &[Event]) -> Vec<&str> {
+    let opened = events.iter().filter_map(|event| match event {
+        Event::FileOpened(path) => Some(path.as_str()),
+        _ => None,
+    });
+    spring_text::index::changed_paths(events).into_iter().map(|(path, _)| path).chain(opened).collect()
 }
 impl Endpoints {
     fn cached_applies(&self, doc: &Document) -> Applies {
@@ -64,40 +72,54 @@ impl Endpoints {
             .map(|(_, a)| *a)
             .unwrap_or_default()
     }
-    fn warm_live(&mut self, project: &Project, budget: Duration) {
+    /// Reads the live caches of `project` for at most `budget`. A provider passes
+    /// its `cached` verdict: then nothing is discovered and no build file is read,
+    /// only passes already under way advance.
+    fn warm_live(&mut self, project: &Project, budget: Duration, cached: Option<Applies>) {
         let deadline = Instant::now() + budget;
         let root = project.root().unwrap_or_default();
         if root.is_empty() {
             return;
         }
-        let doc = Document { path: format!("{root}/__live.java"), language: "java".into(), version: 0, text: String::new() };
-        let applies = self.applicable(&doc);
-        if !(applies.web || applies.websocket || applies.messaging || applies.graphql || applies.webflow || applies.cloud) {
+        let discover = cached.is_none();
+        let applies = cached.unwrap_or_else(|| {
+            let doc = Document { path: format!("{root}/__live.java"), language: "java".into(), version: 0, text: String::new() };
+            self.applicable(&doc)
+        });
+        let wanted = [applies.web, applies.websocket, applies.messaging, applies.graphql, applies.webflow, applies.cloud];
+        if !wanted.contains(&true) {
             return;
         }
         let part = || deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(120));
-        self.live.bounds.get(project, part());
-        if applies.web {
-            self.web.versioning.get(project, part());
-            self.web.models.get(project, part());
+        for (module, bounds) in self.live.bounds.iter_mut().enumerate() {
+            if part().is_zero() {
+                return;
+            }
+            if wanted[module] {
+                bounds.warm(project, part(), discover);
+            }
         }
-        if applies.websocket {
-            self.websocket.live_warm(project, part());
+        if applies.web && !part().is_zero() {
+            self.web.live_warm(project, part(), discover);
+            self.live.imports.warm(project, part(), discover);
         }
-        if applies.messaging {
-            self.messaging.live_warm(project, part());
+        if applies.websocket && !part().is_zero() {
+            self.websocket.live_warm(project, part(), discover);
         }
-        if applies.graphql {
-            self.graphql.live_warm(project, part());
+        if applies.messaging && !part().is_zero() {
+            self.messaging.live_warm(project, part(), discover);
         }
-        if applies.webflow {
-            self.webflow.live_warm(project, part());
+        if applies.graphql && !part().is_zero() {
+            self.graphql.live_warm(project, part(), discover);
         }
-        if applies.cloud {
-            self.cloud.live_warm(project, part());
+        if applies.webflow && !part().is_zero() {
+            self.webflow.live_warm(project, part(), discover);
+        }
+        if applies.cloud && !part().is_zero() {
+            self.cloud.live_warm(project, part(), discover);
         }
     }
-    pub(super) fn activate_live(&mut self) {
+    pub(crate) fn activate_live(&mut self) {
         let globs=GLOBS.iter().chain(TEMPLATE_GLOBS).copied().collect::<Vec<_>>();
         self.live.watching = host::subscribe_paths("files-changed", &globs).is_ok();
         let _ = host::subscribe(EventKind::FileOpened);
@@ -108,81 +130,84 @@ impl Endpoints {
             if budget.is_zero() {
                 break;
             }
-            self.warm_live(&project, budget);
+            self.warm_live(&project, budget, None);
         }
     }
     pub(super) fn live_events(&mut self, events: &[Event]) {
         let deadline = Instant::now() + Duration::from_secs(3);
-        for event in events {
-            let paths: Vec<_> = match event {
-                Event::FileOpened(p) | Event::FileSaved(p) => vec![(p, false)],
-                Event::FilesChanged(f) => {
-                    f.removed.iter().map(|p| (p, true)).chain(f.created.iter().chain(&f.modified).map(|p| (p, false))).collect()
-                }
-                _ => Vec::new(),
-            };
-            for (path, removed) in paths {
-                if Instant::now() >= deadline {
-                    return;
-                }
-                let template=TEMPLATE_GLOBS.iter().any(|glob|spring_text::index::glob_matches(glob,path));
-                if !template && !GLOBS.iter().any(|g| spring_text::index::glob_matches(g, path)) {
-                    continue;
-                }
-                let Some(project) = project_of(path) else {
-                    continue;
-                };
-                if template {
-                    if let Ok(root)=project.root(){let prefix=format!("{root}\n");self.web.listings.retain(|key,_|!key.starts_with(&prefix));}
-                    continue;
-                }
-                let text = if removed {
-                    None
-                } else {
-                    match project.read_file(path) {
-                        Ok(text) => Some(text),
-                        Err(_) => {
-                            self.live.bounds.reset();
-                            self.web.versioning.reset();
-                            self.web.models.reset();
-                            self.web.endpoints.reset();
-                            self.web.settings.reset();
-                            self.websocket.live_reset();
-                            self.messaging.live_reset();
-                            self.graphql.live_reset();
-                            self.webflow.live_reset();
-                            self.cloud.live_reset();
-                            continue;
-                        }
-                    }
-                };
-                self.live.bounds.update_existing(&project, path, text.as_deref());
-                self.web.versioning.update_existing(&project, path, text.as_deref());
-                self.web.models.update_existing(&project,path,text.as_deref());
-                self.web.endpoints.update_existing(&project,path,text.as_deref());
-                self.web.settings.update_existing(&project,path,text.as_deref());
-                self.websocket.live_update(&project, path, text.as_deref());
-                self.messaging.live_update(&project, path, text.as_deref());
-                self.graphql.live_update(&project, path, text.as_deref());
-                self.webflow.live_update(&project, path, text.as_deref());
-                self.cloud.live_update(&project, path, text.as_deref());
-                if path.ends_with("pom.xml") || path.ends_with(".gradle") || path.ends_with(".gradle.kts") {
-                    if let Ok(root) = project.root() {
-                        self.applies.remove(&root);
-                    }
-                }
-                self.warm_live(&project, deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(600)));
+        let mut touched = BTreeMap::new();
+        for path in event_paths(events) {
+            let template = TEMPLATE_GLOBS.iter().any(|glob| spring_text::index::glob_matches(glob, path));
+            if !template && !GLOBS.iter().any(|g| spring_text::index::glob_matches(g, path)) {
+                continue;
             }
+            let Some(project) = project_of(path) else {
+                continue;
+            };
+            let Ok(root) = project.root() else {
+                continue;
+            };
+            if template {
+                let prefix = format!("{root}\n");
+                self.web.listings.retain(|key, _| !key.starts_with(&prefix));
+                continue;
+            }
+            if path.ends_with("pom.xml") || path.ends_with(".gradle") || path.ends_with(".gradle.kts") {
+                self.applies.remove(&root);
+            }
+            touched.insert(root, project);
+        }
+        for bounds in &mut self.live.bounds {
+            bounds.on_events(events, deadline);
+        }
+        self.live.imports.on_events(events, deadline);
+        self.web.versioning.on_events(events, deadline);
+        self.web.models.on_events(events, deadline);
+        self.web.endpoints.on_events(events, deadline);
+        self.web.settings.on_events(events, deadline);
+        self.websocket.live_events(events, deadline);
+        self.messaging.live_events(events, deadline);
+        self.graphql.live_events(events, deadline);
+        self.webflow.live_events(events, deadline);
+        self.cloud.live_events(events, deadline);
+        for project in touched.values() {
+            self.warm_live(project, deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(600)), None);
         }
     }
-    fn allow_absence(&mut self, doc: &Document) -> bool {
+    fn allow_absence(&mut self, doc: &Document, module: usize) -> bool {
         self.live.watching
-            && self.live.bounds.for_cached_document(&doc.path, &doc.text).is_some_and(|i| i.fresh() && i.iter().all(|(_, ok)| *ok))
+            && self.live.bounds[module]
+                .for_cached_document(&doc.path, &doc.text)
+                .is_some_and(|i| i.fresh() && i.iter().all(|(_, ok)| *ok))
+    }
+    /// Why a section's absence checks are off, for its view status.
+    pub(super) fn absence_note(&mut self, project: &Project, section: &str) -> Option<String> {
+        let module = match section {
+            "websocket" => WEBSOCKET,
+            "messaging" => MESSAGING,
+            "graphql" => GRAPHQL,
+            "webflow" => WEBFLOW,
+            "feign" => CLOUD,
+            _ => WEB,
+        };
+        let index = self.live.bounds[module].get(project, Duration::ZERO);
+        if !index.walked() {
+            return None;
+        }
+        if let Some((path, _)) = index.iter().find(|(_, ok)| !**ok) {
+            let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            return Some(format!("absence checks off: {file}"));
+        }
+        match index.unreadable() {
+            0 => None,
+            1 => Some("absence checks off: 1 unreadable file".to_owned()),
+            n => Some(format!("absence checks off: {n} unreadable files")),
+        }
     }
 }
 impl DiagnosticsProvider for Endpoints {
     fn diagnostics(&mut self, doc: &Document) -> Vec<Diagnostic> {
-        if doc.text.len() > MAX_TEXT || matches!(doc.language.as_str(), "java" | "kotlin" | "graphql") && !balanced(&doc.text) {
+        if doc.text.len() > MAX_TEXT || matches!(doc.language.as_str(), "java" | "kotlin" | "graphql") && !spring_text::text::balanced(&doc.text, doc.language == "kotlin") {
             return Vec::new();
         }
         let applicable = self.cached_applies(doc);
@@ -190,18 +215,29 @@ impl DiagnosticsProvider for Endpoints {
         {
             return Vec::new();
         }
+        if let Some(project) = project_of(&doc.path) {
+            self.warm_live(&project, spring_text::index::DIAGNOSTICS_WARM, Some(applicable));
+        }
         if applicable.web {
             let _ = self.web.versioning.for_cached_document(&doc.path, &doc.text);
         }
-        let complete = self.allow_absence(doc);
         let mut out = Vec::new();
         if applicable.web && WEB_LANGUAGES.contains(&doc.language.as_str()) {
             if is_xml(doc) {
-                out.extend(xml_checks::check_in_project(doc).iter().map(|f| f.diagnostic(&doc.text)));
+                let file = doc.path.rsplit('/').next().unwrap_or(&doc.path).to_owned();
+                let imports = self.live.imports.for_cached_document(&doc.path, &doc.text).filter(|i| i.fresh());
+                let imported_elsewhere = || {
+                    let Some(index) = &imports else {
+                        return true;
+                    };
+                    index.iter().any(|(path, found)| path != doc.path && found.iter().any(|resource| resource.contains(&file)))
+                };
+                out.extend(xml_checks::check_in_project(doc, &imported_elsewhere).iter().map(|f| f.diagnostic(&doc.text)));
             } else {
                 out.extend(problems(doc).into_iter().map(|p| p.diagnostic));
+                let web_absence = self.allow_absence(doc, WEB);
                 let (configured, standard, inserter_missing) = match self.web.versioning.for_cached_document(&doc.path, &doc.text) {
-                    Some(index) if complete && index.fresh() => {
+                    Some(index) if web_absence && index.fresh() => {
                         let files: Vec<_> = index.iter().map(|(_, f)| *f).collect();
                         (
                             checks::project_versioning(true, &files),
@@ -222,19 +258,19 @@ impl DiagnosticsProvider for Endpoints {
             }
         }
         if applicable.websocket && WEBSOCKET_LANGUAGES.contains(&doc.language.as_str()) {
-            out.extend(self.websocket.live_diagnostics(doc, complete));
+            out.extend({ let absence = self.allow_absence(doc, WEBSOCKET); self.websocket.live_diagnostics(doc, absence) });
         }
         if applicable.messaging && MESSAGING_LANGUAGES.contains(&doc.language.as_str()) {
-            out.extend(self.messaging.live_diagnostics(doc, complete));
+            out.extend({ let absence = self.allow_absence(doc, MESSAGING); self.messaging.live_diagnostics(doc, absence) });
         }
         if applicable.graphql && GRAPHQL_LANGUAGES.contains(&doc.language.as_str()) {
-            out.extend(self.graphql.live_diagnostics(doc, complete));
+            out.extend({ let absence = self.allow_absence(doc, GRAPHQL); self.graphql.live_diagnostics(doc, absence) });
         }
         if applicable.webflow && WEBFLOW_LANGUAGES.contains(&doc.language.as_str()) {
-            out.extend(self.webflow.live_diagnostics(doc, complete));
+            out.extend({ let absence = self.allow_absence(doc, WEBFLOW); self.webflow.live_diagnostics(doc, absence) });
         }
         if applicable.cloud && CLOUD_LANGUAGES.contains(&doc.language.as_str()) {
-            out.extend(self.cloud.live_diagnostics(doc, complete));
+            out.extend({ let absence = self.allow_absence(doc, CLOUD); self.cloud.live_diagnostics(doc, absence) });
         }
         out.truncate(500);
         out
@@ -334,7 +370,7 @@ fn path_hover(doc: &Document, at: Position) -> Option<Hover> {
 }
 impl HoverProvider for Endpoints {
     fn hover(&mut self, doc: &Document, at: Position) -> Option<Hover> {
-        if doc.text.len() > MAX_TEXT || matches!(doc.language.as_str(), "java" | "kotlin" | "graphql") && !balanced(&doc.text) {
+        if doc.text.len() > MAX_TEXT || matches!(doc.language.as_str(), "java" | "kotlin" | "graphql") && !spring_text::text::balanced(&doc.text, doc.language == "kotlin") {
             return None;
         }
         let applies = self.cached_applies(doc);
@@ -371,6 +407,73 @@ mod tests {
         let mut tools = Endpoints::default();
         tools.activate_live();
         (host, tools)
+    }
+    #[test]
+    fn truncated_xml_list_yields_no_unknown_bean() {
+        let mvc = Document {
+            path: "/project/src/main/resources/mvc.xml".into(),
+            language: "xml".into(),
+            version: 1,
+            text: "<b:beans xmlns:b='http://www.springframework.org/schema/beans' xmlns:m='http://www.springframework.org/schema/mvc'><m:annotation-driven validator='nope'/></b:beans>".into(),
+        };
+        let unknown = |tools: &mut Endpoints| tools.diagnostics(&mvc).iter().any(|d| d.code.as_deref() == Some("mvc-xml-unknown-bean"));
+        let (host, mut tools) = setup();
+        host.add_file("src/main/resources/mvc.xml", &mvc.text);
+        tools.live_events(&[Event::FileSaved(mvc.path.clone())]);
+        assert!(unknown(&mut tools), "a fully read project proves nobody imports the file");
+
+        let host = MockHost::install();
+        host.add_file("pom.xml", POM);
+        host.add_file("src/main/resources/mvc.xml", &mvc.text);
+        for n in 0..10_000 {
+            host.add_file(&format!("fixtures/f{n}.xml"), "<a/>");
+        }
+        let mut tools = Endpoints::default();
+        tools.activate_live();
+        tools.live_events(&[Event::FileSaved(mvc.path.clone())]);
+        assert!(!unknown(&mut tools), "a capped listing may hide an importer");
+    }
+    #[test]
+    fn latin1_properties_does_not_disable_web_absence() {
+        let (host, mut tools) = setup();
+        let test = Document {
+            path: "/project/src/test/java/T.java".into(),
+            language: "java".into(),
+            version: 1,
+            text: "class T { void t() { client.get().uri(\"/x\").apiVersion(\"1\").exchange(); } }".into(),
+        };
+        host.add_file("src/test/java/T.java", &test.text);
+        tools.live_events(&[Event::FileSaved(test.path.clone())]);
+        let has_hint = |tools: &mut Endpoints| tools.diagnostics(&test).iter().any(|d| d.code.as_deref() == Some("api-version-without-inserter"));
+        assert!(has_hint(&mut tools), "absence checks work before the Latin-1 file");
+        host.add_file_bytes("src/main/resources/messages_fr.properties", b"caf\xe9=1");
+        tools.live_events(&[Event::FileSaved("/project/src/main/resources/messages_fr.properties".into())]);
+        assert!(has_hint(&mut tools), "an unrelated Latin-1 properties file keeps web absence checks on");
+        let project = host::projects().unwrap().remove(0);
+        assert_eq!(tools.absence_note(&project, "http"), None);
+        host.add_file_bytes("src/main/java/com/acme/Legacy.java", b"class caf\xe9 {}");
+        tools.live_events(&[Event::FileSaved("/project/src/main/java/com/acme/Legacy.java".into())]);
+        assert!(!has_hint(&mut tools), "an unreadable source file turns the claim off");
+        assert_eq!(tools.absence_note(&project, "http").as_deref(), Some("absence checks off: 1 unreadable file"));
+    }
+
+    #[test]
+    fn deleted_in_batch_is_removal_not_reset() {
+        let (host, mut tools) = setup();
+        host.add_file("src/main/java/com/acme/Users.java", "@RestController class Users { @GetMapping(\"/u\") String u() { return null; } }");
+        tools.live_events(&[Event::FileSaved("/project/src/main/java/com/acme/Users.java".into())]);
+        let project = host::projects().unwrap().remove(0);
+        assert_eq!(tools.web.endpoints.get(&project, Duration::ZERO).files().len(), 1);
+        let gone = openidea_plugin::FilesChanged {
+            created: vec!["/project/src/main/java/com/acme/Gone.java".into()],
+            modified: vec!["/project/Gone.properties".into()],
+            removed: Vec::new(),
+        };
+        tools.live_events(&[Event::FilesChanged(gone)]);
+        let endpoints = tools.web.endpoints.get(&project, Duration::ZERO);
+        assert_eq!(endpoints.files().len(), 1, "the other files stay indexed");
+        assert!(endpoints.complete());
+        assert!(tools.live.bounds[WEB].get(&project, Duration::ZERO).complete());
     }
     #[test]
     fn wrapper_current_edit_and_fix_returns_one_merged_response_without_manual_publication() {

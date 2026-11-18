@@ -87,7 +87,7 @@ fn facts_with(doc: &Document, prefix: Option<&str>) -> Vec<Fact> {
                     let (title, effective_note) = match &effective {
                         Some(e) => (
                             format!("{verb} {declared} (effective {e})"),
-                            format!("Effective path: {e}\nComposed from quarkus.http.root-path, then @ApplicationPath or else quarkus.rest.path, class @Path and method @Path, all literal. Environment, profile and system-property overrides are not read.\n"),
+                            format!("Effective path: {e}\nComposed from quarkus.http.root-path, then @ApplicationPath or else quarkus.rest.path, class @Path and method @Path, as written in the source. Environment, profile and system-property overrides are not read.\n"),
                         ),
                         None => (format!("{verb} {declared}"), String::new()),
                     };
@@ -202,6 +202,7 @@ pub(crate) fn rest_prefix(path: &str) -> Option<String> {
     Some(join_path(&[root, &rest]))
 }
 
+#[cfg(test)]
 pub(crate) fn lenses(doc: &Document) -> Vec<CodeLens> {
     lenses_with(doc, None)
 }
@@ -222,12 +223,7 @@ pub(crate) fn symbols(doc: &Document) -> Vec<DocumentSymbol> {
         .collect()
 }
 pub(crate) fn inspect(ctx: &Invocation, arg: Option<&str>) -> Result<(), Error> {
-    let raw = arg
-        .filter(|s| s.len() <= 4096)
-        .ok_or("Select a current Quarkus source lens.")?;
-    let payload: serde_json::Value =
-        serde_json::from_str(raw).map_err(|_| Error::Invalid("Invalid source lens.".into()))?;
-    let editor = ctx.editor().ok_or("Focus the source editor again.")?;
+    let editor = ctx.editor().ok_or("Open a Java file with a Quarkus REST endpoint or @Scheduled method first.")?;
     let snapshot = editor.document()?;
     let doc = Document {
         path: editor.path(),
@@ -235,23 +231,45 @@ pub(crate) fn inspect(ctx: &Invocation, arg: Option<&str>) -> Result<(), Error> 
         version: snapshot.version,
         text: snapshot.text,
     };
-    let project = ctx.project().ok_or("No owning project.")?;
+    let project = ctx.project().ok_or("Open a project first.")?;
     let root = project.root()?;
-    if !crate::source_owned(&root, &doc.path)
-        || payload["path"].as_str() != Some(doc.path.as_str())
-        || payload["version"].as_u64() != Some(doc.version)
-    {
-        return Err(Error::Stale);
+    if !crate::source_owned(&root, &doc.path) {
+        return Err(Error::Invalid("This file isn't part of the open project.".into()));
     }
     let prefix = rest_prefix(&doc.path);
-    let fact = facts_with(&doc, prefix.as_deref())
-        .into_iter()
-        .find(|f| {
-            payload["title"].as_str() == Some(f.title.as_str())
-                && payload["line"].as_u64() == Some(f.span.start.line as u64)
-                && payload["character"].as_u64() == Some(f.span.start.character as u64)
-        })
-        .ok_or(Error::Stale)?;
+    let facts = facts_with(&doc, prefix.as_deref());
+    let fact = match arg {
+        None => {
+            if facts.is_empty() {
+                return Err(Error::Invalid("This file has no Quarkus REST endpoint or @Scheduled method.".into()));
+            }
+            let items: Vec<_> = facts
+                .iter()
+                .enumerate()
+                .map(|(i, f)| openidea_plugin::PickItem::new(&i.to_string(), &f.title).description(&format!("line {}", f.span.start.line + 1)))
+                .collect();
+            let chosen = host::pick("Show Quarkus declaration", &items)?.ok_or(Error::Cancelled)?;
+            let index: usize = chosen.parse().map_err(|_| Error::Stale)?;
+            facts.into_iter().nth(index).ok_or(Error::Stale)?
+        }
+        Some(raw) => {
+            let payload: serde_json::Value = serde_json::from_str(raw)
+                .ok()
+                .filter(|_| raw.len() <= 4096)
+                .ok_or_else(|| Error::Invalid("This code lens is out of date. Click it again.".into()))?;
+            if payload["path"].as_str() != Some(doc.path.as_str()) || payload["version"].as_u64() != Some(doc.version) {
+                return Err(Error::Stale);
+            }
+            facts
+                .into_iter()
+                .find(|f| {
+                    payload["title"].as_str() == Some(f.title.as_str())
+                        && payload["line"].as_u64() == Some(f.span.start.line as u64)
+                        && payload["character"].as_u64() == Some(f.span.start.character as u64)
+                })
+                .ok_or(Error::Stale)?
+        }
+    };
     host::open_content_tab(&ContentTab {
         key: format!(
             "quarkus-source:{}:{}:{}",
@@ -352,6 +370,26 @@ mod tests {
             version: 3,
             text: text.into(),
         }
+    }
+    #[test]
+    fn inspect_source_declaration_without_editor_explains() {
+        let host = openidea_plugin::mock::MockHost::install();
+        let error = inspect(&host.invocation(), None).unwrap_err();
+        assert!(error.to_string().contains("Open a Java file with a Quarkus REST endpoint"), "{error:?}");
+    }
+    #[test]
+    fn palette_run_picks_a_declaration_of_the_current_file() {
+        use openidea_plugin::mock::MockHost;
+        let host = MockHost::install().with_capabilities(&["project.read", "editor.read"]);
+        let text = "import io.quarkus.scheduler.Scheduled; class Job { @Scheduled(every=\"10s\") void run() {} }";
+        host.add_file("src/main/java/Job.java", text);
+        host.open_editor("/project/src/main/java/Job.java", "java", text, &[]);
+        host.answer_next_prompt(Some(&["0"]));
+        inspect(&host.invocation(), None).unwrap();
+        host.add_file("src/main/java/Plain.java", "class Plain {}");
+        host.open_editor("/project/src/main/java/Plain.java", "java", "class Plain {}", &[]);
+        let error = inspect(&host.invocation(), None).unwrap_err();
+        assert!(error.to_string().contains("no Quarkus REST endpoint"), "{error}");
     }
     #[test]
     fn jaxrs_lenses_and_symbols_are_literal_declared_routes_not_runtime_urls() {

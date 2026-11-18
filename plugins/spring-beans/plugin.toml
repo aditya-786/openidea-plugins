@@ -1,62 +1,70 @@
 id = "aritti.spring-beans"
 name = "Spring Beans Navigator"
 version = "0.3.0" # x-release-please-version
-description = "Spring Framework beans for Java, Kotlin and XML configuration: finds stereotype classes, @Bean methods, Spring Data repositories and <bean> definitions; links injection points to the beans Spring would pick (by type through the project's type hierarchy, @Qualifier, @Primary, parameter name) and beans to where they are injected; navigates and completes bean names in qualifiers, XML references, SpEL @bean references and named pointcuts; completes SpEL #variables and pointcut designators; lists beans in a Spring Beans tool window, draws their dependencies in a Spring Bean Graph, and turns field injection into constructor injection."
+description = "Spring Framework beans for Java, Kotlin and XML configuration: finds stereotype classes, @Bean methods, Spring Data repositories and <bean> definitions; links injection points to the beans Spring would pick (by type through the project's type hierarchy, @Qualifier, @Primary, parameter name) and beans to where they are injected; navigates and completes bean names in qualifiers, XML references, SpEL @bean references and named pointcuts; completes SpEL #variables and pointcut designators; lists beans and their dependencies in a Spring Beans tool window, and turns field injection into constructor injection."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Unreleased: beans whose literal @ConditionalOnProperty, @Profile (single spring.profiles.active literal) or @ConditionalOnMissingBean (plain project component of the type) is provably false are shown as inactive (condition) and leave injection candidates; undecided conditions stay candidates; ObjectFactory and SortedSet injection points unwrap. Unreleased: source-owned physical SpEL annotation/XML injections, independent no-association SpEL lexical language and embedded keyword/context-variable completion; no evaluation or inferred member semantics. Unreleased: bean definition annotations require canonical source ownership; foreign or shadowed annotations cannot manufacture bean targets.  core XML bean reference attributes require exact unqualified names; foreign-prefixed ref fields do not create guessed Spring links. Unreleased: explicit-class, namespace-preserving XML bean creation for a selected literal reference with exact review and source-name collision refusal. reviewed atomic Java annotation-to-property FileAction replaces partial tee/clipboard mutation; the menu command directs to the editor intention, unused process:tee grant removed. The Spring Beans, Spring Bean Graph and Spring Configuration Report windows are one Spring Beans window with Beans, Graph and Report sections, live templates (completion by abbreviation) and beans XML file templates, scope, profile and constructor-arg name completion, @MockitoBean names, relative resource paths and the default @ContextConfiguration file, factory-method visibility and lookup-method checks, imports that are not beans files, unresolved class attributes and filter expressions, @CacheConfig misuse, Kotlin publisher/listener and @ComponentScan/@Bean override markers, Move Annotation String to Property routes to the atomic two-file editor intention. Check Spring Configuration and Dump Spring Configuration commands (results in a Spring Configuration Report view), Move Annotation String to Property command, file templates for components, services, configurations, Boot applications and tests, and configuration properties (Java and Kotlin); inspections for unproxied @Bean calls, @Cacheable SpEL syntax and attribute conflicts, @Bean initMethod/destroyMethod, @TestBean and @Required targets, same-class overloads in self-invocation, unresolved @Lookup/@Scheduled/@MockitoSpyBean names and missing @ImportResource/@PropertySource/@ContextConfiguration/@Sql files (opt in), XML component-scan filters, missing imports, unresolved ref/parent/depends-on and placeholders (opt in), inactive profile blocks, and checks of bean classes (abstract, factory-method, constructor-arg count, init/destroy, @Required); setter completion and navigation for <property name>; document-index links for profiles, resource files, packages and @Value placeholders; META-INF/spring.handlers and spring.schemas checks; Kotlin redundant open, router pathVariable and reified extension hints. Also: Generate Setter, Constructor, Autowired Dependency and Event Listener editor commands; Change Active Spring Profiles (narrows the duplicate bean name check); gutter markers between event publishers and listeners and between classes and their XML beans, with a chooser for several targets, following the project's type hierarchy across files. Also: project-wide Go to Declaration and gutter markers from the host's document index (bean names, aliases, qualifiers, injection points by type), without the provider time budget. 0.2.0: Kotlin and XML bean configuration; bean names, aliases, @Qualifier, @Primary and @Profile; candidates through the whole type hierarchy; gutter icons from beans to their injection points; SpEL and AspectJ pointcut completion and navigation; Spring Bean Graph; Use constructor injection quick fix. 0.1.0 (first release): bean index, injection navigation, Spring Beans tool window, field injection warning."
+change-notes = """\
+Next release: The Spring Beans window docks on the right next to Spring Structure and Spring Endpoints, appears only in Maven or Gradle projects, the empty Report tab has a Check Spring Configuration button, and Find Bean or Focus in Graph shows one bean with its dependencies and dependents. Beans, Graph and Report share one Spring Beans window, and Check Spring Configuration runs as a background task; beans switched off by a false @ConditionalOnProperty, @Profile or @ConditionalOnMissingBean show as inactive, and @NoRepositoryBean interfaces are not beans; SpEL completion and checks in injections, and bean navigation, markers and completion cover the whole project with no 512-file limit, and a bean gutter icon with several targets opens the IDE's target list under the icon; Create Bean from a reference in XML, and the Generate commands, Move Annotation String to Property and XML bean intentions work on files of any size and show only the changed lines; short setting titles, clearer permission messages, one Refresh scans the whole project, and Report results can be run again. \
+0.3.0: one Spring Beans window with live templates and more completion. \
+0.2.0: plugin icon and bean checks."""
 categories = ["frameworks"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-language:spel", "on-language:java", "on-language:kotlin", "on-language:xml", "on-event:file-opened", "on-event:file-saved"]
 
 [capabilities]
 required = ["project.read", "editor.read"]
-optional = ["events", "editor.write", "storage"]
+optional = ["events", "editor.write", "storage", "project.write"]
 
 [[contributes.providers]]
-kinds = ["definition", "line-markers", "completion", "code-actions", "diagnostics", "injections", "gutter-actions"]
+kinds = ["definition", "line-markers", "completion", "code-actions", "diagnostics", "injections"]
 languages = ["java", "kotlin", "xml"]
 
 [[contributes.commands]]
 id = "generate-setter"
-title = "Generate Setter Dependency"
+title = "Spring Beans: Generate Setter Dependency"
 category = "Spring"
 
 [[contributes.commands]]
 id = "generate-constructor-dependency"
-title = "Generate Constructor Dependency"
+title = "Spring Beans: Generate Constructor Dependency"
 category = "Spring"
 
 [[contributes.commands]]
 id = "generate-autowired-dependency"
-title = "Generate Autowired Dependency"
+title = "Spring Beans: Generate Autowired Dependency"
 category = "Spring"
 
 [[contributes.commands]]
 id = "generate-event-listener"
-title = "Generate Event Listener"
+title = "Spring Beans: Generate Event Listener"
 category = "Spring"
 
 [[contributes.commands]]
 id = "change-active-profiles"
-title = "Change Active Spring Profiles"
+title = "Spring Beans: Change Active Spring Profiles"
 category = "Spring"
 
 [[contributes.commands]]
 id = "check-spring-configuration"
-title = "Check Spring Configuration"
+title = "Spring Beans: Check Spring Configuration"
 category = "Spring"
 
 [[contributes.commands]]
 id = "dump-spring-configuration"
-title = "Dump Spring Configuration"
+title = "Spring Beans: Dump Spring Configuration"
+category = "Spring"
+
+[[contributes.commands]]
+id = "focus-in-graph"
+title = "Spring Beans: Focus Bean in Graph"
 category = "Spring"
 
 [[contributes.commands]]
 id = "externalize-annotation-string"
-title = "Move Annotation String to Property"
+title = "Spring Beans: Move Annotation String to Property"
 category = "Spring"
 
 [[contributes.menus]]
@@ -87,14 +95,17 @@ when = "editorLangId == java"
 [[contributes.menus]]
 menu = "tools"
 command = "change-active-profiles"
+when = "workspaceContains:pom.xml || workspaceContains:build.gradle || workspaceContains:build.gradle.kts || workspaceContains:settings.gradle || workspaceContains:settings.gradle.kts"
 
 [[contributes.menus]]
 menu = "tools"
 command = "check-spring-configuration"
+when = "workspaceContains:pom.xml || workspaceContains:build.gradle || workspaceContains:build.gradle.kts || workspaceContains:settings.gradle || workspaceContains:settings.gradle.kts"
 
 [[contributes.menus]]
 menu = "tools"
 command = "dump-spring-configuration"
+when = "workspaceContains:pom.xml || workspaceContains:build.gradle || workspaceContains:build.gradle.kts || workspaceContains:settings.gradle || workspaceContains:settings.gradle.kts"
 
 [[contributes.fileTemplates]]
 id = "spring-component-java"
@@ -193,8 +204,9 @@ extensions = ["java", "kt", "xml", "properties", "yml", "yaml", "sql"]
 id = "beans"
 title = "Spring Beans"
 icon = "icons/beans.svg"
-location = "left"
+location = "right"
 web = "web/resources/hub.html"
+when = "workspaceContains:pom.xml || workspaceContains:build.gradle || workspaceContains:build.gradle.kts || workspaceContains:settings.gradle || workspaceContains:settings.gradle.kts"
 
 [contributes.settings]
 schema = "settings.schema.json"
@@ -202,8 +214,13 @@ title = "Spring Beans"
 
 [[contributes.commands]]
 id = "reindex"
-title = "Spring Beans: Reindex Project Sources"
+title = "Spring Beans: Reindex Project"
 category = "Spring"
+
+[[contributes.menus]]
+menu = "tools"
+command = "reindex"
+when = "workspaceContains:pom.xml || workspaceContains:build.gradle || workspaceContains:build.gradle.kts || workspaceContains:settings.gradle || workspaceContains:settings.gradle.kts"
 
 [[contributes.providers]]
 kinds = ["hover"]
@@ -219,8 +236,3 @@ languages = ["spel"]
 [[contributes.markerIcons]]
 id = "bean"
 icon = "icons/marker-bean.svg"
-
-[[contributes.commands]]
-id = "choose-source-gutter-target"
-title = "Spring: Choose Source Gutter Target"
-category = "Spring"

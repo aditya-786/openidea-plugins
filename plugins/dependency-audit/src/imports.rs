@@ -4,6 +4,7 @@
 use crate::{Declaration, Row};
 use openidea_plugin::Project;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 const GLOBS: [&str; 3] = ["**/*.py", "**/*.java", "**/*.kt"];
 const MAX_FILES_PER_GLOB: u32 = 300;
@@ -91,7 +92,7 @@ pub(crate) fn annotate(rows: &mut [Row], imports: &Imports) {
 }
 
 /// Bounded read of project sources; skipped entirely when no PyPI/Maven row exists.
-pub(crate) fn scan(project: &Project, rows: &mut [Row]) {
+pub(crate) fn scan(project: &Project, rows: &mut [Row], deadline: Instant) {
     if !rows.iter().any(|r| matches!(r.ecosystem.as_deref(), Some("PyPI" | "Maven"))) {
         return;
     }
@@ -100,6 +101,9 @@ pub(crate) fn scan(project: &Project, rows: &mut [Row]) {
     for glob in GLOBS {
         let Ok(found) = project.find_files(glob, MAX_FILES_PER_GLOB) else { continue };
         for path in found {
+            if Instant::now() >= deadline {
+                break;
+            }
             let Ok(text) = project.read_file(&path) else { continue };
             total += text.len();
             if text.len() <= MAX_FILE_BYTES {

@@ -56,7 +56,7 @@ impl Liquibase {
         for index in &indexes {
             let item = &report.items[*index];
             text.push_str(&format!("\n{} · {}\n{}\n", item.kind, item.object, item.detail));
-            if text.len() > 128 << 10 { return Err("Selected output exceeds the128KiB review limit; choose fewer observations.".into()); }
+            if text.len() > 128 << 10 { return Err("Selected output exceeds the 128KiB review limit; choose fewer observations.".into()); }
         }
         self.offline.generated_view = false;
         self.offline.review = (!indexes.is_empty()).then_some(Selection { identity: id, text, count: indexes.len() });

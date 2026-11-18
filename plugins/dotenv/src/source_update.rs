@@ -81,7 +81,7 @@ impl FileActions for DotEnv {
             .find(|(_, p)| p.root == root && p.doc.path == doc.path && p.doc.version == doc.version && p.line == selection.start.line)
         {
             return vec![FileAction {
-                title: format!("Update this file's literal ${{{old}}} references to ${{{new}}} (source only)…"),
+                title: format!("Update ${{{old}}} → ${{{new}}} in this file…"),
                 kind: Some("refactor.rewrite".into()),
                 data: Some(token.clone()),
                 ..Default::default()
@@ -95,7 +95,7 @@ impl FileActions for DotEnv {
         let token = format!("source-update-{next}");
         self.updates.pending.insert(token.clone(), Pending { root, doc: doc.clone(), line: selection.start.line, edits });
         vec![FileAction {
-            title: format!("Update this file's literal ${{{old}}} references to ${{{new}}} (source only)…"),
+            title: format!("Update ${{{old}}} → ${{{new}}} in this file…"),
             kind: Some("refactor.rewrite".into()),
             data: Some(token),
             ..Default::default()
@@ -138,12 +138,12 @@ impl FileActions for DotEnv {
                 edit.text
             ));
         }
-        if !ui_kit::prompts::confirm_exact("Update current-file interpolation tokens?", &preview)? {
+        if !ui_kit::prompts::confirm_exact("Update references in this file?", &preview)? {
             return Err(Error::Cancelled);
         }
         verify(self)?;
         Ok(FileAction {
-            title: "Update current-file literal interpolation tokens".into(),
+            title: "Update references in this file".into(),
             kind: Some("refactor.rewrite".into()),
             edits: vec![(doc.path.clone(), pending.edits)],
             ..Default::default()

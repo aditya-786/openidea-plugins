@@ -4,20 +4,27 @@ version = "0.3.0" # x-release-please-version
 description = "Inspections and editing tools for .properties files. Reports duplicate keys, broken \\u escapes, trailing spaces, delimiters that don't match the code style, known missing translations, with quick fixes; text search reports potential unused-key candidates. Also removes a key from every locale, sorts and reformats files, groups keys by prefix in a structure view, edits a resource bundle as a table (Open With › Resource Bundle), goes to declaration in the parent locale or from Java/Kotlin strings, completes keys in i18n calls and simplelogger.properties, and copies a property's key or value."
 authors = ["Arnaud Ritti"]
 license = "MIT"
-change-notes = "Unreleased: Kotlin primary and secondary constructor @PropertyKey parameters (val/var, annotated, defaulted) resolve for Msg(\"k\") and Msg(key = \"k\") calls with the same exact-import/shadow/overload refusals; varargs, unknown or duplicate named arguments, and unsupplied required parameters stay quiet; Rename still refuses. Unreleased: @PropertyKey(resourceBundle) string literals passed to project method/constructor parameters (exact org.jetbrains.annotations import or FQN, same-class, Type.method or new Type calls, no overloads/varargs/defaults) resolve, hover, complete and find usages like JDK bundle keys, warn only when the whole bundle was indexed, and make reviewed Rename refuse instead of leaving them behind. Unreleased: same-file Java/Kotlin constant keys (static final String / const val) resolve like literals when every use is one direct JDK getString/getObject/getStringArray call on one bundle; reviewed Rename refuses constant-held keys. Unreleased: optional JDK compiler graph for canonical ResourceBundle/@PropertyKey contracts with complete physical inventories, unsaved snapshots and exact reviewed atomic Rename; native continuation/comment/group line folds. Unreleased: opt-in staged editable multi-locale native grid, exact atomic Apply intention, cancellation/stale preservation and source-observed retirement. Unreleased: shared creation/discovery locale grammar supports ISO 639-2 three-letter languages, scripts and Java variant suffixes. Unreleased: reviewed locale-file Rename/Remove and lossless Unicode/native property source conversion. Unreleased: reviewed atomic creation of up to 32 locale files, with duplicate, collision, open-buffer and post-confirmation guards. Unreleased: read-only native bundle overview with explicit selected-property Edit Value, Rename Key, Add/Remove and Open Translation controls; foreign typed cell events now refuse instead of discarding their values. Unreleased: native source-linked structure tree and toolbar replace the packaged HTML wrapper; current-source navigation and existing editor actions are preserved. Unreleased: reviewed scoped key Rename updates visible bundle declarations and proven same-module Java/Kotlin JDK literals together, with complete source fingerprints, collision checks, separate encodings and exact before/after review. Unreleased: memory-only Revert last reviewed bundle edit control with exact after-text/version/project guards and confirmed inverse delta; native Undo is unchanged. Unreleased: navigation-index source metadata is bounded before reads, retaining unsaved-text postread limits. Unreleased: confirmed bundle-only key change with lossless escaping, duplicate/collision checks and explicit unchanged code references; atomic locale sources are admitted before reads. Unreleased: explicit source usage search validates bounded current project ownership and source metadata before reads. Unreleased: native bundle edits require rendered source binding and exact key/path/before-after review; stale or ambiguous rows and incomplete/oversized layouts refuse. Unreleased: copy commands refuse lossy UTF-16/Unicode conversion before changing the clipboard. Unreleased: preserve UTF-16 key identity for duplicate checks and refuse lossy keys in source references and bundle edit preparation. Unreleased: cached property facts revalidate current innermost project ownership, withholding reassigned resource sources without provider source reads. Unreleased: Java/Kotlin property links/completion/hover now require explicit JDK bundle/key calls and same-module conventional resource candidates; arbitrary framework literals and unknown getters stay quiet. Unreleased: confirmed atomic FileActions for cross-locale add/remove/sort and selected-locale value updates, preserving unsaved project text; locale creation with validated names and non-overwrite guard. Other-locale table cells open the file instead of writing through tee; the tee permission is removed. Earlier: live unused-key hints, related-locale navigation and incomplete-key filtering."
+change-notes = """\
+Next release: Copy Property Key, Copy Property Value and Reformat File are in the editor context menu of .properties files only, and a denied clipboard says how to allow it; Kotlin and Java @PropertyKey keys resolve to bundle entries, and a gutter icon on bundle keys lists the same key in the other locales; edit several locales in one grid and create up to 32 locale files at once; keys continued over a line break and form feeds around separators are read the way Java reads them, and the plugin starts only for .properties, Java, Kotlin, HTML and JSP files; one name per action (Edit All Locales, Apply Locale Edits, Discard Locale Edits, Find Bundle Key Usages), a shorter bundle toolbar with row actions under More, and clearer messages. \
+0.3.0: locale file Rename and Remove, native source conversion. \
+0.2.0: plugin icon and audit improvements."""
 categories = ["languages", "linters"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
-activation = ["on-event:file-opened", "on-event:file-saved", "on-event:files-changed"]
+activation = ["on-language:properties", "on-file:**/*.properties", "on-language:java", "on-language:kotlin", "on-language:html", "on-language:jsp"]
 
 [capabilities]
 required = ["project.read", "editor.read", "editor.write", "events"]
 optional = ["clipboard", "process:java"]
 
 [[contributes.providers]]
-kinds = ["code-actions", "definition", "completion", "folding"]
+kinds = ["code-actions", "definition", "completion", "folding", "line-markers"]
 languages = ["properties"]
+
+[[contributes.markerIcons]]
+id = "locales"
+icon = "icons/marker-locales.svg"
 
 [[contributes.providers]]
 kinds = ["definition", "completion"]
@@ -52,16 +59,24 @@ priority = "option"
 id = "copy-key"
 title = "Properties: Copy Property Key"
 category = "Properties"
+when = "editorLangId == properties"
 
 [[contributes.commands]]
 id = "copy-value"
 title = "Properties: Copy Property Value"
 category = "Properties"
+when = "editorLangId == properties"
 
 [[contributes.commands]]
 id = "reformat"
 title = "Properties: Reformat File"
 category = "Properties"
+when = "editorLangId == properties"
+
+[[contributes.menus]]
+menu = "editor.context"
+command = "reformat"
+when = "editorLangId == properties"
 
 [[contributes.commands]]
 id = "find-unused"
@@ -70,8 +85,19 @@ category = "Properties"
 
 [[contributes.commands]]
 id = "find-owned-usages"
-title = "Properties: Find Explicit Bundle Key Usages"
+title = "Properties: Find Bundle Key Usages"
 category = "Properties"
+when = "editorLangId == properties"
+
+[[contributes.menus]]
+menu = "editor.context"
+command = "copy-value"
+when = "editorLangId == properties"
+
+[[contributes.menus]]
+menu = "editor.context"
+command = "copy-key"
+when = "editorLangId == properties"
 
 [contributes.settings]
 schema = "settings.schema.json"
@@ -91,9 +117,11 @@ path = "templates/properties.properties"
 
 [[contributes.commands]]
 id = "discard-staged-grid"
-title = "Properties: Discard Staged Locale Grid…"
+title = "Properties: Discard Locale Edits…"
 category = "Properties"
 
 [[contributes.commands]]
 id = "inspect-java-contracts"
-title = "Properties: Inspect Compiler-Proved Java Bundle Usages…"
+title = "Properties: Find Java Bundle Usages with the Compiler…"
+category = "Properties"
+when = "editorLangId == properties"

@@ -1,7 +1,7 @@
 use crate::matcher::Rule;
 use std::collections::HashSet;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Syntax {
     Glob,
     Regexp,
@@ -30,7 +30,7 @@ pub fn dialect(path: &str) -> Option<Dialect> {
 
 /// A problem in an ignore file; byte offsets into its text. Each fix replaces
 /// a byte range with a text.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Problem {
     pub start: usize,
     pub end: usize,
@@ -87,7 +87,7 @@ pub fn check(text: &str, dialect: Dialect) -> Vec<Problem> {
 
         entries.push(Entry { start, end, line: whole_line.clone(), text: entry });
 
-        if !seen.insert(entry) {
+        if !seen.insert((syntax, entry)) {
             problems.push(Problem {
                 start,
                 end,
@@ -135,20 +135,34 @@ struct Entry<'a> {
     text: &'a str,
 }
 
+/// Above this many entries, redundancy is not checked: the pairwise comparison would outgrow the editor's time limit.
+const MAX_COVER_ENTRIES: usize = 512;
+
 /// Literal entries another entry already matches, with no entry of the other
 /// kind (ignore / unignore) between them. The files each entry would match
 /// on disk cannot be listed, so this compares the patterns.
-// ponytail: O(n²) over entries; fine for hand-written ignore files.
+// ponytail: O(n²) pattern matches, capped at MAX_COVER_ENTRIES entries.
 fn covered_entries(entries: &[Entry]) -> Vec<Problem> {
+    if entries.len() > MAX_COVER_ENTRIES {
+        return Vec::new();
+    }
     let rules: Vec<Option<Rule>> = entries.iter().map(|e| Rule::parse(e.text)).collect();
+    // negated[k], kept[k]: unignore / ignore rules among rules[..k], so a range is checked in O(1).
+    let (mut negated, mut kept) = (vec![0usize], vec![0usize]);
+    for rule in &rules {
+        negated.push(negated.last().unwrap() + usize::from(rule.as_ref().is_some_and(|r| r.negated)));
+        kept.push(kept.last().unwrap() + usize::from(rule.as_ref().is_some_and(|r| !r.negated)));
+    }
     let mut problems = Vec::new();
 
     for (i, (entry, rule)) in entries.iter().zip(&rules).enumerate() {
         let Some(rule) = rule.as_ref() else { continue };
         let Some((path, dir_only)) = covered_path(rule) else { continue };
+        let other_kind = if rule.negated { &kept } else { &negated };
         let cover = entries.iter().zip(&rules).enumerate().find_map(|(j, (other, other_rule))| {
             let other_rule = other_rule.as_ref()?;
-            let same_kind_between = rules[i.min(j)..=i.max(j)].iter().flatten().all(|r| r.negated == rule.negated);
+            let (low, high) = (i.min(j), i.max(j));
+            let same_kind_between = other_kind[high + 1] == other_kind[low];
             let covers = other.text != entry.text
                 && same_kind_between
                 && (rule.anchored || !other_rule.anchored)

@@ -2,17 +2,18 @@
   "properties": {
     "artisanDockerSocket": {
       "type": "string",
-      "title": "Docker Artisan: explicit local unix:///socket endpoint",
+      "title": "Docker: socket address used to run Artisan in a container (unix:// path)",
       "default": "unix:///var/run/docker.sock"
     },
     "artisanDockerContainer": {
       "type": "string",
-      "title": "Docker Artisan: manual full 64-hex container ID (Choose Docker Target can select per project)",
+      "title": "Docker: container ID that runs Artisan",
+      "description": "Leave empty and use Laravel: Choose Docker Target\u2026 to pick one per project.",
       "default": ""
     },
     "artisanDockerWorkdir": {
       "type": "string",
-      "title": "Docker Artisan: manual absolute container project directory (verified bind mapping)",
+      "title": "Docker: project folder inside the container (absolute path, mounted from this project)",
       "default": ""
     },
     "diagnostics": {
@@ -62,7 +63,8 @@
     },
     "reportUnknownLivewireMethods": {
       "type": "boolean",
-      "title": "Report wire:click and wire:submit methods that the component class of a livewire/ view does not have",
+      "title": "Report unknown wire:click and wire:submit methods",
+      "description": "Methods that the component class of a livewire/ view does not have.",
       "default": true
     },
     "modelDirectories": {
@@ -91,13 +93,15 @@
       "default": true
     },
     "checkEloquent": {
+      "title": "Check Eloquent models and queries",
       "type": "boolean",
-      "title": "Report mass assignment of unguarded models, unscheduled prunable models and orderBy() on date columns that latest() or oldest() replace",
-      "default": true
+      "default": true,
+      "description": "Report mass assignment of unguarded models, unscheduled prunable models and orderBy() on date columns that latest() or oldest() replace"
     },
     "checkFunctions": {
       "type": "boolean",
-      "title": "Report env() calls outside the config directory (they return null once the configuration is cached)",
+      "title": "Report env() calls outside the config directory",
+      "description": "env() returns null once the configuration is cached.",
       "default": true
     },
     "checkSecurity": {
@@ -122,13 +126,15 @@
     },
     "routeHints": {
       "type": "boolean",
+      "title": "Show route and controller hints in the editor",
       "default": true,
-      "description": "Show cached route and controller hints in the editor."
+      "description": "Inline hints next to route names and controller actions, from the project index."
     },
     "scopeAttributeIntentions": {
       "type": "boolean",
+      "title": "Offer to convert query scopes to the #[Scope] attribute (Laravel 12.6+)",
       "default": true,
-      "description": "Offer scope-to-attribute intentions when composer.lock establishes Laravel 12.6 or newer."
+      "description": "Shown only when composer.lock pins Laravel 12.6 or newer."
     },
     "uiLanguage": {
       "type": "string",

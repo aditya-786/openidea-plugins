@@ -4,6 +4,15 @@ use crate::*;
 use serde_json::Value;
 
 pub(crate) const VIEW: &str = "npm-dependency-graph";
+pub(crate) const DEFAULT_MAX_PACKAGES: usize = 2000;
+
+// ponytail: every package and edge becomes a native tree item; 20000 packages (~100k items) is the
+// ceiling before the 5 s command budget and view refresh get risky. Page the tree if users need more.
+fn max_packages() -> usize {
+    host::setting_number("npmGraphMaxPackages")
+        .filter(|n| n.is_finite())
+        .map_or(DEFAULT_MAX_PACKAGES, |n| n.clamp(100.0, 20000.0) as usize)
+}
 pub(crate) struct Snapshot {
     root: String,
     path: String,
@@ -63,9 +72,11 @@ fn locate(packages: &serde_json::Map<String, Value>, parent: &str, name: &str, f
     }
 }
 
-fn model(text: &str) -> Result<(Vec<TreeItem>, HashMap<String, usize>, String), Error> {
-    if text.len() > 512 << 10 {
-        return Err("Lockfile graph input exceeds512KiB.".into());
+fn model(text: &str, max_packages: usize) -> Result<(Vec<TreeItem>, HashMap<String, usize>, String), Error> {
+    let raise = "Raise Most packages in the npm graph in Settings › Plugins › Dependency Audit.";
+    let max_bytes = max_packages << 10;
+    if text.len() > max_bytes {
+        return Err(format!("This lockfile is larger than {} KiB, the npm graph limit. {raise}", max_bytes >> 10).into());
     }
     let root: Value = serde_json::from_str(text)
         .map_err(|_| Error::Invalid("Invalid package lock JSON.".into()))?;
@@ -78,8 +89,10 @@ fn model(text: &str) -> Result<(Vec<TreeItem>, HashMap<String, usize>, String), 
     let packages = root
         .get("packages")
         .and_then(Value::as_object)
-        .filter(|packages| packages.len() <= 2000)
-        .ok_or("A bounded packages map is required (at most2000 entries).")?;
+        .ok_or("The lockfile has no packages map.")?;
+    if packages.len() > max_packages {
+        return Err(format!("This lockfile has {} packages, more than the npm graph limit ({max_packages}). {raise}", packages.len()).into());
+    }
     let root_members =
         manifest::object_members(text, 0).ok_or("Ambiguous lockfile root ownership.")?;
     let package_at = root_members
@@ -157,8 +170,8 @@ fn model(text: &str) -> Result<(Vec<TreeItem>, HashMap<String, usize>, String), 
         }
         for ((name, kind), requirement) in dependencies {
             edges += 1;
-            if edges > 8000 {
-                return Err("Lockfile graph exceeds8000 edges.".into());
+            if edges > max_packages * 4 {
+                return Err(format!("This lockfile has more than {} dependency edges, the npm graph limit. {raise}", max_packages * 4).into());
             }
             let key = format!("npm-edge:{index}:{edges}");
             let target = resolve(packages, path, name);
@@ -230,7 +243,7 @@ impl Snapshot {
         if !owned_source_path(&root, &path) {
             return Err(Error::Stale);
         }
-        let (items, targets, status) = model(&text)?;
+        let (items, targets, status) = model(&text, max_packages())?;
         Ok(Self {
             root,
             path,
@@ -297,7 +310,7 @@ mod tests {
     #[test]
     fn nested_lookup_resolves_nearest_physical_version_and_leaves_links_unknown() {
         let text = r#"{"lockfileVersion":3,"packages":{"":{"dependencies":{"a":"*","linked":"*"}},"node_modules/a":{"version":"1","dependencies":{"b":"*"}},"node_modules/b":{"version":"2"},"node_modules/a/node_modules/b":{"version":"1"},"node_modules/linked":{"link":true,"resolved":"packages/linked"}}}"#;
-        let (items, targets, status) = model(text).unwrap();
+        let (items, targets, status) = model(text, DEFAULT_MAX_PACKAGES).unwrap();
         assert!(items.iter().any(|item| {
             item.detail
                 .as_deref()
@@ -305,19 +318,33 @@ mod tests {
         }));
         assert!(status.contains("1 unresolved/linked"));
         assert!(!targets.is_empty());
-        assert!(model(r#"{"lockfileVersion":1}"#).is_err());
+        assert!(model(r#"{"lockfileVersion":1}"#, DEFAULT_MAX_PACKAGES).is_err());
+    }
+    #[test]
+    fn package_limit_comes_from_the_setting_and_errors_name_it() {
+        let h = openidea_plugin::mock::MockHost::install();
+        let packages: String = (0..150).map(|i| format!(r#","node_modules/p{i}":{{"version":"1"}}"#)).collect();
+        let text = format!(r#"{{"lockfileVersion":3,"packages":{{"":{{}}{packages}}}}}"#);
+        h.open_editor("/project/package-lock.json", "json", &text, &[(0, 0, 0, 0)]);
+        h.set_setting("npmGraphMaxPackages", "100");
+        let error = Snapshot::capture(&h.invocation()).err().unwrap().to_string();
+        assert!(error.contains("151 packages") && error.contains("Settings › Plugins › Dependency Audit"));
+        h.set_setting("npmGraphMaxPackages", "1");
+        assert!(Snapshot::capture(&h.invocation()).is_err());
+        h.set_setting("npmGraphMaxPackages", "200");
+        assert!(Snapshot::capture(&h.invocation()).is_ok());
     }
     #[test]
     fn navigation_uses_package_owner_not_equal_nested_metadata_key() {
         let text = r#"{"lockfileVersion":3,"packages":{"":{"dependencies":{"b":"*"},"metadata":{"node_modules/b":{}}},"node_modules/b":{"version":"1"}}}"#;
-        let (_, targets, _) = model(text).unwrap();
+        let (_, targets, _) = model(text, DEFAULT_MAX_PACKAGES).unwrap();
         let expected = text.rfind("node_modules/b").unwrap();
         assert!(
             targets
                 .values()
                 .all(|at| *at == expected || *at == text.find("\"\":{").unwrap() + 1)
         );
-        assert!(model(r#"{"lockfileVersion":3,"packages":{"node_modules/b":{"version":"1"},"node_modules/b":{"version":"2"}}}"#).is_err());
+        assert!(model(r#"{"lockfileVersion":3,"packages":{"node_modules/b":{"version":"1"},"node_modules/b":{"version":"2"}}}"#, DEFAULT_MAX_PACKAGES).is_err());
     }
     #[test]
     fn native_expansion_survives_rerender_and_leaf_nodes_do_not_show_spinners() {

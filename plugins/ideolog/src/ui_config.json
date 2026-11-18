@@ -1,7 +1,7 @@
 {
   "title": "Ideolog",
   "views": {
-    "patterns": "Ideolog",
+    "patterns": "Formats and Highlighting",
     "log-snapshot": "Log Snapshot",
     "jvm-observations": "JVM Observations",
     "live-tail": "Live Log Tail"
@@ -14,7 +14,7 @@
     "tabs": [
       {
         "id": "patterns",
-        "label": "Ideolog"
+        "label": "Formats and Highlighting"
       },
       {
         "id": "log-snapshot",

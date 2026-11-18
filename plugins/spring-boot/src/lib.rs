@@ -31,14 +31,10 @@ use openidea_plugin::{
     TextEdit, host, register_plugin,
 };
 use spring_text::config::{self, Key, canonical, is_config_file};
-use spring_text::index::{COMMAND_BUDGET, Index, Indexes, PROVIDER_BUDGET, project_of};
+use spring_text::index::project_of;
+use std::time::{Duration, Instant};
 use spring_text::metadata::{Catalog, Lookup, Meta, properties_completion, yaml_completion};
 use spring_text::{contains, java, range};
-
-const SOURCES: &[&str] = &[
-    "**/META-INF/*spring-configuration-metadata.json",
-    "**/*.java",
-];
 
 fn parse_source(path: &str, text: &str) -> Option<Meta> {
     if path.ends_with(".json") {
@@ -67,9 +63,6 @@ const AUTOWIRE_MODE_GLOBS: &[&str] = &[
 pub struct BootTools {
     live: live::State,
     jars: jar_metadata::State,
-    sources: Indexes<Meta>,
-    facts: Indexes<facts::Facts>,
-    locations: Indexes<fileset::Locations>,
     rename: property_rename::State,
 }
 
@@ -78,109 +71,19 @@ impl Default for BootTools {
         Self {
             live: live::State::default(),
             jars: jar_metadata::State::default(),
-            sources: Indexes::new(SOURCES, parse_source),
-            facts: Indexes::new(nav::SOURCE_GLOBS, facts::read),
-            locations: Indexes::new(fileset::GLOBS, fileset::read),
             rename: property_rename::State::default(),
         }
-    }
-}
-
-impl BootTools {
-    /// The project's own properties, and whether a whole pass over the project was read.
-    fn project(&mut self, doc: &Document) -> (Catalog, bool) {
-        let Some((roots, owner)) = source_scope(&doc.path) else {
-            return (Catalog::default(), false);
-        };
-        match self
-            .sources
-            .for_document(&doc.path, &doc.text, PROVIDER_BUDGET)
-        {
-            Some(index) => {
-                let mut catalog = Catalog::default();
-                let mut owned = 0;
-                for (_, meta) in index
-                    .iter()
-                    .filter(|(path, _)| live::current_owner(&roots, path) == Some(owner.as_str()))
-                {
-                    owned += 1;
-                    catalog.add(meta);
-                }
-                (catalog, index.fresh() && owned == index.files().len())
-            }
-            None => (Catalog::default(), false),
-        }
-    }
-
-    /// The project's classes, enums and packages, as far as they were read.
-    fn summary(&mut self, doc: &Document) -> Summary {
-        let Some((roots, owner)) = source_scope(&doc.path) else {
-            return Summary::default();
-        };
-        match self
-            .facts
-            .for_document(&doc.path, &doc.text, PROVIDER_BUDGET)
-        {
-            Some(index) => {
-                let owned: Vec<_> = index
-                    .iter()
-                    .filter(|(path, _)| live::current_owner(&roots, path) == Some(owner.as_str()))
-                    .map(|(_, f)| f)
-                    .collect();
-                Summary::merge(
-                    owned.iter().copied(),
-                    index.fresh() && owned.len() == index.files().len(),
-                )
-            }
-            None => Summary::default(),
-        }
-    }
-
-    /// Whether Spring Boot reads the document as configuration: by name, or because a standard file points at it.
-    fn is_config(&mut self, doc: &Document) -> bool {
-        let Some((roots, owner)) = source_scope(&doc.path) else {
-            return false;
-        };
-        if is_config_file(&doc.path) {
-            return true;
-        }
-        let Some(index) = self
-            .locations
-            .for_document(&doc.path, &doc.text, PROVIDER_BUDGET)
-        else {
-            return false;
-        };
-        fileset::is_configuration(
-            &doc.path,
-            index
-                .iter()
-                .filter(|(path, _)| live::current_owner(&roots, path) == Some(owner.as_str()))
-                .map(|(path, l)| (path, l)),
-        )
     }
 }
 
 // Metadata-only ownership validation shared by legacy source catalog providers.
 fn source_scope(path: &str) -> Option<(Vec<String>, String)> {
     let roots = live::current_roots()?;
-    let owner = live::current_owner(&roots, path)?.to_owned();
+    let owner = spring_text::scope::current_owner(path, &roots)?;
     if project_of(path)?.root().ok()? != owner {
         return None;
     }
     Some((roots, owner))
-}
-
-fn catalog_of(index: &Index<Meta>, roots: &[String], owner: &str) -> (Catalog, bool) {
-    let mut catalog = Catalog::default();
-    let mut owned = 0;
-    for (_, meta) in index
-        .iter()
-        .filter(|(path, _)| live::current_owner(roots, path) == Some(owner))
-    {
-        owned += 1;
-        catalog.add(meta);
-    }
-    (catalog, index.fresh() && owned == index.files().len())
 }
 
 fn removal_actions(doc: &Document, selection: Range) -> Vec<CodeAction> {
@@ -432,24 +335,6 @@ fn driver_check_on() -> bool {
 }
 
 impl BootTools {
-    fn profiles(doc: &Document) -> Vec<String> {
-        let Some((roots, owner)) = source_scope(&doc.path) else {
-            return Vec::new();
-        };
-        let Some(project) = project_of(&doc.path) else {
-            return Vec::new();
-        };
-        let files = project
-            .find_files("**/application-*.*", 200)
-            .unwrap_or_default();
-        let names: std::collections::BTreeSet<String> = files
-            .iter()
-            .filter(|f| live::current_owner(&roots, f) == Some(owner.as_str()))
-            .filter_map(|f| nav::profile_of(f))
-            .collect();
-        names.into_iter().collect()
-    }
-
     /// The files under `src/main/resources`, as `classpath:` locations.
     fn resources(doc: &Document) -> Vec<String> {
         let Some((roots, owner)) = source_scope(&doc.path) else {
@@ -463,7 +348,7 @@ impl BootTools {
             .unwrap_or_default();
         files
             .iter()
-            .filter(|f| live::current_owner(&roots, f) == Some(owner.as_str()))
+            .filter(|f| spring_text::scope::current_owner(f, &roots).as_deref() == Some(owner.as_str()))
             .filter_map(|f| {
                 f.split_once("/src/main/resources/")
                     .map(|(_, rest)| rest.to_owned())
@@ -499,7 +384,7 @@ impl BootTools {
         let Some(file) = project.find_files(&glob, 5).ok().and_then(|files| {
             files
                 .into_iter()
-                .find(|path| live::current_owner(&roots, path) == Some(owner.as_str()))
+                .find(|path| spring_text::scope::current_owner(path, &roots).as_deref() == Some(owner.as_str()))
         }) else {
             return Vec::new();
         };
@@ -532,23 +417,22 @@ impl Providers for BootTools {
         at: Position,
         _trigger: Option<&str>,
     ) -> Vec<CompletionItem> {
-        if !self.is_config(doc) {
+        let Some(cached) = self.live_snapshot(doc).filter(|cached| cached.is_config) else {
             return Vec::new();
-        }
+        };
         let Some(at) = offset(&doc.text, at) else {
             return Vec::new();
         };
-        let (project, _) = self.project(doc);
         let jars = self.jars.catalog(&doc.path);
-        let lookup = Lookup(vec![&project, &jars, self.jars.bundled(&doc.path)]);
+        let lookup = Lookup(vec![&cached.catalog, &jars, self.jars.bundled(&doc.path)]);
         let mut items = if doc.path.ends_with(".properties") {
             properties_completion(&doc.text, at, &lookup)
         } else {
             yaml_completion(&doc.text, at, &lookup)
         };
-        let facts = self.summary(doc);
+        let facts = &cached.facts;
         let packages: Vec<String> = facts.packages.iter().cloned().collect();
-        let profiles = Self::profiles(doc);
+        let profiles = &cached.profiles;
         let resources = || Self::resources(doc);
         let cx = nav::Context {
             path: &doc.path,
@@ -556,8 +440,8 @@ impl Providers for BootTools {
             at,
             lookup: &lookup,
             packages: &packages,
-            profiles: &profiles,
-            facts: &facts,
+            profiles,
+            facts,
             resources: &resources,
         };
         items.extend(nav::completion(&cx));
@@ -568,15 +452,14 @@ impl Providers for BootTools {
         if let Some(targets) = placeholder_nav::definition(doc, at) {
             return targets;
         }
-        if !self.is_config(doc) {
+        let Some(cached) = self.live_snapshot(doc).filter(|cached| cached.is_config) else {
             return Vec::new();
-        }
+        };
         let Some(at) = offset(&doc.text, at) else {
             return Vec::new();
         };
-        let (project, _) = self.project(doc);
         let jars = self.jars.catalog(&doc.path);
-        let lookup = Lookup(vec![&project, &jars, self.jars.bundled(&doc.path)]);
+        let lookup = Lookup(vec![&cached.catalog, &jars, self.jars.bundled(&doc.path)]);
         let Some(target) = nav::target(&doc.path, &doc.text, at, &lookup) else {
             return Vec::new();
         };
@@ -591,7 +474,7 @@ impl Providers for BootTools {
                 .find_files(&glob, 10)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|path| live::current_owner(&roots, path) == Some(owner.as_str()))
+                .filter(|path| spring_text::scope::current_owner(path, &roots).as_deref() == Some(owner.as_str()))
                 .map(|path| Location {
                     path,
                     range: Range::new(Position::new(0, 0), Position::new(0, 0)),
@@ -606,7 +489,7 @@ impl Providers for BootTools {
                             .find_files(&format!("**/{simple}.{ext}"), 20)
                             .unwrap_or_default()
                     })
-                    .filter(|path| live::current_owner(&roots, path) == Some(owner.as_str()))
+                    .filter(|path| spring_text::scope::current_owner(path, &roots).as_deref() == Some(owner.as_str()))
                     .filter_map(|path| {
                         let text = project.read_file(&path).ok()?;
                         let range = nav::declaration(&path, &text, &name)?;
@@ -625,14 +508,19 @@ impl Providers for BootTools {
 
             return removal_actions(doc, selection);
         }
-        if !self.is_config(doc) {
+        let Some(cached) = self.live_snapshot(doc).filter(|cached| cached.is_config) else {
             return Vec::new();
-        }
-        let (project, complete) = self.project(doc);
+        };
         let jars = self.jars.catalog(&doc.path);
-        let lookup = Lookup(vec![&project, &jars, self.jars.bundled(&doc.path)]);
-        let facts = self.summary(doc);
-        let problems = config_problems(&doc.path, &doc.text, &lookup, complete && !self.jars.version_scoped(&doc.path), None, &facts);
+        let lookup = Lookup(vec![&cached.catalog, &jars, self.jars.bundled(&doc.path)]);
+        let problems = config_problems(
+            &doc.path,
+            &doc.text,
+            &lookup,
+            cached.complete && !self.jars.version_scoped(&doc.path),
+            None,
+            &cached.facts,
+        );
         let mut actions: Vec<CodeAction> = problems
             .iter()
             .filter(|p| contains(p.diagnostic.range, selection.start))
@@ -653,8 +541,7 @@ impl Providers for BootTools {
 
     /// Observe current cached source; the live diagnostics provider owns results.
     fn line_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
-        let _ = self.sources.for_cached_document(&doc.path, &doc.text);
-        let _ = self.live_index(doc);
+        let _ = self.live_snapshot(doc);
         Vec::new()
     }
 }
@@ -692,23 +579,17 @@ fn recheck_report_source(
 impl BootTools {
     /// Every configuration file of the project: the standard names and what `spring.config.*` points at.
     fn configuration_files(
-        &mut self,
+        &self,
         project: &openidea_plugin::Project,
         roots: &[String],
         owner: &str,
+        seeds: &[(String, fileset::Locations)],
     ) -> Vec<String> {
         let mut files: Vec<String> = fileset::GLOBS
             .iter()
             .flat_map(|g| project.find_files(g, 500).unwrap_or_default())
             .collect();
-        let seeds: Vec<(String, fileset::Locations)> = self
-            .locations
-            .get(project, COMMAND_BUDGET)
-            .iter()
-            .filter(|(path, _)| live::current_owner(roots, path) == Some(owner))
-            .map(|(path, l)| (path.to_owned(), l.clone()))
-            .collect();
-        for (_, set) in &seeds {
+        for (_, set) in seeds {
             for name in &set.names {
                 for extension in ["properties", "yml", "yaml"] {
                     files.extend(
@@ -719,8 +600,8 @@ impl BootTools {
                 }
             }
         }
-        files.extend(fileset::discover_in(project, &seeds).files);
-        files.retain(|path| live::current_owner(roots, path) == Some(owner));
+        files.extend(fileset::discover_in(project, seeds).files);
+        files.retain(|path| spring_text::scope::current_owner(path, roots).as_deref() == Some(owner));
         files.sort();
         files.dedup();
         files
@@ -729,6 +610,7 @@ impl BootTools {
     fn configuration_problems(
         &mut self,
         project: &openidea_plugin::Project,
+        deadline: Instant,
     ) -> Result<(usize, Vec<Listed>, bool), Error> {
         let root = project.root()?;
         let (roots, owner) =
@@ -736,46 +618,42 @@ impl BootTools {
         if owner != root {
             return Err(Error::Stale);
         }
-        let (catalog, complete) =
-            catalog_of(self.sources.get(project, COMMAND_BUDGET), &roots, &root);
-        let complete=complete && !self.jars.version_scoped(&format!("{root}/application.properties"));
+        let budget = deadline.saturating_duration_since(Instant::now());
+        let shared = live::shared_of(self.live.files.get(project, budget), &roots, &root, true);
+        let complete = shared.complete && !self.jars.version_scoped(&format!("{root}/application.properties"));
         let jars = self.jars.catalog(&format!("{root}/application.properties"));
-        let lookup = Lookup(vec![&catalog, &jars, self.jars.bundled(&format!("{root}/application.properties"))]);
-        let facts = {
-            let index = self.facts.get(project, COMMAND_BUDGET);
-            let owned: Vec<_> = index
-                .iter()
-                .filter(|(path, _)| live::current_owner(&roots, path) == Some(root.as_str()))
-                .map(|(_, fact)| fact)
-                .collect();
-            Summary::merge(
-                owned.iter().copied(),
-                index.fresh() && owned.len() == index.files().len(),
-            )
-        };
-        let files = self.configuration_files(project, &roots, &root);
+        let lookup = Lookup(vec![&shared.catalog, &jars, self.jars.bundled(&format!("{root}/application.properties"))]);
+        let facts = &shared.facts;
+        let files = self.configuration_files(project, &roots, &root, &shared.locations);
         let metadata: Vec<_> = project
             .find_files("**/META-INF/*spring-configuration-metadata.json", 20)
             .unwrap_or_default()
             .into_iter()
-            .filter(|path| live::current_owner(&roots, path) == Some(root.as_str()))
+            .filter(|path| spring_text::scope::current_owner(path, &roots).as_deref() == Some(root.as_str()))
             .collect();
         let mut listed = Vec::new();
+        let mut complete = complete;
+        let mut checked = 0;
         for path in files.iter().chain(&metadata) {
+            if Instant::now() >= deadline {
+                complete = false;
+                break;
+            }
+            checked += 1;
             let Ok(text) = project.read_file(path) else {
                 continue;
             };
             let found: Vec<Diagnostic> = if local_meta::is_metadata_file(path) {
                 let context = local_meta::Context {
                     defined: &|name| !complete || lookup.prop(name).is_some(),
-                    facts: &facts,
+                    facts,
                 };
                 local_meta::check(&text, &context)
                     .iter()
                     .map(|f| f.diagnostic(&text))
                     .collect()
             } else {
-                config_problems(path, &text, &lookup, complete, None, &facts)
+                config_problems(path, &text, &lookup, complete, None, facts)
                     .into_iter()
                     .map(|p| p.diagnostic)
                     .collect()
@@ -794,13 +672,16 @@ impl BootTools {
         if live::current_roots().as_ref() != Some(&roots) {
             return Err(Error::Stale);
         }
-        Ok((files.len() + metadata.len(), listed, complete))
+        Ok((checked, listed, complete))
     }
 
     fn show_diagnostics(&mut self, ctx: &Invocation) -> Result<Option<String>, Error> {
         let project = ctx.project().ok_or("Open a project first.")?;
         let root = project.root()?;
-        let (checked, mut listed, complete) = self.configuration_problems(&project)?;
+        let (checked, mut listed, complete) = {
+            let _task = host::begin_task("Checking Spring Boot configuration", false);
+            self.configuration_problems(&project, Instant::now() + Duration::from_secs(30))?
+        };
         if listed.is_empty() {
             let message = if complete {
                 format!("No configuration problems in {checked} files.")
@@ -902,6 +783,12 @@ mod tests {
     use openidea_plugin::mock::MockHost;
     use openidea_plugin::text::position;
 
+    fn warm() -> BootTools {
+        let mut tools = BootTools::default();
+        tools.activate_live();
+        tools
+    }
+
     const PROPS: &str = "/project/src/main/resources/application.properties";
     const YAML: &str = "/project/src/main/resources/application.yml";
 
@@ -925,7 +812,7 @@ public class MailProperties {
             "nested/src/main/resources/META-INF/additional-spring-configuration-metadata.json",
             EXTRA,
         );
-        let mut tools = BootTools::default();
+        let mut tools = warm();
         let current = doc(PROPS, "acme.");
         let at = position(&current.text, current.text.len());
         assert!(
@@ -954,29 +841,26 @@ public class MailProperties {
         );
         host.add_file(
             "nested/src/main/java/com/inner/Inner.java",
-            "package com.inner; class Inner {}\n",
+            "package com.inner;\nclass Inner {}\n",
         );
         host.add_file(
             "nested/src/main/resources/META-INF/additional-spring-configuration-metadata.json",
             EXTRA,
         );
-        let mut tools = BootTools::default();
+        let mut tools = warm();
         let current = doc(PROPS, "spring.config.import=classpath:extra.yml\n");
         assert_eq!(tools.definition(&current, Position::new(0, 30)).len(), 1);
-        let _ = tools.summary(&current);
+        tools.activate_live();
         assert!(BootTools::resources(&current).contains(&"extra.yml".to_owned()));
-        assert!(!BootTools::profiles(&current).is_empty());
+        let before = tools.live_snapshot(&current).unwrap();
+        assert!(before.profiles.contains(&"secret".to_owned()));
+        assert!(before.facts.packages.iter().any(|p| p == "com.inner"));
         host.add_project("/project/nested");
         assert!(tools.definition(&current, Position::new(0, 30)).is_empty());
         assert!(BootTools::resources(&current).is_empty());
-        assert!(BootTools::profiles(&current).is_empty());
-        assert!(
-            !tools
-                .summary(&current)
-                .packages
-                .iter()
-                .any(|p| p == "com.inner")
-        );
+        let after = tools.live_snapshot(&current).unwrap();
+        assert!(after.profiles.is_empty());
+        assert!(after.facts.packages.iter().all(|p| p != "com.inner"));
         let keydoc = doc(PROPS, "spring.datasource.urll=x\n");
         let problem = Problem {
             diagnostic: Diagnostic::new(
@@ -1006,7 +890,7 @@ public class MailProperties {
         );
         let d = doc(PROPS, "spring.datasource.type=com.acme.Handler\n");
         assert!(
-            BootTools::default()
+            warm()
                 .definition(&d, Position::new(0, 30))
                 .is_empty(),
             "a matching path does not establish the declared class"
@@ -1018,7 +902,7 @@ public class MailProperties {
         let source = "// 😀 class HandlerBogus\r\npackage com.acme;\r\npublic class Handler {}\r\n";
         h.add_file("src/main/java/com/acme/Handler.java", source);
         let d = doc(PROPS, "spring.datasource.type=com.acme.Handler\n");
-        let targets = BootTools::default().definition(&d, Position::new(0, 30));
+        let targets = warm().definition(&d, Position::new(0, 30));
         assert_eq!(targets.len(), 1);
         assert_eq!(
             targets[0].range,
@@ -1032,7 +916,7 @@ public class MailProperties {
         let text = "// 😀 class HandlerBogus\r\npackage com.acme\r\nclass Handler\r\n";
         h.add_file(path, text);
         let d = doc(PROPS, "spring.datasource.type=com.acme.Handler\n");
-        let mut tools = BootTools::default();
+        let mut tools = warm();
         let targets = tools.definition(&d, Position::new(0, 30));
         assert_eq!(targets.len(), 1);
         assert_eq!(
@@ -1053,7 +937,7 @@ public class MailProperties {
             "/project/src/main/resources/META-INF/additional-spring-configuration-metadata.json";
         h.add_file(path, "{}");
         let d = doc(PROPS, "spring.datasource.urll\"evil=x\n");
-        let actions = BootTools::default()
+        let actions = warm()
             .code_actions(&d, Range::new(Position::new(0, 3), Position::new(0, 3)));
         let action = actions
             .iter()
@@ -1091,7 +975,7 @@ public class MailProperties {
         ] {
             let _h = deprecation_host(replacement);
             let d = doc(PROPS, "app.old=keep\n");
-            let actions = BootTools::default()
+            let actions = warm()
                 .code_actions(&d, Range::new(Position::new(0, 3), Position::new(0, 3)));
             assert!(
                 actions
@@ -1112,7 +996,7 @@ public class MailProperties {
         ] {
             let _h = deprecation_host(replacement);
             let d = doc(YAML, "app:\n  old: keep\n");
-            let actions = BootTools::default()
+            let actions = warm()
                 .code_actions(&d, Range::new(Position::new(1, 3), Position::new(1, 3)));
             assert!(
                 actions
@@ -1126,7 +1010,7 @@ public class MailProperties {
     fn registered_deprecation_replacement_refuses_existing_target_key_collision() {
         let _h = deprecation_host("app.new");
         let d = doc(PROPS, "app.old=one\napp.new=two\n");
-        let actions = BootTools::default()
+        let actions = warm()
             .code_actions(&d, Range::new(Position::new(0, 3), Position::new(0, 3)));
         assert!(
             actions
@@ -1146,7 +1030,7 @@ public class MailProperties {
         ] {
             let _h = deprecation_host("app.new-key");
             let d = doc(path, text);
-            let actions = BootTools::default().code_actions(&d, Range::new(selection, selection));
+            let actions = warm().code_actions(&d, Range::new(selection, selection));
             let action = actions
                 .iter()
                 .find(|action| action.title.starts_with("Replace with"))
@@ -1170,7 +1054,7 @@ public class MailProperties {
         let _h = deprecation_host("app.new");
         let d = doc(YAML, "APP:\n  old: keep\n");
         assert!(
-            BootTools::default()
+            warm()
                 .code_actions(&d, Range::new(Position::new(1, 3), Position::new(1, 3)))
                 .iter()
                 .all(|action| !action.title.starts_with("Replace with"))
@@ -1197,7 +1081,7 @@ public class MailProperties {
             let selection = position(&text, from + 1);
             let d = doc("/project/App.java", &text);
             assert!(
-                BootTools::default()
+                warm()
                     .code_actions(&d, Range::new(selection, selection))
                     .is_empty(),
                 "{source}"
@@ -1214,7 +1098,7 @@ public class MailProperties {
                 .unwrap()
                 + 1,
         );
-        let mut tools = BootTools::default();
+        let mut tools = warm();
         let d = doc("/project/App.java", text);
         let actions = tools.code_actions(&d, Range::new(at, at));
         assert_eq!(actions.len(), 1);
@@ -1248,7 +1132,7 @@ public class MailProperties {
         h.add_file("nested/application.properties", "server.port=oops\n");
         h.add_project("/project/nested");
         h.answer_next_prompt(Some(&["/project/nested/application.properties\t0\t12"]));
-        BootTools::default()
+        warm()
             .run_command("show-diagnostics", &h.invocation(), None)
             .unwrap();
         assert!(
@@ -1272,8 +1156,8 @@ public class MailProperties {
             r#"{"properties":[{"name":"outer.count","type":"Integer","description":"Count"}]}"#,
         );
         let project = h.invocation().project().unwrap();
-        let mut tools = BootTools::default();
-        let (_, before, _) = tools.configuration_problems(&project).unwrap();
+        let mut tools = warm();
+        let (_, before, _) = tools.configuration_problems(&project, Instant::now() + Duration::from_secs(30)).unwrap();
         assert!(
             before
                 .iter()
@@ -1282,7 +1166,7 @@ public class MailProperties {
                     && finding.code == "invalid-property-value")
         );
         h.add_project("/project/nested");
-        let (_, after, _) = tools.configuration_problems(&project).unwrap();
+        let (_, after, _) = tools.configuration_problems(&project, Instant::now() + Duration::from_secs(30)).unwrap();
         assert!(
             !after
                 .iter()
@@ -1305,8 +1189,8 @@ public class MailProperties {
         let text = "server.port=oops\n";
         h.add_file(path, text);
         let project = h.invocation().project().unwrap();
-        let mut tools = BootTools::default();
-        let (_, listed, _) = tools.configuration_problems(&project).unwrap();
+        let mut tools = warm();
+        let (_, listed, _) = tools.configuration_problems(&project, Instant::now() + Duration::from_secs(30)).unwrap();
         let finding = listed
             .iter()
             .find(|finding| finding.path == path && finding.code == "invalid-property-value")
@@ -1372,9 +1256,87 @@ public class MailProperties {
         tools.line_markers(doc)
     }
 
+    #[test]
+    fn completion_reads_live_index_only() {
+        let host = MockHost::install();
+        host.add_file(
+            "src/main/resources/META-INF/additional-spring-configuration-metadata.json",
+            EXTRA,
+        );
+        let mut tools = warm();
+        let current = doc(PROPS, "acme.");
+        let at = position(&current.text, current.text.len());
+        let labels = |tools: &mut BootTools| {
+            tools
+                .completion(&current, at, None)
+                .into_iter()
+                .map(|item| item.label)
+                .collect::<Vec<_>>()
+        };
+        let before = labels(&mut tools);
+        assert!(before.iter().any(|label| label.contains("mode")));
+        host.add_file(
+            "src/main/resources/META-INF/additional-spring-configuration-metadata.json",
+            r#"{"properties":[{"name":"acme.other","type":"java.lang.String"}]}"#,
+        );
+        host.add_file("src/main/java/com/acme/Late.java", MAIL);
+        assert_eq!(labels(&mut tools), before);
+        assert!(host.requests().is_empty() && host.process_runs().is_empty());
+    }
+
+    #[test]
+    fn completion_on_a_cold_index_does_not_scan() {
+        let host = MockHost::install();
+        host.add_file(
+            "src/main/resources/META-INF/additional-spring-configuration-metadata.json",
+            EXTRA,
+        );
+        let mut tools = BootTools::default();
+        let current = doc(PROPS, "acme.");
+        let at = position(&current.text, current.text.len());
+        assert!(
+            !tools
+                .completion(&current, at, None)
+                .iter()
+                .any(|item| item.label.contains("mode"))
+        );
+    }
+
+    #[test]
+    fn show_diagnostics_runs_inside_a_task_and_reuses_the_live_index() {
+        let host = MockHost::install();
+        host.add_file("src/main/resources/application.properties", "server.port=oops\n");
+        let mut tools = warm();
+        let before = host.tasks().len();
+        host.answer_next_prompt(None);
+        tools.show_diagnostics(&host.invocation()).unwrap();
+        assert!(host.tasks().len() > before);
+        assert!(host.tasks().len() >= 1);
+    }
+
+    #[test]
+    fn project_enum_database_does_not_flag_jpa_database() {
+        let host = MockHost::install();
+        host.add_file(
+            "src/main/java/com/acme/Database.java",
+            "package com.acme;\npublic enum Database { ORACLE, MYSQL }\n",
+        );
+        let text = "spring.jpa.database=postgresql\n";
+        let mut tools = warm();
+        let markers = diagnose(&host, &mut tools, &doc(PROPS, text));
+        assert!(markers.is_empty());
+        let found = host.provider_diagnostics().get(PROPS).cloned().unwrap_or_default();
+        assert!(
+            found
+                .iter()
+                .all(|d| d.code.as_deref() != Some("invalid-property-value")),
+            "{found:?}"
+        );
+    }
+
     /// Completion at the end of `text`.
     fn complete(path: &str, text: &str) -> Vec<CompletionItem> {
-        BootTools::default().completion(&doc(path, text), position(text, text.len()), None)
+        warm().completion(&doc(path, text), position(text, text.len()), None)
     }
 
     fn find<'a>(items: &'a [CompletionItem], label: &str) -> &'a CompletionItem {
@@ -1485,7 +1447,7 @@ public class MailProperties {
     fn problems(path: &str, text: &str) -> Vec<Diagnostic> {
         let host = MockHost::install();
         host.add_file("src/main/java/com/acme/MailProperties.java", MAIL);
-        diagnose(&host, &mut BootTools::default(), &doc(path, text));
+        diagnose(&host, &mut warm(), &doc(path, text));
         host.provider_diagnostics()
             .get(path)
             .cloned()
@@ -1503,7 +1465,7 @@ public class MailProperties {
     fn warns_about_deprecated_keys_and_fixes_them() {
         let host = setup();
         let text = "spring.redis.host=localhost\nspring.jpa.show-sql=true\n";
-        let mut tools = BootTools::default();
+        let mut tools = warm();
         diagnose(&host, &mut tools, &doc(PROPS, text));
         let found = &host.provider_diagnostics()[PROPS];
         assert_eq!(
@@ -1664,7 +1626,7 @@ public class MailProperties {
         let _host = MockHost::install();
         let text = "package a;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.context.annotation.ComponentScan;\n@SpringBootApplication\n@ComponentScan\nclass App {}\n";
         let path = "/project/src/main/java/App.java";
-        let mut tools = BootTools::default();
+        let mut tools = warm();
         let actions = tools.code_actions(
             &doc(path, text),
             Range::new(Position::new(4, 3), Position::new(4, 3)),
@@ -1697,7 +1659,7 @@ public class MailProperties {
         let host = MockHost::install();
         host.set_setting("springBoot.checkApplicationSetup", "false");
         let text = "package a;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\nimport org.springframework.context.annotation.ComponentScan;\n@SpringBootApplication\n@ComponentScan\nclass App {}\n";
-        let mut tools = BootTools::default();
+        let mut tools = warm();
         let actions = tools.code_actions(
             &doc("/project/src/main/java/App.java", text),
             Range::new(Position::new(4, 3), Position::new(4, 3)),
@@ -1711,7 +1673,7 @@ public class MailProperties {
         host.add_file("src/test/resources/spring.properties", "other=1\n");
         let path = "/project/src/test/java/OwnerTests.java";
         let broken = "import org.springframework.context.event.EventListener;\n@SpringBootTest\nclass OwnerTests {\n    OwnerTests(Service s) {}\n    @EventListener\n    void é😀(A a, B b) {}\n}\n";
-        let mut tools = BootTools::default();
+        let mut tools = warm();
         diagnose(&host, &mut tools, &doc(path, broken));
         let found = &host.provider_diagnostics()[path];
         let codes: Vec<_> = found.iter().filter_map(|d| d.code.as_deref()).collect();
@@ -1753,7 +1715,7 @@ public class MailProperties {
         let path = "/project/src/test/java/OwnerTests.java";
         diagnose(
             &host,
-            &mut BootTools::default(),
+            &mut warm(),
             &doc(
                 path,
                 "@SpringBootTest\nclass OwnerTests {\n    OwnerTests(Service s) {}\n}\n",
@@ -1776,7 +1738,7 @@ public class MailProperties {
         let path = "/project/src/test/java/OwnerTests.java";
         diagnose(
             &host,
-            &mut BootTools::default(),
+            &mut warm(),
             &doc(
                 path,
                 "@SpringBootTest\nclass OwnerTests {\n    OwnerTests(Service s) {}\n}\n",
@@ -1797,7 +1759,7 @@ public class MailProperties {
             "package com.acme;\nimport org.springframework.boot.context.properties.ConfigurationProperties;\n@ConfigurationProperties(prefix = \"app.fuel\")\npublic class FuelProperties {\n    private List<Integer> years = new ArrayList<>();\n}\n",
         );
         let text = "app.fuel.years=${APP_FUEL_YEARS:2021,2022,2026}\napp.fuel.years=2021,2x\n";
-        diagnose(&host, &mut BootTools::default(), &doc(PROPS, text));
+        diagnose(&host, &mut warm(), &doc(PROPS, text));
         let lines: Vec<u32> = host.provider_diagnostics()[PROPS]
             .iter()
             .filter(|d| d.code.as_deref() == Some("invalid-property-value"))
@@ -1832,7 +1794,7 @@ public class MailProperties {
         host.set_setting("springBoot.checkPropertyValues", "false");
         diagnose(
             &host,
-            &mut BootTools::default(),
+            &mut warm(),
             &doc(PROPS, "server.port=x\n"),
         );
         assert!(
@@ -1849,7 +1811,7 @@ public class MailProperties {
             "/project/src/main/resources/META-INF/additional-spring-configuration-metadata.json";
         let text =
             r#"{"properties": [{"name": "acme.x", "type": "java.lang.String", "colour": 1}]}"#;
-        diagnose(&host, &mut BootTools::default(), &doc(path, text));
+        diagnose(&host, &mut warm(), &doc(path, text));
         let codes: Vec<_> = host.provider_diagnostics()[path]
             .iter()
             .map(|d| d.code.clone().unwrap())
@@ -1864,7 +1826,7 @@ public class MailProperties {
     fn offers_to_define_an_unknown_key_in_the_metadata_file() {
         let host = setup();
         let text = "spring.datasource.urll=x\n";
-        let actions = BootTools::default().code_actions(
+        let actions = warm().code_actions(
             &doc(PROPS, text),
             Range::new(Position::new(0, 3), Position::new(0, 3)),
         );
@@ -1880,7 +1842,7 @@ public class MailProperties {
         assert!(define.edits[0].1[0].text.contains("spring.datasource.urll"));
         drop(host);
         let _host = MockHost::install();
-        let none = BootTools::default().code_actions(
+        let none = warm().code_actions(
             &doc(PROPS, text),
             Range::new(Position::new(0, 3), Position::new(0, 3)),
         );
@@ -1899,11 +1861,11 @@ public class MailProperties {
             "package com.acme;\npublic class Handler {}\n",
         );
         let text = "spring.config.import=optional:classpath:extra.yml\n";
-        let found = BootTools::default().definition(&doc(PROPS, text), Position::new(0, 40));
+        let found = warm().definition(&doc(PROPS, text), Position::new(0, 40));
         assert_eq!(found.len(), 1);
         assert!(found[0].path.ends_with("extra.yml"));
         assert!(
-            BootTools::default()
+            warm()
                 .definition(
                     &doc(PROPS, "spring.config.import=vault://x\n"),
                     Position::new(0, 25)
@@ -1917,14 +1879,14 @@ public class MailProperties {
         let host = MockHost::install();
         host.add_file("pom.xml", "<artifactId>postgresql</artifactId>");
         let text = "spring.datasource.url=jdbc:mysql://db/app\n";
-        diagnose(&host, &mut BootTools::default(), &doc(PROPS, text));
+        diagnose(&host, &mut warm(), &doc(PROPS, text));
         assert!(
             host.provider_diagnostics()
                 .get(PROPS)
                 .is_none_or(|d| d.is_empty())
         );
         host.set_setting("springBoot.checkDriverDependency", "true");
-        diagnose(&host, &mut BootTools::default(), &doc(PROPS, text));
+        diagnose(&host, &mut warm(), &doc(PROPS, text));
         assert_eq!(
             host.provider_diagnostics()[PROPS][0].code.as_deref(),
             Some("missing-jdbc-driver")
@@ -1938,7 +1900,7 @@ public class MailProperties {
         let path = "/project/src/main/java/A.java";
         diagnose(
             &host,
-            &mut BootTools::default(),
+            &mut warm(),
             &doc(path, "class A { void f() { Hooks.onOperatorDebug(); } }"),
         );
         assert_eq!(
@@ -1959,7 +1921,7 @@ public class MailProperties {
             {"name": "acme.ports", "type": "java.util.List<java.lang.Integer>", "description": "d"}]}"#,
         );
         let text = "acme.mode=slow\nacme.mode=safe-mode\nacme.handler=com.acme.Gone\nacme.handler=com.acme.Handler\nacme.handler=org.lib.Any\nacme.ports=80,x\nacme.ports=80,90\nmanagement.endpoint.health.show-details=sometimes\nmanagement.endpoint.health.show-details=always\n";
-        diagnose(&host, &mut BootTools::default(), &doc(PROPS, text));
+        diagnose(&host, &mut warm(), &doc(PROPS, text));
         let lines: Vec<u32> = host.provider_diagnostics()[PROPS]
             .iter()
             .filter(|d| d.code.as_deref() == Some("invalid-property-value"))
@@ -1967,7 +1929,7 @@ public class MailProperties {
             .collect();
         assert_eq!(lines, [0, 2, 5, 7]);
         let yaml = "acme:\n  ports:\n    - 1\n    - two\n";
-        diagnose(&host, &mut BootTools::default(), &doc(YAML, yaml));
+        diagnose(&host, &mut warm(), &doc(YAML, yaml));
         assert_eq!(
             host.provider_diagnostics()[YAML]
                 .iter()
@@ -1987,19 +1949,19 @@ public class MailProperties {
         let extra = "/project/src/main/resources/custom/extra.yml";
         diagnose(
             &host,
-            &mut BootTools::default(),
+            &mut warm(),
             &doc(extra, "server:\n  port: abc\n"),
         );
         assert_eq!(host.provider_diagnostics()[extra].len(), 1);
         let other = "/project/src/main/resources/custom/other.yml";
         diagnose(
             &host,
-            &mut BootTools::default(),
+            &mut warm(),
             &doc(other, "server:\n  port: abc\n"),
         );
         assert!(host.provider_diagnostics().get(other).is_none());
         assert!(
-            !BootTools::default()
+            !warm()
                 .completion(
                     &doc(extra, "server:\n  po"),
                     position("server:\n  po", 13),
@@ -2023,7 +1985,7 @@ public class MailProperties {
         host.answer_next_prompt(Some(&[
             "/project/src/main/resources/application.properties\t0\t12",
         ]));
-        let _ = BootTools::default()
+        let _ = warm()
             .run_command("show-diagnostics", &host.invocation(), None)
             .unwrap();
         assert_eq!(
@@ -2039,7 +2001,7 @@ public class MailProperties {
             "src/main/resources/application.properties",
             "server.port=1\n",
         );
-        BootTools::default()
+        warm()
             .run_command("show-diagnostics", &clean.invocation(), None)
             .unwrap();
         assert!(clean.opened_locations().is_empty());

@@ -3,6 +3,7 @@ use super::*;
 use openidea_plugin::{Range,Position};
 use openidea_plugin::details::{Details, Pane, Tab};
 use openidea_plugin::inlay_hints::{InlayHint, InlayHints};
+use spring_text::index::Index;
 const VIEW: &str = "runtime-snapshot";
 const MAX_ROWS: usize = 512;
 #[derive(Clone)]
@@ -47,7 +48,7 @@ fn qualified(name: &str) -> bool {
                 && p.bytes().enumerate().all(|(i, b)| b.is_ascii_alphabetic() || b == b'_' || b == b'$' || i > 0 && b.is_ascii_digit())
         })
 }
-fn source_owned(path: &str, root: &str) -> bool {
+pub(crate) fn source_owned(path: &str, root: &str) -> bool {
     path.len() <= 4096
         && !path.chars().any(char::is_control)
         && !path.contains('\\')
@@ -300,7 +301,7 @@ impl Runtime {
         };
         self.load_scope(scope.clone());
         let Some(snap) = &self.snapshot else {
-            return Ok(View::message("No cached snapshot. Refresh in Spring Runtime first; this view never fetches."));
+            return Ok(View::message("No runtime data yet. Start the application, then click Refresh to read its Actuator.").button(crate::refresh_button()));
         };
         let at = snap.fetched_at;
         if self.panes.scope.as_ref() != Some(&scope) || self.panes.at != at || self.panes.rows.is_empty() {
@@ -340,16 +341,19 @@ impl Runtime {
             }
             Body::Other { kind: "tree".into(), data: serde_json::json!({"items":rows}).to_string() }
         } else { Body::Tree(items) };
-        Ok(View::new(body)
+        let view = View::new(body)
             .button(Button::new("snapshot-related-beans", "Related Beans…").icon("hierarchy").enabled(self.panes.selected.as_ref().and_then(|key|self.panes.rows.get(key)).is_some_and(|row|!row.relations.is_empty())))
             .button(Button::new("snapshot-method", &format!("HTTP Method: {}", self.panes.method.as_deref().unwrap_or("All"))).icon("filter"))
             .button(Button::new("snapshot-open-browser", "Open GET in Browser…").icon("external-link").enabled(self.panes.selected.as_ref().and_then(|key|self.panes.rows.get(key)).is_some_and(|row|row.methods.iter().any(|method|method=="GET"))))
             .button(Button::new("snapshot-send-request", "Send Local Request…").icon("run").enabled(self.panes.selected.as_ref().and_then(|key| self.panes.rows.get(key)).is_some_and(|row| !row.methods.is_empty())))
             .button(Button::new("snapshot-create-request", "Create HTTP Request File…").icon("add").enabled(self.panes.selected.as_ref().and_then(|key| self.panes.rows.get(key)).is_some_and(|row| row.request.is_some())))
             .button(Button::new("snapshot-copy-request", "Copy HTTP Requests").icon("copy").enabled(self.panes.selected.as_ref().and_then(|key| self.panes.rows.get(key)).is_some_and(|row| row.request.is_some())))
+            .status(&format!("{visible} of {} observations · read {} · right-click a row for its actions",self.panes.rows.len(),age(at)));
+        // The packaged window has its own search box above the rows.
+        if custom { return Ok(view); }
+        Ok(view
             .button(Button::new("snapshot-search", "Search Observations…").icon("search"))
-            .button(Button::new("snapshot-search-clear", "Clear Search").icon("close").enabled(self.panes.query.is_some()))
-            .status(&format!("Cached observations · {visible}/{} shown · {} · Unix {} · bounded sections (up to 64 rows each; health/env 32) · values omitted · Show Details for Observation / Provenance; activate to navigate to a unique source candidate",self.panes.rows.len(),age(at),at)))
+            .button(Button::new("snapshot-search-clear", "Clear Search").icon("close").enabled(self.panes.query.is_some())))
     }
     pub(crate) fn choose_related_bean(&mut self,ctx:&Invocation)->Result<(),Error> {
         let key=self.panes.selected.clone().ok_or(Error::Stale)?;
@@ -426,7 +430,7 @@ impl Runtime {
         let task=host::begin_task("Sending local runtime mapping request",true);
         if task.is_cancelled(){return Err(Error::Cancelled)}
         let request=HttpRequest{method:method.clone(),url:url.clone(),headers,body:(!body.is_empty()).then(||body.into_bytes()),timeout_ms:Some(controls::timeout())};
-        let response=host::fetch(&request).map_err(|error|match error {Error::Denied(_)=>Error::Failed("Allow the declared local network capability to send this request.".into()),Error::Cancelled=>Error::Cancelled,_=>Error::Failed("The local request failed; no response was adopted.".into())})?;
+        let response=host::fetch(&request).map_err(|error|match error {Error::Denied(_)=>Error::Failed(ui_kit::denied::message("Sending this request","net:localhost","Spring Runtime Insight")),Error::Cancelled=>Error::Cancelled,_=>Error::Failed("The local request failed; no response was adopted.".into())})?;
         if task.is_cancelled(){return Err(Error::Cancelled)}
         controls::verify(&project,&scope)?;
         if Scope::current(&project)?!=scope {return Err(Error::Stale)}
@@ -454,13 +458,13 @@ impl Runtime {
         controls::verify(&project,&scope)?;
         if Scope::current(&project)? != scope || self.pane_record(key,ctx)?.request.as_deref() != Some(&request)
             || host::project_of(&path).and_then(|p|p.root().ok()).as_deref() != Some(&scope.root) || project.exists(&path)? { return Err(Error::Stale); }
-        project.write_file(&path,&request)?;
+        project.write_file(&path,&request).map_err(|e|ui_kit::denied::map(e,"Create HTTP Request File","project.write","Spring Runtime Insight"))?;
         host::open_location(&path,0,0)
     }
     pub(crate) fn copy_pane_requests(&self, ctx: &Invocation) -> Result<(), Error> {
         let key = self.panes.selected.as_deref().ok_or_else(|| Error::Invalid("Select a mapping observation first.".into()))?;
         let request = self.pane_record(key, ctx)?.request.as_ref().ok_or_else(|| Error::Invalid("The selected observation has no explicit HTTP methods and paths.".into()))?;
-        host::copy_to_clipboard(request)
+        host::copy_to_clipboard(request).map_err(|e|ui_kit::denied::map(e,"Copy HTTP Requests","clipboard","Spring Runtime Insight"))
     }
     pub(crate) fn search_panes(&mut self, clear: bool, ctx: &Invocation) -> Result<(), Error> {
         let project = ctx.project().ok_or(Error::Stale)?;
@@ -503,21 +507,36 @@ impl Runtime {
         };
         let project = ctx.project().ok_or(Error::Stale)?;
         let scope = Scope::current(&project)?;
-        self.java.reset();
-        let (path, line, column) = match self.resolve(&project, &scope, &target) {
+        let (path, line, column) = match self.resolve(&project, &scope, &target, true) {
             Resolved::Found(path, line, column) => (path, line, column),
+            Resolved::Warming => return Err(Error::Failed(WARMING.into())),
+            Resolved::NotIndexed => return Err(Error::Failed(NOT_INDEXED.into())),
             Resolved::Library => return Err(Error::Failed("No project source with this exact name (library class); no file opened.".into())),
             Resolved::Refused(why) => return Err(Error::Failed(why)),
         };
         if Scope::current(&project)? != scope || !source_owned(&path, &scope.root) { return Err(Error::Stale); }
         host::open_location(&path, line, column)
     }
-    fn resolve(&mut self, project: &Project, scope: &Scope, target: &Target) -> Resolved {
-        let index = self.java.get(project, COMMAND_BUDGET);
-        if !index.fresh() || index.iter().any(|(_, types)| types.iter().any(|t| t.fqn == "\0incomplete")) {
-            return Resolved::Refused("Source index incomplete or stale; no candidate opened.".into());
+    /// `warm` lets the call read project files for a while; otherwise only the index as it is counts.
+    fn resolve(&mut self, project: &Project, scope: &Scope, target: &Target, warm: bool) -> Resolved {
+        let index: &Index<Vec<JavaType>> = if warm {
+            self.java.get(project, COMMAND_BUDGET)
+        } else {
+            match self.java.cached(&scope.root) {
+                Some(index) => index,
+                None => return Resolved::Warming,
+            }
+        };
+        if !index.fresh() {
+            return Resolved::Warming;
         }
         let owned = || index.iter().filter(|(path, _)| source_owned(path, &scope.root)).flat_map(|(path, types)| types.iter().map(move |t| (path, t)));
+        let (Target::Type(subject, _) | Target::Overload(subject, ..) | Target::Props(_, subject)) = target else {
+            return Resolved::Refused("Not a source candidate.".into());
+        };
+        if owned().any(|(_, t)| t.could_hold(subject)) {
+            return Resolved::Refused("A large source file in this project could declare this class and is not indexed; no file opened.".into());
+        }
         let (class, method) = match target {
             Target::Type(class, method) => (class, method.as_ref().map(|m| (m, None))),
             Target::Overload(class, name, params) => (class, Some((name, Some(params)))),
@@ -540,7 +559,8 @@ impl Runtime {
         };
         let hits: Vec<_> = owned().filter(|(_, t)| t.fqn == *class).take(2).collect();
         let [(path, ty)] = hits.as_slice() else {
-            return if hits.is_empty() { Resolved::Library } else { Resolved::Refused("No unique exact qualified source candidate; no file opened.".into()) };
+            let in_project_package = || !package(class).is_empty() && owned().any(|(_, t)| package(&t.fqn) == package(class));
+            return if hits.is_empty() { if in_project_package() { Resolved::NotIndexed } else { Resolved::Library } } else { Resolved::Refused("No unique exact qualified source candidate; no file opened.".into()) };
         };
         let Some((name, params)) = method else {
             return Resolved::Found(path.to_string(), ty.line, ty.column);
@@ -556,7 +576,11 @@ impl Runtime {
         }
     }
 }
+const NOT_INDEXED: &str = "This class is in a project package but its source is not indexed yet; try again after the source index refreshes.";
+const WARMING: &str = "Source index warming; try again in a moment.";
 enum Resolved {
+    Warming,
+    NotIndexed,
     Found(String, u32, u32),
     Library,
     Refused(String),
@@ -593,7 +617,9 @@ impl Details for Runtime {
         let (body, endpoint, target) = (record.body.clone(), record.endpoint, record.target.clone());
         let scope = scope.clone();
         let source = match (target, matches!(endpoint, "conditions" | "configprops" | "mappings"), ctx.project()) {
-            (Some(target), true, Some(project)) => Some(match self.resolve(&project, &scope, &target) {
+            (Some(target), true, Some(project)) => Some(match self.resolve(&project, &scope, &target, false) {
+                Resolved::Warming => "Source: index warming; open the item once to scan project sources.".to_owned(),
+                Resolved::NotIndexed => "Source: in a project package but not indexed yet.".to_owned(),
                 Resolved::Found(path, line, _) => format!("Project source: {}:{}", presentation(&path, 1024), line + 1),
                 Resolved::Library => "library: no project source declares this exact name.".to_owned(),
                 Resolved::Refused(why) => format!("Not navigable: {why}"),
@@ -656,13 +682,7 @@ impl InlayHints for Runtime {
         {
             return Vec::new();
         }
-        let Some(scope) = spring_text::index::project_of(&doc.path).and_then(|p| Scope::current(&p).ok()) else {
-            return Vec::new();
-        };
-        if !self.loaded || self.scope.as_ref() != Some(&scope) {
-            return Vec::new();
-        }
-        let Some(s) = &self.snapshot else {
+        let Some((s, _)) = self.document_snapshot(&doc.path) else {
             return Vec::new();
         };
         if !s.has("env") {
@@ -689,7 +709,7 @@ impl InlayHints for Runtime {
             // Exact key only: no relaxed aliases, source defaults, environment
             // transformations or inferred active profile/runtime identity.
             let (source,value)=lookup.get(key.as_str()).copied().flatten()?;
-            Some(InlayHint::new(p,if value==MASK{"snapshot: redacted"}else{"snapshot: observed"}).padding_left().tooltip(presentation(&format!("Cached /env observation for exact key {}\nProperty source: {}\nFetched Unix {} ({})\nActuator: {}\nValues and source defaults omitted. Active profile, source-file/runtime identity and current effective value are unverified.",key,presentation(source,1024),s.fetched_at,age(s.fetched_at),scope.url),4096)))
+            Some(InlayHint::new(p,if value==MASK{"snapshot: redacted"}else{"snapshot: observed"}).padding_left().tooltip(presentation(&format!("Cached /env observation for exact key {}\nProperty source: {}\nFetched Unix {} ({})\nActuator: {}\nValues and source defaults omitted. Active profile, source-file/runtime identity and current effective value are unverified.",key,presentation(source,1024),s.fetched_at,age(s.fetched_at),s.url),4096)))
         }).collect()
     }
 }
@@ -839,6 +859,34 @@ mod tests {
         }
     }
     #[test]
+    fn create_http_request_file_denied_names_permission() {
+        let (host,mut runtime) = setup();
+        let host = host.with_capabilities(&["project.read","storage"]);
+        runtime.snapshot.as_mut().unwrap().mappings.push(Mapping { predicate:"GET /users".into(), requests:vec![("GET".into(),"/users".into())], ..Default::default() });
+        let ctx = host.invocation();
+        runtime.render_panes(&ctx).unwrap();
+        let key = runtime.panes.rows.iter().find(|(_,r)|r.endpoint=="mappings").unwrap().0.clone();
+        runtime.select_pane(&key,&ctx).unwrap();
+        host.answer_next_prompt(Some(&["runtime-requests.http"]));
+        host.answer_next_prompt(Some(&[]));
+        let error = runtime.create_pane_requests(&ctx).unwrap_err().to_string();
+        assert!(error.contains("needs the project.write permission"), "{error}");
+        assert!(error.contains("Settings › Plugins › Spring Runtime Insight"), "{error}");
+    }
+    #[test]
+    fn copy_http_requests_denied_names_permission() {
+        let (host,mut runtime) = setup();
+        let host = host.with_capabilities(&["project.read","storage"]);
+        runtime.snapshot.as_mut().unwrap().mappings.push(Mapping { predicate:"GET /users".into(), requests:vec![("GET".into(),"/users".into())], ..Default::default() });
+        let ctx = host.invocation();
+        runtime.render_panes(&ctx).unwrap();
+        let key = runtime.panes.rows.iter().find(|(_,r)|r.endpoint=="mappings").unwrap().0.clone();
+        runtime.select_pane(&key,&ctx).unwrap();
+        let error = runtime.copy_pane_requests(&ctx).unwrap_err().to_string();
+        assert!(error.contains("needs the clipboard permission"), "{error}");
+        assert!(error.contains("Settings › Plugins › Spring Runtime Insight"), "{error}");
+    }
+    #[test]
     fn explicit_mapping_requests_copy_from_selected_current_snapshot_without_network() {
         let (host, mut runtime) = setup();
         let host = host.with_capabilities(&["project.read", "storage", "clipboard"]);
@@ -876,7 +924,7 @@ mod tests {
         let Body::Tree(rows) = view.body else { panic!() };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label, "POST misleading presentation");
-        assert!(view.status.unwrap().contains("1/5 shown"));
+        assert!(view.status.unwrap().contains("1 of 5 observations"));
         assert_eq!(runtime.panes.method.as_deref(), Some("GET"));
         host.set_project_root(Some("/other"));
         runtime.render_panes(&host.invocation()).unwrap();
@@ -910,7 +958,7 @@ mod tests {
         let Body::Tree(rows) = filtered.body else { panic!("native tree") };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label, "service");
-        assert!(filtered.status.unwrap().contains("1/2 shown"));
+        assert!(filtered.status.unwrap().contains("1 of 2 observations"));
         runtime.panes.query = Some("nothing-matches".into());
         let empty = runtime.render_panes(&ctx).unwrap();
         assert!(matches!(empty.body, Body::Tree(rows) if rows.is_empty()));
@@ -1137,7 +1185,7 @@ mod tests {
     fn oversized_source_does_not_silently_hide_ambiguous_owner() {
         let (host, mut runtime) = setup();
         host.add_file("src/Service.java", "package com.acme; class Service {}");
-        host.add_file("src/Large.java", &" ".repeat((512 << 10) + 1));
+        host.add_file("src/Large.java", &format!("package com.acme;{}", " ".repeat(512 << 10)));
         let ctx = host.invocation();
         runtime.render_panes(&ctx).unwrap();
         let key = runtime.panes.rows.keys().next().unwrap().clone();
@@ -1222,6 +1270,73 @@ mod tests {
         assert!(rows.iter().all(|r| r.body.len() <= 8192));
         assert!(rows.iter().all(|r| r.target.is_none()));
     }
+    fn bean_key(runtime: &Runtime) -> String {
+        runtime.panes.rows.iter().find(|(_, row)| row.endpoint == "beans").unwrap().0.clone()
+    }
+    #[test]
+    fn open_source_does_not_reset_index() {
+        let (host, mut runtime) = setup();
+        host.add_file("src/Service.java", "package com.acme; class Service {}");
+        let ctx = host.invocation();
+        runtime.render_panes(&ctx).unwrap();
+        let key = bean_key(&runtime);
+        runtime.activate_pane(&key, &ctx).unwrap();
+        host.add_file("src/Service.java", "package com.acme;\n\n\nclass Service {}");
+        runtime.activate_pane(&key, &ctx).unwrap();
+        let opened = host.opened_locations();
+        assert_eq!(opened.len(), 2);
+        assert_eq!(opened[0], opened[1], "the second click used the cached index");
+    }
+    #[test]
+    fn huge_unrelated_file_does_not_block_navigation() {
+        let (host, mut runtime) = setup();
+        host.add_file("src/Service.java", "package com.acme; class Service {}");
+        host.add_file("src/Generated.java", &format!("package org.other;{}", " ".repeat(512 << 10)));
+        let ctx = host.invocation();
+        runtime.render_panes(&ctx).unwrap();
+        runtime.activate_pane(&bean_key(&runtime), &ctx).unwrap();
+        assert_eq!(host.opened_locations().len(), 1);
+    }
+    #[test]
+    fn detail_uses_the_cached_index_only() {
+        let (host, mut runtime) = setup();
+        host.add_file("src/MailConfig.java", "package com.acme; @Configuration class MailConfig {}");
+        runtime.snapshot.as_mut().unwrap().read("conditions", &serde_json::json!({"contexts":{"application":{
+            "negativeMatches":{"com.acme.MailConfig":{"notMatched":[{"condition":"OnClassCondition","message":"m"}],"matched":[]}},
+            "positiveMatches":{},"unconditionalClasses":[]}}}));
+        let ctx = host.invocation();
+        runtime.render_panes(&ctx).unwrap();
+        let row = pane_key(&runtime, "conditions", "com.acme.MailConfig");
+        let tabs = runtime.detail(VIEW, &row, &ctx).unwrap();
+        assert!(tabs.iter().any(|t| matches!(&t.body, Pane::Text(text) if text.contains("index warming"))));
+        runtime.activate_pane(&row, &ctx).unwrap();
+        let tabs = runtime.detail(VIEW, &row, &ctx).unwrap();
+        assert!(tabs.iter().any(|t| matches!(&t.body, Pane::Text(text) if text.starts_with("Project source"))));
+    }
+    #[test]
+    fn new_project_class_is_not_indexed_yet_not_a_library() {
+        let (host, mut runtime) = setup();
+        host.add_file("src/Service.java", "package com.acme; class Service {}");
+        let project = host.invocation().project().unwrap();
+        let scope = runtime.scope.clone().unwrap();
+        let look = |runtime: &mut Runtime, class: &str| runtime.resolve(&project, &scope, &Target::Type(class.into(), None), true);
+        assert!(matches!(look(&mut runtime, "com.acme.Fresh"), Resolved::NotIndexed));
+        assert!(matches!(look(&mut runtime, "org.other.Lib"), Resolved::Library));
+    }
+    #[test]
+    fn kotlin_inlays_cold_instance() {
+        let (host, runtime) = setup();
+        let scope = runtime.scope.clone().unwrap();
+        crate::persistence::write(&scope, runtime.snapshot.as_ref().unwrap()).unwrap();
+        let mut cold = Runtime::default();
+        let source = r#"class C { @Value("\${demo.key}") lateinit var value:String }"#;
+        let mut d = doc(source, "kotlin");
+        d.path = "/project/src/C.kt".into();
+        assert_eq!(cold.inlay_hints(&d, all(&d)).len(), 1);
+        assert!(cold.scope.is_none(), "providers never adopt view state");
+        assert_eq!(host.fetches(), 0);
+    }
+
 }
 
 fn health_detail_lines(s: &Snapshot, path: &str) -> String {

@@ -3,7 +3,7 @@
   "tabs": [
     {
       "id": "merge-requests",
-      "label": "GitLab"
+      "label": "Merge Requests"
     },
     {
       "id": "merge-request",

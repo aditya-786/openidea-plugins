@@ -16,21 +16,8 @@ pub fn problems(
     target: &dyn Fn(&Include) -> Target,
     defined: Option<&dyn Fn(&str) -> bool>,
 ) -> Vec<Diagnostic> {
-    // Compute UTF-16 coordinates once: repeated prefix scans become quadratic
-    // for large same-line changelogs with many changesets.
-    let mut coordinates = vec![Position::new(0, 0); text.len() + 1];
-    let mut at = Position::new(0, 0);
-    for (byte, ch) in text.char_indices() {
-        coordinates[byte] = at;
-        if ch == '\n' {
-            at.line += 1;
-            at.character = 0;
-        } else {
-            at.character += ch.len_utf16() as u32;
-        }
-        coordinates[byte + ch.len_utf8()] = at;
-    }
-    let range = |_: &str, a: usize, b: usize| Range::new(coordinates[a.min(text.len())], coordinates[b.min(text.len())]);
+    let coordinates = Coordinates::new(text);
+    let range = |_: &str, a: usize, b: usize| Range::new(coordinates.position(a), coordinates.position(b));
     let mut out: Vec<(usize, Diagnostic)> = Vec::new();
 
     if log.format == Format::Sql && !log.header {
@@ -155,4 +142,72 @@ fn xml_comments(text: &str) -> Vec<(usize, usize)> {
         from = end;
     }
     out
+}
+
+/// UTF-16 positions by binary search: line starts, plus the running byte-minus-UTF-16 surplus of the non-ASCII characters.
+struct Coordinates<'a> {
+    text: &'a str,
+    line_starts: Vec<usize>,
+    wide: Vec<(usize, usize)>,
+}
+
+impl<'a> Coordinates<'a> {
+    fn new(text: &'a str) -> Self {
+        let mut line_starts = vec![0];
+        let mut wide = Vec::new();
+        let mut surplus = 0;
+        for (at, ch) in text.char_indices() {
+            if ch == '\n' {
+                line_starts.push(at + 1);
+            }
+            if !ch.is_ascii() {
+                surplus += ch.len_utf8() - ch.len_utf16();
+                wide.push((at, surplus));
+            }
+        }
+        Self { text, line_starts, wide }
+    }
+
+    fn surplus_before(&self, at: usize) -> usize {
+        match self.wide.partition_point(|(byte, _)| *byte < at) {
+            0 => 0,
+            n => self.wide[n - 1].1,
+        }
+    }
+
+    /// An offset inside a character, or past the end, snaps to the closest boundary before it.
+    fn position(&self, at: usize) -> Position {
+        let mut at = at.min(self.text.len());
+        while !self.text.is_char_boundary(at) {
+            at -= 1;
+        }
+        let line = self.line_starts.partition_point(|start| *start <= at) - 1;
+        let start = self.line_starts[line];
+        let column = (at - start) - (self.surplus_before(at) - self.surplus_before(start));
+        Position::new(line as u32, column as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openidea_plugin::text::position;
+
+    #[test]
+    fn position_non_boundary_offset_snaps_nearby() {
+        let text = "é<a/>\n😀x";
+        let coordinates = Coordinates::new(text);
+        assert_eq!(coordinates.position(1), Position::new(0, 0));
+        assert_eq!(coordinates.position(text.find('😀').unwrap() + 2), position(text, text.find('😀').unwrap()));
+        assert_eq!(coordinates.position(10_000), position(text, text.len()));
+    }
+
+    #[test]
+    fn positions_match_the_sdk_at_every_char_boundary() {
+        let text = "a😀é\n\n<x y='ü'/>\r\n😀";
+        let coordinates = Coordinates::new(text);
+        for (at, _) in text.char_indices().chain([(text.len(), ' ')]) {
+            assert_eq!(coordinates.position(at), position(text, at), "{at}");
+        }
+    }
 }

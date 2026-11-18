@@ -96,7 +96,7 @@ pub fn template_props(text: &str) -> Vec<String> {
 pub fn template_blocks(text: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     for (at, _) in text.match_indices("{%") {
-        let Some(end) = text[at..].find("%}") else { continue };
+        let Some(end) = text[at + 2..].find("%}").map(|found| found + 2) else { continue };
         let tag = text[at + 2..at + end].trim_matches(['-', '~']).trim();
         let Some(name) = tag.strip_prefix("block ") else { continue };
         let name = name.split_whitespace().next().unwrap_or_default();

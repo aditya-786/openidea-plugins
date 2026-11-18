@@ -106,6 +106,42 @@ try {
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
   if(output)await page.screenshot({path:join(output,`${engine}-group-tabs-${theme}-${width}.png`)});
  }
+ // Optional packaged sections show one cluster of tabs behind a compact picker; reveal_view follows the active view.
+ await page.goto(pathToFileURL(join(scratch,'hub.html')).href);await page.waitForFunction(()=>window.sent.length>0);
+ await page.evaluate(()=>window.uiKitViewSections=[{id:'browse',label:'Browse',tabs:['first','second']},{id:'run',label:'Run',tabs:['third']}]);await answer(base('first'));
+ const shownTabs=()=>page.locator('#view-tabs [role=tab]').evaluateAll(nodes=>nodes.map(node=>node.dataset.viewKey));
+ const picker=page.getByRole('combobox',{name:'View group',exact:true});
+ assert.deepEqual(await shownTabs(),['first','second']);assert.equal(await picker.textContent(),'Browse');
+ await switchTo('second',base('second'));
+ await picker.click();await page.getByRole('option',{name:'Run',exact:true}).click();
+ let sectionRequest=await last();assert.equal(sectionRequest.op,'select-view');assert.equal(sectionRequest.target,'third');await answer(base('third'),sectionRequest);
+ assert.deepEqual(await shownTabs(),['third']);assert.equal(await picker.textContent(),'Run');
+ await picker.focus();await page.keyboard.press('Enter');await page.keyboard.press('Home');await page.keyboard.press('Enter');
+ sectionRequest=await last();assert.equal(sectionRequest.target,'second','a section reopens on its last tab');await answer(base('second'),sectionRequest);
+ await answer(base('third'));assert.deepEqual(await shownTabs(),['third']);assert.equal(await picker.textContent(),'Run');
+ await page.setViewportSize({width:320,height:520});assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));await page.setViewportSize({width:768,height:520});
+ await open(base('first'));assert.equal(await page.locator('.view-section-picker').isVisible(),false,'groups without sections keep flat tabs');
+ // Resource tables are grids with a visible row focus; filter counts are announced once settled.
+ assert.equal(await page.locator('table').getAttribute('role'),'grid');
+ await page.locator('tr[data-resource-key=alpha]').focus();await page.keyboard.press('ArrowDown');
+ assert.equal(await page.locator('tr[data-resource-key=beta]').evaluate(node=>getComputedStyle(node).outlineStyle),'solid');await answer(base('first'));
+ const statusBefore=await page.locator('#status').textContent();await page.locator('#search').pressSequentially('alp');
+ assert.equal(await page.locator('#status').textContent(),statusBefore,'typing does not rewrite the live region per keystroke');
+ await page.waitForFunction(()=>document.querySelector('#status').textContent.startsWith('1 of 2'));await page.locator('#search').fill('');
+ // Narrow docks ellipsize resource identifiers instead of scrolling the table sideways.
+ const long={kind:'resources',columns:['Path','Name','Handler'],items:[{key:'long',cells:['/api/v1/organisations/{organisation}/projects/{project}/environments','organisation.project.environments.index','App\\Http\\Controllers\\EnvironmentController@index']}]};
+ await answer(base('first',long));await page.setViewportSize({width:320,height:520});
+ assert.ok(await page.locator('#content').evaluate(node=>node.scrollWidth<=node.clientWidth+1),'no horizontal table scroll at 320px');
+ assert.equal(await page.locator('td').first().getAttribute('title'),long.items[0].cells[0]);await page.setViewportSize({width:768,height:520});
+ // Failed loads are distinguishable from empty projects and retry the render; denied loads name the permission.
+ await page.goto(pathToFileURL(join(scratch,'hub.html')).href);await page.waitForFunction(()=>window.sent.length>0);
+ await page.evaluate(request=>window.receive({...request,error:'disk unavailable'}),await last());
+ assert.equal(await page.locator('.ui-empty[data-state=error]').isVisible(),true);assert.match(await page.locator('#content').textContent(),/disk unavailable/);
+ await page.getByRole('button',{name:'Retry',exact:true}).click();assert.equal((await last()).op,'render');
+ await page.evaluate(request=>window.receive({...request,error:'permission denied: project.read is not granted',denied:'project.read'}),await last());
+ assert.match(await page.locator('.ui-empty[data-state=denied]').textContent(),/project\.read.*Settings › Plugins/);
+ await page.getByRole('button',{name:'Retry',exact:true}).click();await answer(base('first'));assert.equal(await page.locator('.ui-empty').count(),0);assert.equal(await page.locator('tbody tr').count(),2);
+ await answer(base('first',{...rows,items:[]}));assert.equal(await page.locator('.ui-empty[data-state=empty]').count(),1);
  // Project the shipped group definitions, preserving every logical tab label/id.
  let groups=0;
  for(const plugin of readdirSync('plugins')) {

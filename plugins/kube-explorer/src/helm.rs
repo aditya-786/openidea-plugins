@@ -399,7 +399,7 @@ impl Chart {
         let defines = project
             .find_files(&format!("{prefix}templates/**"), MAX_TEMPLATES)
             .ok()
-            .filter(|files| files.len() < MAX_TEMPLATES as usize)
+            .filter(|files| !files.is_empty() && files.len() < MAX_TEMPLATES as usize)
             .map(|files| {
                 let mut names: BTreeSet<String> = defined_names(current).collect();
                 for file in files {
@@ -429,6 +429,19 @@ mod tests {
 
     fn flagged<'a>(text: &'a str, chart: &Chart, code: &str) -> Vec<&'a str> {
         check(text, chart).iter().filter(|f| f.code == code).map(|f| &text[f.start..f.end]).collect()
+    }
+
+    #[test]
+    fn helm_include_no_false_undefined_when_templates_missing() {
+        use openidea_plugin::mock::MockHost;
+        let host = MockHost::install().with_capabilities(&["project.read"]);
+        host.set_project_root(Some("/p"));
+        host.add_file("chart/Chart.yaml", "apiVersion: v2\nname: c\nversion: 1\n");
+        host.add_file("chart/values.yaml", "a: 1\n");
+        let project = openidea_plugin::host::project_of("/p/chart/Chart.yaml").unwrap();
+        let loaded = Chart::load(&project, "/p", "/p/chart", "x: {{ include \"c.helper\" . }}\n");
+        assert!(loaded.defines.is_none());
+        assert!(check("x: {{ include \"c.helper\" . }}\n", &loaded).iter().all(|f| f.code != crate::checks::HELM_UNKNOWN_INCLUDE));
     }
 
     #[test]

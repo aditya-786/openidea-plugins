@@ -1,8 +1,8 @@
 use super::*;
-use openidea_plugin::{language_features::LanguageFeatures, mock::MockHost, text::position};
+use openidea_plugin::{mock::MockHost, text::position};
 
 #[test]
-fn merged_plugin_routes_service_aware_definitions_and_gutter_commands() {
+fn merged_plugin_routes_service_aware_definitions_and_markers() {
     let host = MockHost::install().with_capabilities(&["project.read", "editor.read"]);
     host.add_file("pom.xml", "<project><artifactId>spring-cloud-starter-openfeign</artifactId></project>");
     let client = "import org.springframework.cloud.openfeign.FeignClient;\nimport org.springframework.web.bind.annotation.GetMapping;\n@FeignClient(\"users\") interface Client { @GetMapping(\"/users\") String get(); }";
@@ -18,13 +18,13 @@ fn merged_plugin_routes_service_aware_definitions_and_gutter_commands() {
     let source = editor.document().unwrap();
     let doc = Document { path: path.into(), language: "java".into(), text: source.text, version: source.version };
     let mut endpoints = Endpoints::default();
+    let project = host.invocation().project().unwrap();
+    endpoints.cloud.live_warm(&project, spring_text::index::COMMAND_BUDGET, true);
     let targets = endpoints.definition(&doc, position(client, client.find("get()").unwrap()));
     assert_eq!(targets.len(), 2);
     assert!(targets.iter().all(|l| !l.path.contains("/admin/")));
-    assert!(endpoints.line_markers(&doc).is_empty());
-    let action = endpoints.gutter_actions(&doc).remove(0);
-    host.answer_next_prompt(Some(&["1"]));
-    endpoints.run_command(&action.command, &host.invocation(), action.argument.as_deref()).unwrap();
-    assert_eq!(host.opened_locations()[0].0, "/project/users/src/main/java/Controller.java");
+    let markers = endpoints.line_markers(&doc);
+    assert_eq!(markers.len(), 2);
+    assert!(markers.iter().all(|m| m.target.as_ref().is_some_and(|t| !t.path.contains("/admin/"))));
     assert!(host.requests().is_empty() && host.process_runs().is_empty());
 }

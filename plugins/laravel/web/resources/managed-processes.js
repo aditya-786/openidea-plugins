@@ -9,7 +9,7 @@
       const command=$("process-command").value;
       root.querySelectorAll("[data-process-serve]").forEach(node=>node.hidden=command!=="serve");
       root.querySelectorAll("[data-process-queue]").forEach(node=>node.hidden=command!=="queue:work");
-      $("process-preview").disabled=busy;$("process-start").disabled=busy||!token;$("process-refresh").disabled=busy;
+      $("process-preview").disabled=busy;$("process-start").disabled=busy||!token;if($("process-refresh"))$("process-refresh").disabled=busy;
     }
     function send(request){if(disposed||busy)return false;clearTimeout(timer);busy=true;pending=request.op;pendingRevision=revision;controls();bridge.postMessage(JSON.stringify(request));return true;}
     function changed(){revision++;token=null;$("process-argv").textContent=t("previewUpdated","Preview the updated command before starting.");controls();}
@@ -23,9 +23,9 @@
       send({op:"preview",command,runner:$("process-runner").value,options});
     });
     $("process-start").addEventListener("click",()=>{if(!token)return;const id=globalThis.crypto?.randomUUID?.()||`process-${Date.now()}-${Math.random().toString(36).slice(2)}`;send({op:"run",id,token});token=null;});
-    $("process-refresh").addEventListener("click",()=>send({op:"poll"}));
+    $("process-refresh")?.addEventListener("click",()=>send({op:"poll"}));
     function render(){
-      const list=$("process-jobs");list.replaceChildren();
+      const list=$("process-jobs");if(!list)return;list.replaceChildren();
       if(!jobs.length)list.append(make("p",t("empty","No managed processes in this session.")));
       for(const job of jobs){
         const article=make("article"),heading=make("strong",`${job.command} · ${job.runner} · ${job.running?t("running","Running"):job.stopped?t("stopped","Stopped"):t("exited","Exited ({status})",{status:job.status??t("unknown","unknown")})}`);

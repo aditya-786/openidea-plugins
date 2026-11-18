@@ -19,7 +19,7 @@ impl WebSocketTools {
         let Some(index) = self.index.for_cached_document(&doc.path, &doc.text).filter(|i| i.fresh()) else {
             return Vec::new();
         };
-        let snapshot = collect(index.iter(), |_| true, true);
+        let snapshot = collect(index.iter(), |_| true);
         snapshot
             .of_document(doc)
             .filter(|u| u.kind == Kind::Send && !snapshot.config.brokers.is_empty() && !snapshot.config.routed(&u.dest))

@@ -6,6 +6,7 @@ use crate::lib_hits;
 use crate::model::{self, FileModel};
 use crate::sites::Site;
 use openidea_plugin::indexing::{Alias, Anchor, Document, DocumentIndexer, Edges};
+use openidea_plugin::text::offset;
 use spring_text::java::{Annotation, JavaFile};
 use spring_text::{config, range, xml};
 
@@ -390,12 +391,33 @@ pub(crate) fn navigation_of(path: &str, text: &str, model: &FileModel) -> Edges 
     Edges { definitions, references, aliases, markers }
 }
 
+/// Whether host Rename may rewrite `range` to a new spelling of `key`'s name:
+/// a profile or resource-file reference whose text is exactly that name.
+/// Class keys are simple names, which other packages share, and the
+/// synthetic first-line definitions of configuration files are not names;
+/// providers keep resolving both.
+fn renamable(text: &str, key: &str, range: openidea_plugin::Range) -> bool {
+    let Some(name) = key.strip_prefix("profile#").or_else(|| key.strip_prefix("resource#")) else { return false };
+    let (Some(from), Some(to)) = (offset(text, range.start), offset(text, range.end)) else { return false };
+    text.get(from..to) == Some(name)
+}
+
 impl DocumentIndexer for Navigator {
-    fn index(&mut self, _doc: &Document) -> Edges {
-        // Type/bean/event/filename links do not all cover interchangeable names.
-        // Providers resolve them from the project-owned model instead. Native
-        // language-server Rename remains available for actual source symbols.
-        Edges::default()
+    /// Only references whose anchors cover exactly a renamable name; no
+    /// definitions, aliases or markers (the line-markers provider shows those).
+    fn index(&mut self, doc: &Document) -> Edges {
+        if doc.text.len() > crate::cache::MAX_TEXT || crate::cache::build_output(&doc.path) {
+            return Edges::default();
+        }
+        let Some(model) = model::parse(&doc.path, &doc.text) else { return Edges::default() };
+        let references = model
+            .navigation
+            .references
+            .iter()
+            .filter(|(key, range)| renamable(&doc.text, key, *range))
+            .map(|(key, range)| Anchor { key: key.clone(), range: *range })
+            .collect();
+        Edges { references, ..Edges::default() }
     }
 }
 
@@ -621,6 +643,45 @@ mod anchor_tests {
         for text in ["", "\n  \n"] {
             let (definitions, ..) = link_keys("src/main/resources/application-dev.yml", text);
             assert!(definitions.iter().all(|d| nonempty(&d.range)));
+        }
+    }
+    fn published(path: &str, text: &str) -> Edges {
+        let _host = openidea_plugin::mock::MockHost::install();
+        Navigator::default().index(&Document { path: path.into(), text: text.into(), symbols: Vec::new() })
+    }
+
+    const DEV: &str = "package a;\n@org.springframework.context.annotation.Profile(\"dev & !cloud\")\n@org.springframework.context.annotation.ImportResource(\"classpath:config/beans.xml\")\n@org.springframework.stereotype.Service(\"devService\")\nclass Dev implements Api {\n /* é😀 */ @org.springframework.beans.factory.annotation.Autowired Api api;\n}\n";
+    const BEANS: &str = "<beans xmlns=\"http://www.springframework.org/schema/beans\" profile=\"dev,qa\">\n  <import resource=\"classpath:other-beans.xml\"/>\n  <bean id=\"a\" class=\"a.A\"/>\n</beans>\n";
+
+    #[test]
+    fn indexer_publishes_profile_and_resource_references() {
+        let java = published("/project/src/main/java/a/Dev.java", DEV);
+        let keys: Vec<&str> = java.references.iter().map(|a| a.key.as_str()).collect();
+        assert!(keys.contains(&"profile#dev") && keys.contains(&"profile#cloud") && keys.contains(&"resource#beans.xml"), "{keys:?}");
+        let xml = published("/project/src/main/resources/beans.xml", BEANS);
+        let keys: Vec<&str> = xml.references.iter().map(|a| a.key.as_str()).collect();
+        assert!(keys.contains(&"profile#qa") && keys.contains(&"resource#other-beans.xml"), "{keys:?}");
+        let config = published("/project/src/main/resources/application-dev.yml", "server:\n  port: 1\n");
+        for edges in [&java, &xml, &config] {
+            assert!(edges.definitions.is_empty() && edges.markers.is_empty() && edges.aliases.is_empty());
+            assert!(edges.references.iter().all(|a| a.key.starts_with("resource#") || a.key.starts_with("profile#")));
+        }
+    }
+
+    #[test]
+    fn published_anchor_ranges_cover_exactly_the_name() {
+        for (path, text) in [
+            ("/project/src/main/java/a/Dev.java", DEV),
+            ("/project/src/main/resources/beans.xml", BEANS),
+            ("/project/src/main/resources/application-dev.yml", "app:\n  name: x\n"),
+        ] {
+            let edges = published(path, text);
+            for anchor in edges.definitions.iter().chain(&edges.references).chain(&edges.markers) {
+                let from = openidea_plugin::text::offset(text, anchor.range.start).unwrap();
+                let to = openidea_plugin::text::offset(text, anchor.range.end).unwrap();
+                let name = anchor.key.split_once('#').map_or(anchor.key.as_str(), |(_, name)| name);
+                assert_eq!(&text[from..to], name, "{path}: {}", anchor.key);
+            }
         }
     }
 }

@@ -14,11 +14,7 @@ pub(crate) struct Links {
     next: u64,
     pending: BTreeMap<String, Pending>,
 }
-fn normalized(path: &str) -> bool {
-    path.starts_with('/') && path != "/" && path.len() <= 512
-        && !path.chars().any(char::is_control) && !path.contains(['\\', '*', '?', '[', ']', '{', '}'])
-        && !path.split('/').any(|part| matches!(part, "." | ".."))
-}
+use crate::batch_step_rename::normalized;
 fn current(pending: &Pending, doc: &Document) -> Result<(), Error> {
     if *doc != pending.doc { return Err(Error::Stale); }
     let project = host::project_of(&doc.path).ok_or(Error::Stale)?;

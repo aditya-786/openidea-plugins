@@ -140,7 +140,7 @@ fn locate(text: &str, offset: usize) -> Option<Position> {
     }
 
     let name_end = text[..paren].trim_end().len();
-    let name_start = text[..name_end].rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '\\'))).map_or(0, |found| found + 1);
+    let name_start = text[..name_end].char_indices().rev().find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '\\'))).map_or(0, |(found, c)| found + c.len_utf8());
     let attribute = text[name_start..name_end].to_owned();
     let before = text[group + 2..name_start].trim_end();
     if attribute.is_empty() || !(before.is_empty() || before.ends_with(',')) {

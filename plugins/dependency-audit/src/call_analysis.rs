@@ -150,7 +150,7 @@ fn snapshot(project: &Project, root: &str) -> Result<BTreeMap<String, String>, E
         let source = project.read_file(&path)?;
         bytes += source.len();
         if result.len() >= 500 || bytes > 512 << 10 {
-            return Err("Call-analysis sources exceed500 files/512KiB.".into());
+            return Err("Call analysis supports at most 500 source files and 512 KiB.".into());
         }
         result.insert(path, source);
     }
@@ -185,7 +185,7 @@ fn version_matches(s: &str, language: Language) -> bool {
 }
 fn parse(root: &str, language: Language, text: &str) -> Result<(Vec<Fact>, usize), Error> {
     if text.len() > 4 << 20 {
-        return Err("Scanner JSON exceeds4MiB.".into());
+        return Err("Scanner JSON exceeds 4MiB.".into());
     }
     let v: serde_json::Value = serde_json::from_str(text).map_err(|_| {
         Error::Invalid("Malformed/truncated scanner JSON; previous evidence retained.".into())
@@ -194,7 +194,7 @@ fn parse(root: &str, language: Language, text: &str) -> Result<(Vec<Fact>, usize
         .as_array()
         .ok_or("Scanner result list is unavailable; no clean result inferred.")?;
     if sources.len() > 500 {
-        return Err("Scanner source bound exceeds500; previous evidence retained.".into());
+        return Err("Scanner source bound exceeds 500; previous evidence retained.".into());
     }
     let mut facts = Vec::new();
     let mut count = 0;
@@ -362,14 +362,20 @@ impl State {
             stderr_tail: String::new(),
         };
         current(&probe, ctx)?;
-        let version = p.run_process(language.program(), &["--version".into()], None)?;
+        let version = p
+            .run_process(language.program(), &["--version".into()], None)
+            .map_err(|e| ui_kit::denied::map(e, "Vulnerable call analysis", &format!("process:{}", language.program()), "Dependency Audit"))?;
         if version.status != Some(0) || !version_matches(&version.stdout, language) {
-            return Err(format!(
-                "Approve {} {} for this explicit profile.",
-                language.program(),
-                language.version()
-            )
-            .into());
+            let found = version
+                .stdout
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("osv-scanner version: "))
+                .filter(|found| found.len() <= 64);
+            let needed = language.version();
+            return Err(Error::Invalid(match found {
+                Some(found) => format!("Found {} {found}; needs {needed}. Install that version and try again.", language.program()),
+                None => format!("Couldn't read the {} version; needs {needed}.", language.program()),
+            }));
         }
         current(&probe, ctx)?;
         let stamp = SystemTime::now()
@@ -464,7 +470,7 @@ impl State {
                 let json =
                     serde_json::to_string(&evidence).map_err(|e| Error::Invalid(e.to_string()))?;
                 if json.len() > 512 << 10 {
-                    return Err("Call evidence exceeds512KiB local storage budget; previous evidence retained.".into());
+                    return Err("Call evidence exceeds 512KiB local storage budget; previous evidence retained.".into());
                 }
                 host::storage::set(&format!("call-analysis:{}", run.root), &json)?;
                 self.evidence = Some(evidence);

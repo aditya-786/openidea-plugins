@@ -13,8 +13,15 @@
     },
     "autoResolveBuilds": {
       "type": "boolean",
-      "title": "Resolve Maven/Gradle dependencies after each scan (runs the project's build tool, no confirmation)",
-      "default": true
+      "title": "Run Maven/Gradle when the IDE hasn't resolved dependencies",
+      "description": "Off by default. After each scan, Maven/Gradle versions come from the IDE's last Maven reload or Dependency Analyzer. When it has none and this is on, mvn or gradle runs in the project, asking once per project first.",
+      "default": false
+    },
+    "npmGraphMaxPackages": {
+      "type": "number",
+      "title": "Most packages in the npm graph (100 to 20000)",
+      "description": "Inspect npm Lockfile Graph refuses bigger lockfiles. The file size limit (1 KiB per package) and edge limit (4 per package) follow it. Large graphs take longer to open.",
+      "default": 2000
     }
   }
 }

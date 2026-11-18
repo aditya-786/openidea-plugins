@@ -50,13 +50,14 @@ impl Liquibase {
         }
         view.button(Button::new("browser-new", "New…").icon("plus"))
             .button(Button::new("browser-open", "Open").icon("file").enabled(selected.is_some()))
+            .button(Button::new("browser-status", "Pending…").icon("database"))
             .button(Button::new("browser-filter", "Filter…").icon("filter"))
             .button(Button::new("browser-clear-filter", "Clear").icon("close").enabled(!query.is_empty()))
             .button(Button::new("browser-actions", "More…").icon("more"))
     }
     pub(crate) fn native_browser_event(&mut self, event: &ViewEvent, ctx: &Invocation) -> Result<bool, Error> {
         let relevant = matches!(event, ViewEvent::Select(_))
-            || matches!(event, ViewEvent::Button(id) if matches!(id.as_str(), "browser-filter" | "browser-clear-filter" | "browser-actions" | "browser-open" | "browser-new"));
+            || matches!(event, ViewEvent::Button(id) if matches!(id.as_str(), "browser-filter" | "browser-clear-filter" | "browser-actions" | "browser-open" | "browser-new" | "browser-status"));
         if !relevant { return Ok(false); }
         let project = ctx.project().ok_or(Error::Stale)?;
         let root = owner(&project)?;
@@ -70,7 +71,7 @@ impl Liquibase {
             return Ok(true);
         }
         let ViewEvent::Button(id) = event else { return Ok(false) };
-        if !matches!(id.as_str(), "browser-filter" | "browser-clear-filter" | "browser-actions" | "browser-open" | "browser-new") { return Ok(false) }
+        if !matches!(id.as_str(), "browser-filter" | "browser-clear-filter" | "browser-actions" | "browser-open" | "browser-new" | "browser-status") { return Ok(false) }
         match id.as_str() {
             "browser-open" => {
                 let (path,line) = self.selected_source(&project).ok_or(Error::Stale)?;
@@ -95,13 +96,14 @@ impl Liquibase {
                 self.browser_filter = Some((root, query.trim().to_lowercase()));
             }
             "browser-clear-filter" => { self.browser_filter = Some((root, String::new())); }
+            "browser-status" => return self.show_pending(ctx).map(|()| true),
             "browser-actions" => {
                 let actions = [
-                                    ("offline-diff", "Review offline diff…"),
-            ("choose-sources", "Choose browser sources…"),
-            ("clear-sources", "Browse all project changelogs"),
-            ("update-confirmed", "Update database…"),
-            ("rollback-count", "Roll back changesets…")
+                                    ("offline-diff", "Review Offline Snapshot Diff"),
+            ("choose-sources", "Choose Sources…"),
+            ("clear-sources", "Browse All Changelogs"),
+            ("update-confirmed", "Update Database…"),
+            ("rollback-count", "Rollback Count…")
                 ];
                 let items: Vec<_> = actions.iter().map(|(id,label)| openidea_plugin::PickItem::new(id,label)).collect();
                 let Some(chosen) = host::pick("More migration actions", &items)? else { return Ok(true) };

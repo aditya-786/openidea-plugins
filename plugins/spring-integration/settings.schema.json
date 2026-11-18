@@ -24,23 +24,27 @@
         "operator-6.0.6"
       ],
       "default": "disabled",
-      "title": "Optional Batch CLI profile (exact supported distribution)"
+      "title": "Batch command-line runner",
+      "description": "Turns on the Spring Batch job run commands. runner-5.2.6 uses CommandLineJobRunner from Spring Batch 5.2.6; operator-6.0.6 uses CommandLineJobOperator from Spring Batch 6.0.6."
     },
     "springBatch.runtimeClasspath": {
       "type": "string",
       "default": "",
-      "title": "Batch classpath: project-relative directories/JARs, one per line; no wildcards",
+      "title": "Batch run classpath",
+      "description": "Project-relative directories or JAR files, one per line, such as target/classes. No wildcards.",
       "multiline": true
     },
     "springBatch.runtimeContext": {
       "type": "string",
       "default": "",
-      "title": "Exact compiled JVM context class (or Runner XML classpath resource)"
+      "title": "Batch application context class",
+      "description": "Fully qualified configuration class that defines your jobs, such as com.acme.BatchConfig. With runner-5.2.6 this can also be an XML file on the classpath, such as jobs.xml."
     },
     "springBatch.runtimeContextSource": {
       "type": "string",
       "default": "",
-      "title": "Project-relative Java/Kotlin/XML source for the selected runtime context"
+      "title": "Batch application context source file",
+      "description": "Project-relative path to the source of that class or XML file, such as src/main/java/com/acme/BatchConfig.java."
     }
   }
 }

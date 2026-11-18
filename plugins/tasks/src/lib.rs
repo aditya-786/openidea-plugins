@@ -14,7 +14,7 @@ mod state;
 mod trackers;
 mod view_scope;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openidea_plugin::views::{Body, Button, Field, FieldValue, TreeItem, View, ViewEvent, Viewport, Views};
@@ -58,6 +58,7 @@ enum Form {
 #[derive(Default)]
 struct Tasks {
     git: bool,
+    git_notice: std::sync::atomic::AtomicBool,
     scope: view_scope::Scope,
     issue_search: search::Search,
     selected: Option<String>,
@@ -111,7 +112,7 @@ impl Plugin for Tasks {
         refresh_tasks_view();
         match id {
             "review-issue-branch-at-caret" => {
-                if !self.git { return Err("Grant process:git and reload Tasks to review branch options.".into()); }
+                if !self.git { return Err(ui_kit::denied::message("Reviewing branch options", "process:git", "Tasks").into()); }
                 let review = issue_context::prepare(&self.issue_search, ctx)?;
                 if tasks.find(&review.issue.id).is_some() {
                     return Err("This issue already has a local task; use its existing task switch/branch workflow.".into());
@@ -157,8 +158,25 @@ impl Plugin for Tasks {
             "apply-commit-message" => commit_message::run(&project)?,
             "copy-commit-message" => {
                 let message = tasks.commit_message(&commit_message_format())?;
-                host::copy_to_clipboard(&message)?;
+                host::copy_to_clipboard(&message).map_err(|e| ui_kit::denied::map(e, "Copy Commit Message", "clipboard", "Tasks"))?;
                 host::notify(NotificationLevel::Info, "Commit message copied", &message);
+            }
+            "new-task" => {
+                self.button("new", ctx)?;
+                refresh_tasks_view();
+                let _ = host::reveal_view(VIEW);
+            }
+            "open-task" => {
+                let previous = self.selected.take();
+                let result = self.button("find", ctx);
+                if self.selected.is_none() {
+                    self.selected = previous;
+                }
+                result?;
+                refresh_tasks_view();
+                if self.form.is_some() {
+                    let _ = host::reveal_view(VIEW);
+                }
             }
             "refresh" => refresh_issues(&project, false)?,
             "search-issues" => self.search_issues(&project, &tasks, ctx)?,
@@ -309,7 +327,7 @@ impl Views for Tasks {
             }
 
             if tasks.pending_issues().next().is_none() {
-                let hint = "No issues (trackers are set up in Settings › Plugins › Tasks)";
+                let hint = no_issues_hint(&root);
                 items.push(TreeItem::new("no-issues", hint).parent("issues").icon("info"));
             }
 
@@ -324,10 +342,8 @@ impl Views for Tasks {
                     .button(Button::new("new", "New Task…").icon("plus"))
                     .button(Button::new("find", open_label).icon("run").enabled(open_enabled))
                     .button(Button::new("close-active", "Close Active Task…").icon("check").enabled(!tasks.active().is_default()))
-                    .button(Button::new("search-issues", "Search Issues…").icon("search"))
-                    .button(Button::new("contexts", "Contexts…").icon("layout"))
-                    .button(Button::new("actions", "Task Actions…").icon("more").enabled(selected.is_some()))
-                    .button(Button::new("refresh", "Update Issues").icon("refresh"))
+                    .button(Button::new("actions", "Task Actions…").icon("edit").enabled(selected.is_some()))
+                    .button(Button::new("more", "More…").icon("more"))
                     .status(&format!("Active: {} · {}", tasks.active().label(), selected.map(|task| format!("Selected: {}", task.label())).unwrap_or_else(|| "Select a task; Enter opens it".into()))),
             ))
         })().map(ui_kit::actions::available)
@@ -443,7 +459,7 @@ impl Tasks {
                 }
 
                 if let Some((branch, base)) = task.and_then(|t| Some((t.branch.as_ref()?, t.base_branch.as_ref()?))).filter(|_| self.git) {
-                    let label = format!("Merge branch {branch} into {base}");
+                    let label = format!("Merge branch {branch} into {base}, then delete {branch}");
                     fields.push(checkbox("merge_branch", &label, self.choices.merge_branch));
                 }
 
@@ -560,14 +576,22 @@ impl Tasks {
                 }
             }
             "search-issues" => self.search_issues(&project, &tasks, ctx)?,
-            "contexts" => {
-                let choices = [PickItem::new("save", "Save Open Editor Context…"), PickItem::new("load", "Load Context…"), PickItem::new("remove", "Remove Context…")];
-                if let Some(action) = host::pick("Tasks and Contexts", &choices)? {
+            "more" => {
+                let choices = [
+                    PickItem::new("search-issues", "Search Issues…"),
+                    PickItem::new("refresh", "Update Issues"),
+                    PickItem::new("save-context", "Save Context…"),
+                    PickItem::new("load-context", "Load Context…"),
+                    PickItem::new("remove-context", "Remove Saved Context…"),
+                ];
+                if let Some(action) = host::pick("More Tasks actions", &choices)? {
                     if load(&project.root()?)? != tasks { return Err(Error::Stale); }
                     match action.as_str() {
-                        "save" => save_context(&project, &tasks, ctx)?,
-                        "load" => load_context(&project, &tasks)?,
-                        "remove" => remove_context(&project, &tasks)?,
+                        "search-issues" => self.search_issues(&project, &tasks, ctx)?,
+                        "refresh" => refresh_issues(&project, false)?,
+                        "save-context" => save_context(&project, &tasks, ctx)?,
+                        "load-context" => load_context(&project, &tasks)?,
+                        "remove-context" => remove_context(&project, &tasks)?,
                         _ => return Err(Error::Stale),
                     }
                 }
@@ -728,6 +752,11 @@ impl Tasks {
         }
         let _progress = host::begin_task("Switching task", false);
         let git = self.git.then(|| Git::new(project));
+
+        if git.is_none() && new_task && choices.create_branch {
+            ui_kit::denied::notify_once(&self.git_notice, "Creating a branch per task", "process:git", "Tasks");
+        }
+
         let mut warnings = Vec::new();
 
         let files = update(&root, |tasks, now| {
@@ -811,7 +840,10 @@ impl Tasks {
         let mut warnings = Vec::new();
 
         if choices.update_state && trackers::can_update_state(&task) {
-            note(&mut warnings, trackers::close_issue(&task));
+            match trackers::close_issue(&task) {
+                Err(Error::Denied(_)) => warnings.push(format!("The issue state was not updated: allow network access to {} in Settings › Plugins › Tasks.", trackers::name(&task))),
+                result => note(&mut warnings, result),
+            }
         }
 
         if tasks.active == id {
@@ -823,7 +855,10 @@ impl Tasks {
         }
 
         update(&root, |tasks, _| tasks.close(id))?;
-        warn(&format!("Closed {}, but some steps failed", task.id), &warnings);
+        match warnings.is_empty() {
+            true => host::notify(NotificationLevel::Info, "Task closed", &format!("Closed {}", task.label())),
+            false => warn(&format!("Closed {}, but some steps failed", task.id), &warnings),
+        }
 
         Ok(())
     }
@@ -1014,7 +1049,12 @@ fn add_repository(project: &Project) -> Result<(), Error> {
         return Ok(());
     };
 
-    if !repository.contains('/') {
+    let valid = match kind.as_str() {
+        "gitlab" => repository.contains('/'),
+        _ => trackers::valid_repo(&repository),
+    };
+
+    if !valid {
         return Err("Enter the repository as owner/name.".into());
     }
 
@@ -1063,6 +1103,22 @@ fn remove_repository(project: &Project, tasks: &TaskList) -> Result<(), Error> {
     refresh_issues(project, false)
 }
 
+thread_local! {
+    /// Why the last issue update of a project root loaded nothing, when every tracker failed.
+    static ISSUE_FAILURES: std::cell::RefCell<BTreeMap<String, &'static str>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+/// The text of the Issues group's placeholder row.
+fn no_issues_hint(root: &str) -> &'static str {
+    if let Some(failure) = ISSUE_FAILURES.with_borrow(|failures| failures.get(root).copied()) {
+        return failure;
+    }
+    if !trackers::any_configured() {
+        return "No issue tracker set up: add a tracker token in Settings › Plugins › Tasks";
+    }
+    "No open issues"
+}
+
 /// `quiet`: problems go to the log instead of a notification.
 fn refresh_issues(project: &Project, quiet: bool) -> Result<(), Error> {
     let root = project.root()?;
@@ -1070,13 +1126,14 @@ fn refresh_issues(project: &Project, quiet: bool) -> Result<(), Error> {
     let remotes = project.vcs_remotes().unwrap_or_default();
     let repositories = load(&root)?.repositories;
     let fetched = trackers::fetch_all(&trackers::Scope { remotes: &remotes, query: None, page: 1, repositories: &repositories });
+    ISSUE_FAILURES.with_borrow_mut(|failures| failures.remove(&root));
 
     if fetched.trackers == 0 {
         if !quiet {
             host::notify(
                 NotificationLevel::Info,
                 "No issue tracker set up",
-                "Enter a GitHub, GitLab, Codeberg, YouTrack, Jira or Trello token in Settings › Plugins › Tasks.",
+                "Add a tracker token in Settings › Plugins › Tasks. Trackers that use a credential profile are searched with Search Issues.",
             );
         }
         return Ok(());
@@ -1091,13 +1148,18 @@ fn refresh_issues(project: &Project, quiet: bool) -> Result<(), Error> {
 
     // Offline (every tracker failed): keep the earlier issues rather than emptying the list.
     if fetched.errors.len() == fetched.trackers {
+        let failure = match fetched.denied == fetched.trackers {
+            true => "Issues couldn't be loaded: network access is not allowed (Settings › Plugins › Tasks)",
+            false => "Issues couldn't be loaded: run Update Issues to see why",
+        };
+        ISSUE_FAILURES.with_borrow_mut(|failures| failures.insert(root.clone(), failure));
         return Ok(());
     }
 
     update(&root, |tasks, _| {
         // Tasks follow their issue's summary.
         for task in &mut tasks.tasks {
-            if let Some(issue) = fetched.issues.iter().find(|i| i.id == task.id && i.tracker == task.tracker) {
+            if let Some(issue) = fetched.issues.iter().find(|i| i.tracker == task.tracker && trackers::same_issue(i, task)) {
                 task.summary = issue.summary.clone();
                 task.description = issue.description.clone();
                 task.url = issue.url.clone();
@@ -1105,9 +1167,17 @@ fn refresh_issues(project: &Project, quiet: bool) -> Result<(), Error> {
             }
         }
 
-        let retained_bridge: Vec<_> = tasks.issues.iter().filter(|t| matches!(t.tracker.as_deref(),Some("fogbugz"|"redmine"|"mantis"|"generic"))).cloned().collect();
+        let retained: Vec<_> = tasks
+            .issues
+            .iter()
+            .filter(|t| {
+                let tracker = t.tracker.as_deref().unwrap_or_default();
+                matches!(tracker, "fogbugz" | "redmine" | "mantis" | "generic") || fetched.failed_trackers.iter().any(|f| f == tracker)
+            })
+            .cloned()
+            .collect();
         tasks.issues = fetched.issues;
-        tasks.issues.extend(retained_bridge);
+        tasks.issues.extend(retained);
         Ok(())
     })
 }
@@ -1196,6 +1266,8 @@ mod tests {
             let (status, stdout) = match command.as_str() {
                 "rev-parse --abbrev-ref HEAD" => (0, "main\n"),
                 c if c.starts_with("rev-parse --verify") => (1, ""),
+                c if c.starts_with("rev-parse --path-format=absolute --git-path") => (0, "/project/.git/openidea-task-message\n"),
+                c if c.starts_with("config --local --get") => (1, ""),
                 _ => (0, ""),
             };
             Ok(ProcessOutput { status: Some(status), stdout: stdout.into(), stderr: String::new() })
@@ -1226,12 +1298,34 @@ mod tests {
         host.refreshed_views()[after..].iter().any(|view| view == VIEW)
     }
     #[test]
+    fn copy_commit_message_denied_names_permission() {
+        let (host, mut plugin) = seeded();
+        let error = plugin.run_command("copy-commit-message", &host.invocation(), None).unwrap_err().to_string();
+        assert!(error.contains("needs the clipboard permission"), "{error}");
+        assert!(error.contains("Settings › Plugins › Tasks"), "{error}");
+    }
+
+    #[test]
+    fn branch_per_task_notice_shown_once() {
+        let (host, plugin) = seeded();
+        update("/project", |tasks, _| { tasks.add_local("Second task", ""); tasks.add_local("Third task", ""); Ok(()) }).unwrap();
+        let project = host.invocation().project().unwrap();
+        plugin.switch_task(&project, "LOCAL-00002", true, &Choices::default()).unwrap();
+        plugin.switch_task(&project, "LOCAL-00003", true, &Choices::default()).unwrap();
+        let notices: Vec<_> = host.notifications().into_iter().filter(|n| n.body.contains("needs the process:git permission")).collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].body.contains("Settings › Plugins › Tasks"));
+    }
+
+    #[test]
     fn native_primary_controls_distinguish_selection_from_active_task() {
         let (host, mut plugin) = seeded();
         update("/project", |tasks, _| { tasks.add_local("Selected next task", ""); Ok(()) }).unwrap();
         press(&mut plugin, &host, ViewEvent::Select("task:LOCAL-00002".into()));
         let view = plugin.render(VIEW, None, &host.invocation()).unwrap();
         assert!(view.toolbar.iter().any(|b| b.label == "Switch Task" && b.enabled));
+        let labels: Vec<_> = view.toolbar.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["New Task…", "Switch Task", "Close Active Task…", "Task Actions…", "More…"]);
         press(&mut plugin, &host, ViewEvent::Button("close-active".into()));
         assert!(matches!(&plugin.form, Some(Form::Close { id }) if id == "LOCAL-00001"));
         let form = plugin.render(VIEW, None, &host.invocation()).unwrap();
@@ -1272,6 +1366,40 @@ mod tests {
         plugin.run_command("close",&host.invocation(),None).unwrap();
         assert!(notified(&host,before));assert!(matches!(plugin.form,Some(Form::Close{..})));
         assert_eq!(load("/project").unwrap().active,"LOCAL-00001");assert!(host.requests().is_empty());
+    }
+    #[test]
+    fn new_task_command_opens_the_new_task_form() {
+        let (host,mut plugin)=seeded();
+        plugin.run_command("new-task",&host.invocation(),None).unwrap();
+        assert!(matches!(plugin.form,Some(Form::New{..})));
+    }
+    #[test]
+    fn open_task_command_reveals_the_window_for_the_branch_form() {
+        let host=MockHost::install().with_capabilities(&["project.read","storage","process:git"]);
+        let _git=fake_git(&host);
+        let mut plugin=plugin(&host);
+        update("/project",|tasks,_| { tasks.issues=vec![Task::issue("github","tool-12","Crash","https://github.com/x","https://api.github.com/x")]; Ok(()) }).unwrap();
+        host.answer_next_prompt(Some(&["issue:tool-12"]));
+        plugin.run_command("open-task",&host.invocation(),None).unwrap();
+        assert!(matches!(plugin.form,Some(Form::Open{..})));
+        assert_eq!(host.revealed_views(),["tasks"]);
+    }
+    #[test]
+    fn cancelled_open_task_picker_keeps_the_selection() {
+        let (host,mut plugin)=seeded();
+        plugin.run_command("refresh",&host.invocation(),None).ok();
+        plugin.selected=Some("task:LOCAL-00001".into());
+        host.answer_next_prompt(Some(&[]));
+        plugin.run_command("open-task",&host.invocation(),None).unwrap();
+        assert_eq!(plugin.selected.as_deref(),Some("task:LOCAL-00001"));
+    }
+    #[test]
+    fn open_task_command_picks_and_activates_a_task() {
+        let (host,mut plugin)=seeded();
+        update("/project",|tasks,_| { tasks.add_local("Second task",""); Ok(()) }).unwrap();
+        host.answer_next_prompt(Some(&["task:LOCAL-00002"]));
+        plugin.run_command("open-task",&host.invocation(),None).unwrap();
+        assert_eq!(load("/project").unwrap().active,"LOCAL-00002");
     }
     #[test]
     fn external_switch_and_cancelled_switch_refresh_current_action_tokens() {
@@ -1347,6 +1475,7 @@ mod tests {
         assert_eq!(tail, ["switch main", "switch main", "merge --no-edit Fix-login", "branch -d Fix-login"]);
         assert_eq!(host.status_items()[STATUS_ITEM].text, "Default task");
         assert!(load("/project").unwrap().choices.merge_branch);
+        assert!(host.notifications().iter().any(|n| n.body == "Closed Fix login page"));
     }
 
     #[test]
@@ -1421,6 +1550,22 @@ mod tests {
     }
 
     #[test]
+    fn the_empty_issues_row_says_why_there_are_no_issues() {
+        let host = MockHost::install().with_capabilities(&["project.read", "storage", "secrets"]);
+        let mut plugin = plugin(&host);
+        let hint = |plugin: &mut Tasks| {
+            let Body::Tree(items) = plugin.render(VIEW, None, &host.invocation()).unwrap().body else { panic!("not a tree") };
+            items.into_iter().find(|i| i.key.ends_with(":no-issues")).unwrap().label
+        };
+        assert!(hint(&mut plugin).starts_with("No issue tracker set up"));
+
+        host.set_secret("youtrack-token", "token");
+        host.set_setting("youtrackHost", "\"tenant.youtrack.cloud\"");
+        refresh_issues(&host.invocation().project().unwrap(), true).unwrap();
+        assert!(hint(&mut plugin).contains("network access is not allowed"));
+    }
+
+    #[test]
     fn works_without_git_and_reopens_the_files_of_a_task() {
         let host = MockHost::install().with_capabilities(&["project.read", "storage", "events"]);
         let mut plugin = plugin(&host);
@@ -1461,6 +1606,36 @@ mod tests {
     }
 
     #[test]
+    fn partial_refresh_keeps_failed_tracker_issues() {
+        let host = MockHost::install().with_capabilities(&["project.read", "storage", "vcs.read", "secrets", "net:api.github.com", "net:api.trello.com"]);
+        host.set_secret("github-token", "t0ken");
+        host.set_secret("trello-key", "k");
+        host.set_secret("trello-token", "t");
+        host.set_vcs_remotes(&[("origin", "git@github.com:acme/tool.git")]);
+        host.on_fetch(|request| {
+            if request.url.contains("trello") {
+                return Err(Error::Invalid("offline".into()));
+            }
+            let body = r#"{"items":[{"number":7,"title":"Crash","html_url":"https://github.com/acme/tool/issues/7","url":"https://api.github.com/repos/acme/tool/issues/7","repository_url":"https://api.github.com/repos/acme/tool"}]}"#;
+            Ok(HttpResponse { status: 200, headers: vec![], body: body.into() })
+        });
+        update("/project", |tasks, _| {
+            tasks.issues = vec![
+                Task::issue("trello", "5f3a", "Cached card", "https://trello.com/c/abc", "https://api.trello.com/1/cards/5f3a"),
+                Task::issue("github", "old-1", "Gone", "https://github.com/acme/tool/issues/1", "https://api.github.com/repos/acme/tool/issues/1"),
+            ];
+            Ok(())
+        })
+        .unwrap();
+        let project = host::project_of("/project").unwrap();
+
+        refresh_issues(&project, true).unwrap();
+
+        let ids: Vec<_> = load("/project").unwrap().issues.into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["tool-7", "5f3a"]);
+    }
+
+    #[test]
     fn opening_an_issue_with_the_commit_template_on_writes_its_message() {
         let host = MockHost::install().with_capabilities(ALL);
         host.set_setting("fillCommitTemplate", "true");
@@ -1477,8 +1652,48 @@ mod tests {
         press(&mut plugin, &host, ViewEvent::Button("ok".into()));
 
         assert_eq!(load("/project").unwrap().active, "tool-12");
-        assert!(git.borrow().iter().any(|c| c.starts_with("log -1 --format=tool-12 100%% crash --output=")));
+        assert!(git.borrow().iter().any(|c| c.starts_with("config --local commit.template ")));
+        let template = git.borrow().iter().find(|c| c.starts_with("config --local commit.template ")).cloned().unwrap();
+        assert_eq!(template, "config --local commit.template /project/.git/openidea-task-message");
+        assert!(git.borrow().iter().any(|c| c == "log -1 --format=tool-12 100%% crash --output=/project/.git/openidea-task-message"));
         assert!(!git.borrow().iter().any(|c| c.starts_with("switch -c")));
+    }
+
+    #[test]
+    fn commit_template_set_in_empty_repo() {
+        let host = MockHost::install().with_capabilities(&["project.read", "storage", "process:git"]);
+        host.set_setting("fillCommitTemplate", "true");
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let seen = calls.clone();
+        host.on_process("git", move |args, _| {
+            let command = args.join(" ");
+            seen.borrow_mut().push(command.clone());
+            let (status, stdout) = match command.as_str() {
+                "rev-parse --abbrev-ref HEAD" => (0, "main\n"),
+                c if c.starts_with("log ") => (128, ""),
+                c if c.starts_with("rev-parse --path-format=absolute --git-path") => (0, "/project/.git/openidea-task-message\n"),
+                c if c.starts_with("config --local --get") => (1, ""),
+                _ => (0, ""),
+            };
+            Ok(ProcessOutput { status: Some(status), stdout: stdout.into(), stderr: String::new() })
+        });
+        let mut plugin = plugin(&host);
+        update("/project", |tasks, _| {
+            tasks.issues = vec![Task::issue("github", "tool-12", "Crash", "https://github.com/x", "https://api.github.com/x")];
+            Ok(())
+        })
+        .unwrap();
+
+        press(&mut plugin, &host, ViewEvent::Activate("issue:tool-12".into()));
+        press(&mut plugin, &host, ViewEvent::Field("create_branch".into(), "false".into()));
+        press(&mut plugin, &host, ViewEvent::Button("ok".into()));
+
+        assert!(host.notifications().is_empty(), "{:?}", host.notifications());
+        let configure = calls.borrow().iter().find(|c| c.starts_with("config --local commit.template ")).cloned().unwrap();
+        let path = configure.trim_start_matches("config --local commit.template ");
+        assert!(!path.contains(".git"), "{path}");
+        assert!(path.starts_with(&host::fs::plugin_dir().unwrap()), "{path}");
+        assert!(host::fs::read_file(path).unwrap().starts_with("tool-12 Crash"));
     }
 
     fn github_hit(host: &MockHost) {
@@ -1503,6 +1718,21 @@ mod tests {
         assert!(host.requests()[0].url.contains("is%3Aopen%20crash"));
         assert_eq!(plugin.form, Some(Form::Open { id: "tool-7".into() }));
         assert_eq!(host.revealed_views(), ["tasks"]);
+    }
+
+    #[test]
+    fn more_button_runs_search_issues_from_its_picker() {
+        let host = MockHost::install().with_capabilities(ALL);
+        host.set_secret("github-token", "t0ken");
+        host.set_vcs_remotes(&[("origin", "git@github.com:acme/tool.git")]);
+        github_hit(&host);
+        let mut plugin = plugin(&host);
+        host.answer_next_prompt(Some(&["search-issues"]));
+        host.answer_next_prompt(Some(&["crash"]));
+        host.answer_next_prompt(Some(&["0"]));
+        press(&mut plugin, &host, ViewEvent::Button("more".into()));
+
+        assert!(host.requests()[0].url.contains("is%3Aopen%20crash"));
     }
 
     #[test]

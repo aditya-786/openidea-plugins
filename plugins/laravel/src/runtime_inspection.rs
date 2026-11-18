@@ -270,7 +270,7 @@ fn execute(project: &Project, runner: Runner, args: &[String]) -> Result<String,
         crate::ui_text::text("runtime.boundary.07780710af", "Inspect Laravel runtime"),
         true,
     );
-    let child = crate::artisan_runner::start_background(runner.name(), &args, project)?;
+    let child = crate::artisan_runner::start_background(runner, &args, project)?;
     if let Err(error) = child.close_stdin() {
         let _ = child.kill();
         return Err(error);
@@ -910,7 +910,7 @@ mod tests {
         let mut state = State::default();
         assert!(matches!(
             state.capture(&host.invocation(), Runner::Php, "events"),
-            Err(Error::Denied(_))
+            Err(Error::Invalid(message)) if message.contains("process:php permission")
         ));
         assert!(state.snapshots.is_empty());
     }

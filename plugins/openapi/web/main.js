@@ -14,7 +14,7 @@ window.fetch = (input, init) => {
 };
 const ui = SwaggerUIBundle({
   dom_id: "#swagger",
-  supportedSubmitMethods: [], // the frame has no network: no "Try it out"
+  supportedSubmitMethods: [], // the frame has no network: the Try… button asks the plugin instead
   validatorUrl: null,
   deepLinking: false,
 });
@@ -58,9 +58,14 @@ const render = (text) => {
   window.openidea.postMessage(`files\t${id}\t${known}`);
   show(text);
 };
+let rendererRestored = false;
 window.openidea.onMessage((message) => {
   const reply = JSON.parse(message);
   if (reply.id !== id) return; // replies go to every open preview
+  if (!rendererRestored) {
+    rendererRestored = true;
+    if (reply.renderer === "redoc" && mode !== "redoc") setMode("redoc");
+  }
   known = reply.hash;
   const received = reply.files ?? {};
   files = new Map(Object.entries(received).map(([name, text]) => [new URL(name, root).href.split("#")[0], text]));
@@ -75,12 +80,20 @@ document.getElementById("reload").addEventListener("click", () => {
   known = "";
   window.openidea.document.get().then((doc) => render(doc.text));
 });
-document.getElementById("switch").addEventListener("click", (event) => {
-  mode = mode === "swagger" ? "redoc" : "swagger";
-  const button = event.currentTarget;
+// The frame has no storage of its own: the plugin keeps the choice (optional storage grant).
+const setMode = (next) => {
+  mode = next;
+  const button = document.getElementById("switch");
   button.querySelector("[data-renderer-label]").textContent = mode === "swagger" ? "Redoc" : "Swagger UI";
   button.setAttribute("aria-label", `Switch API renderer to ${mode === "swagger" ? "Redoc" : "Swagger UI"}`);
   document.getElementById("swagger").style.display = mode === "swagger" ? "" : "none";
   document.getElementById("redoc").style.display = mode === "redoc" ? "block" : "none";
   show(latest);
+};
+document.getElementById("switch").addEventListener("click", () => {
+  rendererRestored = true;
+  setMode(mode === "swagger" ? "redoc" : "swagger");
+  window.openidea.postMessage(`renderer\t${mode}`);
 });
+// The plugin's own Try it out flow prepares the request and asks before sending it.
+document.getElementById("try").addEventListener("click", () => window.openidea.postMessage("try"));

@@ -96,7 +96,7 @@ pub fn check_java(path: &str, file: &JavaFile, text: &str, world: &World, groups
     let mut out = Vec::new();
     if groups.cache {
         for ty in file.types.iter().filter(|t| t.kind == "class" || t.kind == "interface") {
-            let subtyped = !world.complete || world.files.values().flat_map(|m| &m.types).any(|t| t.supers.contains(&ty.name));
+            let subtyped = !world.complete || world.has_subtypes(&ty.name);
             annotation_checks::check_cache(file, ty, subtyped, &mut out);
         }
     }
@@ -291,7 +291,7 @@ pub(crate) fn profiles_overlap(a: &[String], b: &[String]) -> bool {
     a.iter().any(|p| b.contains(p))
 }
 
-fn is_test_source(path: &str) -> bool {
+pub(crate) fn is_test_source(path: &str) -> bool {
     path.contains("/src/test/")
 }
 
@@ -372,19 +372,6 @@ fn pointcut_designators(path: &str, file: &JavaFile, ty: &TypeDecl, out: &mut Ve
     }
 }
 
-/// Beans only clash inside one build module and one source set (main or test).
-pub(crate) fn same_scope(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    if is_test_source(a) != is_test_source(b) {
-        return false;
-    }
-    match (build_module(a), build_module(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => true,
-    }
-}
 
 fn static_name(annotations: &[Annotation], keys: &[&str]) -> bool {
     !annotations.iter().any(|a| is_dynamic(a, keys))
@@ -419,7 +406,7 @@ fn duplicate_names(path: &str, file: &JavaFile, ty: &TypeDecl, text: &str, world
                 && !other.conditional
                 && shares_name
                 && coexist(&bean.profiles, &other.profiles)
-                && same_scope(path, other_path)
+                && world.same_scope(path, other_path)
         });
         let Some((other_path, other)) = clash else { continue };
         out.push(Finding::new(

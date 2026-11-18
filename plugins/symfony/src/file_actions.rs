@@ -207,7 +207,7 @@ fn config(project: &Project) -> Result<Vec<(String, Option<String>)>, Error> {
         if let Some(text) = &text {
             if text.len() > 64 << 10 || !path.ends_with("yaml") && !path.ends_with("yml") {
                 return Err(
-                    "Twig configuration cannot be verified by this bounded YAML workflow.".into(),
+                    "Can't create the template: the Twig configuration is not YAML or is over 64 KiB. Create the file by hand.".into(),
                 );
             }
             let keys = index::yaml_keys(text);
@@ -219,7 +219,7 @@ fn config(project: &Project) -> Result<Vec<(String, Option<String>)>, Error> {
                     || (key.key == "twig" && !key.value.is_empty())
             }) {
                 return Err(
-                    "Imported, custom-path or flow Twig configuration is outside this workflow."
+                    "This project's Twig configuration (imports or custom paths) isn't supported. Only templates/ is."
                         .into(),
                 );
             }
@@ -233,7 +233,7 @@ fn config(project: &Project) -> Result<Vec<(String, Option<String>)>, Error> {
                         raw.strip_prefix(quote)
                             .and_then(|value| value.strip_suffix(quote))
                             .filter(|value| !value.contains(quote))
-                            .ok_or("Malformed Twig default_path literal.")?
+                            .ok_or("Couldn't read twig.default_path. Check its quotes in the Twig config.")?
                     } else {
                         raw
                     };
@@ -438,7 +438,7 @@ fn php_mapping(project: &Project, pending: &Pending) -> Result<String, Error> {
         let expected = if parent.is_empty() { namespace.to_owned() } else { format!("{namespace}\\{}",parent.replace('/',"\\")) };
         if expected==pending.name { matches+=1; }
     }
-    if matches!=1 { return Err("Source must match exactly one production PSR-4 namespace/directory mapping.".into()); }
+    if matches!=1 { return Err("This file's folder must match exactly one PSR-4 entry in composer.json.".into()); }
     Ok(composer)
 }
 
@@ -451,7 +451,7 @@ fn resolve_php(
 ) -> Result<FileAction, Error> {
     let mapping = php_mapping(project, pending)?;
     let Some(kind) = host::pick(
-        "New sibling PHP class (no registration or Kernel edits)",
+        "New PHP class next to this file",
         &[
             PickItem::new("service", "Plain PHP service class"),
             PickItem::new("compiler", "CompilerPassInterface scaffold"),
@@ -486,7 +486,7 @@ fn resolve_php(
         .get(&pending.root)
         .is_some_and(|i| i.classes.keys().any(|key| key.eq_ignore_ascii_case(&fqcn)))
     {
-        return Err("A cached class already owns this name.".into());
+        return Err("A class with this name already exists. Choose another name.".into());
     }
     let eol = intentions::eol_of(&doc.text);
     let body = if kind == "compiler" {
@@ -504,10 +504,9 @@ fn resolve_php(
     current(pending, doc)?;
     vacant(project, &target, &pending.root)?;
     let preview = format!(
-        "Source: {}\nVersion: {}\nTarget: {target}\nNamespace: {}\n\nNo service registration, dependency inference or Kernel modification. Framework availability is not resolved.\nExact new file:\n{content}",
-        doc.path, doc.version, pending.name
+        "Creates {target} (class {fqcn}) and opens it.\nIt isn't registered as a service and the Kernel isn't edited.\nDelete the file to undo.\n\n{content}"
     );
-    if !ui_kit::prompts::confirm_exact("Create PHP class?", &preview)? {
+    if !ui_kit::prompts::confirm_exact(&format!("Create class {name}?"), &preview)? {
         return Err(Error::Cancelled);
     }
     current(pending, doc)?;
@@ -598,7 +597,7 @@ impl Main {
         vacant(&project, &target, &pending.root)?;
         let modes = [
             PickItem::new("empty", "Empty Twig template"),
-            PickItem::new("body", "Named body block scaffold (no inferred parent)"),
+            PickItem::new("body", "Template with an empty body block"),
         ];
         let Some(mode) = host::pick("Initial content for the missing Twig template", &modes)?
         else {
@@ -616,23 +615,14 @@ impl Main {
         }
         vacant(&project, &target, &pending.root)?;
         let preview = format!(
-            "Invoking source: {}\nSource version: {}\nLiteral template: {}\nTarget: {target}\n\nConventional templates/ root only; no runtime loader/type resolution or inferred parent.\nExact content ({} bytes; {} line endings):\n{}\n\nOne atomic non-overwriting Create; invoking source is unchanged.",
-            doc.path,
-            doc.version,
-            pending.name,
-            content.len(),
-            if content.contains("\r\n") {
-                "CRLF"
-            } else {
-                "LF"
-            },
+            "Creates {target} and opens it.\nThe current file is unchanged.\nDelete the new file to undo.\n\n{}",
             if content.is_empty() {
                 "(empty file)"
             } else {
                 &content
             }
         );
-        if !ui_kit::prompts::confirm_exact("Create missing Twig template?", &preview)? {
+        if !ui_kit::prompts::confirm_exact(&format!("Create template {}?", pending.name), &preview)? {
             return Err(Error::Cancelled);
         }
         current(&pending, doc)?;

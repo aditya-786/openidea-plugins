@@ -452,7 +452,7 @@ mod tests {
         let host = project(&[("k/kustomization.yaml", "resources: []\n"), ("k/dep.yaml", full), ("j/dep.yaml", full)]);
         publish(&host, Event::FileOpened("/p/k/dep.yaml".into()));
         publish(&host, Event::FileOpened("/p/j/dep.yaml".into()));
-        assert_eq!(host.diagnostics().keys().collect::<Vec<_>>(), ["/p/j/dep.yaml"]);
+        assert_eq!(shown(&host).keys().collect::<Vec<_>>(), ["/p/j/dep.yaml"]);
     }
 
     #[test]
@@ -470,11 +470,11 @@ mod tests {
     fn huge_yaml_is_skipped_and_clears_stale_diagnostics() {
         let host = project(&[("ing.yaml", INGRESS)]);
         publish(&host, Event::FileOpened("/p/ing.yaml".into()));
-        assert_eq!(host.diagnostics().len(), 1);
+        assert_eq!(shown(&host).len(), 1);
 
         host.add_file("ing.yaml", &format!("{INGRESS}# {}\n", "x".repeat(crate::MAX_BYTES)));
         publish(&host, Event::FileSaved("/p/ing.yaml".into()));
-        assert!(host.diagnostics().is_empty());
+        assert!(shown(&host).is_empty());
     }
 
     #[test]
@@ -483,7 +483,7 @@ mod tests {
         let before = crate::manifest::SCANS.with(|s| s.get());
         publish(&host, Event::FileOpened("/p/data.yaml".into()));
         assert_eq!(crate::manifest::SCANS.with(|s| s.get()), before);
-        assert!(host.diagnostics().is_empty());
+        assert!(shown(&host).is_empty());
     }
 
     const POD: &str = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: p\nspec:\n  containers:\n    - name: a\n      env:\n        - name: A\n          value: \"1\"\n        - name: B\n          value: \"2\"\n        - name: A\n          valueFrom:\n            secretKeyRef: {name: s, key: k}\n    - name: b\n      env:\n        - name: A\n          value: \"3\"\n";
@@ -858,13 +858,13 @@ mod tests {
         let host = project(&[("chart/Chart.yaml", "apiVersion: v2\nname: c\nversion: 1\ncolour: red\n"), ("chart/templates/a.yaml", "a: 1\n  {{- .Values.x }}\n")]);
         publish(&host, Event::FileOpened("/p/chart/Chart.yaml".into()));
         publish(&host, Event::FileOpened("/p/chart/templates/a.yaml".into()));
-        assert_eq!(host.diagnostics().len(), 2);
+        assert_eq!(shown(&host).len(), 2);
 
         host.add_file("chart/Chart.yaml", "apiVersion: v2\nname: c\nversion: 1\n");
         host.add_file("chart/templates/a.yaml", "a: 1\n{{ .Values.x }}\n");
         publish(&host, Event::FileSaved("/p/chart/Chart.yaml".into()));
         publish(&host, Event::FileSaved("/p/chart/templates/a.yaml".into()));
-        assert!(host.diagnostics().is_empty());
+        assert!(shown(&host).is_empty());
     }
 
     #[test]
@@ -874,7 +874,7 @@ mod tests {
         host.set_setting("checkHelmExcessiveTrim", "false");
         publish(&host, Event::FileOpened("/p/chart/Chart.yaml".into()));
         publish(&host, Event::FileOpened("/p/chart/templates/a.yaml".into()));
-        assert!(host.diagnostics().is_empty());
+        assert!(shown(&host).is_empty());
     }
 
     const PROJECT: &str = "/p";
@@ -889,7 +889,35 @@ mod tests {
     }
 
     fn publish(host: &MockHost, event: Event) {
-        KubeExplorer::default().handle_events(&[event], &host.invocation());
+        let mut kube = KubeExplorer::default();
+        host.open_editor("/p/.unrelated", "text", "", &[]);
+        kube.handle_events(std::slice::from_ref(&event), &host.invocation());
+        if let Event::FileOpened(path) | Event::FileSaved(path) = &event
+            && let Some(text) = openidea_plugin::host::project_of(path).and_then(|project| project.read_file(path).ok())
+        {
+            host.open_editor(path, "yaml", &text, &[]);
+            host.refresh_diagnostics(&mut kube);
+        }
+    }
+
+    fn shown(host: &MockHost) -> std::collections::BTreeMap<String, Vec<openidea_plugin::Diagnostic>> {
+        let mut all = host.provider_diagnostics();
+        for (path, items) in host.diagnostics() {
+            all.entry(path).or_default().extend(items);
+        }
+        all.retain(|_, items| !items.is_empty());
+        all
+    }
+
+    #[test]
+    fn manifest_problem_reported_once() {
+        let host = project(&[("k8s/ing.yaml", INGRESS)]);
+        publish(&host, Event::FileOpened("/p/k8s/ing.yaml".into()));
+        let provider = &host.provider_diagnostics()["/p/k8s/ing.yaml"];
+        assert!(!provider.is_empty());
+        for published in host.diagnostics().values().flatten() {
+            assert!(!provider.contains(published), "{published:?} is reported by both producers");
+        }
     }
 
     #[test]
@@ -897,7 +925,7 @@ mod tests {
         let host = project(&[("k8s/ing.yaml", INGRESS)]);
         publish(&host, Event::FileOpened("/p/k8s/ing.yaml".into()));
 
-        let published = &host.diagnostics()["/p/k8s/ing.yaml"];
+        let published = &shown(&host)["/p/k8s/ing.yaml"];
         assert_eq!(published.len(), 1);
         assert_eq!(published[0].code.as_deref(), Some(DEPRECATED_API_VERSION));
     }
@@ -906,11 +934,11 @@ mod tests {
     fn fixed_file_publishes_empty_list() {
         let host = project(&[("ing.yaml", INGRESS)]);
         publish(&host, Event::FileOpened("/p/ing.yaml".into()));
-        assert_eq!(host.diagnostics().len(), 1);
+        assert_eq!(shown(&host).len(), 1);
 
         host.add_file("ing.yaml", &INGRESS.replace("extensions/v1beta1", "networking.k8s.io/v1"));
         publish(&host, Event::FileSaved("/p/ing.yaml".into()));
-        assert!(host.diagnostics().is_empty());
+        assert!(shown(&host).is_empty());
     }
 
     #[test]
@@ -918,7 +946,7 @@ mod tests {
         let host = project(&[]);
         publish(&host, Event::FileOpened("/p/gone.yaml".into()));
         publish(&host, Event::FileOpened("/p/chart/templates/gone.yaml".into()));
-        assert!(host.diagnostics().is_empty());
+        assert!(shown(&host).is_empty());
     }
 
     #[test]
@@ -926,7 +954,7 @@ mod tests {
         let host = project(&[("docker-compose.yml", "services:\n  web:\n    image: nginx\n"), ("notes.txt", INGRESS)]);
         publish(&host, Event::FileOpened("/p/docker-compose.yml".into()));
         publish(&host, Event::FileOpened("/p/notes.txt".into()));
-        assert!(host.diagnostics().is_empty());
+        assert!(shown(&host).is_empty());
     }
 
     #[test]
@@ -934,7 +962,7 @@ mod tests {
         let host = project(&[("ing.yaml", INGRESS)]);
         host.set_setting("checkDeprecatedApiVersions", "false");
         publish(&host, Event::FileOpened("/p/ing.yaml".into()));
-        assert!(host.diagnostics().is_empty());
+        assert!(shown(&host).is_empty());
     }
 
     #[test]
@@ -944,7 +972,7 @@ mod tests {
         publish(&host, Event::FileOpened("/p/chart/templates/a.yaml".into()));
         publish(&host, Event::FileOpened("/p/other/templates/a.yaml".into()));
 
-        let diagnostics = host.diagnostics();
+        let diagnostics = shown(&host);
         assert_eq!(diagnostics.keys().collect::<Vec<_>>(), ["/p/chart/templates/a.yaml"]);
         assert_eq!(diagnostics["/p/chart/templates/a.yaml"][0].code.as_deref(), Some(HELM_WHITESPACE_TRIM));
     }
@@ -954,7 +982,7 @@ mod tests {
 
     fn published_chart_codes(host: &MockHost) -> Vec<String> {
         publish(host, Event::FileOpened("/p/chart/templates/a.yaml".into()));
-        host.diagnostics().get("/p/chart/templates/a.yaml").into_iter().flatten().map(|d| d.code.clone().unwrap()).collect()
+        shown(&host).get("/p/chart/templates/a.yaml").into_iter().flatten().map(|d| d.code.clone().unwrap()).collect()
     }
 
     #[test]
@@ -992,14 +1020,14 @@ mod tests {
         let host = project(&[("d.yaml", manifest), ("h.yaml", &format!("{manifest}x: {{{{ .Values.a }}}}\n"))]);
         publish(&host, Event::FileOpened("/p/d.yaml".into()));
         publish(&host, Event::FileOpened("/p/h.yaml".into()));
-        let codes: Vec<_> = host.diagnostics()["/p/d.yaml"].iter().map(|d| d.code.clone().unwrap()).collect();
+        let codes: Vec<_> = shown(&host)["/p/d.yaml"].iter().map(|d| d.code.clone().unwrap()).collect();
         assert_eq!(codes, [UNKNOWN_KEY, READ_ONLY_FIELD]);
-        assert!(host.diagnostics().get("/p/h.yaml").is_none_or(|found| found.is_empty()));
+        assert!(shown(&host).get("/p/h.yaml").is_none_or(|found| found.is_empty()));
 
         host.set_setting("checkKindSchema", "false");
         host.set_setting("checkReadOnlyFields", "false");
         publish(&host, Event::FileOpened("/p/d.yaml".into()));
-        assert!(host.diagnostics().get("/p/d.yaml").is_none_or(|found| found.is_empty()));
+        assert!(shown(&host).get("/p/d.yaml").is_none_or(|found| found.is_empty()));
     }
 
     #[test]

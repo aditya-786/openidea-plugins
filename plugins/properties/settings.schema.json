@@ -1,11 +1,5 @@
 {
   "properties": {
-    "bundle.writeOtherLocales": {
-      "type": "boolean",
-      "title": "Legacy other-locale write preference (navigation only)",
-      "description": "Compatibility setting. Other-locale cells now always open the locale file; use native intentions for confirmed atomic bundle edits.",
-      "default": true
-    },
     "codeStyle.keyValueDelimiter": {
       "type": "string",
       "title": "Code style: key/value delimiter",
@@ -52,18 +46,6 @@
       "title": "Report three dots used instead of an ellipsis",
       "default": false
     },
-    "reportMissingKeysInCode": {
-      "type": "boolean",
-      "title": "Legacy missing-key-in-code preference",
-      "description": "Compatibility preference. Missing-key absence warnings are withheld until resource-bundle/classpath ownership and complete discovery can be proven; navigation and candidate hover remain available.",
-      "default": true
-    },
-    "unusedProperties.live": {
-      "type": "boolean",
-      "title": "Cache potential unused-key candidates on open/save",
-      "description": "Compatibility text-search candidate cache (up to 2000 files, each under 256 KiB). No absence diagnostics are published because ignored/generated sources may be unknown. Find Unused Properties reports a potential-unused count on demand.",
-      "default": false
-    },
     "inspections.alphaUnsorted": {
       "type": "boolean",
       "title": "Report alphabetically unsorted files",
@@ -72,7 +54,7 @@
     "compilerClasspathProfile": {
       "type": "string",
       "title": "Optional compiler dependency JAR profile (absolute path)",
-      "description": "Externally provisioned PROPERTIES_CLASSPATH_V1 profile listing exact absolute JAR paths, one per line. Only explicit manual Java analysis uses it; no annotation processors or application bootstrap.",
+      "description": "A text file whose first line is PROPERTIES_CLASSPATH_V1, followed by the absolute path of each dependency JAR your sources need, one per line. Used only when you run the compiler-based usage search or key change.",
       "default": ""
     }
   }

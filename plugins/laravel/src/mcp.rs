@@ -544,7 +544,7 @@ mod tests {
         let request = json!({"runner":"php","command":"app:probe","token":catalog["token"],"requestId":"agent-execution-0001","values":{"name":"A"}});
         assert!(matches!(
             plugin.call("artisan_execute", &request.to_string(), &ctx),
-            Err(Error::Denied(_))
+            Err(Error::Invalid(message)) if message.contains("process:php permission")
         ));
     }
 }

@@ -399,10 +399,15 @@ impl Flyway {
     }
     pub(crate) fn source_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
         let _ = self.source_definition(doc, Position::new(0, 0));
+        let mut markers = self.table_navigation.markers(doc);
+        markers.extend(self.placeholder_markers(doc));
+        markers
+    }
+    /// One marker per distinct placeholder of a line, each to its declaration in the cached configuration.
+    fn placeholder_markers(&self, doc: &Document) -> Vec<LineMarker> {
         let Some(tokens) = sql(&doc.text).filter(|_| doc.language == "sql") else {
             return vec![];
         };
-
         let Some(root) = host::project_of(&doc.path).and_then(|p| p.root().ok()) else {
             return vec![];
         };
@@ -413,22 +418,19 @@ impl Flyway {
         if !owner.files.contains_key(&doc.path) {
             return vec![];
         }
-        let mut markers = Vec::new();
-        let mut lines = BTreeSet::new();
+        let mut lines: BTreeMap<u32, Vec<Location>> = BTreeMap::new();
         for t in tokens {
-            if !lines.insert(t.range.start.line) {
+            let Some(definition) = owner.proof.definitions.iter().find(|d| d.name == t.name) else {
                 continue;
-            }
-            if let Some(definition) = owner.proof.definitions.iter().find(|d| d.name == t.name) {
-                markers.push(LineMarker {
-                    line: t.range.start.line,
-                    icon: Some(crate::PLACEHOLDER_MARKER.into()),
-                    tooltip: "Declared Flyway placeholder in cached source configuration; runtime overrides are not resolved".into(),
-                    target: Some(Location { path: owner.proof.path.clone(), range: definition.range }),
-                });
+            };
+            let target = Location { path: owner.proof.path.clone(), range: definition.range };
+            let targets = lines.entry(t.range.start.line).or_default();
+            if !targets.contains(&target) {
+                targets.push(target);
             }
         }
-        markers
+        const TOOLTIP: &str = "Declared Flyway placeholder in cached source configuration; runtime overrides are not resolved";
+        lines.into_iter().flat_map(|(line, targets)| crate::line_markers(line, crate::PLACEHOLDER_MARKER, TOOLTIP, targets)).collect()
     }
 }
 
@@ -479,6 +481,19 @@ mod tests {
         assert_eq!(back[0].path, SQL);
         assert_eq!(back[0].range, Range::new(Position::new(1, 12), Position::new(1, 16)));
         assert_eq!(p.line_markers(&d)[0].target.as_ref().unwrap().range, found[0].range);
+    }
+    #[test]
+    fn every_placeholder_of_a_line_gets_its_own_marker() {
+        let h = MockHost::install();
+        h.add_file("flyway.conf", "flyway.placeholders.seed=42\nflyway.placeholders.owner=app\n");
+        let mut p = Flyway::default();
+        let d = doc(SQL, "select '${seed}', '${owner}', '${seed}', '${unknown}';\nselect 1;\n");
+        assert!(p.line_markers(&d).is_empty(), "a cold cache gives no marker");
+        let project = host::project_of(SQL).unwrap();
+        p.navigation.warm(&project, &config::load(&project));
+        let markers = p.line_markers(&d);
+        let targets: Vec<_> = markers.iter().map(|m| (m.line, m.icon.as_deref(), m.target.as_ref().unwrap().range.start)).collect();
+        assert_eq!(targets, [(0, Some(crate::PLACEHOLDER_MARKER), Position::new(0, 20)), (0, Some(crate::PLACEHOLDER_MARKER), Position::new(1, 20))]);
     }
     #[test]
     fn toml_literal_keys_have_exact_token_ranges_and_unknown_tables_are_quiet() {

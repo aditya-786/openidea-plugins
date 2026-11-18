@@ -11,14 +11,27 @@ pub fn check(text: &str) -> Vec<Finding> {
     model::check(text)
 }
 /// `check` plus findings that need the project: import closure bean refs and `mvc:resources` locations.
-pub(crate) fn check_in_project(doc: &Document) -> Vec<Finding> {
+pub(crate) fn check_in_project(doc: &Document, imported_elsewhere: &dyn Fn() -> bool) -> Vec<Finding> {
     let mut out = check(&doc.text);
     if let Some(project) = spring_text::index::project_of(&doc.path) {
         let read = |p: &str| project.read_file(p).ok().filter(|t| t.len() <= 256 << 10);
         let find = |glob: &str| project.find_files(glob, 200).ok();
-        out.extend(model::context_findings(&doc.path, &doc.text, &read, &find));
+        out.extend(model::context_findings(&doc.path, &doc.text, &read, &find, imported_elsewhere));
     }
     out
+}
+
+/// The `resource` of every `<import>` of a Spring XML file.
+pub(crate) fn imports(_path: &str, text: &str) -> Option<Vec<String>> {
+    if !text.contains("import") {
+        return None;
+    }
+    let found: Vec<String> = spring_text::xml::elements(text)
+        .iter()
+        .filter(|e| e.local() == "import")
+        .filter_map(|e| e.value("resource").map(str::to_owned))
+        .collect();
+    (!found.is_empty()).then_some(found)
 }
 pub(crate) fn definition(doc: &Document, at: Position) -> Vec<Location> {
     model::definition(doc, at)
@@ -141,6 +154,11 @@ mod tests {
         assert!(check(&other).is_empty());
     }
     #[test]
+    fn jdbc_url_amp_keeps_mvc_xml_checks() {
+        let d = doc("<m:view-controller/><bean url='jdbc:h2:mem:db?a=1&amp;b=2'/>");
+        assert_eq!(check(&d.text).len(), 1);
+    }
+    #[test]
     fn completion_uses_current_unsaved_utf16_value_spans_without_host_access() {
         let _h = MockHost::install().with_capabilities(&[]);
         let d = doc("<!--😀-->\r\n<m:annotation-driven ignore-default-model-on-redirect='fa'/>");
@@ -241,7 +259,14 @@ mod tests {
                     .collect()
             })
         };
-        model::context_findings(path, &d.text, &read, &find)
+        let file = path.rsplit('/').next().unwrap_or(path);
+        let imported_elsewhere = || {
+            let Some(listed): Option<Vec<String>> = find("**/*.xml") else {
+                return true;
+            };
+            listed.iter().filter(|f| f.as_str() != path).any(|f| read(f).is_none_or(|t| t.contains(file) && t.contains("import")))
+        };
+        model::context_findings(path, &d.text, &read, &find, &imported_elsewhere)
             .into_iter()
             .map(|f| (f.code, d.text[f.start..f.end].to_string()))
             .collect()

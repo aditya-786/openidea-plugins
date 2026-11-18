@@ -157,10 +157,10 @@ pub(crate) fn resolve(
     let mut proposed = doc.text.clone();
     proposed.replace_range(start..end, &edit.text);
     let preview = format!(
-        "Source/target: {}\nVersion: {}\nAction: {}\n\nExact resulting service file:\n{proposed}\n\nConstructor values/tags are source-based suggestions; effective runtime wiring is unknown. One atomic existing-file edit; no other file is changed.",
-        doc.path, doc.version, pending.title
+        "Edits {}: {}.\nThe values are suggestions; check them. No other file changes.\nUndo in the editor.\n\nResulting file:\n{proposed}",
+        doc.path, pending.title
     );
-    if !ui_kit::prompts::confirm_exact("Generate service arguments/tags?", &preview)? {
+    if !ui_kit::prompts::confirm_exact("Add service arguments and tags?", &preview)? {
         return Err(Error::Cancelled);
     }
     current(owner, &pending, doc)?;

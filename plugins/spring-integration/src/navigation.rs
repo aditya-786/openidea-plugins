@@ -1,7 +1,6 @@
 //! Bounded current-text XML candidates, deliberately separate from host Rename.
 use crate::*;
 use openidea_plugin::hover::{Hover, HoverProvider};
-use quick_xml::{events::Event, reader::NsReader};
 const MAX_TEXT: usize = 32 << 10;
 const MAX_TOKENS: usize = 256;
 const BEANS: &str = "http://www.springframework.org/schema/beans";
@@ -12,59 +11,16 @@ struct Token {
     declaration: bool,
     collides: bool,
 }
-fn literal(value: &str) -> bool {
-    let mut chars = value.bytes();
-    value.len() <= 128
-        && chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
-}
+use spring_text::provenance::literal;
 fn tokens(doc: &Document) -> Option<Vec<Token>> {
     if doc.language != "xml"
         || !doc.path.ends_with(".xml")
         || doc.text.len() > MAX_TEXT
-        || doc.text.contains('&')
         || beans::ignored(&doc.path)
     {
         return None;
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10);
-    let mut reader = NsReader::from_str(&doc.text);
-    let mut roots = 0;
-    let mut depth = 0usize;
-    for count in 0..=4096 {
-        if count == 4096 || std::time::Instant::now() >= deadline {
-            return None;
-        }
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                if depth == 0 {
-                    roots += 1;
-                }
-                if !crate::xml_namespaces::valid(&reader, &e) {
-                    return None;
-                }
-                depth += 1;
-            }
-            Ok(Event::Empty(e)) => {
-                if depth == 0 {
-                    roots += 1;
-                }
-                if !crate::xml_namespaces::valid(&reader, &e) {
-                    return None;
-                }
-            }
-            Ok(Event::End(_)) => {
-                depth = depth.checked_sub(1)?;
-            }
-            Ok(Event::DocType(_) | Event::GeneralRef(_)) | Err(_) => return None,
-            Ok(Event::Text(t)) if depth == 0 && !t.as_ref().bytes().all(|b| b.is_ascii_whitespace()) => return None,
-            Ok(Event::CData(_)) if depth == 0 => return None,
-            Ok(Event::Decl(_)) if depth != 0 || roots != 0 => return None,
-            Ok(Event::Eof) => break,
-            _ => {}
-        }
-    }
-    if roots != 1 || depth != 0 {
+    if !spring_text::xml::analysis_valid(&doc.text) {
         return None;
     }
     let elements = xml::elements(&doc.text);
@@ -77,7 +33,6 @@ fn tokens(doc: &Document) -> Option<Vec<Token>> {
     // only one Integration channel element spells that name.
     let mut occupied = BTreeSet::new();
     for (i, element) in elements.iter().enumerate().skip(1) {
-        if std::time::Instant::now() >= deadline { return None; }
         let namespace = xml::namespace(&elements, i);
         if namespace == Some(NAMESPACE) {
             // Endpoint IDs are bean registrations too. Only the direct channel
@@ -102,7 +57,7 @@ fn tokens(doc: &Document) -> Option<Vec<Token>> {
     }
     let mut result = Vec::new();
     for (i, e) in elements.iter().enumerate().filter(|(_, e)| e.parent == Some(0)) {
-        if std::time::Instant::now() >= deadline || e.name.matches(':').count() > 1 {
+        if e.name.matches(':').count() > 1 {
             return None;
         }
         if xml::namespace(&elements, i) != Some(NAMESPACE) {
@@ -154,6 +109,9 @@ pub(crate) fn definition(doc: &Document, at: Position) -> Option<Vec<Location>> 
     let tokens = tokens(doc)?;
     let token = selected(&tokens, at)?;
     let declarations: Vec<_> = tokens.iter().filter(|t| t.declaration && t.name == token.name).collect();
+    if declarations.is_empty() && !token.collides {
+        return None;
+    }
     Some(if declarations.len() == 1 && !token.declaration && !token.collides {
         vec![Location { path: doc.path.clone(), range: declarations[0].range }]
     } else {
@@ -166,26 +124,25 @@ fn integration_hover(doc:&Document,at:Position)->Option<Hover>{
         let declarations: Vec<_> = tokens.iter().filter(|t| t.declaration && t.name == token.name).collect();
         let references = tokens.iter().filter(|t| !t.declaration && t.name == token.name).count();
         let ownership = if token.collides {
-            "A local bean/endpoint ID, bean name or alias also registers this spelling: source ownership is ambiguous; Go to Declaration is suppressed.".into()
+            "Another bean, endpoint ID or alias uses this name, so Go to Declaration is off.".into()
         } else { match declarations.as_slice() {
-            [one] => format!("One literal channel declaration in this file at line {}.", one.range.start.line + 1),
-            [] => "No supported local declaration; imported contexts, Java configuration and runtime channels are unresolved.".into(),
-            _ => "Multiple local declarations: ambiguous; Go to Declaration is suppressed.".into(),
+            [one] => format!("Declared in this file at line {}.", one.range.start.line + 1),
+            [] => "Not declared in this file; it may be declared elsewhere in the project.".into(),
+            _ => "Declared more than once in this file, so Go to Declaration is off.".into(),
         }};
-        Some(Hover::new(format!("**Spring Integration channel** `{}`\n\n{ownership}\n\n{references} supported literal reference(s) in this current file. Source candidates only: profiles, imports and bean types are not resolved. Host Find Usages/Rename is intentionally not published.",token.name)).range(token.range))
+        Some(Hover::new(format!("**Spring Integration channel** `{}`\n\n{ownership}\n\n{references} reference(s) in this file.",token.name)).range(token.range))
 }
 impl HoverProvider for crate::structure::Structure {
     fn hover(&mut self,doc:&Document,at:Position)->Option<Hover>{integration_hover(doc,at).or_else(||crate::batch_navigation::hover(doc,at)).or_else(||crate::java_hover::hover(doc,at))}
 }
 
 fn current_source(ctx: &Invocation) -> Result<(String, Document, Position), Error> {
-    let root = ctx.project().ok_or(Error::Stale)?.root()?;
-    let editor = ctx.editor().ok_or("Open an XML channel configuration and place the caret on a channel name.")?;
+    let root = ctx.project().ok_or("Open a project first.")?.root()?;
+    let editor = ctx.editor().ok_or_else(|| format!("Open a Java or XML file and place the caret on a channel name. {}", ui_kit::denied::message("Find Channel Usages in This File", "editor.read", "Spring Structure Tools")))?;
     let current = editor.document()?;
     let at = editor.selections()?.first().map(|selection| selection.start).ok_or(Error::Stale)?;
     let doc = Document { path: editor.path(), language: editor.language(), text: current.text, version: current.version };
-    if !root.starts_with('/') || root == "/" || !doc.path.starts_with(&format!("{root}/"))
-        || host::project_of(&doc.path).and_then(|p| p.root().ok()).as_deref() != Some(root.as_str()) {
+    if spring_text::index::owning_root(&doc.path).as_deref() != Some(root.as_str()) {
         return Err(Error::Stale);
     }
     Ok((root, doc, at))
@@ -198,10 +155,10 @@ fn unchanged_source(ctx: &Invocation, root: &str, doc: &Document) -> Result<(), 
 /// Physical current-file occurrences, never a global usages or Rename graph.
 pub(crate) fn occurrences(ctx: &Invocation) -> Result<Option<String>, Error> {
     let (root, doc, at) = current_source(ctx)?;
-    let tokens = tokens(&doc).ok_or("This current file is outside the bounded literal XML channel model.")?;
-    let token = selected(&tokens, at).ok_or("Place the caret on a supported literal channel ID or reference.")?;
+    let tokens = tokens(&doc).ok_or("Channel usages work in Spring XML and Java files. This file isn't one, can't be parsed, or is too large.")?;
+    let token = selected(&tokens, at).ok_or("Place the caret on a channel name.")?;
     if token.collides || tokens.iter().filter(|t| t.declaration && t.name == token.name).count() != 1 {
-        return Err("A unique current-file channel declaration without competing literal registrations is required; effective ownership is unresolved.".into());
+        return Err("Needs exactly one declaration in this file and no other bean with the same name.".into());
     }
     let locations: Vec<_> = tokens.iter().filter(|t| t.name == token.name).collect();
     let items: Vec<_> = locations.iter().enumerate().map(|(i, t)| {
@@ -212,7 +169,7 @@ pub(crate) fn occurrences(ctx: &Invocation) -> Result<Option<String>, Error> {
     let destination = choice.parse::<usize>().ok().and_then(|i| locations.get(i)).ok_or(Error::Stale)?.range.start;
     unchanged_source(ctx, &root, &doc)?;
     host::open_location(&doc.path, destination.line, destination.character)?;
-    Ok(Some("Navigated within this current XML source only. Profiles/imports/runtime ownership and global usages/Rename remain unresolved.".into()))
+    Ok(Some("Opened the occurrence in this file.".into()))
 }
 
 #[cfg(test)]
@@ -243,30 +200,30 @@ mod tests {
         assert_eq!(found[0].range.end.character - found[0].range.start.character, 6);
         let mut owner = crate::structure::Structure::default();
         let hover = owner.hover(&doc, at(&doc, "orders")).unwrap();
-        assert!(hover.markdown.contains("1 supported literal"));
-        assert!(hover.markdown.contains("Rename"));
+        assert!(hover.markdown.contains("1 reference"));
         assert!(host.requests().is_empty());
         let changed = Document { text: doc.text.replace("id=\"orders\"", "id=\"renamed\""), ..doc };
-        assert!(definition(&changed, at(&changed, "orders")).unwrap().is_empty());
+        assert!(definition(&changed, at(&changed, "orders")).is_none());
     }
     #[test]
     fn ambiguous_and_absent_local_declarations_never_choose_global_name() {
-        for body in ["<i:channel id=\"x\"/><i:channel id=\"x\"/><i:bridge input-channel=\"x\"/>", "<i:bridge input-channel=\"x\"/>"] {
-            let d = doc(body);
-            assert!(definition(&d, at(&d, "x")).unwrap().is_empty());
-        }
+        let d = doc("<i:channel id=\"x\"/><i:channel id=\"x\"/><i:bridge input-channel=\"x\"/>");
+        assert!(definition(&d, at(&d, "x")).unwrap().is_empty());
+        let d = doc("<i:bridge input-channel=\"x\"/>");
+        assert!(definition(&d, at(&d, "x")).is_none(), "a project-wide declaration may exist");
     }
     #[test]
     fn unknown_namespaces_escaped_values_nested_profiles_and_malformed_are_quiet() {
         for body in [
             "<i:channel id=\"x\"/><i:bridge input-channel=\"${x}\"/>",
-            "<i:channel id=\"x\"/><i:bridge input-channel=\"&#120;\"/>",
             "<beans profile=\"a\"><i:channel id=\"x\"/><i:bridge input-channel=\"x\"/></beans>",
             "<i:channel id=\"x\"><i:bridge input-channel=\"x\"/>",
         ] {
             let d = doc(body);
-            assert!(definition(&d, at(&d, "x")).is_none());
+            assert!(definition(&d, at(&d, "x")).is_none(), "{body}");
         }
+        let d = doc("<i:channel id=\"x\"/><i:bridge input-channel=\"&#120;\"/>");
+        assert_eq!(definition(&d, at(&d, "x")), Some(Vec::new()), "the lone declaration has no other place to go to");
         let d = doc("<i:channel id=\"x\"/><i:bridge input-channel=\"x\"/>");
         let foreign = Document { text: d.text.replace(NAMESPACE, &format!("{NAMESPACE}-fake")), ..d };
         assert!(definition(&foreign, at(&foreign, "x")).is_none());
@@ -286,7 +243,7 @@ mod tests {
             let d = doc(&format!("<!--😀--><i:channel id='orders'/>{collision}<i:bridge input-channel='orders'/>"));
             let at = at(&d, "orders");
             assert!(owner.definition(&d, at).is_empty(), "{collision}");
-            assert!(owner.hover(&d, at).unwrap().markdown.contains("ownership is ambiguous"));
+            assert!(owner.hover(&d, at).unwrap().markdown.contains("uses this name"));
             let fixed = Document { text: d.text.replace(collision, ""), ..d.clone() };
             assert_eq!(owner.definition(&fixed, self::at(&fixed, "orders")).len(), 1);
         }
@@ -310,7 +267,7 @@ mod tests {
         let message = owner.run_command("integration.current-file-channel-occurrences", &h.invocation(), None).unwrap().unwrap();
         let expected = tokens(&d).unwrap()[0].range.start;
         assert_eq!(h.opened_locations(), [(d.path.clone(), expected.line, expected.character)]);
-        assert!(message.contains("current XML source only"));
+        assert!(message.contains("Opened the occurrence"));
         assert!(h.requests().is_empty() && h.process_runs().is_empty());
         let h = command_host(&d, tokens(&d).unwrap()[0].range.start);
         h.answer_next_prompt(Some(&["2"]));

@@ -1,12 +1,17 @@
 //! DDEV's unmodified, bundled schema. No schema or ref is fetched on the
 //! editing path; the complete Draft 7 validator has network/file resolving off.
 use serde_json::Value;
-use std::{collections::BTreeMap, sync::OnceLock};
+use std::{
+    collections::BTreeMap,
+    sync::{Mutex, OnceLock},
+};
 
 pub const VERSION: &str = "DDEV v1.25.5";
 pub struct Schema {
+    // Never mutated after init, so the pointer-keyed condition cache stays valid.
     pub root: Value,
     pub validator: jsonschema::Validator,
+    conditions: Mutex<BTreeMap<usize, Option<std::sync::Arc<jsonschema::Validator>>>>,
 }
 static PROJECT: OnceLock<Schema> = OnceLock::new();
 static GLOBAL: OnceLock<Schema> = OnceLock::new();
@@ -15,7 +20,11 @@ pub fn project() -> &'static Schema {
         let root: Value = serde_json::from_str(include_str!("../../schemas/project-v1.25.5.json"))
             .expect("bundled DDEV schema JSON");
         let validator = jsonschema::validator_for(&root).expect("bundled DDEV schema compiles");
-        Schema { root, validator }
+        Schema {
+            root,
+            validator,
+            conditions: Mutex::default(),
+        }
     })
 }
 pub fn global() -> &'static Schema {
@@ -24,13 +33,33 @@ pub fn global() -> &'static Schema {
             .expect("bundled global DDEV schema JSON");
         let validator =
             jsonschema::validator_for(&root).expect("bundled global DDEV schema compiles");
-        Schema { root, validator }
+        Schema {
+            root,
+            validator,
+            conditions: Mutex::default(),
+        }
     })
 }
 
 impl Schema {
+    fn condition_holds(&self, condition: &Value, instance: &Value) -> bool {
+        let key = std::ptr::from_ref(condition) as usize;
+        let compiled = self
+            .conditions
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| {
+                jsonschema::validator_for(condition)
+                    .ok()
+                    .map(std::sync::Arc::new)
+            })
+            .clone();
+        compiled.is_some_and(|validator| validator.is_valid(instance))
+    }
     pub fn variants<'a>(&'a self, schemas: &[&'a Value], instance: &Value) -> Vec<&'a Value> {
         fn visit<'a>(
+            schema: &Schema,
             root: &'a Value,
             s: &'a Value,
             instance: &Value,
@@ -47,29 +76,29 @@ impl Schema {
                 .and_then(|s| s.strip_prefix('#'))
                 && let Some(target) = root.pointer(reference)
             {
-                visit(root, target, instance, out, depth + 1);
+                visit(schema, root, target, instance, out, depth + 1);
             }
             for keyword in ["allOf", "anyOf", "oneOf"] {
                 if let Some(list) = s.get(keyword).and_then(Value::as_array) {
                     for branch in list {
-                        visit(root, branch, instance, out, depth + 1);
+                        visit(schema, root, branch, instance, out, depth + 1);
                     }
                 }
             }
             if let Some(condition) = s.get("if") {
-                let branch = if jsonschema::is_valid(condition, instance) {
+                let branch = if schema.condition_holds(condition, instance) {
                     "then"
                 } else {
                     "else"
                 };
                 if let Some(branch) = s.get(branch) {
-                    visit(root, branch, instance, out, depth + 1);
+                    visit(schema, root, branch, instance, out, depth + 1);
                 }
             }
         }
         let mut out = vec![];
         for s in schemas {
-            visit(&self.root, s, instance, &mut out, 0);
+            visit(self, &self.root, s, instance, &mut out, 0);
         }
         out
     }

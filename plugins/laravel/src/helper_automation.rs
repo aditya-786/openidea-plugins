@@ -269,6 +269,36 @@ fn load_session(
     projects.insert(root, restore(project, runner)?);
     Ok(true)
 }
+/// A short readable status for the output panel.
+pub(crate) fn summary(state: &Value) -> String {
+    let mut lines = vec![match state["job"]["command"].as_str() {
+        Some(command) if state["job"]["running"] == true => crate::ui_text::format("native.helper.summaryRunning", "Running: {command}", &[("command", command)]),
+        _ => crate::ui_text::t("native.helper.summaryIdle", "No helper command is running."),
+    }];
+    if let Some(queued) = state["queued"].as_u64().filter(|queued| *queued > 0) {
+        lines.push(crate::ui_text::format("native.helper.summaryQueued", "Waiting to run: {count}", &[("count", &queued.to_string())]));
+    }
+    if state["paused"] == true {
+        lines.push(crate::ui_text::t("native.helper.summaryPaused", "Paused after an interruption. Run Laravel: Run Pending Model Helper Commands to continue."));
+    }
+    if let Some(reason) = state["reason"].as_str() {
+        lines.push(reason.into());
+    }
+    for entry in state["history"].as_array().into_iter().flatten().take(8) {
+        let outcome = if entry["cancelled"] == true {
+            crate::ui_text::t("native.helper.summaryCancelled", "cancelled")
+        } else if entry["interrupted"] == true {
+            crate::ui_text::t("native.helper.summaryInterrupted", "interrupted")
+        } else {
+            match entry["status"].as_i64() {
+                Some(code) => crate::ui_text::format("native.helper.summaryExit", "exit code {code}", &[("code", &code.to_string())]),
+                None => crate::ui_text::t("native.helper.summaryUnknown", "unknown result"),
+            }
+        };
+        lines.push(format!("- {}: {outcome}", entry["command"].as_str().unwrap_or("artisan")));
+    }
+    lines.join("\n")
+}
 fn empty_state(stopped: bool) -> Value {
     json!({"paused":false,"interrupted":null,"pending":false,"queued":0,"job":null,"history":[],"reason":if stopped{Some(crate::ui_text::text("process.helper.text19","Stopped by user"))}else{None}})
 }
@@ -328,7 +358,7 @@ fn commands_valid(commands: &[Vec<String>]) -> bool {
                     .all(|arg| arg.len() <= 4096 && !arg.chars().any(char::is_control))
         })
 }
-fn apply_edits(source: &str, edits: &[TextEdit]) -> Result<String, Error> {
+pub(crate) fn apply_edits(source: &str, edits: &[TextEdit]) -> Result<String, Error> {
     let mut ranges = edits
         .iter()
         .map(|edit| {

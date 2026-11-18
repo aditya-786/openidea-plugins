@@ -4,16 +4,24 @@ version = "0.3.0" # x-release-please-version
 description = "Spring Dynamic Modules (Spring OSGi) support for Spring XML files. Checks <osgi:service>, <osgi:reference>, <osgi:list>/<osgi:set> and their listeners: conflicting declarations, service beans that don't implement the exported interfaces, listener methods with a wrong signature, and listeners that don't implement OsgiServiceLifecycleListener. Adds Go to Definition and completion for bean references, exported interfaces and listener methods."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Unreleased: source-only XML checks do not require project/editor grants; source discovery and generation degrade through optional project/editor capabilities and fail without writes when denied.  exported service types must be source-established before mismatch errors; unknown inline factory types stay quiet and bean completion text is XML-escaped.  Java bean facts require owned annotation/literal-name metadata; computed, inner, profile and factory XML roles no longer prove global bean types, and missing-source-name Info messages retain incomplete provenance.  lazy generation resolution rechecks project-visible source text before and after prompts, refusing stale actual buffers while keeping host-owned atomic apply/undo.  cached OSGi source facts respect current innermost project ownership and cold-cache transitions after open-project/grant changes; navigation/completion alone warm files.  scoped OSGi/Beans XML namespace ownership for live checks/navigation/hover, quiet invalid-source cache recovery and scoped compendium tag suggestions; generation retains atomic source-local operations with strict XML validation.  unresolved ref, comparator-ref and depends-on reported as Info, ref completion sorts implementors of the exported interfaces first, osgix compendium tag completion. OSGi generation is available exclusively through lazy reviewed FileActions. 0.1.0 (first release): Spring OSGi inspections (elements inconsistency, service, listener) and reference navigation and completion."
+change-notes = """\
+Next release: Setting to turn the checks off, and XML checks work without extra permissions, also in files with a DOCTYPE or character entities, and are faster on large files; unresolved references are reported as plainer hints, completion lists matching implementations first, and Kotlin projects no longer get false 'No bean named' hints; diagnostics keep working after you open or save a file, re-read only that file, and survive one oversized or unparseable Java file; generating a bean asks you to save an unsaved file first and works on Windows drives, with one name per command and clearer permission messages, shown only for Spring OSGi files. \
+0.3.0: more XML checks and code generation with a preview. \
+0.2.0: plugin icon and service checks. \
+0.1.0: OSGi service and listener inspections with navigation and completion."""
 categories = ["frameworks"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-language:xml"]
 
 [capabilities]
 required = []
 optional = ["project.read", "events"]
+
+[contributes.settings]
+schema = "settings.schema.json"
+title = "Spring OSGi"
 
 [[contributes.providers]]
 kinds = ["completion", "definition", "diagnostics", "code-actions", "hover"]

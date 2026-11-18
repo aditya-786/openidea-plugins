@@ -73,7 +73,9 @@ impl QuarkusTools {
         let Ok(root) = project.root() else {
             return;
         };
-        self.uses_quarkus(path);
+        if !self.uses_quarkus(path) {
+            return;
+        }
         self.warm_qute(path);
         if let Some(text) = text {
             self.sources.update_existing(&project, path, Some(text));
@@ -625,4 +627,38 @@ mod tests {
         tools.warm_live(&current.path,None,Instant::now()+Duration::from_secs(1));assert!(tools.definition(&current,at).is_empty());
     }
 
+    #[test]
+    fn no_warm_without_quarkus_dependency() {
+        let host = MockHost::install();
+        host.add_file("pom.xml", "<project/>");
+        host.add_file("src/main/java/App.java", "class App {}");
+        let mut tools = QuarkusTools::default();
+        tools.activate_live();
+        tools.warm_live(JAVA, Some("class App {}"), Instant::now() + Duration::from_secs(1));
+        assert!(tools.live.env.is_empty());
+    }
+    #[test]
+    fn env_refreshed_on_save() {
+        let (host, mut tools) = setup();
+        host.add_file(".env", "A=1\n");
+        tools.live_events(&[Event::FileOpened(format!("{ROOT}/.env"))]);
+        assert!(tools.live.env[ROOT].as_ref().unwrap().contains("a"));
+        host.add_file(".env", "B=1\n");
+        tools.live_events(&[Event::FileSaved(format!("{ROOT}/.env"))]);
+        let keys = tools.live.env[ROOT].as_ref().unwrap();
+        assert!(keys.contains("b") && !keys.contains("a"));
+    }
+    #[test]
+    fn quarkus_dependency_added_later_starts_warming() {
+        let host = MockHost::install();
+        host.add_file("pom.xml", "<project/>");
+        host.add_file(".env", "a=1\n");
+        let mut tools = QuarkusTools::default();
+        tools.activate_live();
+        tools.warm_live(JAVA, None, Instant::now() + Duration::from_secs(1));
+        assert!(tools.live.env.is_empty());
+        host.add_file("pom.xml", "<project><dependencies><dependency><groupId>io.quarkus</groupId><artifactId>quarkus-rest</artifactId></dependency></dependencies></project>");
+        tools.live_events(&[Event::FileSaved(format!("{ROOT}/pom.xml"))]);
+        assert!(tools.live.env.contains_key(ROOT));
+    }
 }

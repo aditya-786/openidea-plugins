@@ -18,6 +18,17 @@ pub fn bundled() -> &'static Catalog {
     })
 }
 
+/// Whether a key of Spring Boot's own metadata has a type of this simple name.
+pub(crate) fn library_type(name: &str) -> bool {
+    static TYPES: OnceLock<std::collections::BTreeSet<String>> = OnceLock::new();
+    TYPES
+        .get_or_init(|| spring_text::metadata::Lookup(vec![bundled()])
+                .all()
+                .map(|prop| prop.ty.clone())
+                .collect())
+        .contains(name)
+}
+
 /// Dataset origin from the packaged snapshot, never the project's effective version.
 pub(crate) fn bundled_origin() -> &'static str {
     include_str!("../data/boot-properties.tsv")

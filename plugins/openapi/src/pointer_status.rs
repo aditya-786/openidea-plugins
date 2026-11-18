@@ -349,15 +349,36 @@ impl Proof {
         let key=self.source.get(&path).and_then(|index|self.keys.get(*index))?;
         (key.at<key.end).then(||spring_text::range(&self.text,key.at,key.end))
     }
-    pub fn operation_reference(&self,operation:&spec::Operation)->Option<(String,openidea_plugin::Range)> {
-        self.operation_owner(operation)?;
+    /// Every resolvable local `$ref` of the operation in source order, one per distinct target.
+    pub fn operation_references(&self,operation:&spec::Operation)->Vec<(String,openidea_plugin::Range)> {
+        if self.operation_owner(operation).is_none() {return Vec::new();}
         let prefix=format!("/paths/{}/{}/",operation.path.replace('~',"~0").replace('/',"~1"),operation.method.to_ascii_lowercase());
-        self.reference_paths.range(prefix.clone()..).take_while(|(pointer,_)|pointer.starts_with(&prefix))
+        let mut found:Vec<_>=self.reference_paths.range(prefix.clone()..).take_while(|(pointer,_)|pointer.starts_with(&prefix))
             .filter_map(|(_, (at,target))| {
                 let pointer=target.strip_prefix('#')?;
                 let location=self.pointer_location(pointer)?;
                 Some((*at,target.clone(),location))
-            }).min_by_key(|(at,_,_)|*at).map(|(_,target,location)|(target,location))
+            }).collect();
+        found.sort_by_key(|(at,_,_)|*at);
+        let mut seen=std::collections::HashSet::new();
+        found.into_iter().filter(|(_,_,location)|seen.insert((location.start.line,location.start.character)))
+            .map(|(_,target,location)|(target,location)).collect()
+    }
+    /// Components of this document with the local `$ref` value spans that point at them or a descendant, in source order.
+    pub fn component_usages(&self)->Vec<(String,openidea_plugin::Range,Vec<openidea_plugin::Range>)> {
+        let mut grouped:BTreeMap<String,Vec<openidea_plugin::Range>>=BTreeMap::new();
+        for ((from,to),target) in &self.references {
+            let Some(pointer)=target.strip_prefix("#/components/") else {continue;};
+            let owner=pointer.splitn(3,'/').take(2).collect::<Vec<_>>().join("/");
+            grouped.entry(format!("/components/{owner}")).or_default().push(spring_text::range(&self.text,*from,*to));
+        }
+        let mut usages:Vec<_>=grouped.into_iter().filter_map(|(base,uses)| {
+            let base=self.component_base(&base)?;
+            let declaration=self.pointer_location(&base)?;
+            Some((base,declaration,uses))
+        }).collect();
+        usages.sort_by_key(|(_,declaration,_)|(declaration.start.line,declaration.start.character));
+        usages
     }
 
 }

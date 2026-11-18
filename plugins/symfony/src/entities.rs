@@ -2,7 +2,6 @@
 //! Attribute mapping only (legacy annotations, XML and YAML mappings are not read).
 use crate::index::{Entry, Lines};
 use crate::php_text::{self, Target};
-use openidea_plugin::Position;
 
 const ENTITY: &str = "Doctrine\\ORM\\Mapping\\Entity";
 const TABLE: &str = "Doctrine\\ORM\\Mapping\\Table";

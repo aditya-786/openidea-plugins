@@ -268,7 +268,7 @@ pub fn component_context(text: &str, at: usize) -> Option<ComponentContext> {
             }
         }
 
-        if tag_end.is_none_or(|end| end >= at) {
+        if name_end <= at && tag_end.is_none_or(|end| end >= at) {
             let attributes = &text[name_end..at];
             let mut open_quote = None;
             for character in attributes.chars() {
@@ -573,7 +573,7 @@ fn is_constraint_message(before: &str) -> bool {
 }
 
 pub fn translation_domain(language: &str, text: &str, reference: &Reference) -> Option<String> {
-    if language == "php" && is_constraint_message(text[..reference.start - 1].trim_end()) {
+    if language == "php" && is_constraint_message(text[..reference.start.checked_sub(1)?].trim_end()) {
         return Some("validators".to_owned());
     }
 
@@ -583,7 +583,7 @@ pub fn translation_domain(language: &str, text: &str, reference: &Reference) -> 
         let open = after.starts_with('(').then(|| text.len() - after.len());
         (open, 1)
     } else {
-        let before = text[..reference.start - 1].trim_end();
+        let before = text[..reference.start.checked_sub(1)?].trim_end();
         (before.ends_with('(').then(|| before.len() - 1), 2)
     };
 

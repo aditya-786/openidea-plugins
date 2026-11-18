@@ -97,6 +97,8 @@ pub struct Launcher {
     catalog_status: Option<String>,
     sections: Switcher,
     dependencies: dependencies::State,
+    /// Capabilities from `activate`; `None` before it ran.
+    granted: Option<Vec<String>>,
 }
 
 impl Default for Launcher {
@@ -114,6 +116,7 @@ impl Default for Launcher {
             catalog_status: None,
             sections: Switcher::new("initializr.section", SECTIONS),
             dependencies: Default::default(),
+            granted: None,
         }
     }
 }
@@ -268,8 +271,12 @@ impl Launcher {
         if self.get("groupId").is_empty() {
             return Some("The group is required.".into());
         }
-        if self.get("artifactId").is_empty() {
+        let artifact = self.get("artifactId");
+        if artifact.is_empty() {
             return Some("The artifact is required.".into());
+        }
+        if artifact.len() > 128 || artifact.starts_with('.') || !artifact.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+            return Some("The artifact must be a plain folder name of letters, digits, '.', '_' or '-', not starting with '.'.".into());
         }
         self.compatibility_problem()
     }
@@ -416,7 +423,7 @@ impl Launcher {
         let project=ctx.project().ok_or(Error::Stale)?;let root=project.root()?;
         if self.owner!=format!("project:{root}")||root.is_empty()||root=="/" {return Err(Error::Stale);}
         let artifact=self.get("artifactId");
-        if artifact.starts_with('.')||artifact.len()>128 {Self::warn("CLI destination must be a non-hidden artifact child of at most128bytes.");return Ok(());}
+        if artifact.starts_with('.')||artifact.len()>128 {Self::warn("CLI destination must be a non-hidden artifact child of at most 128 bytes.");return Ok(());}
         let target=format!("{}/{artifact}",root.trim_end_matches('/'));
         if host::project_of(&root).ok_or(Error::Stale)?.root()?!=root||host::project_of(&target).ok_or(Error::Stale)?.root()?!=root {return Err(Error::Stale);}
         if project.exists(&target)? {Self::warn("CLI destination already exists; no merge, overwrite or partial extraction is started.");return Ok(());}
@@ -425,7 +432,7 @@ impl Launcher {
                 host::notify(
                     NotificationLevel::Warning,
                     "Spring Initializr",
-                    "The Spring Boot CLI path needs the process:spring capability; downloading the project in the browser instead.",
+                    &format!("{} Downloading the project in the browser instead.", ui_kit::denied::message("Run Spring Boot CLI in Terminal", "process:spring", "Spring Initializr Launcher")),
                 );
                 host::open_url(&self.starter_url())
             }
@@ -463,6 +470,16 @@ impl Launcher {
         self.prepare_starters(ctx)
     }
 
+    /// A capability Generate and Open lacks; unknown grants (before activation) count as present.
+    fn missing_archive_capability(&self) -> Option<&'static str> {
+        let granted = self.granted.as_ref()?;
+        ["net:start.spring.io", "process:python3"].into_iter().find(|c| !granted.iter().any(|g| g == c))
+    }
+
+    fn archive_primary(&self) -> bool {
+        self.server == START && self.missing_archive_capability().is_none()
+    }
+
     /// The project zip.
     pub fn starter_url(&mut self) -> String {
         format!("{}/starter.zip?{}", self.get("server").trim_end_matches('/'), self.query())
@@ -483,19 +500,13 @@ impl Launcher {
         }
         let problem = self.problem();
         let generate = |button: Button| button.enabled(problem.is_none());
-        let status = match &problem {
-            Some(p) => p.clone(),
-            None => format!("Generate Project downloads {}.zip in the browser.", self.get("artifactId")),
+        let local_generation = problem.is_none() && self.server == START;
+        let status = match (&problem, &self.catalog_status) {
+            (Some(p), _) => p.clone(),
+            (None, Some(note)) if !note.starts_with("Server metadata refreshed") => note.clone(),
+            _ if self.archive_primary() => format!("Generate and Open creates {} in a folder you choose.", self.get("artifactId")),
+            _ => format!("Download ZIP downloads {}.zip in the browser.", self.get("artifactId")),
         };
-        let status = format!(
-            "{status} {}",
-            self.catalog_status.clone().unwrap_or_else(|| if self.metadata.is_some() {
-                "Using saved server metadata; Refresh updates compatibility facts.".into()
-            } else {
-                "Compatibility is unverified until server metadata is loaded.".into()
-            })
-        );
-        let status=if self.metadata.is_some() {format!("{status} Only advertised choices and supported ranges are checked; unspecified/unknown requirements remain unverified.")}else{status};
         let mut view = if self.sections.active() == DEPENDENCIES_SECTION {
             let (view, tree_status) = self.dependencies_tree();
             let status = if problem.is_some() { status } else { tree_status };
@@ -537,12 +548,12 @@ impl Launcher {
             View::new(Body::Form(fields)).status(&status)
         };
         view = view
-            .button(generate(Button::new("generate-archive", "Generate and Open…").icon("folder-open")))
-            .button(generate(Button::new("generate", "Generate Project").icon("export")))
-            .button(generate(Button::new("cli", "Generate with Spring Boot CLI").icon("terminal")))
+            .button(Button::new("generate-archive", "Generate and Open…").icon("folder-open").enabled(local_generation))
+            .button(generate(Button::new("generate", "Download ZIP").icon("export")))
+            .button(generate(Button::new("cli", "Run Spring Boot CLI in Terminal").icon("terminal")))
             .button(generate(Button::new("explore", "Explore in Browser").icon("external-link")))
-            .button(Button::new("prepare-import", "Prepare source-only import…").icon("import").enabled(_ctx.project().is_some()&&problem.is_none()))
-            .button(Button::new("open-reviewed-import", "Open reviewed source folder…").icon("folder-open").enabled(_ctx.project().is_some()&&self.import_issued()));
+            .button(Button::new("prepare-import", "Import Maven Project…").icon("import").enabled(_ctx.project().is_some()&&local_generation))
+            .button(Button::new("open-reviewed-import", "Open Source Folder").icon("folder-open").enabled(_ctx.project().is_some()&&self.import_issued()));
         if self.sections.active() == PROJECT_SECTION {
             view = view
                 .button(Button::new("choose-dependencies", "Dependencies").icon("package"))
@@ -557,7 +568,7 @@ impl Launcher {
     fn more_actions_snapshot(&mut self, view: &str, ctx: &Invocation) -> Result<MoreActions, Error> {
         let expanded = self.render_expanded(view, None, ctx)?;
         let saved = session::capture(&self.owner, &self.server).ok().map(|b| (b.state, b.selector));
-        Ok(MoreActions { expanded, owner: self.owner.clone(), server: self.server.clone(), saved })
+        Ok(MoreActions { expanded, owner: self.owner.clone(), server: self.server.clone(), saved, archive_primary: self.archive_primary() })
     }
 
     fn dispatch_more_action(&mut self, view: &str, snapshot: MoreActions, selected: Option<String>, ctx: &Invocation) -> Result<(), Error> {
@@ -577,15 +588,21 @@ struct MoreActions {
     owner: String,
     server: String,
     saved: Option<(Option<String>, Option<String>)>,
+    archive_primary: bool,
 }
 
-fn secondary_action(id: &str) -> bool {
-    matches!(id, "generate-archive" | "cli" | "explore" | "prepare-import" | "open-reviewed-import" | "pickBoot" | "reset" | "reload-saved" | "refreshCatalogue")
+/// Generate and Open is the primary action when it can run, else Download ZIP.
+fn secondary_action(id: &str, archive_primary: bool) -> bool {
+    match id {
+        "generate-archive" => !archive_primary,
+        "generate" => archive_primary,
+        _ => matches!(id, "cli" | "explore" | "prepare-import" | "open-reviewed-import" | "pickBoot" | "reset" | "reload-saved" | "refreshCatalogue"),
+    }
 }
 
 impl MoreActions {
     fn items(&self) -> Vec<PickItem> {
-        self.expanded.toolbar.iter().filter(|button| secondary_action(&button.id) && button.enabled)
+        self.expanded.toolbar.iter().filter(|button| secondary_action(&button.id, self.archive_primary) && button.enabled)
             .map(|button| PickItem::new(&button.id, &button.label)).collect()
     }
 }
@@ -594,9 +611,10 @@ impl Views for Launcher {
     fn render(&mut self, view: &str, viewport: Option<Viewport>, ctx: &Invocation) -> Result<View, Error> {
         (|| -> Result<View, Error> {
             let mut expanded = self.render_expanded(view, viewport, ctx)?;
-            let has_more = expanded.toolbar.iter().any(|button| secondary_action(&button.id) && button.enabled);
-            let has_secondary = expanded.toolbar.iter().any(|button| secondary_action(&button.id));
-            expanded.toolbar.retain(|button| !secondary_action(&button.id));
+            let primary = self.archive_primary();
+            let has_more = expanded.toolbar.iter().any(|button| secondary_action(&button.id, primary) && button.enabled);
+            let has_secondary = expanded.toolbar.iter().any(|button| secondary_action(&button.id, primary));
+            expanded.toolbar.retain(|button| !secondary_action(&button.id, primary));
             if has_secondary {
                 expanded = expanded.button(Button::new("more-actions", "More Actions…").icon("more-horizontal").enabled(has_more));
             }
@@ -645,7 +663,8 @@ impl Views for Launcher {
 }
 
 impl Plugin for Launcher {
-    fn activate(&mut self, _ctx: &openidea_plugin::Context) -> Result<(), Error> {
+    fn activate(&mut self, ctx: &openidea_plugin::Context) -> Result<(), Error> {
+        self.granted = Some(ctx.capabilities.clone());
         host::subscribe(openidea_plugin::EventKind::TerminalExited)
     }
     fn handle_events(&mut self, events: &[openidea_plugin::Event], ctx: &Invocation) {
@@ -739,7 +758,9 @@ mod tests {
             (options, chosen.as_str()),
             (vec!["Maven".into(), "Gradle - Groovy".into(), "Gradle - Kotlin".into()], "Gradle - Groovy")
         );
-        assert!(view.status.as_deref().unwrap().starts_with("Generate Project downloads demo.zip in the browser."));
+        assert!(view.status.as_deref().unwrap().starts_with("Catalogue refresh failed:"));
+        fresh.catalog_status = None;
+        assert_eq!(fresh.render(VIEW, None, &host.invocation()).unwrap().status.as_deref(), Some("Generate and Open creates demo in a folder you choose."));
 
         click(&mut fresh, &host, "generate");
         click(&mut fresh, &host, "explore");
@@ -760,7 +781,7 @@ mod tests {
         assert_eq!(
             icons,
             [
-                ("Generate Project", "export"),
+                ("Generate and Open…", "folder-open"),
                 ("Dependencies", "package"),
                 ("More Actions…", "more-horizontal")
             ]
@@ -842,7 +863,7 @@ mod tests {
         field(&mut l, &host, "artifactId", "a b; rm -rf ~");
         click(&mut l, &host, "cli");
         assert!(host.terminals().is_empty());
-        assert_eq!(host.notifications().len(), 1);
+        assert!(l.problem().unwrap().contains("plain folder name"), "shown in the status line before any click");
         assert!(l.cli_args().unwrap_err().contains("artifact"));
     }
 
@@ -884,7 +905,7 @@ mod tests {
             field(&mut l, &host, "artifactId", value);
             click(&mut l, &host, "cli");
             assert!(host.terminals().is_empty(), "{value}");
-            assert_eq!(host.notifications().len(), 1, "{value}");
+            assert!(l.problem().unwrap().contains("plain folder name"), "{value}");
         }
     }
 
@@ -1238,7 +1259,7 @@ mod tests {
         click(&mut l, &host, "section:dependencies");
         let view = l.render(VIEW, None, &host.invocation()).unwrap();
         assert_eq!(view.toolbar[1].label, "\u{25cf} Dependencies (3)");
-        for id in ["generate", "more-actions"] {
+        for id in ["generate-archive", "more-actions"] {
             assert!(view.toolbar.iter().any(|b| b.id == id), "{id}");
         }
         assert!(!view.toolbar.iter().any(|b| b.id == "reset"));
@@ -1308,12 +1329,12 @@ mod more_actions_tests {
         let host = MockHost::install();
         let mut launcher = Launcher::default();
         let snapshot = launcher.more_actions_snapshot(VIEW, &host.invocation()).unwrap();
-        let expected: Vec<_> = snapshot.expanded.toolbar.iter().filter(|b| b.enabled && secondary_action(&b.id)).map(|b| b.id.clone()).collect();
+        let expected: Vec<_> = snapshot.expanded.toolbar.iter().filter(|b| b.enabled && secondary_action(&b.id, snapshot.archive_primary)).map(|b| b.id.clone()).collect();
         assert_eq!(snapshot.items().iter().map(|i| i.key.clone()).collect::<Vec<_>>(), expected);
         assert!(expected.iter().any(|id| id == "prepare-import"));
         assert!(!expected.iter().any(|id| id == "open-reviewed-import"));
         let view = launcher.render(VIEW, None, &host.invocation()).unwrap();
-        assert_eq!(view.toolbar.iter().filter(|b| !b.id.starts_with("section:")).map(|b| b.id.as_str()).collect::<Vec<_>>(), ["generate", "choose-dependencies", "more-actions"]);
+        assert_eq!(view.toolbar.iter().filter(|b| !b.id.starts_with("section:")).map(|b| b.id.as_str()).collect::<Vec<_>>(), ["generate-archive", "choose-dependencies", "more-actions"]);
         host.set_project_root(None);
         launcher.bind(&host.invocation()).unwrap();
         launcher.set("artifactId", "");
@@ -1321,6 +1342,62 @@ mod more_actions_tests {
         let ids: Vec<_> = snapshot.items().into_iter().map(|i| i.key).collect();
         for disabled in ["cli", "explore", "prepare-import", "open-reviewed-import"] { assert!(!ids.iter().any(|id| id == disabled)); }
         assert!(ids.iter().any(|id| id == "reset"));
+    }
+
+    #[test]
+    fn generate_disabled_for_custom_server() {
+        let host = MockHost::install();
+        let mut launcher = Launcher::default();
+        let enabled = |launcher: &mut Launcher| -> Vec<bool> {
+            let view = launcher.render(VIEW, None, &host.invocation()).unwrap();
+            ["generate-archive", "prepare-import"].iter().map(|id| view.toolbar.iter().chain(&launcher.more_actions_snapshot(VIEW, &host.invocation()).unwrap().expanded.toolbar).find(|b| b.id == *id).unwrap().enabled).collect()
+        };
+        assert_eq!(enabled(&mut launcher), [true, true]);
+        launcher.server = "https://example.test".into();
+        assert_eq!(enabled(&mut launcher), [false, false]);
+    }
+
+    #[test]
+    fn generate_and_open_is_primary_only_when_it_can_run() {
+        fn ids(launcher: &mut Launcher, host: &MockHost) -> Vec<String> {
+            launcher.render(VIEW, None, &host.invocation()).unwrap().toolbar.into_iter().map(|b| b.id).filter(|id| id.starts_with("generate")).collect()
+        }
+        fn items(launcher: &mut Launcher, host: &MockHost) -> Vec<String> {
+            launcher.more_actions_snapshot(VIEW, &host.invocation()).unwrap().items().into_iter().map(|i| i.key).collect()
+        }
+        let host = MockHost::install();
+        let mut launcher = Launcher::default();
+        assert_eq!(ids(&mut launcher, &host), ["generate-archive"], "unknown grants keep it primary");
+        assert!(items(&mut launcher, &host).contains(&"generate".to_string()));
+        let host = host.with_capabilities(&["storage", "project.read", "net:start.spring.io", "process:python3"]);
+        launcher.activate(&host.context("aritti.spring-initializr")).unwrap();
+        assert_eq!(ids(&mut launcher, &host), ["generate-archive"]);
+        let host = host.with_capabilities(&["storage", "project.read", "net:start.spring.io"]);
+        launcher.activate(&host.context("aritti.spring-initializr")).unwrap();
+        assert_eq!(ids(&mut launcher, &host), ["generate"]);
+        assert!(items(&mut launcher, &host).contains(&"generate-archive".to_string()));
+        launcher.catalog_status = None;
+        assert_eq!(launcher.render(VIEW, None, &host.invocation()).unwrap().status.as_deref(), Some("Download ZIP downloads demo.zip in the browser."));
+        let host = host.with_capabilities(&["storage", "project.read", "net:start.spring.io", "process:python3"]);
+        launcher.activate(&host.context("aritti.spring-initializr")).unwrap();
+        launcher.set("server", "http://localhost:8080");
+        assert_eq!(ids(&mut launcher, &host), ["generate"], "Generate and Open uses start.spring.io only");
+    }
+
+    #[test]
+    fn artifact_rules_show_in_the_status_line_before_any_click() {
+        let host = MockHost::install();
+        let mut launcher = Launcher::default();
+        launcher.bind(&host.invocation()).unwrap();
+        for artifact in ["my app", ".hidden", &"a".repeat(129)] {
+            launcher.set("artifactId", artifact);
+            let view = launcher.render(VIEW, None, &host.invocation()).unwrap();
+            let status = view.status.unwrap();
+            assert!(status.starts_with("The artifact must be a plain folder name"), "{artifact}: {status}");
+            assert!(!view.toolbar.iter().any(|b| b.id.starts_with("generate")), "{artifact}");
+        }
+        launcher.set("artifactId", "my-app_2.0");
+        assert_eq!(launcher.problem(), None);
     }
 
     #[test]

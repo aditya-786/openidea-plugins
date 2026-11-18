@@ -50,7 +50,7 @@ impl Job {
         runner.verify(project)?;
         let executable = runner.argv(project, &argv, false)?;
         let target_label=if runner==crate::artisan_runner::Runner::Docker {crate::artisan_docker::target_label(project)?}else{None};
-        let child = crate::artisan_runner::start_background(runner.name(), &executable, project)?;
+        let child = crate::artisan_runner::start_background(runner, &executable, project)?;
         child.close_stdin()?;
         Ok(Self {
             child: Some(child),

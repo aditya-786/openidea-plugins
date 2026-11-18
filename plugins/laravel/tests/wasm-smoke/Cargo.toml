@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 [workspace]
 [dependencies]
-ide-plugin = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
-ide-core = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
-ide-extension = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
+ide-plugin = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
+ide-core = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
+ide-extension = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
 serde_json = "1"

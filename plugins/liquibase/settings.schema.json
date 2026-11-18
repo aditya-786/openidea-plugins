@@ -7,9 +7,9 @@
     },
     "checkProperties": {
       "type": "boolean",
-      "title": "Undeclared-property warnings (pending complete source scope)",
+      "title": "Warn about undeclared properties",
       "default": true,
-      "description": "Live diagnostics currently stay quiet about undeclared properties because includes, configuration and runtime parameters may supply them."
+      "description": "Warn when a ${name} placeholder is not declared in the project's changelogs or set as a parameter in its Liquibase configuration."
     }
   }
 }

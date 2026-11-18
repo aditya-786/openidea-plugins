@@ -46,7 +46,7 @@ impl KubeExplorer {
                 host::notify(
                     NotificationLevel::Info,
                     "Helm repositories",
-                    "Allow the optional process:helm capability to read the repository list.",
+                    &ui_kit::denied::message("Reading the Helm repository list", "process:helm", "Kube Explorer"),
                 );
                 return Ok(());
             }

@@ -19,7 +19,7 @@ struct Chart {
 }
 #[derive(Default)]
 pub(crate) struct Cache {
-    charts: BTreeMap<String, Chart>,
+    charts: crate::lru::Lru<String, Chart>,
     catalogs: BTreeMap<String, Catalog>,
 }
 struct Catalog {
@@ -427,6 +427,15 @@ impl Cache {
         self.charts.clear();
         self.catalogs.clear();
     }
+    pub(crate) fn evict(&mut self, path: &str) {
+        let Some((directory, file)) = path.rsplit_once('/') else {
+            return;
+        };
+        if matches!(file, "Chart.yaml" | "values.yaml" | "values.schema.json") {
+            self.charts.remove(directory);
+            self.catalogs.remove(directory);
+        }
+    }
     pub(crate) fn warm_file(&mut self, path: &str) {
         if let Some(project) = host::project_of(path) {
             if let Ok(source) = project.read_file(path) {
@@ -481,9 +490,6 @@ impl Cache {
             None => None,
         };
         let values = read("values.yaml");
-        if self.charts.len() >= 64 {
-            self.charts.clear();
-        }
         self.charts.insert(
             directory.into(),
             Chart {
@@ -493,6 +499,7 @@ impl Cache {
                 schema,
                 values,
             },
+            64,
         );
     }
     fn chart(&self, doc: &Document) -> Option<&Chart> {
@@ -653,7 +660,7 @@ impl Cache {
             .as_vec()
             .ok_or("This chart has no dependency list.")?;
         if dependencies.len() > 32 {
-            return Err("Dependency catalog refresh supports at most32 dependencies.".into());
+            return Err("Dependency catalog refresh supports at most 32 dependencies.".into());
         }
         let output = host::run_process(
             "helm",
@@ -908,8 +915,9 @@ impl Cache {
         let Some(parsed) = yaml(&doc.text) else {
             return vec![];
         };
+        let values_file = doc.path.ends_with("/values.yaml");
         let mut messages = Vec::new();
-        if doc.path.ends_with("/values.yaml") {
+        if values_file {
             if let Some((_, schema)) = &chart.schema {
                 if let Some(value) = json_value(&parsed) {
                     validate(&value, schema, schema, "values", 0, &mut messages);
@@ -922,15 +930,29 @@ impl Cache {
             .into_iter()
             .take(64)
             .map(|message| {
-                Diagnostic::new(
-                    Range::new(Position::new(0, 0), Position::new(0, 0)),
-                    Severity::Warning,
-                    message,
-                )
-                .code("helm-local-schema")
+                let range = if values_file {
+                    values_finding_range(&doc.text, &message)
+                } else {
+                    crate::helm_values::find_key(&doc.text, &["dependencies".to_owned()]).unwrap_or_default()
+                };
+                Diagnostic::new(range, Severity::Warning, message).code("helm-local-schema")
             })
             .collect()
     }
+}
+/// The deepest key of the finding's `values/a/b` path that the file spells out.
+fn values_finding_range(values: &str, message: &str) -> Range {
+    let path = message.split_once(": ").map_or("", |(path, _)| path);
+    let mut keys: Vec<String> = path.split('/').skip(1).map(str::to_owned).collect();
+    let array_at = keys.iter().position(|key| key.parse::<usize>().is_ok());
+    keys.truncate(array_at.unwrap_or(keys.len()));
+    while !keys.is_empty() {
+        if let Some(range) = crate::helm_values::find_key(values, &keys) {
+            return range;
+        }
+        keys.pop();
+    }
+    Range::default()
 }
 fn dependency_identity(metadata: &Yaml) -> String {
     let identities: Vec<_> = metadata["dependencies"]
@@ -1200,6 +1222,15 @@ mod tests {
                 .completion(&document("text: |\n  pu"), Position::new(1, 4))
                 .is_empty()
         );
+    }
+    #[test]
+    fn values_schema_finding_has_key_range() {
+        let (_host, cache) = setup();
+        let source = "image: {}\nreplicas: 0\n";
+        let findings = cache.diagnostics(&document(source));
+        let at = |needle: &str| findings.iter().find(|finding| finding.message.contains(needle)).unwrap().range;
+        assert_eq!(at("missing required value repository"), Range::new(Position::new(0, 0), Position::new(0, 5)));
+        assert_eq!(at("minimum"), Range::new(Position::new(1, 0), Position::new(1, 8)));
     }
     #[test]
     fn schema_validation_matches_known_constraints_and_withdraws_stale_sources() {

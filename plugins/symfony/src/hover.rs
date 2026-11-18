@@ -60,12 +60,12 @@ impl HoverProvider for Main {
             || host::project_of(&entry.path).and_then(|project|project.root().ok()).as_deref()!=Some(root.as_str()) {
             return None;
         }
-        let mut body = format!("**Cached {kind} declaration** {}", escaped(name));
+        let mut body = format!("**{kind}** {}", escaped(name));
         if let Some(domain) = domain {
             body.push_str(&format!("\n\nDomain: {}", escaped(&domain)));
         }
         let relative = entry.path.strip_prefix(&format!("{root}/"))?;
-        body.push_str(&format!("\n\nCached declaration: {}:{}", escaped(relative), entry.at.line + 1));
+        body.push_str(&format!("\n\nDeclared in: {}:{}", escaped(relative), entry.at.line + 1));
         if r.kind == Kind::Route {
             let routes: Vec<_> = index.route_defs.iter().filter(|route| route.name.as_deref() == Some(name)).take(9).collect();
             if routes.len() == 1 {
@@ -77,9 +77,9 @@ impl HoverProvider for Main {
             }
         }
         body.push_str(if !index.settings_current() || index.partial {
-            "\n\nPartial cached source index; may be stale. Source-pattern association; runtime/type resolution and cache age are unknown."
+            "\n\nFrom an incomplete project scan; it may be out of date."
         } else {
-            "\n\nCached source index; may be stale. Source-pattern association; runtime/type resolution and cache age are unknown."
+            "\n\nFrom the last project scan; it may be out of date."
         });
         Some(Hover::new(body).range(range_of(&doc.text, r.start, r.end)))
     }
@@ -179,7 +179,7 @@ mod tests {
             h.markdown.contains("Route")
                 && h.markdown.contains("GET")
                 && h.markdown.contains("/home")
-                && h.markdown.contains("cache age are unknown")
+                && h.markdown.contains("may be out of date")
         );
         assert_eq!(h.range, Some(range_of(&d.text, d.text.find("home").unwrap(), d.text.find("home").unwrap() + 4)));
         let (d, p) = at("<?php $container->get('mai^ler');", "php");
@@ -252,7 +252,7 @@ mod tests {
         let mut m = model();
         let (d, p) = at("{{ path('ho^me') }}", "twig");
         m.indexes.get_mut("/p").unwrap().partial = true;
-        assert!(m.hover(&d, p).unwrap().markdown.contains("Partial cached"));
+        assert!(m.hover(&d, p).unwrap().markdown.contains("incomplete project scan"));
         let unknown = Document { text: d.text.replace("home", "gone"), version: 10, ..d.clone() };
         assert!(m.hover(&unknown, p).is_none());
         let outside = Document { path: "/p2/file.twig".into(), ..d.clone() };

@@ -18,6 +18,7 @@ openidea-plugin build
 
 - New plugin: `openidea-plugin new plugins/<name>`. Id is `aritti.<name>`; never `openidea.*`.
 - Request only the capabilities the code uses.
+- Plugin READMEs are written for users: follow [the README template](plugin-readme-template.md) and update the README with any user-visible change.
 - Commits follow Conventional Commits (`feat(spring-web): ...`); release-please derives versions and changelogs from them. Don't bump `version` by hand.
 - The plugin API is upstream. Needing a new extension point means a pull request to [`l0ng-ai/openidea`](https://github.com/l0ng-ai/openidea), not a patch here.
 - Never commit signing keys.

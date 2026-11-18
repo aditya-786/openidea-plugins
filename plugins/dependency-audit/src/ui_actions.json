@@ -4,28 +4,32 @@
     "view": "vulnerabilities",
     "command": "preview-upgrade",
     "when": "viewItemKind == dep",
-    "icon": "diff"
+    "icon": "diff",
+    "label": "Preview Upgrade…"
   },
   {
     "menu": "viewItem.context",
     "view": "vulnerabilities",
     "command": "open-declaration",
     "when": "viewItemKind == dep",
-    "icon": "file"
+    "icon": "file",
+    "label": "Go to Declaration…"
   },
   {
     "menu": "viewItem.context",
     "view": "vulnerabilities",
     "command": "open-advisory",
     "when": "viewItemKind == dep",
-    "icon": "external-link"
+    "icon": "external-link",
+    "label": "Open Advisory on OSV.dev…"
   },
   {
     "menu": "viewItem.context",
     "view": "vulnerabilities",
     "command": "ignore-finding",
     "when": "viewItemKind == dep",
-    "icon": "hide"
+    "icon": "hide",
+    "label": "Ignore Finding with Reason…"
   },
   {
     "menu": "viewItem.context",
@@ -33,13 +37,15 @@
     "command": "open-advisory",
     "when": "viewItemKind == advisory",
     "replaces_open": true,
-    "icon": "external-link"
+    "icon": "external-link",
+    "label": "Open Advisory on OSV.dev…"
   },
   {
     "menu": "viewItem.context",
     "view": "vulnerabilities",
     "command": "ignore-finding",
     "when": "viewItemKind == advisory",
-    "icon": "hide"
+    "icon": "hide",
+    "label": "Ignore Finding with Reason…"
   }
 ]

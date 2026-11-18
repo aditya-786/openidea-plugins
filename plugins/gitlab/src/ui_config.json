@@ -1,7 +1,7 @@
 {
   "title": "GitLab",
   "views": {
-    "merge-requests": "GitLab",
+    "merge-requests": "Merge Requests",
     "merge-request": "Details",
     "gitlab-projects": "Projects"
   },
@@ -13,7 +13,7 @@
     "tabs": [
       {
         "id": "merge-requests",
-        "label": "GitLab"
+        "label": "Merge Requests"
       },
       {
         "id": "merge-request",

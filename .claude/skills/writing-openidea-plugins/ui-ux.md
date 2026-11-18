@@ -122,7 +122,10 @@ Native conversion (2026-11-09): JPA Structure, Properties Structure, Tasks, Ideo
 `crates/ui-kit/web/`. The 12 packaged-UI packages materialize those assets with
 `python3 scripts/sync-plugin-ui.py`; run `--check` after edits. Do not hand-edit
 copied `web/resources` files or `src/ui_config.json`. Per-package `src/ui_actions.json`
-retains resource action declarations for the generated bridge allowlist. Validate
+retains resource action declarations for the generated bridge allowlist. A
+`Body::Other` resources/tree/list/table body may set `emptyTitle`, `emptyText` and
+`emptyAction` (an enabled toolbar button key, shown as the empty state's button)
+to replace the generic "No resources found" state with domain wording. Validate
 commands against each manifest; native `viewItem.context` contributions cannot
 target a web view and must not be added back for these packaged pages.
 

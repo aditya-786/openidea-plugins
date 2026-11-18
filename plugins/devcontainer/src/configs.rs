@@ -48,7 +48,7 @@ fn owned(project: &Project, path: &str) -> Result<bool, Error> {
 
 pub(crate) fn ensure_owned(project: &Project, path: &str) -> Result<(), Error> {
     if !owned(project, path)? {
-        return Err(Error::Invalid("The configuration path is not owned by this project's current innermost scope. Choose it from its owning project.".into()));
+        return Err(Error::Invalid("This configuration belongs to another open project nested in this one. Choose it from that project's window.".into()));
     }
     Ok(())
 }

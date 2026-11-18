@@ -11,9 +11,10 @@
       "default": true
     },
     "quarkus.checkExpressions": {
+      "title": "Check property names in expressions (same file)",
       "type": "boolean",
-      "title": "Warn about ${...} expressions naming nothing defined in the file, the environment or the system properties",
-      "default": true
+      "default": true,
+      "description": "Warn about ${...} expressions naming nothing defined in the file, the environment or the system properties"
     },
     "quarkus.checkRequired": {
       "type": "boolean",

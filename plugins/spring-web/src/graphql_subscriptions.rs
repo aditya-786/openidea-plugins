@@ -11,6 +11,9 @@ const OUTPUT: &str = "Spring GraphQL Subscriptions";
 pub(crate) const START: &str = "graphql.subscription-start";
 pub(crate) const POLL: &str = "graphql.subscription-poll";
 pub(crate) const CANCEL: &str = "graphql.subscription-cancel";
+/// Read as `plugin.aritti.spring-web.graphqlSubscriptionActive` by the Read/Cancel commands and Tools menu entries.
+const ACTIVE_CONTEXT: &str = "graphqlSubscriptionActive";
+const NOT_RUNNING: &str = "No GraphQL subscription is running. Start one with Spring Endpoints: Start GraphQL Subscription…";
 fn invalid(s: &str) -> Error {
     Error::Invalid(s.into())
 }
@@ -115,7 +118,7 @@ fn selection_end(tokens: &[&str], mut at: usize) -> Result<usize, Error> {
                 }
                 stack.push(token);
                 if stack.len() > 64 {
-                    return Err(invalid("GraphQL nesting exceeds64 levels."));
+                    return Err(invalid("GraphQL nesting exceeds 64 levels."));
                 }
             }
             ")" | "]" | "}" => {
@@ -142,7 +145,7 @@ fn selection_end(tokens: &[&str], mut at: usize) -> Result<usize, Error> {
 }
 fn subscription_name(text: &str) -> Result<Option<String>, Error> {
     if text.is_empty() || text.len() > 8192 {
-        return Err(invalid("Use a subscription document of at most8 KiB."));
+        return Err(invalid("Use a subscription document of at most 8 KiB."));
     }
     let t = tokens(text.trim_start_matches('\u{feff}'))?;
     if t.first() != Some(&"subscription") {
@@ -170,7 +173,7 @@ fn subscription_name(text: &str) -> Result<Option<String>, Error> {
             || !t.get(at + 3).is_some_and(|s| name(s))
         {
             return Err(invalid(
-                "Only one subscription operation and its explicit fragments are admitted.",
+                "The document must contain exactly one subscription operation (fragments are allowed).",
             ));
         }
         if fragments.contains(&t[at + 1]) {
@@ -246,7 +249,7 @@ fn endpoint(s: &str) -> Result<(), Error> {
 fn object(text: &str, label: &str) -> Result<Value, Error> {
     if text.len() > 4096 {
         return Err(invalid(
-            "Variables and initialization payload each have a4 KiB limit.",
+            "Variables and the connection payload must each be under 4 KiB.",
         ));
     }
     let value: Value = serde_json::from_str(text)
@@ -437,7 +440,7 @@ fn command(probe: bool) -> Command {
         "--".into(),
         if probe { "probe" } else { "run" }.into(),
     ];
-    // The released native host caps every argv item at4096 bytes. Chunk by
+    // The released native host caps every argv item at 4096 bytes. Chunk by
     // Unicode scalar count so each fragment is <=4000 bytes, preserving source.
     let chars = HELPER.chars().collect::<Vec<_>>();
     for chunk in chars.chunks(1000) {
@@ -471,7 +474,7 @@ impl Backend for Native {
             if let Some(status) = chunk.status {
                 if status != 0 {
                     return Err(invalid(
-                        "Install/approve Node22 or newer with its built-in WebSocket available.",
+                        "Install/approve Node 22 or newer with its built-in WebSocket available.",
                     ));
                 }
                 return parse_probe(&output);
@@ -501,7 +504,7 @@ fn parse_probe(output: &str) -> Result<String, Error> {
             .is_none_or(|v| v < 22)
     {
         return Err(invalid(
-            "Node22 or newer with built-in WebSocket is required.",
+            "Node 22 or newer with built-in WebSocket is required.",
         ));
     }
     Ok(version.into())
@@ -532,12 +535,22 @@ impl Runtime {
         ctx: &Invocation,
         backend: &mut impl Backend,
     ) -> Result<Option<String>, Error> {
+        let result = self.run_session(id, ctx, backend);
+        let _ = host::set_context(ACTIVE_CONTEXT, self.session.is_some());
+        result
+    }
+    fn run_session(
+        &mut self,
+        id: &str,
+        ctx: &Invocation,
+        backend: &mut impl Backend,
+    ) -> Result<Option<String>, Error> {
         let Some(project) = ctx.project() else {
             if let Some(session) = self.session.take() {
                 let _ = session.child.kill();
             }
             return Err(invalid(
-                "Open the subscription project. Any previous owned subscription process was ended without forwarding its output.",
+                "Open the project that contains the subscription document. Any running subscription was stopped.",
             ));
         };
         let root = project.root()?;
@@ -545,14 +558,14 @@ impl Runtime {
             let s = self.session.take().ok_or(Error::Stale)?;
             let _ = s.child.kill();
             return Err(invalid(
-                "Project changed; ended the previous project's owned subscription process without forwarding its output. Retry in the current project.",
+                "The project changed, so the running subscription was stopped. Run the command again.",
             ));
         }
         match id {
             START => {
                 if self.session.is_some() {
                     return Err(invalid(
-                        "Poll or cancel the existing owned subscription before starting another.",
+                        "A subscription is already running. Run Spring Endpoints: Read GraphQL Subscription Output or Spring Endpoints: Cancel GraphQL Subscription first.",
                     ));
                 }
                 let source = Source::capture(ctx)?;
@@ -562,7 +575,7 @@ impl Runtime {
                     .as_ref()
                     .map(|p| format!("ws://localhost:8080{p}"));
                 let Some(url) = host::input(
-                    "Exact GraphQL WebSocket endpoint (selected authority)",
+                    "GraphQL WebSocket URL",
                     suggestion.as_deref(),
                 )?
                 else {
@@ -570,7 +583,7 @@ impl Runtime {
                 };
                 endpoint(&url)?;
                 let Some(variables) = host::input_multiline(
-                    "Subscription variables (explicit JSON object)",
+                    "Subscription variables (JSON object)",
                     Some("{}"),
                 )?
                 else {
@@ -578,7 +591,7 @@ impl Runtime {
                 };
                 let variables = object(&variables, "Variables")?;
                 let Some(init) = host::input_multiline(
-                    "Connection initialization payload (explicit JSON object; sent once)",
+                    "Connection payload (JSON object, sent once)",
                     Some("{}"),
                 )?
                 else {
@@ -588,22 +601,17 @@ impl Runtime {
                 let operation = subscription_name(&source.text)?;
                 let node = backend.probe(&project)?;
                 let review = format!(
-                    "Project: {}\nDocument: {} (editor version {})\nSelected endpoint: {}\nProtocol: graphql-transport-ws\nNode runtime: {}\nConfigured local path suggestion: {}\n\nSubscription sent exactly as written:\n{}\n\nVariables:\n{}\n\nConnection initialization payload sent once:\n{}\n\nThis opens one selected WebSocket with normal runtime TLS validation. Initialization and variables are only those entered above; no Actuator/application credentials, custom HTTP headers or cookies are copied. The optional Node process uses the inherited local runtime environment. Input payloads go through stdin, not argv or disk. Server results appear in a bounded output pane. This finite session ends after120 seconds or plugin/window disposal. Cancellation first requests protocol Complete and close, with a bounded process-kill fallback. The selected document is not proof of current server schema or resolver behavior.",
+                    "Project: {}\nDocument: {}\nEndpoint: {}\nNode: {}\n\nSubscription:\n{}\n\nVariables:\n{}\n\nConnection payload (sent once):\n{}\n\nOnly the values above are sent: no credentials, headers or cookies from your application. Results appear in the {OUTPUT} output. The subscription stops after 120 seconds.",
                     source.root,
                     source.path,
-                    source.version,
                     url,
                     node,
-                    config
-                        .path
-                        .as_deref()
-                        .unwrap_or("none/unresolved; endpoint selected explicitly"),
                     ui_kit::prompts::readable_source(&source.text),
                     serde_json::to_string_pretty(&variables).unwrap_or_default(),
                     serde_json::to_string_pretty(&init).unwrap_or_default()
                 );
                 if !ui_kit::prompts::confirm_exact(
-                    "Connect this explicit GraphQL subscription?",
+                    "Start this GraphQL subscription?",
                     &review,
                 )? {
                     return Err(Error::Cancelled);
@@ -617,7 +625,7 @@ impl Runtime {
                 let input=serde_json::to_string(&json!({"endpoint":url,"query":source.text,"operationName":operation,"variables":variables,"init":init})).map_err(|_|invalid("Cannot serialize subscription input."))?+"\n";
                 if input.len() > 24 * 1024 {
                     return Err(invalid(
-                        "Reviewed subscription input exceeds its protocol limit.",
+                        "The subscription, variables and connection payload are too large together (over 24 KiB).",
                     ));
                 }
                 let child = backend.start(&project)?;
@@ -628,7 +636,7 @@ impl Runtime {
                 let _ = host::output_append(
                     OUTPUT,
                     &format!(
-                        "\nSubscription document: {}\nNode {node}; graphql-transport-ws; finite120-second session. Payloads are not logged.\n",
+                        "\nSubscription document: {}\nNode {node}. Stops after 120 seconds. Variables and payloads are not logged.\n",
                         source.path
                     ),
                 );
@@ -641,11 +649,11 @@ impl Runtime {
                     pending: String::new(),
                     terminal: false,
                 });
-                Ok(Some("Owned subscription started. Poll Subscription Output reads results; Cancel Subscription sends Complete/close before a bounded process-kill fallback. Session timeout is120 seconds; plugin/window disposal also ends the owned process.".into()))
+                Ok(Some("Subscription started. Run Spring Endpoints: Read GraphQL Subscription Output to see results, or Spring Endpoints: Cancel GraphQL Subscription to stop it. It stops on its own after 120 seconds.".into()))
             }
             POLL => {
                 let Some(session) = self.session.as_mut() else {
-                    return Err(invalid("No owned subscription is active."));
+                    return Err(invalid(NOT_RUNNING));
                 };
                 let chunk = session.child.poll(256 * 1024)?;
                 if let Err(error) = append(session, &chunk) {
@@ -658,22 +666,22 @@ impl Runtime {
                         self.session = None;
                     }
                     format!(
-                        "Subscription client exited with status {status}. {} Inspect protocol output for completion/error details; an open socket alone does not prove operation success.",
+                        "The subscription ended (exit status {status}). {} Check the output for errors.",
                         if terminal {
-                            "Final client protocol record received."
+                            "All output has been read."
                         } else {
-                            "Poll again for remaining buffered output, or Cancel to release this ended client."
+                            "Read the output again for the rest, or cancel the subscription."
                         }
                     )
                 } else {
-                    "Subscription client is running; poll again for further results.".into()
+                    "The subscription is running. Read the output again for new results.".into()
                 };
                 let _ = host::output_reveal(OUTPUT);
                 Ok(Some(result))
             }
             CANCEL => {
                 let Some(mut session) = self.session.take() else {
-                    return Err(invalid("No owned subscription is active."));
+                    return Err(invalid(NOT_RUNNING));
                 };
                 let sent = session.child.write("{\"type\":\"cancel\"}\n").is_ok();
                 let chunk = if sent {
@@ -688,7 +696,7 @@ impl Runtime {
                 if forced {
                     session.child.kill()?;
                 }
-                Ok(Some(if forced{"Ended the owned local process after a bounded graceful-cancellation attempt. Remote subscription cleanup is not confirmed."}else{"Client ended after the Complete/close cancellation request. Remote application cleanup is not independently confirmed."}.into()))
+                Ok(Some(if forced{"Stopped the subscription. The server did not confirm that it closed the subscription."}else{"Subscription cancelled."}.into()))
             }
             _ => Err(invalid("Unknown GraphQL subscription command.")),
         }
@@ -741,7 +749,7 @@ fn append(session: &mut Session, chunk: &host::Chunk) -> Result<(), Error> {
     if shown < data.len() {
         session.child.kill()?;
         return Err(invalid(
-            "Subscription process exceeded the256 KiB display bound and was ended.",
+            "Subscription process exceeded the 256 KiB display bound and was ended.",
         ));
     }
     Ok(())
@@ -895,6 +903,17 @@ mod tests {
             Ok(Box::new(Controlled(self.state.clone())))
         }
     }
+    #[test]
+    fn read_and_cancel_commands_are_enabled_only_while_a_subscription_runs() {
+        let manifest = include_str!("../plugin.toml");
+        for id in [POLL, CANCEL] {
+            let command = manifest.split("[[contributes.commands]]").find(|c| c.contains(&format!("id = \"{id}\""))).unwrap();
+            assert!(command.contains(&format!("when = \"plugin.aritti.spring-web.{ACTIVE_CONTEXT}\"")), "{id}");
+        }
+        let (h, mut runtime, mut backend) = setup();
+        let error = runtime.run_with(POLL, &h.invocation(), &mut backend).unwrap_err();
+        assert!(matches!(error, Error::Invalid(ref m) if m.contains("Start GraphQL Subscription")));
+    }
     fn setup() -> (Rc<MockHost>, Runtime, Fake) {
         let h = Rc::new(MockHost::install().with_capabilities(&["project.read", "editor.read"]));
         h.add_file("pom.xml", "spring-boot-starter-graphql");
@@ -977,10 +996,12 @@ mod tests {
             runtime
                 .run_with(START, &h.invocation(), &mut backend)
                 .unwrap();
+            assert_eq!(h.context_keys()[ACTIVE_CONTEXT], openidea_plugin::ContextValue::Flag(true));
             backend.state.borrow_mut().wait_status = status;
             runtime
                 .run_with(CANCEL, &h.invocation(), &mut backend)
                 .unwrap();
+            assert_eq!(h.context_keys()[ACTIVE_CONTEXT], openidea_plugin::ContextValue::Flag(false));
             let state = backend.state.borrow();
             assert_eq!(state.writes[1], "{\"type\":\"cancel\"}\n");
             assert_eq!(state.waits, vec![1500]);
@@ -1004,7 +1025,7 @@ mod tests {
             .run_with(POLL, &h.invocation(), &mut backend)
             .unwrap()
             .unwrap();
-        assert!(result.contains("does not prove operation success"));
+        assert!(result.contains("All output has been read."));
         assert!(h.output()[OUTPUT].contains("value"));
         assert!(runtime.session.is_none());
     }
@@ -1024,7 +1045,7 @@ mod tests {
             .run_with(POLL, &h.invocation(), &mut backend)
             .unwrap()
             .unwrap();
-        assert!(result.contains("remaining buffered output"));
+        assert!(result.contains("Read the output again for the rest"));
         assert!(runtime.session.is_some());
         backend.state.borrow_mut().chunks.push_back(host::Chunk {
             stdout: "{\"type\":\"server-complete\"}\n".into(),
@@ -1060,11 +1081,11 @@ mod tests {
         h.open_editor(
             "/project/events.graphql",
             "graphql",
-            &format!("subscription {{event}} #{}", "x".repeat(7800)),
+            &format!("subscription {{event}} #{}", "x".repeat(8100)),
             &[],
         );
         h.answer_next_prompt(Some(&["ws://localhost:8080/graphql"]));
-        let payload = serde_json::to_string(&json!({"value":"x".repeat(3900)})).unwrap();
+        let payload = serde_json::to_string(&json!({"value":"x".repeat(4000)})).unwrap();
         h.answer_next_prompt(Some(&[&payload]));
         h.answer_next_prompt(Some(&[&payload]));
         h.answer_next_prompt(Some(&["yes"]));

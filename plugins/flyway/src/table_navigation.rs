@@ -1,5 +1,5 @@
 //! Source-only table navigation, deliberately separate from Rename identities.
-use openidea_plugin::{Location, Position, Project, Range, host, providers::Document, text::position};
+use openidea_plugin::{Location, Position, Project, Range, host, providers::{Document, LineMarker}, text::position};
 use std::{collections::{BTreeMap, BTreeSet}, time::{Duration, Instant}};
 #[derive(Clone)]
 struct Token { word: String, text: String, start: usize, end: usize, quote: Option<char> }
@@ -298,21 +298,30 @@ fn xml_mappings(project: &Project, root: &str) -> XmlMappings {
     out
 }
 fn module(path: &str) -> Option<&str> { path.split_once("/src/").map(|(prefix, _)| prefix) }
-struct Owner { files: BTreeSet<String>, dialect: Option<Dialect>, definitions: BTreeMap<String, Vec<Location>>, at: Instant }
+struct Owner { inputs: Vec<String>, files: BTreeSet<String>, dialect: Option<Dialect>, definitions: BTreeMap<String, Vec<Location>>, at: Instant }
+const TTL: Duration = Duration::from_secs(120);
+/// Files whose change can alter tables or entity mappings: sources, mapping XML and datasource/build config.
+const MAPPING_FILES: &[&str] = &[".java", ".kt", ".xml", ".properties", ".yml", ".yaml", ".conf", ".toml", ".gradle", ".kts"];
 #[derive(Default)]
 pub(crate) struct State { owners: BTreeMap<String, Owner> }
 impl State {
+    /// Rebuilds only when the migration list changed, the cache expired or an event invalidated it.
     pub fn warm(&mut self, project: &Project, files: &[String]) {
         let Ok(root) = project.root() else { return; };
+        if let Some(owner) = self.owners.get_mut(&root).filter(|owner| owner.inputs == files && owner.at.elapsed() < TTL) {
+            owner.at = Instant::now();
+            return;
+        }
         self.owners.remove(&root);
-        if files.len() > 128 { return; }
         let at = Instant::now(); let dialect = detect_dialect(project); let mut definitions: BTreeMap<String, Vec<Location>> = BTreeMap::new(); let mut bytes = 0;
         let mut accepted = BTreeSet::new();
         for path in files {
             if !path.ends_with(".sql") || !path.starts_with(&format!("{root}/")) { continue; }
-            if at.elapsed() > Duration::from_millis(200) || host::project_of(path).and_then(|p| p.root().ok()).as_deref() != Some(&root) { return; }
-            let Ok(text) = project.read_file(path) else { return; }; bytes += text.len();
-            if bytes > 2 << 20 { return; }
+            // ponytail: time and byte budget keep a partial index (see coverage); index incrementally if large projects need all of it
+            if at.elapsed() > Duration::from_millis(200) { break; }
+            if host::project_of(path).and_then(|p| p.root().ok()).as_deref() != Some(&root) { continue; }
+            let Ok(text) = project.read_file(path) else { continue; }; bytes += text.len();
+            if bytes > 2 << 20 { break; }
             let Some(tables) = tables(&text) else { continue; };
             accepted.insert(path.clone());
             for table in tables.into_iter().filter(|table| table.definition) {
@@ -356,18 +365,50 @@ impl State {
             }
         }
         if self.owners.len() >= 8 { self.owners.clear(); }
-        self.owners.insert(root, Owner { files: accepted, dialect, definitions, at });
+        self.owners.insert(root, Owner { inputs: files.to_vec(), files: accepted, dialect, definitions, at });
     }
-    pub fn invalidate(&mut self, path: &str) { self.owners.retain(|root, _| !path.starts_with(&format!("{root}/"))); }
+    /// Indexed and listed SQL migrations of a warm root.
+    pub fn coverage(&self, root: &str) -> Option<(usize, usize)> {
+        self.owners.get(root).map(|owner| (owner.files.len(), owner.inputs.iter().filter(|path| path.ends_with(".sql")).count()))
+    }
+    /// Drops a root only for a listed migration (or its parent) or a mapping file; build copies stay cached.
+    pub fn invalidate(&mut self, path: &str) {
+        let parent = format!("{}/", path.trim_end_matches('/'));
+        self.owners.retain(|root, owner| {
+            let inside = path == root || path.starts_with(&format!("{root}/"));
+            let relevant = owner.inputs.iter().any(|input| input == path || input.starts_with(&parent)) || MAPPING_FILES.iter().any(|ext| path.ends_with(ext));
+            !(inside && relevant)
+        });
+    }
+    fn owner(&self, doc: &Document) -> Option<&Owner> {
+        if doc.language != "sql" { return None; }
+        let root = host::project_of(&doc.path).and_then(|p| p.root().ok())?;
+        self.owners.get(&root).filter(|owner| owner.at.elapsed() < TTL && owner.files.contains(&doc.path))
+    }
+    /// The `CREATE TABLE` migrations and mapped entities of `table`; nothing when more than 32 claim it.
+    fn targets(owner: &Owner, path: &str, table: &Table) -> Vec<Location> {
+        key(&table.parts, owner.dialect).and_then(|name| owner.definitions.get(&name)).filter(|locations| locations.len() <= 32).map(|locations| locations.iter()
+            .filter(|location| location.path.ends_with(".sql") || module(path).is_none() || module(path) == module(&location.path))
+            .cloned().collect()).unwrap_or_default()
+    }
     pub fn definition(&self, doc: &Document, at: Position) -> Vec<Location> {
-        if doc.language != "sql" { return vec![]; }
-        let Some(root) = host::project_of(&doc.path).and_then(|p| p.root().ok()) else { return vec![]; };
-        let Some(owner) = self.owners.get(&root).filter(|owner| owner.at.elapsed() < Duration::from_secs(120) && owner.files.contains(&doc.path)) else { return vec![]; };
+        let Some(owner) = self.owner(doc) else { return vec![]; };
         let Some(tables) = tables(&doc.text) else { return vec![]; };
         let Some(table) = tables.iter().find(|table| !table.definition && table.range.start <= at && at < table.range.end) else { return vec![]; };
-        key(&table.parts, owner.dialect).and_then(|name| owner.definitions.get(&name)).filter(|locations| locations.len() <= 32).map(|locations| locations.iter()
-            .filter(|location| location.path.ends_with(".sql") || module(&doc.path).is_none() || module(&doc.path) == module(&location.path))
-            .cloned().collect()).unwrap_or_default()
+        Self::targets(owner, &doc.path, table)
+    }
+    /// Gutter markers on table references: the same targets as Go to Definition, merged per line.
+    pub fn markers(&self, doc: &Document) -> Vec<LineMarker> {
+        let Some(owner) = self.owner(doc) else { return vec![]; };
+        let Some(tables) = tables(&doc.text) else { return vec![]; };
+        let mut lines: BTreeMap<u32, Vec<Location>> = BTreeMap::new();
+        for table in tables.iter().filter(|table| !table.definition) {
+            let targets = lines.entry(table.range.start.line).or_default();
+            for target in Self::targets(owner, &doc.path, table) {
+                if !targets.contains(&target) { targets.push(target); }
+            }
+        }
+        lines.into_iter().flat_map(|(line, targets)| crate::line_markers(line, crate::TABLE_MARKER, "Table's CREATE TABLE migrations and mapped entities", targets)).collect()
     }
 }
 #[cfg(test)]
@@ -408,6 +449,71 @@ mod tests {
         assert!(state.definition(&foreign, Position::new(0, 10)).is_empty());
         state.invalidate(create);
         assert!(state.definition(&doc, Position::new(0, 10)).is_empty());
+    }
+
+    #[test]
+    fn reference_lines_get_one_table_marker_per_create_table_and_entity() {
+        let host = openidea_plugin::mock::MockHost::install();
+        host.add_file("sql/V1__init.sql", "CREATE TABLE users(id int);\nCREATE TABLE orders(id int);");
+        host.add_file("sql/V2__query.sql", "SELECT * FROM users JOIN orders ON 1=1;\nUPDATE users SET id=1; UPDATE users SET id=2;\nCREATE TABLE audit(id int);");
+        host.add_file("src/main/java/User.java", "import jakarta.persistence.Entity; import jakarta.persistence.Table; @Entity @Table(name=\"users\") class User {}");
+        let files = vec!["/project/sql/V1__init.sql".to_string(), "/project/sql/V2__query.sql".to_string()];
+        let doc = Document { path: files[1].clone(), language: "sql".into(), version: 1, text: "SELECT * FROM users JOIN orders ON 1=1;\nUPDATE users SET id=1; UPDATE users SET id=2;\nCREATE TABLE audit(id int);".into() };
+        assert!(State::default().markers(&doc).is_empty(), "a cold cache gives no marker");
+        let mut state = State::default();
+        state.warm(&host.invocation().project().unwrap(), &files);
+        let markers = state.markers(&doc);
+        assert!(markers.iter().all(|m| m.icon.as_deref() == Some(crate::TABLE_MARKER) && m.line < 2));
+        let line = |n: u32| markers.iter().filter(|m| m.line == n).map(|m| m.target.clone().unwrap()).collect::<Vec<_>>();
+        let first = line(0);
+        assert_eq!(first.iter().map(|l| (l.path.as_str(), l.range.start)).collect::<Vec<_>>(), [
+            ("/project/sql/V1__init.sql", Position::new(0, 13)),
+            ("/project/src/main/java/User.java", Position::new(0, 104)),
+            ("/project/sql/V1__init.sql", Position::new(1, 13)),
+        ]);
+        assert!(first.iter().all(|l| l.range.start < l.range.end));
+        assert_eq!(line(1).len(), 2, "the same table twice on a line lists its targets once");
+        assert_eq!(first[..2], state.definition(&doc, Position::new(0, 15))[..]);
+    }
+
+    #[test]
+    fn table_navigation_with_200_migrations() {
+        let host = openidea_plugin::mock::MockHost::install();
+        let mut files = vec!["/project/sql/V0__unreadable.sql".to_string()];
+        host.add_file("sql/V1__init.sql", "CREATE TABLE users(id int);");
+        files.push("/project/sql/V1__init.sql".into());
+        for n in 2..=200 {
+            host.add_file(&format!("sql/V{n}__touch.sql"), "UPDATE users SET id=1;");
+            files.push(format!("/project/sql/V{n}__touch.sql"));
+        }
+        files.sort();
+        let mut state = State::default();
+        state.warm(&host.invocation().project().unwrap(), &files);
+        let doc = Document { path: "/project/sql/V200__touch.sql".into(), language: "sql".into(), version: 1, text: "UPDATE users SET id=1;".into() };
+        let locations = state.definition(&doc, Position::new(0, 8));
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].path, "/project/sql/V1__init.sql");
+        assert_eq!(state.coverage("/project"), Some((200, 201)));
+    }
+
+    #[test]
+    fn unrelated_changes_keep_table_navigation() {
+        let host = openidea_plugin::mock::MockHost::install();
+        host.add_file("sql/V1__init.sql", "CREATE TABLE users(id int);");
+        host.add_file("sql/V2__touch.sql", "UPDATE users SET id=1;");
+        let files = vec!["/project/sql/V1__init.sql".to_string(), "/project/sql/V2__touch.sql".to_string()];
+        let mut state = State::default();
+        state.warm(&host.invocation().project().unwrap(), &files);
+        let doc = Document { path: files[1].clone(), language: "sql".into(), version: 1, text: "UPDATE users SET id=1;".into() };
+        for unrelated in ["/project/target/classes/sql/V1__init.sql", "/project/README.md", "/other/sql/V1__init.sql"] {
+            state.invalidate(unrelated);
+            assert_eq!(state.definition(&doc, Position::new(0, 8)).len(), 1, "{unrelated}");
+        }
+        state.invalidate("/project/src/main/java/User.java");
+        assert!(state.definition(&doc, Position::new(0, 8)).is_empty());
+        state.warm(&host.invocation().project().unwrap(), &files);
+        state.invalidate("/project/sql");
+        assert!(state.definition(&doc, Position::new(0, 8)).is_empty(), "a removed parent directory drops its migrations");
     }
 
     #[test]

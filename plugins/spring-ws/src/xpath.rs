@@ -230,7 +230,7 @@ fn cached_package(nav: &mut WsTools, doc: &Document) -> Vec<Binding> {
         }
         let index = nav
             .xpath_packages
-            .for_cached_document(&doc.path, &doc.text)?;
+            .for_cached_document_warm(&doc.path, &doc.text, PROVIDER_BUDGET)?;
         if !index.fresh() {
             return None;
         }
@@ -368,13 +368,13 @@ pub(crate) fn undeclared_prefixes(nav: &mut WsTools, doc: &Document) -> Vec<Diag
     let Some(file) = source(doc) else {
         return quiet;
     };
-    let Some(guards) = nav.xpath_guards.for_cached_document(&doc.path, &doc.text) else {
+    let Some(guards) = nav.source.for_cached_document_warm(&doc.path, &doc.text, DIAGNOSTICS_WARM) else {
         return quiet;
     };
-    if !guards.fresh() || guards.iter().next().is_some() {
+    if !guards.fresh() || guards.iter().any(|(_, facts)| facts.legacy_resolver) {
         return quiet;
     }
-    let Some(packages) = nav.xpath_packages.for_cached_document(&doc.path, &doc.text) else {
+    let Some(packages) = nav.xpath_packages.for_cached_document_warm(&doc.path, &doc.text, DIAGNOSTICS_WARM) else {
         return quiet;
     };
     if !packages.fresh() || packages.iter().any(|(_, fact)| fact.package.is_empty() && fact.bindings.is_none()) {

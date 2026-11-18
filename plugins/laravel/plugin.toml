@@ -5,13 +5,13 @@ description = """Laravel support in PHP and Blade files. Completion and go to de
 authors = ["Arnaud Ritti <arnaud.ritti@gmail.com>"]
 homepage = "https://github.com/arnaud-ritti/openidea-plugins/tree/main/plugins/laravel"
 license = "MIT"
-change-notes = """Unreleased: Background PHP calls on Windows run through php-win, with no console window, when the optional process:php-win permission is granted. Unreleased: Hub: new Database tab lists every migration table with its models, columns, indexes and foreign keys, Compare with database boots the app and lists pending migrations, tables only in the migrations or only in the database and missing columns and indexes, and Rows shows a table read only and paged with secret and personal data columns masked by whole key words; new Schema tab draws every table with its primary, foreign and unique keys and the model using it, joined by foreign keys (solid) and model relations (dashed), with pan, zoom, Fit, filter and click-to-open migration. Compare and Rows run read-only PHP through the existing Artisan runner and need no new capability. Unreleased: Routes rows have Send Request, which opens a Request tab that runs the route inside the app through its HTTP kernel without a server: URI parameters, query, JSON body prefilled from Form Request rules or inline validate, Act as user id, Accept JSON and Roll back database changes (on by default; with it off a write needs a second click). The response shows status, time, query count, size, redirect, headers (cookies masked) and body, and Copy as cURL copies the same request. With rollback on, nothing is sent unless a transaction really started on the default connection. Unreleased: where() values that the column enum cast lacks are reported with a quick fix to the closest case and completed from the enum (setting enumValueInspection). Unreleased: Removed the Services tab with its Sentry issue and Laravel Cloud integrations, their commands, tokens and network access. Unreleased: The Processes tab starts the development server, queue worker and schedule worker in a terminal tab instead of a plugin-managed session; stop or restart them from the tab. Unreleased: Laravel: Search Names… picks across route names, views, components, config, translations and env keys; Generate a feature test (Pest or PHPUnit) for the route a controller method serves, as a reviewed file creation; completion in pint.json and phpstan.neon (with a NEON language); PHP version next to the Laravel version in the status bar; 26 Laravel PHP snippets (routes, relations, fakes, validation). Unreleased: upgrade inspections for code that breaks on the next Laravel major (setting upgradeInspection), Pest dataset and group completion, translation keys missing in some locales (setting missingTranslationInspection), Socialite driver completion, Laravel version in the status bar. Unreleased: security inspections warn on request data passed to create/update/fill (quick fix to $request->validated() with a Form Request), variables in raw SQL, empty $guarded, Model::unguard() and URIs excluded from CSRF verification (setting checkSecurity). Unreleased: gutter markers use dedicated icons per relationship (view, controller, layout, section, stack, model, migration, listener, event, route). Discover bind-backed Compose/Sail/DDEV targets; inspect queue statistics/workers/selected log tails and review selected failed-job retries; preserve MCP job lifecycle after index removal and omit logs unless explicitly requested; extend source Eloquent trait/Composer/type inference. Runtime has separate Application, Events, Schedule and Failed Jobs buttons for direct section capture. Add Docker Artisan execution with exact target/bind revalidation and separate runner drafts; explicit Runtime snapshots for application/events/schedule/failed jobs; seven project-scoped MCP tools; nested trait and typed custom-cast/model-return Eloquent inference. Connect Generate with Artisan and New Eloquent Model to complete cached command forms, including custom/package make commands, with project-bound one-shot selection and guided fallback. Add a Components tab with Blade class/anonymous/alias and Livewire inventories, type filtering, file paths and owned source navigation. Views use a native-style source table with View, File, Folder and Namespace columns, folder/namespace filters, icons and precise source activation. Give the Artisan search, refresh action and command count comfortable 12px padding on every side. Add a small 4px left inset to the Artisan command list. Refresh Routes (PHP) now rebuilds the selected project source index before capturing the registered Artisan route list. Remove Artisan sidebar outer insets; full-width command rows use the same inner padding as group headings and the fixed search header. Routes toolbar keeps one refresh action: registered PHP routes; source reindex remains available through the command palette and other resource tabs. Use a 220px full-height Artisan sidebar with aligned inner padding and full-width selection rows. Align Artisan sidebar group/row insets and reserve the scrollbar gutter. Match shared scrollbars to the slim UI-kit reference: 2px visible thumbs with a 10px drag area; version the shared component stylesheet in Artisan. Add native icons to Artisan Run, Run in Terminal, Cancel, Copy Output and Rerun actions. Artisan uses UI-kit scrollbars on both panes, a compact sidebar and a content-versioned layout stylesheet to retire stale linked-plugin CSS. Artisan fills the dock height with fixed sidebar search and independently scrolling command list and right pane. Fix Config cell text overlapping adjacent columns and long file-filter labels wrapping or clipping; shared dropdowns fit content within the viewport. Refresh registered routes explicitly with Artisan route:list JSON; show captured runtime counts, real paths/controller methods, snapshot provenance and source-safe row actions. Static dynamic URIs no longer appear as /?. Artisan uses shared native-style group dividers for namespace/recent command groups and Arguments, Options and Global options, with description search and keyboard navigation. Expand Config indexing to numeric/list entries, nested list keys and source-resolved class keys; raise Config nesting from 8 to 64 and report incomplete dynamic-array coverage. Config browsing now shows source expressions in Key/Value/File columns with a file filter instead of blank dynamic-value cells. Fix Artisan discovery for larger applications with bounded 4 MiB output and 5 MiB cache, and show workspace operation errors as native notifications. Source-based Eloquent member completion: migration fields, relations, local scopes, model inheritance, query/collection chains and enum casts, with source navigation and bounded cached inference. Artisan workspace: searchable cached command definitions, validated argument/option forms, exact argv preview, kept local-PHP execution with output/cancel/history and terminal fallback. Metadata schema v2 preserves argument order and defaults. Source-mounted Search Everywhere endpoints resolve literal modern/legacy API prefixes and refresh on routing configuration changes; unknown mounts stay unpublished. Unreleased: An explicit read-only literal source-match chooser scans supported project sources and rechecks current owned UTF-16 destinations without adding Rename anchors. A bounded single-method controller with direct or distinct-local array return can transfer authored literal validate rules into a reviewed FormRequest with an atomic create and parameter/call replacement. Reviewed missing FormRequest scaffolds accept one explicit unaliased class import in a bounded single-namespace controller header. Component props/slots and Livewire property source reads retain current project ownership. Definition and gutter destinations retain current project ownership; related graph reads refuse newly foreign scopes. Gate, container alias and migration-column navigation use UTF-16 source token widths. PHP argument comment trivia no longer produces fake Blade literal references or hides valid commented literals. Layout member navigation/completion uses bounded current owned declarations and UTF-16 ranges instead of stale cached byte offsets. Opaque PHP/Blade blocks and strings no longer create fake Laravel literal hover, inventory diagnostics or usage markers. Cached completion/navigation inventories follow the current innermost document owner without ancestor fallback. Explicit foreign facade namespaces no longer inherit Laravel literal-reference features by short-name suffix. Query-variable column hints no longer cross method/brace boundaries or skip nearer shadowing bindings. Missing-view creation/extraction refuse configuration inputs owned by a nested open project. Explicitly namespaced PHP helper calls no longer inherit global Laravel literal-reference features. Opt-in reviewed local Docker Artisan metadata discovery with exact container/bind ownership, separate bounded runtime cache and read-only argument/option browser; cached framework hover, current-text inventory diagnostics, UTF-16 framework target ranges and strict Composer-mapped FormRequest scaffolds. Laravel: the tool window has Routes and Index sections; Routes is a flat list with method icons, a controller filter, a flat/tree toggle, and Copy as curl and Create HTTP Request File row actions. Laravel: 20 more file templates (Channel, Console Command, Http Exception, PHPUnit tests, Resource Collection, Class, Model, Dusk, Nova, Livewire Form, Fractal, Volt, Inertia pages, four Blade files); one problem listing the missing Route::resource methods; Use #[Scope] on all scope methods; column completion through `$query = Model::query()` variables; route and controller gutter links from the document indexer; Remove IDE Helper PHPDoc from Models; Generate for Model from the Project view with factory and resource bodies filled from migration columns (optional project.write); Nova, Filament and Livewire form generators; Create Missing for Job, Mail, Event and similar classes; settings modelDirectories and reportMissingResourceMethods. Laravel: Livewire method, route controller and method problems, Find Unused Views, model/factory/policy/observer/event gutter links from a document indexer, component attribute and slot completion, relation-aware column completion, container name completion (app(), @inject, config providers), scope/constructor/facade/translation/rules intentions and 11 more file templates. Laravel: Run Artisan Command..., Generate with artisan make..., New Eloquent Model..., Generate for Model... and Create Missing View, Component or Controller ask for names and options, then run php artisan make:* in a terminal. 0.1.0: first release: routes, controllers, views, config, translations, \
-assets and the Blade layout markers. Env keys, middleware, route groups, JSON translations, components, Vite entries, \
-validation rules, abilities, columns, problems, the tool window and artisan commands follow Laravel's documentation. This implementation works from a text index of the project, so the features that \
-need PhpStorm's PSI are missing (container types, Eloquent, facades)."""
+change-notes = """\
+Next release: Fresh Migration and Seed Database confirm with the project and database, palette commands ask which route, model, failed job or log entry, commands show only in projects with an artisan file, model helper commands, Create Missing View and the Generators tab write their files after one confirmation, the hub groups its tabs into sections and a controller method's Laravel gutter icon lists all its routes in the IDE's target chooser; Database tab with models, columns, indexes, a Compare view, a Schema sub-tab and a Tables tree, and unreadable migrations are listed instead of breaking it; Send Request shows the response and handles large inputs; Choose Docker Target works again, accepts DDEV synced volumes and refreshes Artisan commands after a pick; enum quick fix in where(), Windows PHP calls without a console window, faster indexing on large projects, shorter setting titles, plainer command names and messages, clear permission messages, shortcuts for Search Routes, Search Names and the tool window and database errors without SQL or connection details. \
+0.3.0: broader Laravel navigation and the hub window. \
+0.2.0: plugin icon and window consolidation."""
 categories = ["frameworks"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-language:php", "on-language:blade", "on-file:pint.json", "on-file:phpstan.neon", "on-file:phpstan.dist.neon", "on-file:resources/js/**", "on-schedule:60"]
 
@@ -22,18 +22,21 @@ optional = ["project.write", "process:php", "process:php-win", "process:docker",
 
 [[contributes.commands]]
 id = "artisan-refresh-docker-metadata"
-title = "Laravel: Refresh Docker Artisan Metadata (Executes Container PHP)"
+title = "Laravel: Refresh Docker Artisan Commands"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "artisan-browse-docker-metadata"
-title = "Laravel: Browse Cached Docker Artisan Metadata (Read-only)"
+title = "Laravel: Show Docker Artisan Commands"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "artisan-refresh-metadata"
-title = "Laravel: Refresh Artisan Command Metadata (Executes Project PHP)"
+title = "Laravel: Refresh Artisan Command Metadata"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.menus]]
 menu = "tools"
@@ -41,132 +44,165 @@ command = "artisan-refresh-metadata"
 
 [[contributes.commands]]
 id = "find-literal-source-matches"
-title = "Laravel: Find Literal Source Matches… (Read-only)"
+title = "Laravel: Find Source Matches…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "routes-runtime-refresh"
-title = "Laravel: Refresh Registered Routes (Executes Project PHP)"
+title = "Laravel: Refresh Registered Routes"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "reindex"
 title = "Laravel: Reindex Project"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "optimize-clear"
 title = "Laravel: Clear All Caches"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "cache-clear"
 title = "Laravel: Clear Application Cache"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "config-clear"
 title = "Laravel: Clear Config Cache"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "route-clear"
 title = "Laravel: Clear Route Cache"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "view-clear"
 title = "Laravel: Clear Compiled Views"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "migrate"
 title = "Laravel: Run Migrations"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "storage-link"
 title = "Laravel: Link Storage"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "route-list"
 title = "Laravel: Show Route List"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "db-seed"
 title = "Laravel: Seed Database"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "migrate-fresh"
 title = "Laravel: Fresh Migration (drops all tables)"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "artisan-run-terminal"
 title = "Laravel: Run Artisan in Terminal…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "artisan-run"
-title = "Laravel: Run Artisan Command..."
+title = "Laravel: Run Artisan Command…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "make"
-title = "Laravel: Generate with artisan make..."
+title = "Laravel: Generate with Artisan make…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "new-model"
-title = "Laravel: New Eloquent Model..."
+title = "Laravel: New Eloquent Model…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "generate-for-model"
-title = "Laravel: Generate for Model..."
+title = "Laravel: Generate for Model…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "create-missing"
 title = "Laravel: Create Missing View, Component or Controller"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "unused-views"
 title = "Laravel: Find Unused Views"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "remove-phpdocs"
 title = "Laravel: Remove IDE Helper PHPDoc from Models"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "route-copy-curl"
-title = "Laravel: Copy as curl"
+title = "Laravel: Copy as cURL"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "route-send-request"
-title = "Laravel: Send Request (Executes Project PHP)"
+title = "Laravel: Send Request"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "route-create-http"
 title = "Laravel: Create HTTP Request File"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "reveal"
 title = "Laravel: Show Laravel Tool Window"
 category = "Laravel"
 
+[[contributes.keymaps]]
+command = "route-search"
+key = "Alt+Shift+Q"
+
+[[contributes.keymaps]]
+command = "search-names"
+key = "Alt+Shift+E"
+
 [[contributes.menus]]
 menu = "editor.context"
 command = "create-missing"
+when = "editorLangId == php || editorLangId == blade"
 
 [[contributes.menus]]
 menu = "projectView.context"
@@ -615,21 +651,25 @@ destructive = false
 id = "artisan-choose-docker-target"
 title = "Laravel: Choose Docker Target…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "artisan-clear-docker-target"
-title = "Laravel: Use Configured Docker Target"
+title = "Laravel: Clear Chosen Docker Target"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "runtime-retry-failed"
-title = "Laravel: Retry Selected Failed Job"
+title = "Laravel: Retry Failed Job…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "runtime-inspect-queue"
 title = "Laravel: Inspect Queue…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.providers]]
 kinds = ["inlay-hints", "code-lenses", "gutter-actions", "signature-help"]
@@ -639,6 +679,7 @@ languages = ["php"]
 id = "route-editor-open"
 title = "Laravel: Open Route Declaration"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "new-project"
@@ -649,6 +690,7 @@ category = "Laravel"
 id = "runtime-open-frame"
 title = "Laravel: Open Error Stack Frame…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.providers]]
 kinds = ["diagnostics"]
@@ -656,33 +698,39 @@ languages = ["json"]
 
 [[contributes.commands]]
 id = "runtime-schema"
-title = "Laravel: Refresh Database Metadata (Executes Project PHP)"
+title = "Laravel: Refresh Database Metadata"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "runtime-register-database"
 title = "Laravel: Add Application Database Connection…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "route-editor-action"
 title = "Laravel: Route Request Actions…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "model-from-database"
-title = "Laravel: New Model from Captured Database Table…"
+title = "Laravel: New Model from Database Table…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "model-open-source"
 title = "Laravel: Open Model Source"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "model-create-fields"
 title = "Laravel: Create Model Fields…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.providers]]
 kinds = ["code-actions"]
@@ -692,41 +740,49 @@ languages = ["json"]
 id = "search-names"
 title = "Laravel: Search Names…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "route-search"
 title = "Laravel: Search Routes…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "runtime-database-list"
 title = "Laravel: Database Connections…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "runtime-database-connect"
 title = "Laravel: Connect Database…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "runtime-database-remove"
 title = "Laravel: Remove Database Connection…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "console-command-open"
 title = "Laravel: Run Command From Class…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "helper-parameters"
 title = "Laravel: Configure Model Helper Parameters…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "regenerate-model-helpers"
-title = "Laravel: Regenerate Reviewed Model Helpers…"
+title = "Laravel: Regenerate Model Helpers…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "project-installation-recovery"
@@ -737,31 +793,37 @@ category = "Laravel"
 id = "helper-source-automation"
 title = "Laravel: Configure Helper Source and Automation…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "helper-automation-state"
-title = "Laravel: Helper Automation Status"
+title = "Laravel: Show Model Helper Command Status"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "helper-automation-poll"
-title = "Laravel: Poll Helper Post-Generation Commands"
+title = "Laravel: Run Pending Model Helper Commands"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "helper-automation-stop"
-title = "Laravel: Stop Helper Post-Generation Commands"
+title = "Laravel: Stop Model Helper Commands"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "runtime-model-connections"
-title = "Laravel: Refresh Model Connection Bindings…"
+title = "Laravel: Read Model Database Connections…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.commands]]
 id = "runtime-application-mcp"
 title = "Laravel: Connect Application MCP Server…"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.secrets]]
 name = "application-mcp-token"
@@ -772,6 +834,7 @@ description = "Authenticate explicitly connected application MCP servers using s
 id = "index-issues"
 title = "Laravel: Show Index Issues"
 category = "Laravel"
+when = "workspaceContains:artisan"
 
 [[contributes.markerIcons]]
 id = "view"
@@ -850,3 +913,7 @@ id = "controller-routes"
 icon = "icons/marker-controller.svg"
 markers = ["controller#", "controller-fqn#"]
 tooltip = "Controller"
+
+[[contributes.markerIcons]]
+id = "related"
+icon = "icons/laravel.svg"

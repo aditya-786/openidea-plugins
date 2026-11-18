@@ -22,18 +22,18 @@ pub fn terminal_key(project: &Project, action: &str, args: &[String]) -> Result<
 }
 
 impl Main {
-    pub(crate) fn check_target_preferences(&mut self, project: &Project) {
+    pub(crate) fn check_target_preferences(&mut self, project: &Project, prefs: &runtime::Prefs) {
         let Ok(root) = project.root() else { return };
-        let container = support::read_string(project, "containerRoot", "/var/www/html");
+        let container = prefs.string("containerRoot", "/var/www/html");
         let changed = self
             .run_targets
             .get(&root)
             .is_some_and(|target| target.container_root.as_deref() != Some(container.as_str()));
-        if !runtime::enabled_for(project, "autoConfigureRunTarget")
+        if !prefs.enabled("autoConfigureRunTarget")
             || !support::valid_container_root(&container)
             || changed
         {
-            self.sync_target(project, None);
+            self.sync_target_with(project, None, prefs);
         }
     }
 
@@ -55,14 +55,23 @@ impl Main {
     }
 
     pub(crate) fn sync_target(&mut self, project: &Project, desc: Option<&Description>) {
+        self.sync_target_with(project, desc, &runtime::Prefs::load(project));
+    }
+
+    pub(crate) fn sync_target_with(
+        &mut self,
+        project: &Project,
+        desc: Option<&Description>,
+        prefs: &runtime::Prefs,
+    ) {
         let Ok(root) = project.root() else { return };
-        if desc.is_none() || !runtime::enabled_for(project, "autoConfigureRunTarget") {
+        if desc.is_none() || !prefs.enabled("autoConfigureRunTarget") {
             host::unregister_run_target(project, TARGET);
             self.run_targets.remove(&root);
             return;
         }
         let desc = desc.unwrap();
-        let container_root = support::read_string(project, "containerRoot", "/var/www/html");
+        let container_root = prefs.string("containerRoot", "/var/www/html");
         if !support::valid_container_root(&container_root) {
             host::unregister_run_target(project, TARGET);
             self.run_targets.remove(&root);

@@ -125,10 +125,12 @@ pub fn version_key(version: &str) -> Vec<String> {
     parts
 }
 
+/// Orders versions numerically without parsing into a machine integer: shorter digit runs sort first.
+pub fn numeric_key(version: &str) -> Vec<(usize, String)> {
+    version_key(version).into_iter().map(|part| (part.len(), part)).collect()
+}
+
 pub fn next_version(versions: &[&str]) -> String {
-    let numeric_key = |version: &str| -> Vec<(usize, String)> {
-        version_key(version).into_iter().map(|part| (part.len(), part)).collect()
-    };
     let Some(highest) = versions.iter().max_by_key(|version| numeric_key(version)) else {
         return "1".into();
     };

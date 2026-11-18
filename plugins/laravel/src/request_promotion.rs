@@ -322,7 +322,7 @@ pub(crate) fn actions(main: &mut Main, doc: &Document, selection: Range) -> Vec<
         },
     );
     vec![FileAction {
-        title: crate::ui_text::text("requestPromotion.action","Promote literal validation to reviewed FormRequest…").into(),
+        title: crate::ui_text::text("requestPromotion.moveAction","Move validation rules to a Form Request…").into(),
         kind: Some("refactor.extract".into()),
         data: Some(key),
         ..Default::default()
@@ -371,7 +371,7 @@ pub(crate) fn resolve(
         &format!("\\{}Http\\Requests\\{name}", p.shape.prefix),
     );
     let preview = crate::ui_text::format("requestPromotion.review","Project: {root}\nSource: {path}\nDocument version: {version}\nVerified Composer mapping: {namespace} → {source}/\n\nCreate (no overwrite): {target}\nExact new request contents:\n{text}\nExact complete replacement controller:\n{replacement}\n\nAuthored literal rules and supported self-contained class-rule expressions are transferred. Moved class references are fully qualified; external variables, closures and controller self/parent scope are withheld. The selected request parameter becomes the explicit absolute generated type. Other parameters, comments, statements and local assignment/return bindings stay in place. Only a first-statement validation call is promoted; other controller methods stay unchanged. validated() preserves the original validation call's array result; safe() would instead return ValidatedInput and is not substituted. authorize() returns true, adding no request-specific authorization gate; review route/controller authorization separately. FormRequest validation runs before the controller method, so preparation/error timing may differ. Installed framework/PHP/autoloader state and custom policies are not resolved. No PHP/Artisan/process runs.\n\nApply one undoable Create + controller Edit atomically?",&[("root",&p.root),("path",&doc.path),("version",&doc.version.to_string()),("namespace",&p.shape.prefix),("source",&source),("target",&target),("text",&text),("replacement",&replacement)]);
-    if !ui_kit::prompts::confirm_exact(crate::ui_text::text("requestPromotion.confirm","Promote literal request validation?"), &preview)? {
+    if !ui_kit::prompts::confirm_exact(crate::ui_text::text("requestPromotion.moveConfirm","Move validation rules to a Form Request?"), &preview)? {
         return Err(Error::Cancelled);
     }
     admitted(main, &p, doc)?;

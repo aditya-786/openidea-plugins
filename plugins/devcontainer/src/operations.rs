@@ -38,7 +38,7 @@ fn owner(ctx: &Invocation) -> Result<(Project, String), Error> {
 }
 
 fn row(message: &str) -> View {
-    View::new(Body::List(vec![ListItem::new("managed-status", "Dev Container CLI").detail(message)]))
+    View::new(Body::List(vec![ListItem::new("managed-status", "Background run").detail(message)]))
         .button(Button::new("refresh-managed", "Refresh Status").icon("refresh"))
 }
 
@@ -58,7 +58,7 @@ fn append(session: &mut Session, label: &str, value: &str) {
 impl Operations {
     pub(crate) fn idle(&self) -> Result<(), Error> {
         if self.session.as_ref().is_some_and(|s| s.child.is_some()) {
-            return Err("An owned CLI handle is still active or draining output. Open Finite CLI Output and Refresh Status or Cancel CLI before starting another.".into());
+            return Err("A background command is still running. Open Dev Container: Show Background Runs, then press Refresh Status or Cancel Command before starting another.".into());
         }
         Ok(())
     }
@@ -76,7 +76,7 @@ impl Operations {
         };
         if let Err(error) = child.close_stdin() {
             let _ = child.kill();
-            self.failed = Some((root, "CLI stdin preparation failed; the handle was closed. Container/build outcome is unknown.".into()));
+            self.failed = Some((root, "Could not prepare the CLI, so the run was stopped. The container may be partly built.".into()));
             host::refresh_view(VIEW);
             return Err(error);
         }
@@ -85,7 +85,7 @@ impl Operations {
         let key = format!("operation-{:016x}", random.finish());
         self.session = Some(Session {
             key, root, config, args, child: Some(child), output: String::new(), truncated: false,
-            status: "CLI started; Refresh Status to read progress. Container/IDE state is not inferred.".into(), exit: None,
+            status: "Started. Refresh Status shows progress.".into(), exit: None,
         });
         self.failed = None;
         host::refresh_view(VIEW);
@@ -97,10 +97,10 @@ impl Operations {
         let Some(session) = self.session.as_mut().filter(|s| s.child.is_some()) else { return; };
         let roots = host::projects().and_then(|projects| projects.into_iter().map(|p| p.root()).collect::<Result<Vec<_>, _>>());
         match roots {
-            Err(_) => session.status = "Project membership unavailable; CLI handle retained. Runtime outcome is unknown.".into(),
+            Err(_) => session.status = "Project list unavailable; the run is kept and its outcome is unknown.".into(),
             Ok(roots) if !roots.contains(&session.root) => {
                 if let Some(child) = session.child.take() { let _ = child.kill(); }
-                session.status = "Owning project closed; CLI handle closed. Container/build outcome is unknown; cancellation is not rollback.".into();
+                session.status = "The project closed, so the run was cancelled. The container may be partly built; cancelling does not undo changes.".into();
             }
             _ => {}
         }
@@ -122,7 +122,7 @@ impl Operations {
             let Chunk { stdout, stderr, status } = match result {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    session.status = "CLI status unavailable; handle and last captured output retained. Container/build outcome is unknown.".into();
+                    session.status = "Status unavailable; the run and its output so far are kept. Refresh Status to retry.".into();
                     return Err(error);
                 }
             };
@@ -132,16 +132,16 @@ impl Operations {
             if stdout.is_empty() && stderr.is_empty() {
                 if let Some(code) = session.exit {
                     session.child.take();
-                    session.status = format!("CLI exited with status {code}. Captured output retained; container/IDE lifetime is not tracked.");
+                    session.status = format!("The CLI exited with status {code}. Its output is kept; the container is not tracked after this.");
                 } else {
-                    session.status = "CLI running; Refresh Status to read progress. Container/IDE state is not inferred.".into();
+                    session.status = "Still running. Refresh Status shows progress.".into();
                 }
                 return Ok(());
             }
         }
         session.status = session.exit.map_or_else(
-            || "CLI running; bounded output read completed. Refresh Status for further progress.".into(),
-            |code| format!("CLI exited with status {code}; output is still draining. Refresh Status or explicitly close the handle."),
+            || "Still running, with more output waiting. Refresh Status reads it.".into(),
+            |code| format!("CLI exited with status {code}; output is still draining. Refresh Status or press Cancel Command."),
         );
         Ok(())
     }
@@ -149,17 +149,17 @@ impl Operations {
     pub(crate) fn render(&self, ctx: &Invocation) -> View {
         let (_, root) = match owner(ctx) {
             Ok(owner) => owner,
-            Err(_) => return row("Open the owning project and allow project.read to inspect its captured operation."),
+            Err(_) => return row("Open the project and allow project.read to see its background run."),
         };
         let failure = self.failed.as_ref().filter(|(owner, _)| owner == &root).map(|(_, error)| error.as_str());
         let Some(session) = self.session.as_ref().filter(|s| s.root == root) else {
-            return row(failure.unwrap_or("No accepted finite CLI operation for this project. Use Start/Rebuild Container (Finite Managed CLI). Existing terminal commands remain available."));
+            return row(failure.unwrap_or("No background command for this project. Run Dev Container: Start Container in Background… or Dev Container: Rebuild Container in Background…. The terminal commands still work."));
         };
-        let mut view = View::new(Body::List(vec![ListItem::new(&session.key, "Dev Container CLI operation")
+        let mut view = View::new(Body::List(vec![ListItem::new(&session.key, "Background run")
             .detail(&format!("{} · {}", session.config, session.status))]))
             .button(Button::new("refresh-managed", "Refresh Status").icon("refresh"))
-            .button(Button::new(&format!("cancel-{}", session.key), "Cancel CLI / Close Handle").enabled(session.child.is_some()))
-            .status("Finite instance-owned CLI · manual status polling · no durable container/IDE owner · cancellation is not rollback");
+            .button(Button::new(&format!("cancel-{}", session.key), "Cancel Command").enabled(session.child.is_some()))
+            .status("Refresh to see progress · cancelling does not undo a started container or build");
         if let Some(error) = failure { view = view.status(error); }
         view
     }
@@ -169,8 +169,8 @@ impl Operations {
         let Some(session) = self.session.as_ref().filter(|s| s.key == key && s.root == root) else { return Ok(Vec::new()); };
         Ok(vec![
             Tab::new("target", "Target / State", Pane::Text(format!(
-                "Project / CLI cwd: {}\nConfiguration: {}\nProgram: devcontainer\nArguments: {}\n\n{}\n\nThe CLI reads disk and may execute referenced build/lifecycle code. This is one client handle, normally reclaimed with the plugin after about300seconds idle. Closing/killing it does not prove a container or Docker build stopped. Existing terminal commands support independent terminal sessions.", session.root, session.config, serde_json::to_string(&session.args).unwrap_or_default(), session.status))),
-            Tab::new("output", "Captured Output", Pane::Text(format!("{}{}", if session.truncated { "[Earlier captured output truncated; latest64KiB retained]\n" } else { "" }, if session.output.is_empty() { "No captured output yet. Refresh Status reads a bounded chunk." } else { &session.output }))),
+                "Project: {}\nConfiguration: {}\nProgram: devcontainer\nArguments: {}\n\n{}\n\nThe CLI reads the configuration and may run the build and lifecycle commands it references. Closing it does not prove the container or build stopped. The handle is released after about 300 seconds idle.", session.root, session.config, serde_json::to_string(&session.args).unwrap_or_default(), session.status))),
+            Tab::new("output", "Captured Output", Pane::Text(format!("{}{}", if session.truncated { "[Earlier output truncated; the latest 64 KiB is kept]\n" } else { "" }, if session.output.is_empty() { "No output yet. Refresh Status reads the latest output." } else { &session.output }))),
         ])
     }
 
@@ -193,13 +193,13 @@ impl Operations {
                     // The user explicitly requested handle closure. Releasing
                     // this owned resource is distinct from inferring an exit.
                     session.child.take();
-                    session.status = "CLI cancellation could not be confirmed; owned handle released, captured output retained. Runtime outcome is unknown.".into();
+                    session.status = "Could not confirm the cancellation; the run was released and its output kept. Its outcome is unknown.".into();
                     host::refresh_view(VIEW);
                     return Err(error);
                 }
                 let _ = Self::poll(session);
                 session.child.take();
-                session.status = "CLI handle closed by request. Container/build outcome is unknown; cancellation is not rollback.".into();
+                session.status = "Cancelled. The container may be partly built; cancelling does not undo changes.".into();
             }
             ViewEvent::Select(key) | ViewEvent::Activate(key) if key != "managed-status" => { self.current(ctx, &key)?; }
             _ => {}
@@ -249,7 +249,7 @@ mod tests {
         refresh(&host, &mut plugin);
         let session = plugin.operations.session.as_ref().unwrap();
         assert!(session.child.is_none() && session.status.contains("status 0") && session.output.contains("started:"));
-        assert!(session.status.contains("container/IDE lifetime is not tracked"));
+        assert!(session.status.contains("not tracked after this"));
         start(&host, &mut plugin, "up");
         assert_eq!(host.terminals().len(), 1, "legacy terminal command remains separate");
     }
@@ -271,7 +271,7 @@ mod tests {
         host.set_project_root(Some("/project"));
         plugin.handle(VIEW, ViewEvent::Button(format!("cancel-{first}")), &host.invocation()).unwrap();
         let session = plugin.operations.session.as_ref().unwrap();
-        assert!(session.child.is_none() && session.status.contains("not rollback") && session.output.contains("started:"));
+        assert!(session.child.is_none() && session.status.contains("does not undo") && session.output.contains("started:"));
         start(&host, &mut plugin, "up-managed");
         assert_ne!(plugin.operations.session.as_ref().unwrap().key, first);
         assert!(plugin.handle(VIEW, ViewEvent::Button(format!("cancel-{first}")), &host.invocation()).is_err());
@@ -286,7 +286,7 @@ mod tests {
         let host = host.with_capabilities(&[]);
         refresh(&host, &mut plugin);
         let session = plugin.operations.session.as_ref().unwrap();
-        assert!(session.child.is_some() && session.status.contains("membership unavailable"));
+        assert!(session.child.is_some() && session.status.contains("Project list unavailable"));
         assert!(session.output.contains("started:"));
         let host = host.with_capabilities(&["project.read", "process:devcontainer"]);
         refresh(&host, &mut plugin);
@@ -309,7 +309,7 @@ mod tests {
         let previous = plugin.operations.session.as_ref().unwrap().output.clone();
         let host = host.with_capabilities(&["project.read"]);
         host.answer_next_prompt(Some(&[]));
-        assert!(matches!(plugin.run_command("up-managed", &host.invocation(), None), Err(Error::Denied(_))));
+        assert!(matches!(plugin.run_command("up-managed", &host.invocation(), None), Err(Error::Invalid(m)) if m.contains("process:devcontainer permission")));
         assert_eq!(plugin.operations.session.as_ref().unwrap().output, previous);
         assert!(plugin.operations.failed.as_ref().unwrap().1.contains("Last start failed"));
         assert!(host.refreshed_views().iter().any(|view| view == VIEW));
@@ -322,7 +322,7 @@ mod tests {
         start(&host, &mut plugin, "up-managed");
         let key = plugin.operations.session.as_ref().unwrap().key.clone();
         let tabs = plugin.detail(VIEW, &key, &host.invocation()).unwrap();
-        assert!(matches!(&tabs[1].body, Pane::Text(text) if text.contains("No captured output yet")));
+        assert!(matches!(&tabs[1].body, Pane::Text(text) if text.contains("No output yet")));
         plugin.render(VIEW, None, &host.invocation()).unwrap();
         assert!(plugin.operations.session.as_ref().unwrap().output.is_empty(), "render does not poll");
         let session = plugin.operations.session.as_mut().unwrap();
@@ -367,7 +367,7 @@ mod tests {
         let session = plugin.operations.session.as_mut().unwrap();
         let previous = session.output.clone();
         assert!(matches!(Operations::poll_with(session, |_, _| Err(Error::Denied("status".into()))), Err(Error::Denied(_))));
-        assert!(session.child.is_some() && session.output == previous && session.status.contains("status unavailable"));
+        assert!(session.child.is_some() && session.output == previous && session.status.contains("Status unavailable"));
         assert_eq!(session.child.as_ref().unwrap().wait(0).unwrap().status, None);
         refresh(&host, &mut plugin);
         assert!(plugin.operations.session.as_ref().unwrap().status.contains("running"));
@@ -385,7 +385,7 @@ mod tests {
             Ok(Chunk { stdout: "x".repeat(max as usize), stderr: "é".repeat(max as usize / 2), status: Some(17) })
         }).unwrap();
         assert_eq!(reads, MAX_POLLS);
-        assert!(session.child.is_some() && session.exit == Some(17) && session.status.contains("draining"));
+        assert!(session.child.is_some() && session.exit == Some(17) && session.status.contains("still draining"));
         assert!(session.truncated && session.output.len() <= MAX_OUTPUT);
         Operations::poll_with(session, |_, _| Ok(Chunk { status: Some(17), ..Chunk::default() })).unwrap();
         assert!(session.child.is_none() && session.status.contains("status 17"));

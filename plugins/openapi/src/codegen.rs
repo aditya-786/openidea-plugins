@@ -29,11 +29,19 @@ impl State {
                         && exit.id == pending.terminal
                         && pending.status.is_none()
                     {
-                        pending.status = Some(if exit.closed {
+                        let status = if exit.closed {
                             -1
                         } else {
                             exit.status.unwrap_or(-1)
-                        });
+                        };
+                        pending.status = Some(status);
+                        let spec = pending.path.rsplit('/').next().unwrap_or(&pending.path);
+                        let body = if status == 0 {
+                            format!("Code generation finished. Press ⌥⏎ in {spec} and choose Apply generated code… to move it to {}.", pending.target)
+                        } else {
+                            "Code generation stopped before finishing. Check its terminal, then run OpenAPI: Stop Tracking Generated Code to start over.".to_owned()
+                        };
+                        host::notify(NotificationLevel::Info, "OpenAPI generation", &body);
                     }
                 }
             }
@@ -54,12 +62,12 @@ impl State {
         }
         if pending.status.is_none() {
             return Err(
-                "Stop or finish generation in its native terminal before forgetting the stage."
+                "Stop or finish generation in its terminal before clearing it."
                     .into(),
             );
         }
         if !host::confirm(
-            "Forget completed generation stage",
+            "Stop tracking generated code",
             &format!(
                 "Stop tracking {}?\n\nFiles remain intact in that staging directory for manual inspection/removal. This does not delete or apply generated output.",
                 pending.stage
@@ -93,7 +101,7 @@ impl State {
             return None;
         }
         Some(FileAction {
-            title: "Apply staged generated API directory…".into(),
+            title: "Apply generated code…".into(),
             kind: Some("source.generate".into()),
             data: Some(format!("codegen-apply:{}:{}", p.key, p.terminal)),
             ..FileAction::default()
@@ -196,7 +204,7 @@ fn supported_version(version: &str) -> bool {
 }
 fn generator_catalog(output: &str) -> Result<Vec<String>, Error> {
     if output.len() > 16 * 1024 {
-        return Err("Swagger Codegen generator catalog exceeds 16KiB.".into());
+        return Err("Swagger Codegen generator catalog exceeds 16 KiB.".into());
     }
     let mut catalogs = output.lines().filter_map(|line| {
         line.strip_prefix("Available languages: [")
@@ -222,7 +230,7 @@ fn generator_catalog(output: &str) -> Result<Vec<String>, Error> {
         }
         names.push(name.to_owned());
         if names.len() > 256 {
-            return Err("Swagger Codegen generator catalog exceeds256 entries.".into());
+            return Err("Swagger Codegen generator catalog exceeds 256 entries.".into());
         }
     }
     names.sort();
@@ -280,7 +288,7 @@ fn run_with_options(
     if let Some(p) = &state.pending {
         let project = host::project_of(&p.path).ok_or(Error::Stale)?;
         if !project.exists(&p.target)? || project.exists(&p.stage)? {
-            return Err("A staged generation is pending. Apply it from the specification's code actions, or finish/stop its terminal and run OpenAPI: Forget Completed Generation Stage before starting another.".into());
+            return Err("Generated code is waiting to be applied. Press ⌥⏎ in the specification and choose Apply generated code…, or run OpenAPI: Stop Tracking Generated Code to start over.".into());
         }
     }
     let editor = ctx
@@ -292,11 +300,11 @@ fn run_with_options(
         || !is_spec_file(&path)
         || spec::parse(&document.text).is_none()
     {
-        return Err("Open a supported OpenAPI specification of at most 1MiB.".into());
+        return Err("Open a supported OpenAPI specification of at most 1 MiB.".into());
     }
     let spec = spec::parse(&document.text).ok_or(Error::Stale)?;
     if spec.version != "2.0" && !spec.version.starts_with("3.0.") {
-        return Err("Swagger Codegen 3 adapter supports Swagger 2.0 and OpenAPI 3.0 input; this specification version is not admitted.".into());
+        return Err("Swagger Codegen 3 supports Swagger 2.0 and OpenAPI 3.0 specifications only.".into());
     }
     let root = comparison_owner(ctx, &path)?;
     let project = ctx.project().ok_or(Error::Stale)?;
@@ -304,7 +312,9 @@ fn run_with_options(
     if project.read_file(&path)? != document.text {
         return Err("Save the current specification before generating code.".into());
     }
-    let version = project.run_process("swagger-codegen", &["version".into()], None)?;
+    let version = project
+        .run_process("swagger-codegen", &["version".into()], None)
+        .map_err(|e| ui_kit::denied::map(e, "Code generation", "process:swagger-codegen", "OpenAPI"))?;
     let version_text = version.stdout.trim();
     if version.status != Some(0)
         || version_text.len() > 128
@@ -358,7 +368,7 @@ fn run_with_options(
     if !host::confirm(
         "Generate API code",
         &format!(
-            "Swagger Codegen {version_text}\nSpecification: {path}\nGenerator: {generator}\nFinal destination: {target}\nStaging directory: {stage}\n{}\n\nThe approved generator runs only in staging. After successful completion, use Apply staged generated API directory from this specification’s code actions to move it atomically into the new destination. Review the specification and its referenced inputs before proceeding. Stop the process in that terminal if needed.",
+            "Swagger Codegen {version_text}\nSpecification: {path}\nGenerator: {generator}\nFinal destination: {target}\nStaging directory: {stage}\n{}\n\nThe approved generator runs only in staging. After successful completion, press ⌥⏎ in this specification and choose Apply generated code… to move it into the new destination. Review the specification and its referenced inputs before proceeding. Stop the process in that terminal if needed.",
             options.summary()
         ),
     )? {
@@ -407,7 +417,7 @@ fn run_with_options(
         NotificationLevel::Info,
         "OpenAPI generation",
         &format!(
-            "Generating into {stage}. Final output is unchanged until you apply the completed staged directory from the specification's code actions."
+            "Generating into {stage}. When it finishes, press ⌥⏎ in the specification and choose Apply generated code…"
         ),
     );
     Ok(None)
@@ -567,6 +577,8 @@ mod tests {
         h.add_file(&format!("{stage}/README.md"), "Generated client");
         let event = h.finish_terminal(&p.key).unwrap();
         state.observe(&[event]);
+        let finished = h.notifications().last().unwrap().body.clone();
+        assert!(finished.contains("Code generation finished") && finished.contains("Apply generated code…"), "{finished}");
         let doc = h.provider_document().unwrap();
         let action = state.offered(&doc).unwrap();
         h.answer_next_prompt(Some(&["ok"]));
@@ -586,6 +598,12 @@ mod tests {
                 .unwrap(),
             "EXISTING"
         );
+    }
+    #[test]
+    fn denied_codegen_names_the_permission() {
+        let h = setup().with_capabilities(&["project.read", "project.write", "editor.read", "events"]);
+        let error = run(&h.invocation()).unwrap_err().to_string();
+        assert!(error.contains("process:swagger-codegen permission"), "{error}");
     }
     #[test]
     fn cancelled_generation_leaves_output_unwritten() {

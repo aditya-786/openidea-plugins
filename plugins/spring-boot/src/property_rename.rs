@@ -335,28 +335,22 @@ fn source(path: &str, text: &str) -> Result<(Vec<Occurrence>, Vec<String>, usize
                 .into(),
         );
     }
-    let mut stack = Vec::new();
+    if !spring_text::text::balanced(text, kotlin) {
+        return Err("Unbalanced or incomplete source prevents complete static Rename.".into());
+    }
+    let mut depth = 0usize;
     for token in java::tokens(text) {
         if token.s.starts_with('"') && !token.s.ends_with('"') {
             return Err("Incomplete source string prevents a complete static inventory.".into());
         }
         match token.s {
-            "(" => stack.push(")"),
-            "[" => stack.push("]"),
-            "{" => stack.push("}"),
-            ")" | "]" | "}" => {
-                if stack.pop() != Some(token.s) {
-                    return Err("Unbalanced source prevents complete static Rename.".into());
-                }
-            }
+            "(" | "[" | "{" => depth += 1,
+            ")" | "]" | "}" => depth = depth.saturating_sub(1),
             _ => {}
         }
-        if stack.len() > 128 {
+        if depth > 128 {
             return Err("Source nesting exceeds static Rename bounds.".into());
         }
-    }
-    if !stack.is_empty() {
-        return Err("Incomplete source prevents complete static Rename.".into());
     }
     let file = spring_text::parse_source(path, text);
     let mut occurrences = Vec::new();

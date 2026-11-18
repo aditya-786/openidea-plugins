@@ -183,6 +183,7 @@ mod tests {
         kube.run_command("resource-show-secret",&h.invocation(),Some(&secret)).unwrap();
         kube.run_command("resource-edit-secret",&h.invocation(),Some(&secret)).unwrap();
         kube.handle(PANEL,ViewEvent::Field(kube.test_control_key("secret-edit:password"),"changed".into()),&h.invocation()).unwrap();
+        h.answer_next_prompt(Some(&[]));
         kube.handle(PANEL,ViewEvent::Button(kube.test_control_key("submit-secret-edit")),&h.invocation()).unwrap();
         kube.run_command("customize-namespaces",&h.invocation(),None).unwrap();
         kube.run_command("cache-cluster-namespaces",&h.invocation(),None).unwrap();
@@ -196,6 +197,7 @@ mod tests {
         h.open_editor("/project/charts/app/templates/pod.yaml","yaml","apiVersion: v1\nkind: Pod\nmetadata:\n  name: web\n  namespace: shop\n",&[]);
         host::storage::set("helm-values","values/relative.yaml").unwrap();
         for id in ["apply","dry-run","diff","kustomize-render","kustomize-apply","helm-template","helm-lint","helm-dependency-update","reload-from-cluster"] {
+            if matches!(id,"apply"|"kustomize-apply") {h.answer_next_prompt(Some(&["apply"]));}
             kube.run_command(id,&h.invocation(),None).unwrap();assert!(kube.process_scope.root().is_none());
         }
         assert!(h.process_runs().iter().all(|r|r.cwd.as_deref()==Some("/project")),"{:?}",h.process_runs());
@@ -220,19 +222,32 @@ mod tests {
         assert!(kube.process_scope.root().is_none());
     }
     #[test]
+    fn services_view_denied_shows_row() {
+        let (h,mut kube)=setup();
+        let invocation=h.invocation();
+        let h=h.with_capabilities(&["storage","process:kubectl"]);
+        let rendered=kube.render(TREE,None,&invocation).unwrap();
+        let Body::Tree(rows)=rendered.body else{panic!("a status row, not a message")};
+        assert_eq!(rows.len(),1);
+        assert!(rows[0].detail.as_deref().is_some_and(|detail|detail.contains("project.read")));
+        assert!(h.process_runs().is_empty());
+    }
+    #[test]
     fn rendering_a_denied_invoking_project_is_inert_without_global_process_fallback() {
         let (h,mut kube)=setup();
         let key=row(&mut kube,&h,"pods","web");
         let invocation=h.invocation();
         let h=h.with_capabilities(&["storage","process:kubectl"]);
         let before=h.process_runs().len();
-        for view in [TREE,PANEL] {
-            let rendered=kube.render(view,None,&invocation).unwrap();
-            let Body::Message(message)=rendered.body else{panic!("denied views must be inert")};
-            assert!(message.contains("project.read"));
-            assert!(rendered.toolbar.is_empty());
-            assert_eq!(h.process_runs().len(),before);
-        }
+        let rendered=kube.render(PANEL,None,&invocation).unwrap();
+        let Body::Message(message)=rendered.body else{panic!("denied views must be inert")};
+        assert!(message.contains("project.read"));
+        assert!(rendered.toolbar.is_empty());
+        assert_eq!(h.process_runs().len(),before);
+        let rendered=kube.render(TREE,None,&invocation).unwrap();
+        assert!(matches!(rendered.body,Body::Tree(ref rows) if rows.len()==1));
+        assert!(rendered.toolbar.is_empty());
+        assert_eq!(h.process_runs().len(),before);
         assert!(matches!(kube.handle(TREE,ViewEvent::Select(key),&invocation),Err(Error::Denied(_))));
         assert!(kube.process_scope.root().is_none());
         assert_eq!(h.process_runs().len(),before);
@@ -542,6 +557,7 @@ mod tests {
         kube.run_command("delete-manifest",&h.invocation(),None).unwrap();let before=h.process_runs().len();
         assert!(matches!(kube.handle(PANEL,ViewEvent::Button(old_confirm),&h.invocation()),Err(Error::Stale)));
         assert_eq!(h.process_runs().len(),before);
+        h.answer_next_prompt(Some(&[]));
         kube.handle(PANEL,ViewEvent::Button(kube.test_control_key("confirm-delete-manifest")),&h.invocation()).unwrap();
         let key=row(&mut kube,&h,"pods","web");
         kube.handle(TREE,ViewEvent::Select(key.clone()),&h.invocation()).unwrap();
@@ -577,6 +593,7 @@ mod tests {
             let current_field=fields.iter().find(|field|field.label=="password").unwrap().key.clone();
             let current_save=view.toolbar.iter().find(|button|button.label=="Save").unwrap().id.clone();
             kube.handle(PANEL,ViewEvent::Field(current_field,"current-value".into()),&h.invocation()).unwrap();
+            h.answer_next_prompt(Some(&[]));
             kube.handle(PANEL,ViewEvent::Button(current_save.clone()),&h.invocation()).unwrap();
             let accepted=h.process_runs().len();assert!(accepted>before);assert!(kube.editing_secret.is_none());
             assert!(matches!(kube.handle(PANEL,ViewEvent::Button(current_save),&h.invocation()),Err(Error::Stale)));
@@ -595,6 +612,7 @@ mod tests {
             kube.run_command("resource-yaml",&h.invocation(),Some(&key)).unwrap();
             let message=kube.test_apply_message("kind: Secret # edited");
             h.on_process(KUBECTL,move |_,_|if process_error {Err(Error::Failed("private-yaml-error c2VjcmV0".into()))}else{Ok(ProcessOutput{status:Some(1),stdout:String::new(),stderr:"private-yaml-error c2VjcmV0".into()})});
+            h.answer_next_prompt(Some(&[]));
             kube.handle(PANEL,ViewEvent::Message(message.clone()),&h.invocation()).unwrap();
             let error=h.view_messages().last().unwrap().1.clone();
             assert!(!error.contains("private-yaml-error")&&!error.contains("c2VjcmV0"),"{error}");
@@ -729,6 +747,7 @@ mod tests {
         let current=kube.test_apply_message("kind: Pod # current page");
         assert!(matches!(kube.handle(PANEL,ViewEvent::Message("apply\nkind: Pod # unproved".into()),&h.invocation()),Err(Error::Stale)));
         assert_eq!(h.process_runs().len(),before);
+        h.answer_next_prompt(Some(&[]));
         kube.handle(PANEL,ViewEvent::Message(current.clone()),&h.invocation()).unwrap();
         let accepted=h.process_runs().len();assert!(accepted>before);
         assert!(matches!(kube.handle(PANEL,ViewEvent::Message(current),&h.invocation()),Err(Error::Stale)));

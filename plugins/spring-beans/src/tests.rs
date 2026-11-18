@@ -263,29 +263,73 @@ fn primary_wins_between_candidates() {
 
 #[test]
 fn beans_show_where_they_are_injected() {
-    use openidea_plugin::language_features::LanguageFeatures;
-    let host = setup();
+    let _host = setup();
     let mut n = warmed_navigator();
-    let path = java("AppConfig.java", CONFIG).path;
-    host.open_editor(&path, "java", CONFIG, &[(5, 0, 5, 0)]);
-    let editor = host.invocation().editor().unwrap();
-    let current = editor.document().unwrap();
-    let doc = Document {path, language: "java".into(), text: current.text, version: current.version};
-    let action = n.gutter_actions(&doc).into_iter().find(|a| a.line == 5).unwrap();
-    assert!(action.tooltip.contains("7 cached Spring source targets"), "{}", action.tooltip);
-    assert!(n.checked_markers(&doc).iter().all(|m| m.line != 5 || m.icon.as_deref() != Some(BEAN_MARKER)));
-    let selected = n.with_doc(&doc, |world, model| {
-        let bean = model.beans.iter().find(|b| b.range.start.line == 5).unwrap();
-        let users = world.users(&doc.path, bean);
-        let names: BTreeSet<_> = users.iter().map(|(_, name)| name.as_str()).collect();
-        assert_eq!(names, BTreeSet::from(["legacy", "mail", "reportService", "sms", "userController"]));
-        users.iter().position(|(location, _)| location.path.ends_with("/UserController.java")).unwrap().to_string()
-    });
-    host.answer_next_prompt(Some(&[&selected]));
-    n.run_command(&action.command, &host.invocation(), action.argument.as_deref()).unwrap();
-    let opened = host.opened_locations();
-    assert_eq!(opened.len(), 1);
-    assert!(opened[0].0.ends_with("/UserController.java"));
+    let doc = java("AppConfig.java", CONFIG);
+    let on_bean: Vec<_> = n.checked_markers(&doc).into_iter().filter(|m| m.line == 5 && m.icon.as_deref() == Some(BEAN_MARKER)).collect();
+    let into: BTreeSet<_> = on_bean.iter().map(|m| m.tooltip.as_str()).collect();
+    assert_eq!(
+        into,
+        BTreeSet::from(["Injected into legacy", "Injected into mail", "Injected into reportService", "Injected into sms", "Injected into userController"])
+    );
+    assert_eq!(on_bean.len(), 6, "one marker per injection point, joined by the IDE into one popup");
+    assert!(on_bean.iter().any(|m| m.target.as_ref().is_some_and(|t| t.path.ends_with("/UserController.java"))));
+}
+
+const CONSUMER: &str = "package shop;\n@org.springframework.stereotype.Service class Consumer {\n @org.springframework.beans.factory.annotation.Autowired ServiceType service;\n @org.springframework.beans.factory.annotation.Autowired Only only;\n}";
+
+fn ambiguous_setup() -> (MockHost, Navigator, Document) {
+    let host = MockHost::install();
+    host.add_file("src/main/java/shop/Consumer.java", CONSUMER);
+    host.add_file("src/main/java/shop/ServiceType.java", "package shop; interface ServiceType {}");
+    host.add_file("src/main/java/shop/First.java", "package shop; @org.springframework.stereotype.Service(\"first\") class First implements ServiceType {}");
+    host.add_file("src/main/java/shop/Second.java", "package shop; @org.springframework.stereotype.Service(\"second\") class Second implements ServiceType {}");
+    host.add_file("src/main/java/shop/Only.java", "package shop; @org.springframework.stereotype.Service class Only {}");
+    let navigator = warmed_navigator();
+    (host, navigator, doc("/project/src/main/java/shop/Consumer.java", CONSUMER))
+}
+
+/// The text a marker's target covers in the project file it points to.
+fn covered(host: &MockHost, marker: &LineMarker) -> String {
+    let target = marker.target.as_ref().unwrap();
+    let text = host.invocation().project().unwrap().read_file(&target.path).unwrap();
+    let (from, to) = (offset(&text, target.range.start).unwrap(), offset(&text, target.range.end).unwrap());
+    text[from..to].to_owned()
+}
+
+#[test]
+fn ambiguous_injection_marks_every_candidate_on_its_line() {
+    let (host, mut navigator, doc) = ambiguous_setup();
+    let markers = navigator.line_markers(&doc);
+    let line: Vec<_> = markers.iter().filter(|m| m.line == 2).collect();
+    assert!(line.iter().all(|m| m.icon.as_deref() == Some(BEAN_MARKER)), "one icon, so the IDE joins them into one popup");
+    let mut tips: Vec<_> = line.iter().map(|m| m.tooltip.as_str()).collect();
+    tips.sort();
+    assert_eq!(tips, ["Candidate bean: first (@Service)", "Candidate bean: second (@Service)"]);
+    let mut targets: Vec<_> = line.iter().map(|m| covered(&host, m)).collect();
+    targets.sort();
+    assert_eq!(targets, ["First", "Second"], "targets sit on the bean's class name, never an empty range");
+    assert!(host.requests().is_empty() && host.process_runs().is_empty());
+}
+
+#[test]
+fn single_candidate_keeps_one_direct_marker() {
+    let (host, mut navigator, doc) = ambiguous_setup();
+    let markers = navigator.line_markers(&doc);
+    let line: Vec<_> = markers.iter().filter(|m| m.line == 3).collect();
+    assert_eq!(line.len(), 1);
+    assert_eq!(line[0].tooltip, "Injected bean: only (@Service)");
+    assert_eq!(covered(&host, line[0]), "Only");
+}
+
+#[test]
+fn line_targets_are_bounded_and_say_so() {
+    let marker = |n: usize| LineMarker { line: 0, icon: None, tooltip: format!("t{n}"), target: None };
+    let mut markers: Vec<_> = (0..MAX_LINE_TARGETS + 1).map(marker).collect();
+    bounded(&mut markers[..], MAX_LINE_TARGETS);
+    assert_eq!(markers[1].tooltip, "t1");
+    bounded(&mut markers[..], MAX_LINE_TARGETS + 5);
+    assert_eq!(markers[1].tooltip, "t1 (1000 of 1005 shown)");
 }
 
 #[test]
@@ -413,9 +457,11 @@ fn views_list_and_draw_beans() {
     assert!(page.contains("<title>users (@Service)</title>"));
     let status = graph.status.unwrap();
     assert!(status.ends_with("dependencies · arrows point to dependencies"), "{status}");
+    n.handle(BEANS_VIEW, ViewEvent::Message(users.key.clone()), &host.invocation()).unwrap();
+    assert_eq!(host.opened_locations().len(), 1, "the first activation focuses the bean");
     let refreshed = host.refreshed_views().len();
     n.handle(BEANS_VIEW, ViewEvent::Message(users.key.clone()), &host.invocation()).unwrap();
-    assert_eq!(host.opened_locations().len(), 2);
+    assert_eq!(host.opened_locations().len(), 2, "activating the focused bean opens it");
     assert_eq!(host.refreshed_views().len(), refreshed, "a complete scan doesn't re-render");
 
     n.handle(BEANS_VIEW, ViewEvent::Button("refresh".into()), &host.invocation()).unwrap();
@@ -424,6 +470,17 @@ fn views_list_and_draw_beans() {
 
 fn toolbar_ids(view: &View) -> Vec<&str> {
     view.toolbar.iter().map(|b| b.id.as_str()).collect()
+}
+
+#[test]
+fn dump_report_can_run_again_from_its_toolbar() {
+    let host = setup();
+    let mut n = warmed_navigator();
+    n.run_command("dump-spring-configuration", &host.invocation(), None).unwrap();
+    n.sections.set(REPORT_SECTION);
+    let dumped = n.render(BEANS_VIEW, None, &host.invocation()).unwrap();
+    assert!(toolbar_ids(&dumped).contains(&"dump"));
+    n.handle(BEANS_VIEW, ViewEvent::Button("dump".into()), &host.invocation()).unwrap();
 }
 
 #[test]
@@ -436,7 +493,22 @@ fn beans_window_has_three_sections() {
     n.handle(BEANS_VIEW, ViewEvent::Button("section:report".into()), &host.invocation()).unwrap();
     let report = n.render(BEANS_VIEW, None, &host.invocation()).unwrap();
     assert!(matches!(report.body, Body::Message(_)));
-    assert_eq!(toolbar_ids(&report), ["section:beans", "section:graph", "section:report"]);
+    assert_eq!(toolbar_ids(&report), ["section:beans", "section:graph", "section:report", "check"]);
+    n.handle(BEANS_VIEW, ViewEvent::Button("check".into()), &host.invocation()).unwrap();
+    let checked = n.render(BEANS_VIEW, None, &host.invocation()).unwrap();
+    assert!(toolbar_ids(&checked).contains(&"check"), "results can be checked again");
+}
+
+#[test]
+fn empty_beans_view_says_when_the_project_has_no_build_file() {
+    let host = MockHost::install();
+    host.add_file("src/Plain.java", "class Plain {}");
+    let mut n = warmed_navigator();
+    let view = n.render(BEANS_VIEW, None, &host.invocation()).unwrap();
+    assert!(matches!(view.body, Body::Message(ref text) if text.contains("doesn't look like a Spring project")), "{:?}", view.body);
+    host.add_file("build.gradle.kts", "plugins {}");
+    let view = n.render(BEANS_VIEW, None, &host.invocation()).unwrap();
+    assert!(matches!(view.body, Body::Message(ref text) if text == "No Spring beans found."), "{:?}", view.body);
 }
 
 #[test]
@@ -461,15 +533,113 @@ fn graph_section_renders_the_bean_graph() {
 }
 
 #[test]
-fn graph_says_when_it_is_capped() {
+fn graph_over_the_cap_starts_with_a_search_prompt_and_focuses_the_first_match() {
     let host = MockHost::install();
     let beans: String = (0..MAX_GRAPH + 1).map(|i| format!("    @org.springframework.context.annotation.Bean Clock clock{i}() {{ return null; }}\n")).collect();
     host.add_file("src/main/java/com/acme/Many.java", &format!("@org.springframework.context.annotation.Configuration\nclass Many {{\n{beans}}}\n"));
     let mut n = warmed_navigator();
     n.sections.set(GRAPH_SECTION);
-    let graph = n.render(BEANS_VIEW, None, &host.invocation()).unwrap();
-    let status = graph.status.unwrap();
-    assert!(status.starts_with(&format!("{MAX_GRAPH} of {} beans shown · ", MAX_GRAPH + 2)), "{status}");
+    let total = MAX_GRAPH + 2;
+    let prompt = n.render(BEANS_VIEW, None, &host.invocation()).unwrap();
+    assert_eq!(prompt.status.as_deref(), Some(&*format!("0 of {total} beans shown · find a bean to focus")));
+    assert!(toolbar_ids(&prompt).contains(&graph::FIND));
+    let Body::Html(page) = prompt.body else { panic!("html expected") };
+    assert!(page.contains("Find a bean to show its neighbours.") && page.contains(&format!("has {total} beans")), "{page}");
+    assert!(!page.contains("<svg"));
+
+    host.answer_next_prompt(Some(&["  CLOCK7 "]));
+    n.handle(BEANS_VIEW, ViewEvent::Button(graph::FIND.into()), &host.invocation()).unwrap();
+    let focused = n.render(BEANS_VIEW, None, &host.invocation()).unwrap();
+    let Body::Html(page) = focused.body else { panic!("html expected") };
+    assert!(page.contains("Focused on <strong>clock7</strong>"), "{page}");
+    assert!(page.contains(&format!("11 of {total} beans match \u{201c}CLOCK7\u{201d}.")), "{page}");
+    assert!(page.contains("data-id=\"graph:all\">Clear Focus<"));
+    assert!(focused.status.unwrap().starts_with(&format!("1 of {total} beans shown · 0 dependencies")));
+
+    host.answer_next_prompt(None);
+    n.handle(BEANS_VIEW, ViewEvent::Button(graph::FIND.into()), &host.invocation()).unwrap();
+    assert!(n.graph.query.is_empty(), "Escape clears the search");
+    n.handle(BEANS_VIEW, ViewEvent::Message("graph:all".into()), &host.invocation()).unwrap();
+    let Body::Html(page) = n.render(BEANS_VIEW, None, &host.invocation()).unwrap().body else { panic!("html expected") };
+    assert!(page.contains("Find a bean to show its neighbours."));
+}
+
+fn graph_page(n: &mut Navigator, host: &MockHost) -> String {
+    let Body::Html(page) = n.render(BEANS_VIEW, None, &host.invocation()).unwrap().body else { panic!("html expected") };
+    page
+}
+
+fn bean_key(n: &mut Navigator, host: &MockHost, name: &str) -> String {
+    let index = n.indexes.cached(&host.invocation().project().unwrap()).unwrap();
+    World::new(index).beans().find(|b| b.1.name == name).map(|(p, b)| location_key(p, b.range)).unwrap()
+}
+
+fn drawn(page: &str) -> Vec<&str> {
+    page.match_indices("<g class=\"n").map(|(i, _)| &page[i + page[i..].find("<title>").unwrap() + 7..][..page[i + page[i..].find("<title>").unwrap() + 7..].find(" (").unwrap()]).collect()
+}
+
+#[test]
+fn focusing_a_bean_shows_its_dependencies_and_dependents() {
+    let host = setup();
+    let mut n = warmed_navigator();
+    n.sections.set(GRAPH_SECTION);
+    assert!(graph_page(&mut n, &host).contains("Select a bean to show only its dependencies and dependents."));
+    let users = bean_key(&mut n, &host, "users");
+    n.handle(BEANS_VIEW, ViewEvent::Message(users), &host.invocation()).unwrap();
+    let page = graph_page(&mut n, &host);
+    assert_eq!(drawn(&page), ["users", "mail", "userRepository", "sms", "userController", "legacy", "fake"]);
+    assert!(page.contains("<g class=\"n a\" data-id=\"b:"), "the focused bean is accented");
+    assert!(page.contains("aria-checked=\"true\">1 hop<") && page.contains("data-id=\"graph:all\">Show All<"));
+
+    n.handle(BEANS_VIEW, ViewEvent::Message("graph:hops:2".into()), &host.invocation()).unwrap();
+    let page = graph_page(&mut n, &host);
+    assert!(drawn(&page).contains(&"clock"), "userController's own dependency is two hops away");
+    assert!(!drawn(&page).contains(&"reports"));
+    assert!(page.contains("aria-checked=\"true\">2 hops<"));
+
+    n.handle(BEANS_VIEW, ViewEvent::Message("graph:open".into()), &host.invocation()).unwrap();
+    assert_eq!(host.opened_locations(), [(format!("{ROOT}/UserServiceImpl.java"), 7, 13)]);
+    n.handle(BEANS_VIEW, ViewEvent::Message("graph:all".into()), &host.invocation()).unwrap();
+    assert_eq!(drawn(&graph_page(&mut n, &host)).len(), 14);
+    assert!(matches!(n.handle(BEANS_VIEW, ViewEvent::Message("b:0:0:/project/Gone.java".into()), &host.invocation()), Err(Error::Stale)));
+}
+
+#[test]
+fn graph_search_matches_names_and_types_ignoring_case() {
+    let host = setup();
+    let mut n = warmed_navigator();
+    n.sections.set(GRAPH_SECTION);
+    host.answer_next_prompt(Some(&["serviceIMPL"]));
+    n.handle(BEANS_VIEW, ViewEvent::Button(graph::FIND.into()), &host.invocation()).unwrap();
+    let page = graph_page(&mut n, &host);
+    assert!(page.contains("Focused on <strong>users</strong> <span class=\"t\">UserServiceImpl · @Service</span>"), "{page}");
+    assert!(page.contains("1 of 14 beans match"));
+    n.handle(BEANS_VIEW, ViewEvent::Message("graph:all".into()), &host.invocation()).unwrap();
+
+    n.graph.query = "user".into();
+    let page = graph_page(&mut n, &host);
+    assert_eq!(drawn(&page), ["userController", "userRepository", "users"], "unfocused, the graph shows only the matches");
+    assert!(page.contains("3 of 14 beans match \u{201c}user\u{201d}. Select one to show its neighbours."));
+    n.handle(BEANS_VIEW, ViewEvent::Message("graph:clear".into()), &host.invocation()).unwrap();
+    assert_eq!(drawn(&graph_page(&mut n, &host)).len(), 14);
+
+    n.graph.query = "nothing-like-this".into();
+    let page = graph_page(&mut n, &host);
+    assert!(page.contains("No beans match") && page.contains("data-id=\"graph:clear\""));
+}
+
+#[test]
+fn focus_in_graph_row_action_opens_the_graph_on_that_bean() {
+    let host = setup();
+    let mut n = warmed_navigator();
+    let key = bean_key(&mut n, &host, "userController");
+    n.run_command("focus-in-graph", &host.invocation(), Some(&key)).unwrap();
+    assert_eq!(n.sections.active(), GRAPH_SECTION);
+    assert_eq!(host.revealed_views(), [BEANS_VIEW]);
+    assert!(graph_page(&mut n, &host).contains("Focused on <strong>userController</strong>"));
+    assert!(matches!(n.run_command("focus-in-graph", &host.invocation(), Some("b:1:1:/project/Gone.java")), Err(Error::Stale)));
+    let actions: serde_json::Value = serde_json::from_str(include_str!("ui_config.json")).unwrap();
+    assert_eq!(actions["actions"][0]["id"], "focus-in-graph");
 }
 
 #[test]
@@ -1007,7 +1177,7 @@ fn unresolved_references_are_quiet_on_a_partial_index() {
     let host = setup();
     host.set_setting("springBeans.checkUnresolvedReferences", "true");
     let text = "@org.springframework.stereotype.Service\n@DependsOn(\"cache\")\nclass A {}\n";
-    let mut index = Index::new(GLOBS, model::parse);
+    let mut index = cache::Cache::new();
     index.update(&format!("{ROOT}/Subject.java"), text);
     assert!(!index.complete());
     let file = java::parse(text);
@@ -2420,7 +2590,7 @@ fn generators_without_write_access_show_a_notice() {
     host.open_editor("/project/src/main/java/com/acme/Orders.java", "java", ORDERS, &[(3, 0, 3, 0)]);
     run(&host, "generate-autowired-dependency", &[&["0"], &["ok"]]).unwrap();
     assert_eq!(host.editor_text(), ORDERS);
-    assert!(host.notifications()[0].body.contains("Allow editor changes"));
+    assert!(host.notifications()[0].body.contains("editor.write permission"));
 }
 
 #[test]
@@ -2438,7 +2608,7 @@ fn java_generators_cancel_exact_preview_without_any_source_change() {
 
 #[test]
 fn java_generation_refuses_oversize_preview_unknown_owner_and_invalid_event_identifiers() {
-    let oversized = format!("{}{}", ORDERS, " ".repeat(12 * 1024));
+    let oversized = format!("{}{}", ORDERS, " ".repeat(17 * 1024));
     let host = command_host(&oversized);
     assert!(run(&host, "generate-event-listener", &[&["OrderPlaced"], &["ok"]]).is_err());
     assert_eq!(host.editor_text(), oversized);
@@ -2929,14 +3099,14 @@ fn externalize_host(text: &str, line: u32, column: u32) -> MockHost {
 }
 
 #[test]
-fn annotation_externalization_command_routes_to_atomic_intention_without_writes() {
+fn annotation_externalization_command_cancelled_at_the_first_prompt_changes_nothing() {
     let host = externalize_host(SCHEDULED, 2, 24);
     host.add_file("src/main/resources/application.properties", "a=1\n");
     run(&host, "externalize-annotation-string", &[]).unwrap();
     assert_eq!(host.editor_text(), SCHEDULED);
     assert_eq!(host.clipboard(), None);
     assert!(host.process_runs().is_empty());
-    assert!(host.notifications().last().unwrap().body.contains("editor intentions"));
+    assert_eq!(host::project_of("/project/src/main/resources/application.properties").unwrap().read_file("/project/src/main/resources/application.properties").unwrap(), "a=1\n");
     let outside = externalize_host(SCHEDULED, 3, 6);
     assert!(run(&outside, "externalize-annotation-string", &[]).is_err());
 }
@@ -3068,7 +3238,9 @@ fn relationship_targets_are_provider_navigation_never_host_rename_anchors() {
     for (path, text) in [("A.java", SERVICE), ("L.java", listener), ("P.java", publisher), ("application-dev.yml", "app:\n  name: hello\n")]
     {
         let graph = navigator.index(&IndexDocument { path: path.into(), text: text.into(), symbols: Vec::new() });
-        assert!(graph.definitions.is_empty() && graph.references.is_empty() && graph.aliases.is_empty() && graph.markers.is_empty());
+        let mut keys = graph.definitions.iter().chain(&graph.references).chain(&graph.markers).map(|a| a.key.as_str());
+        assert!(keys.all(|k| k.starts_with("class:") || k.starts_with("resource#") || k.starts_with("profile#")), "{path}");
+        assert!(graph.aliases.is_empty());
     }
     let markers = navigator.checked_markers(&java("Sender.java", publisher));
     assert!(markers.iter().any(|m| m.target.as_ref().is_some_and(|t| t.path.ends_with("ReadyListener.java"))), "{markers:?}");
@@ -3270,7 +3442,7 @@ mod external_packaged_refresh_tests {
         assert!(matches!(nav.render(BEANS_VIEW,None,&host.invocation()).unwrap().body,Body::Message(_)));
         host.set_project_root(Some("/project"));let host=host.with_capabilities(&["storage"]);
         let model=nav.render(BEANS_VIEW,None,&host.invocation()).unwrap();
-        assert!(matches!(model.body,Body::Message(text) if text.contains("Project identity is unavailable")));
+        assert!(matches!(model.body,Body::Message(text) if text.contains("Project identity is unavailable") && !text.contains("Allow project.read")));
     }
     #[test]
     fn closed_report_owner_is_invalidated_even_without_file_event(){
@@ -3292,7 +3464,7 @@ mod external_packaged_refresh_tests {
     #[test]
     fn cold_foreign_cache_and_irrelevant_event_do_not_scan_or_notify(){
         let host=setup();let mut nav=warmed_navigator();host.set_project_root(Some("/other"));let before=host.view_messages().len();
-        let model=nav.render(BEANS_VIEW,None,&host.invocation()).unwrap();assert!(matches!(model.body,Body::Message(text) if text.contains("cold")));
+        let model=nav.render(BEANS_VIEW,None,&host.invocation()).unwrap();assert!(matches!(model.body,Body::Message(text) if text.contains("Not scanned yet")));
         nav.handle_events(&[Event::EditorFocused(None)],&host.invocation());assert!(notices(&host,before).is_empty());
         assert!(host.requests().is_empty());assert!(host.process_runs().is_empty());
     }
@@ -3313,7 +3485,7 @@ fn invalid_xml_current_text_drops_old_bean_facts_and_marks_context_incomplete_un
     host.add_file(XML_PATH,&good);host.add_file("Other.java","@org.springframework.stereotype.Service class Unaffected {}");let project=host.invocation().project().unwrap();let mut nav=Navigator::default();
     assert!(nav.indexes.get(&project,COMMAND_BUDGET).complete());assert!(nav.indexes.cached(&project).unwrap().files().contains_key(XML_PATH));
     let bad=good.replacen("<beans ","<beans xmlns:xml=\"urn:foreign\" ",1);assert!(nav.diagnostics(&doc(XML_PATH,&bad)).is_empty());
-    let cache=nav.indexes.cached(&project).unwrap();assert!(!cache.complete()&&!cache.files().contains_key(XML_PATH));assert!(cache.files().contains_key("/project/Other.java"));assert!(cache.state().contains("unsupported XML"));
+    let cache=nav.indexes.cached(&project).unwrap();assert!(!cache.complete()&&!cache.files().contains_key(XML_PATH));assert!(cache.files().contains_key("/project/Other.java"));assert!(cache.state().contains("not valid Spring XML"));
     assert!(parse(XML_PATH,&bad).is_none());nav.diagnostics(&doc(XML_PATH,&good));assert!(nav.indexes.cached(&project).unwrap().complete());assert!(nav.indexes.cached(&project).unwrap().files().contains_key(XML_PATH));
 }
 
@@ -3803,3 +3975,189 @@ fn bean_marker_icon_is_declared_in_the_manifest() {
     assert!(manifest.contains(&format!("icon = \"{BEAN_MARKER}\"")));
     assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(BEAN_MARKER).is_file());
 }
+
+#[test]
+fn conditional_on_missing_bean_build_files_memoized() {
+    let host = MockHost::install();
+    let config = "@org.springframework.context.annotation.Configuration class Cfg {\n @org.springframework.context.annotation.Bean @org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean Clock clock() { return null; }\n}\n";
+    host.add_file("app/src/main/java/Cfg.java", config);
+    host.add_file("lib/src/main/java/SystemClock.java", "@org.springframework.stereotype.Component class SystemClock extends Clock {}\n");
+    let consumer = "@org.springframework.stereotype.Service class Consumer {\n @org.springframework.beans.factory.annotation.Autowired Clock clock;\n}\n";
+    host.add_file("app/src/main/java/Consumer.java", consumer);
+    let mut nav = warmed_navigator();
+    let source = doc("/project/app/src/main/java/Consumer.java", consumer);
+    let before = nav.line_markers(&source);
+    assert!(before.iter().any(|m| m.line == 1 && m.target.as_ref().is_some_and(|t| t.path.ends_with("/SystemClock.java"))), "{before:?}");
+    host.add_file("app/pom.xml", "<project/>");
+    host.add_file("lib/pom.xml", "<project/>");
+    assert_eq!(nav.line_markers(&source), before, "build modules are looked up once, not on every provider call");
+}
+
+#[test]
+fn cross_file_navigation_with_600_models() {
+    let host = MockHost::install();
+    for n in 0..600 {
+        host.add_file(&format!("src/main/java/p/Filler{n}.java"), &format!("package p; class Filler{n} {{}}\n"));
+    }
+    host.add_file("src/main/java/p/Repo.java", "package p; @org.springframework.stereotype.Repository class Repo {}\n");
+    let consumer = "package p;\n@org.springframework.stereotype.Service class Consumer {\n @org.springframework.beans.factory.annotation.Autowired Repo repo;\n}\n";
+    host.add_file("src/main/java/p/Consumer.java", consumer);
+    let mut nav = warmed_navigator();
+    let project = host.invocation().project().unwrap();
+    assert!(nav.indexes.cached(&project).unwrap().files().len() > 600);
+    let source = doc("/project/src/main/java/p/Consumer.java", consumer);
+    let markers = nav.line_markers(&source);
+    assert!(markers.iter().any(|m| m.line == 2 && m.target.as_ref().is_some_and(|t| t.path.ends_with("/Repo.java"))), "{markers:?}");
+    let at = position(consumer, consumer.find("Repo repo").unwrap() + 1);
+    assert!(nav.definition(&source, at).iter().any(|l| l.path.ends_with("/Repo.java")));
+}
+
+#[test]
+fn same_document_version_is_applied_and_parsed_once() {
+    let host = setup();
+    let mut nav = warmed_navigator();
+    let source = java("UserController.java", CONTROLLER);
+    let markers = nav.line_markers(&source);
+    let generation = nav.indexes.document(&source.path).unwrap().generation();
+    nav.diagnostics(&source);
+    nav.definition(&source, Position::new(5, 20));
+    nav.completion(&source, Position::new(5, 20), None);
+    assert_eq!(nav.indexes.document(&source.path).unwrap().generation(), generation, "one version is applied once");
+    host.add_file("src/main/java/com/acme/UserServiceImpl.java", "class Changed {}");
+    assert_eq!(nav.line_markers(&source), markers, "providers read the cache, never the disk");
+}
+
+#[test]
+fn large_sql_seed_keeps_index_complete() {
+    let host = MockHost::install();
+    host.add_file("src/main/java/A.java", "@org.springframework.stereotype.Component class A {}\n");
+    host.add_file("src/main/resources/data.sql", &"insert into t values (1);\n".repeat(30_000));
+    host.add_file("src/test/resources/fixture.xml", "<root><a:b/></root>");
+    host.add_file_bytes("src/main/resources/messages.properties", b"greeting=caf\xe9\n");
+    let mut nav = warmed_navigator();
+    let project = host.invocation().project().unwrap();
+    let cache = nav.indexes.cached(&project).unwrap();
+    assert!(cache.complete(), "{}", cache.state());
+    assert!(cache.files().contains_key("/project/src/main/java/A.java"));
+    host.add_file_bytes("src/main/java/B.java", b"class B { String s = \"caf\xe9\"; }");
+    nav.indexes.changed(&project, "/project/src/main/java/B.java", false);
+    assert!(!nav.indexes.cached(&project).unwrap().complete(), "an unreadable Java source still counts");
+}
+
+#[test]
+fn check_configuration_runs_in_a_task() {
+    let host = MockHost::install();
+    host.add_file("src/main/java/A.java", "@org.springframework.stereotype.Component class A {}\n");
+    Navigator::default().run_command("check-spring-configuration", &host.invocation(), None).unwrap();
+    assert!(!host.tasks().is_empty());
+}
+
+#[test]
+fn yaml_not_parsed_as_java() {
+    let host = MockHost::install();
+    let scheduled = "class Jobs { @org.springframework.scheduling.annotation.Scheduled(fixedRate = 1) void run(String a) {} }\n";
+    host.add_file("src/main/java/Jobs.java", scheduled);
+    host.add_file("src/main/resources/application.yml", scheduled);
+    host.add_file("src/main/resources/application.properties", scheduled);
+    let mut nav = Navigator::default();
+    nav.run_command("check-spring-configuration", &host.invocation(), None).unwrap();
+    let Report::Problems(files) = &nav.report else { panic!("problems report") };
+    assert!(files.iter().any(|(path, _)| path.ends_with("Jobs.java")), "the Java source is checked");
+    assert!(files.iter().all(|(path, _)| path.ends_with(".java")), "{files:?}");
+}
+
+#[test]
+fn generate_setter_on_20kib_file() {
+    let filler: String = (0..1200).map(|n| format!("    void m{n}() {{}}\n")).collect();
+    let text = format!("package com.acme;\n\npublic class Orders {{\n    private int count;\n{filler}}}\n");
+    assert!(text.len() > 20 * 1024);
+    let host = command_host(&text);
+    run(&host, "generate-setter", &[&["0"], &["ok"]]).unwrap();
+    let result = host.editor_text();
+    assert!(result.contains("    private Mailer mailer;\n") && result.contains("public void setMailer(Mailer mailer)"), "{}", &result[..400]);
+}
+
+#[test]
+fn no_repository_bean_not_a_bean() {
+    let java = "@org.springframework.data.repository.NoRepositoryBean\ninterface BaseRepository<T> extends JpaRepository<T, Long> {}\ninterface Users extends BaseRepository<User> {}\n";
+    let names: Vec<String> = model::parse("A.java", java).unwrap().beans.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, ["users"]);
+    let kotlin = "@org.springframework.data.repository.NoRepositoryBean\ninterface BaseRepository<T> : JpaRepository<T, Long>\ninterface Users : BaseRepository<User>\n";
+    let names: Vec<String> = model::parse("A.kt", kotlin).unwrap().beans.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, ["users"]);
+}
+
+#[test]
+fn target_classes_copy_ignored() {
+    let host = MockHost::install();
+    let beans = "<beans xmlns=\"http://www.springframework.org/schema/beans\"><bean id=\"worker\" class=\"a.Worker\"/></beans>";
+    host.add_file("src/main/resources/beans.xml", beans);
+    host.add_file("target/classes/beans.xml", beans);
+    host.add_file("module/build/resources/main/application.properties", "spring.profiles.active=dev\n");
+    host.add_file("src/main/java/a/build/Job.java", "package a.build; @org.springframework.stereotype.Component class Job {}\n");
+    let mut nav = warmed_navigator();
+    let project = host.invocation().project().unwrap();
+    let cache = nav.indexes.cached(&project).unwrap();
+    assert!(cache.complete(), "{}", cache.state());
+    assert!(cache.files().contains_key("/project/src/main/resources/beans.xml"));
+    assert!(cache.files().contains_key("/project/src/main/java/a/build/Job.java"), "a source package named build is kept");
+    assert!(cache.files().keys().all(|p| !p.starts_with("/project/target/") && !p.contains("/module/build/")), "{:?}", cache.files().keys());
+    nav.diagnostics(&doc("/project/target/classes/beans.xml", beans));
+    assert!(!nav.indexes.cached(&project).unwrap().files().contains_key("/project/target/classes/beans.xml"));
+}
+
+#[test]
+fn profiles_storage_denied_message() {
+    let host = MockHost::install().with_capabilities(&["project.read", "editor.read"]);
+    host.add_file("src/main/resources/application-prod.yml", "a: b\n");
+    host.answer_next_prompt(Some(&["prod"]));
+    assert!(warmed_navigator().run_command("change-active-profiles", &host.invocation(), None).is_ok());
+    assert!(
+        host.notifications().iter().any(|n| n.body == "Remembering active profiles needs the storage permission. Allow it in Settings › Plugins › Spring Beans Navigator."),
+        "{:?}",
+        host.notifications()
+    );
+    let denied_set = MockHost::install().with_capabilities(&["project.read", "editor.read"]);
+    assert!(!commands::save_profiles(&["prod".to_owned()]).unwrap(), "a denied set is a notice, not an error");
+    assert!(denied_set.notifications().iter().any(|n| n.body == "Remembering active profiles needs the storage permission. Allow it in Settings › Plugins › Spring Beans Navigator."));
+    let allowed = MockHost::install();
+    assert!(commands::save_profiles(&["prod".to_owned()]).unwrap());
+    assert_eq!(allowed.storage()["activeProfiles"], "prod");
+}
+
+#[test]
+fn reviewed_edits_show_changed_lines_with_three_lines_of_context() {
+    let text: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+    let at = |line: u32| Position::new(line, 0);
+    let edits = [
+        TextEdit { range: Range::new(at(1), at(1)), text: "added A\n".into() },
+        TextEdit { range: Range::new(at(15), at(16)), text: "replaced 16\n".into() },
+    ];
+    let (after, shown) = reviewed(&text, &edits).unwrap();
+    assert!(after.contains("line 1\nadded A\nline 2\n") && after.contains("line 15\nreplaced 16\nline 17\n"));
+    assert_eq!(shown, "Lines 1–5:\nline 1\nadded A\nline 2\nline 3\nline 4\n\nLines 14–20:\nline 13\nline 14\nline 15\nreplaced 16\nline 17\nline 18\nline 19");
+    assert!(!shown.contains("line 9"));
+    let overlapping = [edits[1].clone(), TextEdit { range: Range::new(at(15), at(17)), text: String::new() }];
+    assert!(matches!(reviewed(&text, &overlapping), Err(Error::Stale)));
+}
+
+#[test]
+fn providers_reuse_lookups_of_one_generation() {
+    let host = setup();
+    let mut nav = warmed_navigator();
+    let source = java("UserController.java", CONTROLLER);
+    let markers = nav.line_markers(&source);
+    nav.diagnostics(&source);
+    let built = nav.indexes.document(&source.path).unwrap().lookups(|| panic!("lookups rebuilt for an unchanged cache"));
+    nav.definition(&source, Position::new(5, 20));
+    nav.completion(&source, Position::new(5, 20), None);
+    assert_eq!(nav.line_markers(&source), markers);
+    let again = nav.indexes.document(&source.path).unwrap().lookups(|| panic!("lookups rebuilt for an unchanged cache"));
+    assert!(Rc::ptr_eq(&built, &again));
+    host.add_file("src/main/java/com/acme/Extra.java", "@org.springframework.stereotype.Component class Extra {}");
+    nav.indexes.changed(&host.invocation().project().unwrap(), "/project/src/main/java/com/acme/Extra.java", false);
+    let rebuilt = nav.indexes.document(&source.path).unwrap().lookups(|| Lookups::build(&BTreeMap::new(), false, &RefCell::default()));
+    assert!(!Rc::ptr_eq(&built, &rebuilt), "a changed cache gets new lookups");
+}
+
+

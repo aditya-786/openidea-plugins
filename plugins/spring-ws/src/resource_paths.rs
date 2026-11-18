@@ -71,7 +71,7 @@ impl Paths {
     pub(crate) fn reset(&mut self) {
         self.roots.clear();
     }
-    /// Only activation/lifecycle invokes discovery. Each extension has independent
+    /// Discovery runs from activation, file events, providers and refresh. Each extension has independent
     /// completeness, so capped XML/policy paths cannot corrupt XSD QName authority.
     pub(crate) fn warm(&mut self, project: &Project, budget: Duration) {
         if budget.is_zero() {
@@ -198,6 +198,16 @@ impl Paths {
             family.bytes += path.len();
         }
         // Observing one path does not renew the discovery snapshot's TTL.
+    }
+    pub(crate) fn ready(&self, root: &str) -> bool {
+        self.roots.get(root).is_some_and(|state| state.families.iter().all(Family::ready))
+    }
+    #[cfg(test)]
+    pub(crate) fn expire(&mut self) {
+        let old = Instant::now().checked_sub(TTL * 2);
+        for family in self.roots.values_mut().flat_map(|root| &mut root.families) {
+            family.scanned = old;
+        }
     }
     pub(crate) fn paths(&self, root: &str, relative: &str) -> Option<&BTreeSet<String>> {
         let family = &self.roots.get(root)?.families[kind(relative)?];

@@ -85,7 +85,7 @@ pub(super) fn body(state: &State, root: &str) -> Option<Body> {
     Some(Body::Form(vec![
         Field::new("generated-provenance", "Observed source provenance", FieldValue::readonly_text(&provenance(document), true)),
         Field::new("generated-source", "Exact selected XML (not applied to a database)", FieldValue::readonly_text(&document.text, true)),
-        Field::new("generated-save", "Save reviewed source", FieldValue::readonly_text("Open an XML/YAML/JSON/SQL editor in this project, then choose Save reviewed offline changesets… from its code actions. The final exact preview returns one non-overwriting, undoable FileAction Create. Choose a smaller subset if the16KiB confirmation limit is exceeded. Source is instance-owned and disappears on reload/reclamation; no source file has been saved yet.", true)),
+        Field::new("generated-save", "Save reviewed source", FieldValue::readonly_text("Open an XML/YAML/JSON/SQL editor in this project, then choose Save reviewed offline changesets… from its code actions. The final exact preview returns one non-overwriting, undoable FileAction Create. Choose a smaller subset if the 16KiB confirmation limit is exceeded. Source is instance-owned and disappears on reload/reclamation; no source file has been saved yet.", true)),
     ]))
 }
 impl Liquibase {
@@ -150,7 +150,7 @@ impl Liquibase {
         let mut groups = document.groups.clone(); let mut active = document.active.clone();
         match action.as_str() {
             "new" => {
-                if groups.len() >= 32 { return Err("At most32 migration groups.".into()); }
+                if groups.len() >= 32 { return Err("At most 32 migration groups.".into()); }
                 let Some(name) = host::input("Migration group label", Some(&format!("Migration {}", groups.len() + 1)))? else { return Ok(()); };
                 if name.trim().is_empty() || name.len() > 80 || name.chars().any(char::is_control) || groups.contains_key(&name) { return Err("Use a unique nonempty bounded group label.".into()); }
                 groups.insert(name.clone(), BTreeSet::new()); active = name;

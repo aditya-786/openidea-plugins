@@ -2,32 +2,32 @@
   "properties": {
     "watchDdev": {
       "type": "boolean",
-      "title": "Refresh DDEV status automatically every minute",
+      "title": "Refresh DDEV status every minute",
       "default": true
     },
     "checkForUpdates": {
       "type": "boolean",
-      "title": "Check for DDEV updates automatically (requires GitHub and storage permissions)",
+      "title": "Check for DDEV updates automatically",
       "default": true
     },
     "autoConfigureDataSource": {
+      "title": "Keep a Database connection for the DDEV database",
       "type": "boolean",
-      "title": "Maintain a DDEV Database source and secure credential (database.sources; project.write enables a non-secret file fallback)",
       "default": true
     },
     "phpVersion": {
       "type": "string",
-      "title": "PHP version passed to Configure Project (for example 8.3; empty uses project PHP hints, then DDEV defaults)",
+      "title": "PHP version for Configure Project (optional)",
       "default": ""
     },
     "autoConfigureRunTarget": {
       "type": "boolean",
-      "title": "Offer a DDEV execution target for PHP, Node.js, Composer and project runs",
+      "title": "Offer DDEV for PHP, Node.js, Composer and project runs",
       "default": true
     },
     "containerRoot": {
       "type": "string",
-      "title": "Project root inside the DDEV web container",
+      "title": "Project path inside the web container",
       "default": "/var/www/html"
     }
   }

@@ -1,5 +1,4 @@
 use super::*;
-use openidea_plugin::language_features::LanguageFeatures;
 use openidea_plugin::{mock::MockHost, text::position};
 
 const CLIENT: &str = r#"import org.springframework.cloud.openfeign.FeignClient;
@@ -37,9 +36,10 @@ fn setup() -> (MockHost, CloudTools, Document) {
 #[test]
 fn same_route_in_two_services_resolves_only_the_named_service() {
     let (_host, mut tools, doc) = setup();
+    warm(&mut tools);
     let targets = tools.definition(&doc, position(CLIENT, CLIENT.find("find()").unwrap()));
     assert_eq!(targets.iter().map(|l| l.path.as_str()).collect::<Vec<_>>(), [USERS]);
-    let markers = tools.line_markers(&doc);
+    let markers = markers(&mut tools, &doc);
     assert_eq!(markers.len(), 1);
     assert_eq!(markers[0].target.as_ref().unwrap().path, USERS);
 }
@@ -48,10 +48,22 @@ fn same_route_in_two_services_resolves_only_the_named_service() {
 fn reverse_gutter_does_not_link_a_client_of_another_service() {
     let (_host, mut tools, _) = setup();
     let server = Document { path: ADMIN.into(), language: "java".into(), text: SERVER.into(), version: 1 };
-    assert!(tools.line_markers(&server).is_empty());
+    assert!(markers(&mut tools, &server).is_empty());
+}
+
+/// Editor providers read only the warmed index, as in the IDE after its background scan.
+fn warm(tools: &mut CloudTools) {
+    let project = spring_text::index::project_of(CLIENT_PATH).unwrap();
+    tools.live_warm(&project, spring_text::index::COMMAND_BUDGET, true);
+}
+
+fn markers(tools: &mut CloudTools, doc: &Document) -> Vec<LineMarker> {
+    warm(tools);
+    tools.line_markers(doc)
 }
 
 fn targets(tools: &mut CloudTools, doc: &Document) -> Vec<String> {
+    warm(tools);
     tools.definition(doc, position(&doc.text, doc.text.find("find()").unwrap())).into_iter().map(|l| l.path).collect()
 }
 
@@ -147,41 +159,34 @@ fn watched_and_unsaved_configuration_updates_invalidate_the_match() {
     let path = "/project/admin/src/main/resources/application.yaml";
     let text = "spring.application.name: users\n";
     host.add_file(path, text);
-    tools.live_update(&project, path, Some(text));
+    tools.config.update_existing(&project, path, Some(text));
     assert_eq!(targets(&mut tools, &doc), [ADMIN, USERS]);
     // Provider-supplied unsaved configuration supersedes cached disk content.
     let config = Document { path: path.into(), language: "yaml".into(), version: 2, text: "spring.application.name: admin\n".into() };
     tools.indexes(&config);
     assert_eq!(targets(&mut tools, &doc), [USERS]);
-    tools.live_update(&project, path, None);
+    tools.config.update_existing(&project, path, None);
     assert_eq!(targets(&mut tools, &doc), [ADMIN, USERS]);
     assert!(host.requests().is_empty() && host.process_runs().is_empty());
 }
 
 #[test]
-fn ambiguous_gutter_opens_selected_candidate_without_first_match_jump() {
+fn same_named_services_get_one_marker_per_target() {
     let (host, mut tools, doc) = setup();
     host.add_file("admin/src/main/resources/application.yaml", "spring.application.name: users\n");
     assert_eq!(targets(&mut tools, &doc), [ADMIN, USERS]);
-    assert!(tools.line_markers(&doc).is_empty());
-    let action = tools.gutter_actions(&doc).remove(0);
-    assert_eq!(action.command, CHOOSE_TARGET);
-    assert!(action.tooltip.contains("2 HTTP source targets"));
-    host.answer_next_prompt(Some(&["1"]));
-    tools.run_command(CHOOSE_TARGET, &host.invocation(), action.argument.as_deref()).unwrap();
-    assert_eq!(host.opened_locations().len(), 1);
-    assert_eq!(host.opened_locations()[0].0, USERS);
+    let mut marked: Vec<_> = markers(&mut tools, &doc).into_iter().map(|m| m.target.unwrap().path).collect();
+    marked.sort();
+    assert_eq!(marked, [ADMIN, USERS]);
     assert!(host.requests().is_empty() && host.process_runs().is_empty());
-    assert!(tools.run_command(CHOOSE_TARGET, &host.invocation(), action.argument.as_deref()).is_err());
 }
 
 #[test]
-fn reverse_ambiguity_uses_chooser() {
+fn reverse_markers_list_every_client_of_the_service() {
     let (host, mut tools, _) = setup();
     host.add_file("client/src/main/java/OtherClient.java", &CLIENT.replace("UserClient", "OtherClient"));
     let doc = Document { path: USERS.into(), language: "java".into(), text: SERVER.into(), version: 1 };
-    assert!(tools.line_markers(&doc).is_empty());
-    assert_eq!(tools.gutter_actions(&doc).len(), 1);
+    assert_eq!(markers(&mut tools, &doc).len(), 2);
 }
 
 #[test]
@@ -193,38 +198,7 @@ fn multiple_mappings_on_one_line_return_all_distinct_locations() {
     assert_eq!(found.len(), 2);
     assert!(found.iter().any(|p| p == USERS));
     assert!(found.iter().any(|p| p.ends_with("/Other.java")));
-    assert!(tools.line_markers(&doc).is_empty());
-    assert_eq!(tools.gutter_actions(&doc).len(), 1);
-}
-
-#[test]
-fn canceled_forged_and_stale_picker_tickets_never_open_a_target() {
-    for change in ["cancel", "origin", "target", "config", "project", "forged", "selection"] {
-        let (host, mut tools, doc) = setup();
-        host.add_file("admin/src/main/resources/application.yaml", "spring.application.name: users\n");
-        let action = tools.gutter_actions(&doc).remove(0);
-        match change {
-            "origin" => host.type_in_editor(" "),
-            "target" => host.add_file(ADMIN, &SERVER.replace("/users/{id}", "/other")),
-            "config" => host.add_file("admin/src/main/resources/application.yaml", "spring.application.name: admin\n"),
-            "project" => host.set_project_root(Some("/other")),
-            _ => {}
-        }
-        host.answer_next_prompt(if change == "cancel" {
-            None
-        } else if change == "selection" {
-            Some(&["999"])
-        } else {
-            Some(&["0"])
-        });
-        let argument = if change == "forged" { Some("forged") } else { action.argument.as_deref() };
-        let result = tools.run_command(CHOOSE_TARGET, &host.invocation(), argument);
-        if change != "cancel" {
-            assert!(result.is_err(), "{change}");
-        } else {
-            assert!(result.is_ok());
-        }
-        assert!(host.opened_locations().is_empty(), "{change}");
-        assert!(host.requests().is_empty() && host.process_runs().is_empty());
-    }
+    let marked: Vec<_> = markers(&mut tools, &doc).into_iter().map(|m| m.target.unwrap().path).collect();
+    assert_eq!(marked.len(), 2);
+    assert!(marked.iter().any(|p| p.ends_with("/Other.java")));
 }

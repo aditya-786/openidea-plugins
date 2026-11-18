@@ -3,7 +3,15 @@
   "views": {
     "beans": "Spring Beans"
   },
-  "actions": [],
+  "actions": [
+    {
+      "view": "beans",
+      "id": "focus-in-graph",
+      "label": "Focus in Graph",
+      "kind": "b",
+      "icon": "hierarchy"
+    }
+  ],
   "project_independent": false,
   "project_bound_buttons": [],
   "context_buttons": {

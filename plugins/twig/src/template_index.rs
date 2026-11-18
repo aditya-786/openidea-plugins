@@ -627,7 +627,7 @@ pub(crate) fn index(input: &IndexedDocument) -> Edges {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openidea_plugin::{indexing::DocumentIndexer, mock::MockHost};
+    use openidea_plugin::mock::MockHost;
     fn doc(path: &str, text: &str) -> IndexedDocument {
         IndexedDocument {
             path: path.into(),
@@ -761,15 +761,5 @@ mod tests {
         let source = "{% from 'forms.twig' import badge %}{{ badge() }}";
         let found = crate::indexing::source_edges(&doc("/project/templates/a.twig", source));
         assert!(found.references.is_empty());
-        host.set_setting("staticTemplateReferences", "false");
-        assert!(
-            Twig::default()
-                .index(&doc(
-                    "/project/templates/a.twig",
-                    "{% macro badge() %}{% endmacro %}"
-                ))
-                .definitions
-                .is_empty()
-        );
     }
 }

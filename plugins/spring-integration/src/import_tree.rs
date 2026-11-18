@@ -7,7 +7,7 @@ const TITLE:&str="Rename channel in this XML import tree…";
 struct Site {path:String,from:usize,to:usize,name:String,declaration:bool}
 #[derive(Clone,Debug,PartialEq,Eq)]
 struct Tree {files:BTreeMap<String,String>,sites:Vec<Site>,aliases:BTreeMap<String,String>,occupied:BTreeSet<String>}
-fn literal(value:&str)->bool {let mut b=value.bytes();value.len()<=128 && b.next().is_some_and(|c|c.is_ascii_alphabetic()||c==b'_') && b.all(|c|c.is_ascii_alphanumeric()||b"_.-".contains(&c))}
+use spring_text::provenance::literal;
 fn imported(root:&str,base:&str,value:&str)->Option<String> {
     if value.is_empty() || value.len()>512 || value.contains(['\\',':','*','?','[',']','{','}']) || value.starts_with('/') || value.chars().any(char::is_control) {return None;}
     let mut parts:Vec<_>=base.rsplit_once('/')?.0.split('/').collect();
@@ -19,9 +19,9 @@ fn read_tree(root:&str,path:&str)->Result<Tree,Error> {
     let mut tree=Tree{files:BTreeMap::new(),sites:Vec::new(),aliases:BTreeMap::new(),occupied:BTreeSet::new()};let mut queue=vec![path.to_owned()];let mut bytes=0;
     while let Some(path)=queue.pop() {
         if tree.files.contains_key(&path) {continue;}
-        if tree.files.len()>=16 || crate::source_scope::Scope::for_path(&path).is_none() || host::project_of(&path).and_then(|p|p.root().ok()).as_deref()!=Some(root) {return Err(Error::Invalid("XML import tree exceeds this project's supported scope.".into()));}
+        if tree.files.len()>=16 || spring_text::index::owning_root(&path).is_none() || host::project_of(&path).and_then(|p|p.root().ok()).as_deref()!=Some(root) {return Err(Error::Invalid("XML import tree exceeds this project's supported scope.".into()));}
         let text=project.read_file(&path)?;bytes+=text.len();
-        if bytes>256*1024 || text.len()>32*1024 || !crate::xml_namespaces::document_valid(&text) || (text.contains("${") || text.contains("#{")) {return Err(Error::Invalid("Use a bounded, literal XML import tree without expressions or encoded values.".into()));}
+        if bytes>256*1024 || text.len()>32*1024 || !spring_text::xml::generation_valid(&text) || (text.contains("${") || text.contains("#{")) {return Err(Error::Invalid("Use a bounded, literal XML import tree without expressions or encoded values.".into()));}
         let elements=xml::elements(&text);let first=elements.first().ok_or(Error::Stale)?;
         if first.local()!="beans" || xml::namespace(&elements,0)!=Some(BEANS) || first.attrs.iter().any(|a|!a.name.starts_with("xmlns")&&a.name!="xsi:schemaLocation") {return Err(Error::Invalid("Only unprofiled beans roots are supported.".into()));}
         for (i,e) in elements.iter().enumerate().skip(1) {
@@ -38,7 +38,7 @@ fn read_tree(root:&str,path:&str)->Result<Tree,Error> {
                 tree.sites.push(Site{path:path.clone(),from:name.value_at,to:name.value_end,name:name.value.clone(),declaration:false});
                 tree.sites.push(Site{path:path.clone(),from:alias.value_at,to:alias.value_end,name:alias.value.clone(),declaration:false});continue;
             }
-            if ns!=Some(NAMESPACE) {return Err(Error::Invalid("Only literal channels, supported endpoints, imports and aliases are admitted.".into()));}
+            if ns!=Some(NAMESPACE) {return Err(Error::Invalid("The import tree contains elements other than channels, Integration endpoints, imports and aliases, so it can't be searched safely.".into()));}
             let channel=matches!(e.local(),"channel"|"publish-subscribe-channel");
             let allowed:&[&str]=match e.local() {
                 "channel"|"publish-subscribe-channel"=>&["id"],
@@ -67,8 +67,8 @@ fn canonical<'a>(tree:&'a Tree,name:&'a str)->Option<&'a str> {
     (!tree.occupied.contains(target)&&tree.sites.iter().filter(|s|s.declaration&&s.name==target).count()==1&&!tree.aliases.contains_key(target)).then_some(target)
 }
 pub(crate) fn occurrences(ctx:&Invocation)->Result<Option<String>,Error> {
-    let root=ctx.project().ok_or(Error::Stale)?.root()?;
-    let editor=ctx.editor().ok_or("Open a literal XML import-tree root and grant optional editor.read.")?;
+    let root=ctx.project().ok_or("Open a project first.")?.root()?;
+    let editor=ctx.editor().ok_or_else(||format!("Open the XML file that imports the others first. {}",ui_kit::denied::message("Find Channel Usages in XML Import Tree","editor.read","Spring Structure Tools")))?;
     let source=editor.document()?;let doc=Document{path:editor.path(),language:editor.language(),text:source.text,version:source.version};
     if doc.language!="xml" {return Err(Error::Invalid("Open an XML import-tree root.".into()));}
     let selections=editor.selections()?;let [selection]=selections.as_slice() else{return Err(Error::Stale);};

@@ -346,31 +346,21 @@ fn rename_preview(
     let inherited = if inherited.is_empty() {
         String::new()
     } else {
-        format!("\n\nInheriting subclass availability selectors edited in the same action (path:line:col):\n{}", inherited.join("\n"))
+        format!("\n\nAlso updates availability selectors in subclasses:\n{}", inherited.join("\n"))
     };
     let spans = edits
         .iter()
-        .map(|e| {
-            format!(
-                "{}:{}..{}:{}",
-                e.range.start.line + 1,
-                e.range.start.character + 1,
-                e.range.end.line + 1,
-                e.range.end.character + 1
-            )
-        })
+        .map(|e| format!("{}:{}", e.range.start.line + 1, e.range.start.character + 1))
         .collect::<Vec<_>>()
-        .join("\n");
-    let old_label=if command.insertion.is_some(){"Old derived command key"}else{"Old literal"};
+        .join(", ");
     format!(
-        "Local physical-source edit only. Runtime/global registry, other files and host indexed usages/Rename are unresolved.\n\n{old_label}: \"{}\"\nNew literal: \"{}\"\nExact spans: {} (UTF-16, 1-based, end-exclusive)\n{}\n\nFile: {}\nVersion: {}\nClass: {}\n\nWildcards and command-side indicator method names remain unchanged.{}\n\nComplete resulting source:\n{}",
+        "Rename command \"{}\" to \"{}\" in {} (class {}).\nChanges ({}) at line:column {}{}\n\nOther files, wildcard selectors and availability method names are not changed.\n\nResulting source:\n{}",
         command.name,
         new,
+        doc.path,
+        command.class,
         edits.len(),
         spans,
-        doc.path,
-        doc.version,
-        command.class,
         inherited,
         after
     )
@@ -379,8 +369,11 @@ impl ShellTools {
     /// Subclass selectors (`path:line:col`) naming a command this class declares. Refuses when
     /// a subclass chain, selector or command name cannot be proven literal and collision free.
     fn inherited_selectors(&mut self, doc: &Document, command: &CommandName, new: &str, project: &host::Project) -> Result<Vec<(String, String, Range)>, Error> {
-        let unproven = || Error::Invalid("A subclass of this command's class is not fully literal; rename refused.".into());
-        let index = self.indexes.for_document(&doc.path, &doc.text, PROVIDER_BUDGET).ok_or_else(unproven)?;
+        let unproven = || Error::Invalid("A subclass of this class can't be read completely, so the rename could miss commands. Rename it by hand.".into());
+        let index = self.indexes.for_document(&doc.path, &doc.text, COMMAND_BUDGET).ok_or_else(unproven)?;
+        if !trustworthy(index) {
+            return Err(Error::Invalid("Spring Shell commands are still being indexed. Try again in a moment.".into()));
+        }
         let mut subclasses = Vec::new();
         for (path, shell) in index.iter() {
             for class in shell.classes.iter().filter(|c| c.component && c.kind == "class" && c.qualified != command.class) {
@@ -394,13 +387,14 @@ impl ShellTools {
                 subclasses.push((path.to_owned(), class.qualified.clone()));
             }
         }
-        let inheriting: Vec<_> = all_inherited(index).into_iter().filter(|(_, declaring, c)| *declaring == doc.path && c.key == command.name && subclasses.iter().any(|(_, q)| *q == c.class)).collect();
-        let collides = all_commands(index).map(|(_, c)| c).chain(all_inherited(index).iter().map(|(_, _, c)| c)).any(|c| c.key == new && subclasses.iter().any(|(_, q)| *q == c.class));
+        let derived = derived(index);
+        let inheriting: Vec<_> = derived.inherited.iter().filter(|(_, declaring, c)| *declaring == doc.path && c.key == command.name && subclasses.iter().any(|(_, q)| *q == c.class)).collect();
+        let collides = all_commands(index).map(|(_, c)| c).chain(derived.inherited.iter().map(|(_, _, c)| c)).any(|c| c.key == new && subclasses.iter().any(|(_, q)| *q == c.class));
         if collides {
             return Err(Error::Invalid("A subclass already has a command with that key.".into()));
         }
         let mut out = Vec::new();
-        for (owner, _, inherited) in inheriting {
+        for (owner, _, inherited) in inheriting.iter().copied() {
             let sub = Document {
                 path: owner.clone(),
                 language: if owner.ends_with(".kt") { "kotlin" } else { "java" }.into(),
@@ -490,7 +484,7 @@ impl ShellTools {
                 },
             );
             out.push(FileAction {
-                title: "Preview rename local Shell command key…".into(),
+                title: "Rename command key…".into(),
                 kind: Some("refactor.rename".into()),
                 data: Some(token),
                 ..Default::default()
@@ -523,12 +517,18 @@ impl ShellTools {
         let current = |project: &host::Project| -> Result<bool, Error> {
             Ok(project.read_file(&doc.path)? == doc.text && model(doc).contains(&pending.command))
         };
-        if !fresh(trigger_doc) || !current(&project)? || project.read_file(&trigger_doc.path)? != trigger_doc.text {
+        if !fresh(trigger_doc) {
             return Err(Error::Stale);
         }
-        let new=host::input("New local Shell command key (space-separated lowercase words using letters/digits/hyphens, each starting with a letter; max64)",Some(&pending.command.name))?.ok_or(Error::Cancelled)?;
+        if project.read_file(&trigger_doc.path)? != trigger_doc.text {
+            return Err(Error::Invalid("Save the file first".into()));
+        }
+        if !current(&project)? {
+            return Err(Error::Stale);
+        }
+        let new=host::input("New command name (lowercase words separated by spaces, up to 64 characters)",Some(&pending.command.name))?.ok_or(Error::Cancelled)?;
         if !name(&new) || new == pending.command.name || pending.command.names.contains(&new) {
-            return Err(Error::Invalid("Use a different non-colliding lowercase literal command key, at most64 characters.".into()));
+            return Err(Error::Invalid("Use a new command name that no other command uses: lowercase words of letters, digits and hyphens, each starting with a letter, up to 64 characters.".into()));
         }
         let declaration=match &pending.command.insertion {
             Some((range,before,after))=>TextEdit{range:*range,text:format!("{before}{new}{after}")},
@@ -547,7 +547,7 @@ impl ShellTools {
         let selectors = self.inherited_selectors(doc, &pending.command, &new, &project)?;
         let labels: Vec<_> = selectors.iter().map(|(path, _, r)| format!("{}:{}:{}", path, r.start.line + 1, r.start.character + 1)).collect();
         let preview = rename_preview(doc, &pending.command, &new, &edits, &after, &labels);
-        if !ui_kit::prompts::confirm_exact("Rename local Shell command key?", &preview)? {
+        if !ui_kit::prompts::confirm_exact("Rename command key?", &preview)? {
             return Err(Error::Cancelled);
         }
         if !fresh(trigger_doc) || !current(&project)? || project.read_file(&trigger_doc.path)? != trigger_doc.text {
@@ -566,7 +566,7 @@ impl ShellTools {
         }
         self.command_renames.pending.remove(token);
         Ok(FileAction {
-            title: "Rename local Shell command key".into(),
+            title: "Rename command key".into(),
             kind: Some("refactor.rename".into()),
             edits: files,
             ..Default::default()
@@ -625,28 +625,22 @@ mod tests {
             1,
         );
         let preview = rename_preview(&d, &command, "launch", &edits, &after, &[]);
-        assert!(preview.starts_with("Local physical-source edit only. Runtime/global registry, other files and host indexed usages/Rename are unresolved."));
-        assert!(preview.contains("Old literal: \"run\"\nNew literal: \"launch\"\nExact spans: 2 (UTF-16, 1-based, end-exclusive)"));
+        assert!(preview.starts_with("Rename command \"run\" to \"launch\""));
+        assert!(preview.contains("Changes (2) at line:column"));
         for e in &edits {
-            let exact = format!(
-                "{}:{}..{}:{}",
-                e.range.start.line + 1,
-                e.range.start.character + 1,
-                e.range.end.line + 1,
-                e.range.end.character + 1
-            );
+            let exact = format!("{}:{}", e.range.start.line + 1, e.range.start.character + 1);
             assert!(preview.contains(&exact));
         }
-        assert_eq!(preview.matches("Complete resulting source:").count(), 1);
+        assert_eq!(preview.matches("Resulting source:").count(), 1);
         assert!(preview.ends_with(&after));
         assert_eq!(preview.matches(&after).count(), 1);
         assert!(!preview.contains("Complete source before:"));
         assert!(!preview.contains(TEXT));
         assert!(
             preview
-                .find("Wildcards and command-side indicator")
+                .find("Other files, wildcard selectors")
                 .unwrap()
-                < preview.find("Complete resulting source:").unwrap()
+                < preview.find("Resulting source:").unwrap()
         );
     }
     #[test]
@@ -970,17 +964,17 @@ mod public_anchor_tests {
 }
 
 pub(super) fn occurrences(ctx: &Invocation,at_override:Option<Position>) -> Result<Option<String>,Error> {
-    let editor=ctx.editor().ok_or("Open a supported Java or Kotlin ShellComponent and select a literal command or availability name.")?;
+    let editor=ctx.editor().ok_or("Open a Java or Kotlin @ShellComponent class and put the caret on a command or availability name.")?;
     let snapshot=editor.document()?;let path=editor.path();
-    let at=if let Some(at)=at_override{at}else{editor.selections()?.first().map(|r|r.start).ok_or(Error::Stale)?};
+    let at=if let Some(at)=at_override{at}else{editor.selections()?.first().map(|r|r.start).ok_or_else(||Error::Invalid("Put the caret on a Spring Shell command key first.".into()))?};
     let project=ctx.project().ok_or(Error::Stale)?;let root=project.root()?;
     if root=="/" || !path.starts_with(&format!("{root}/")) || host::project_of(&path).and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str()) {return Err(Error::Stale);}
     let edges=public_edges(&openidea_plugin::indexing::Document {path:path.clone(),text:snapshot.text.clone(),symbols:vec![]});
-    let selected=edges.definitions.iter().chain(&edges.references).find(|a|a.range.start<=at && at<a.range.end).ok_or("Select a supported literal command or availability name in a closed Java or Kotlin source scope.")?;
+    let selected=edges.definitions.iter().chain(&edges.references).find(|a|a.range.start<=at && at<a.range.end).ok_or("Put the caret on a Spring Shell command key first.")?;
     let mut spans:Vec<_>=edges.definitions.iter().chain(&edges.references).filter(|a|a.key==selected.key).map(|a|a.range).collect();
     spans.sort_by_key(|r|(r.start.line,r.start.character));
-    let items:Vec<_>=spans.iter().enumerate().map(|(i,r)|openidea_plugin::PickItem::new(&i.to_string(),&format!("Literal occurrence · {}:{}",r.start.line+1,r.start.character+1)).description("Current document only; command selectors and indicator method names have separate identity")).collect();
-    let Some(choice)=host::pick("Spring Shell literal source occurrences",&items)? else {return Ok(None);};
+    let items:Vec<_>=spans.iter().enumerate().map(|(i,r)|openidea_plugin::PickItem::new(&i.to_string(),&format!("Line {}, column {}",r.start.line+1,r.start.character+1)).description("In this file")).collect();
+    let Some(choice)=host::pick("Command usages in this file",&items)? else {return Ok(None);};
     let destination=spans.get(choice.parse::<usize>().map_err(|_|Error::Stale)?).ok_or(Error::Stale)?.start;
     let current=ctx.editor().ok_or(Error::Stale)?;let fresh=current.document()?;
     if ctx.project().ok_or(Error::Stale)?.root()?!=root || host::project_of(&path).and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str()) || current.path()!=path || fresh.version!=snapshot.version || fresh.text!=snapshot.text {return Err(Error::Stale);}
@@ -991,6 +985,20 @@ pub(super) fn occurrences(ctx: &Invocation,at_override:Option<Position>) -> Resu
 mod occurrence_command_tests {
     use super::*;
     use openidea_plugin::mock::MockHost;
+    #[test]
+    fn command_occurrences_without_selection_explains() {
+        let h=MockHost::install();
+        h.open_editor("/project/C.java","java","class C {}",&[]);
+        let error=ShellTools::default().run_command("command-occurrences",&h.invocation(),None).unwrap_err();
+        assert!(matches!(error,Error::Invalid(ref message) if message=="Put the caret on a Spring Shell command key first."),"{error:?}");
+    }
+    #[test]
+    fn command_occurrences_with_the_caret_off_a_key_explains() {
+        let h=MockHost::install();
+        h.open_editor("/project/C.java","java","class C {}",&[(0,0,0,0)]);
+        let error=ShellTools::default().run_command("command-occurrences",&h.invocation(),None).unwrap_err();
+        assert!(error.to_string().contains("Put the caret on a Spring Shell command key first."),"{error:?}");
+    }
     #[test]
     fn registered_picker_keeps_selector_and_indicator_roles_separate() {
         let h=MockHost::install();
@@ -1177,5 +1185,31 @@ mod implicit_transaction_tests {
         assert!(rename_from(false, &CHILD.replace("(\"shared\")", "(KEY)")).is_err());
         let colliding = CHILD.replace("extends Base {", "extends Base { @org.springframework.shell.standard.ShellMethod(key=\"common\",value=\"C\") void c(){}");
         assert!(rename_from(false, &colliding).is_err());
+    }
+
+    #[test]
+    fn rename_refuses_incomplete_index() {
+        let h = MockHost::install();
+        h.add_file("src/main/java/p/Base.java", BASE);
+        h.add_file("src/main/java/p/Child.java", CHILD);
+        h.add_file("src/main/java/p/Broken.java", "class Broken {");
+        let d = Document { path: "/project/src/main/java/p/Base.java".into(), language: "java".into(), version: 1, text: BASE.into() };
+        let command = model(&d).into_iter().next().unwrap();
+        let project = host::project_of(&d.path).unwrap();
+        let result = ShellTools::default().inherited_selectors(&d, &command, "common", &project);
+        assert!(matches!(result, Err(Error::Invalid(_))), "{result:?}");
+    }
+
+    #[test]
+    fn rename_on_unsaved_buffer_says_save_first() {
+        let h = MockHost::install();
+        h.add_file("src/main/java/p/Base.java", BASE);
+        let unsaved = format!("{BASE}\n// unsaved");
+        let d = Document { path: "/project/src/main/java/p/Base.java".into(), language: "java".into(), version: 1, text: unsaved.clone() };
+        let mut tools = ShellTools::default();
+        let at = position(&unsaved, unsaved.find("\"shared\"").unwrap() + 1);
+        let a = tools.file_actions(&d, Range::new(at, at)).into_iter().find(|a| a.data.as_deref().is_some_and(|s| s.starts_with("shell-command:"))).unwrap();
+        let result = tools.resolve_file_action(&d, a);
+        assert!(matches!(&result, Err(Error::Invalid(m)) if m == "Save the file first"), "{result:?}");
     }
 }

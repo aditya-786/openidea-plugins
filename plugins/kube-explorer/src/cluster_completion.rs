@@ -45,11 +45,8 @@ impl Cache {
         if self.resources.get(&kind).is_some_and(|snapshot|snapshot.root==root){self.resources.remove(&kind);}
         let scope=forward::Scope::capture_for_project(context,namespace,&project)?;
         let resolved_namespace=scope.args(&[]).into_iter().find_map(|arg|arg.strip_prefix("--namespace=").map(str::to_owned)).ok_or(Error::Stale)?;
-        let out=project.run_process("kubectl",&scope.args(&["get",resource,"-o","name",REQUEST_TIMEOUT]),None).map_err(|error|match error {
-            Error::Denied(_)|Error::Cancelled=>error,
-            _=>Error::Failed("Resource name query failed; raw tool errors withheld.".into()),
-        })?;
-        if out.status!=Some(0){return Err("Resource name query failed; no completion snapshot accepted.".into());}
+        let out=project.run_process("kubectl",&scope.args(&["get",resource,"-o","name",REQUEST_TIMEOUT]),None).map_err(|error|crate::tool_error("Reading resource names",context,error))?;
+        if out.status!=Some(0){return Err(Error::Failed(crate::failure_reason("Reading resource names",context,&out.stderr)));}
         let names=parse_resources(&out.stdout,resource)?;
         if forward::owner(Some(ctx))?.1!=root||!scope.configuration_current()
             ||forward::Scope::capture_for_project(context,namespace,&project)?!=scope{return Err(Error::Stale);}
@@ -87,7 +84,7 @@ impl Cache {
 }
 const RESOURCE_KINDS:&[(&str,&str)]=&[("Secret","secret"),("ConfigMap","configmap"),("Service","service"),("PersistentVolumeClaim","persistentvolumeclaim"),("ServiceAccount","serviceaccount")];
 fn parse_resources(output:&str,kind:&str)->Result<BTreeSet<String>,Error> {
-    if output.len()>MAX_TEXT{return Err("Resource completion snapshot exceeds64KiB.".into());}
+    if output.len()>MAX_TEXT{return Err("Resource completion snapshot exceeds 64KiB.".into());}
     let mut names=BTreeSet::new();
     for line in output.lines(){
         let name=line.strip_prefix(kind).and_then(|tail|tail.strip_prefix('/')).filter(|name|crate::is_dns_subdomain(name)).ok_or("Unsupported resource name output; no snapshot accepted.")?;

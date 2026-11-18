@@ -2,7 +2,6 @@
 use crate::indexer::{deployment_isolation, edges_in};
 use openidea_plugin::providers::LineMarker;
 use openidea_plugin::{Location, Position, Project, host};
-use std::collections::{BTreeMap, VecDeque};
 use ui_kit::navigation::{Graph, Resolver};
 const MAX_TEXT: usize = 128 << 10;
 const MAX_BYTES: usize = 8 << 20;
@@ -31,21 +30,30 @@ struct Cached {
 }
 #[derive(Default)]
 pub(crate) struct Cache {
-    files: BTreeMap<(String, String), Cached>,
-    order: VecDeque<(String, String)>,
+    files: crate::lru::Lru<(String, String), Cached>,
     bytes: usize,
+    transformers: crate::indexer::TransformerFlags,
 }
 impl Cache {
     pub(crate) fn clear(&mut self) {
         self.files.clear();
-        self.order.clear();
         self.bytes = 0;
+        self.transformers.clear();
+    }
+    pub(crate) fn forget_transformers(&mut self) {
+        self.transformers.clear();
+    }
+    pub(crate) fn evict(&mut self, path: &str) {
+        let keys: Vec<_> = self.files.keys().filter(|(_, p)| p == path).cloned().collect();
+        for key in keys {
+            self.remove(&key);
+        }
     }
     fn remove(&mut self, key: &(String, String)) {
-        if let Some(old) = self.files.remove(key) {
+        if let Some(old) = self.files.get(key) {
             self.bytes = self.bytes.saturating_sub(old.bytes);
         }
-        self.order.retain(|k| k != key);
+        self.files.remove(key);
     }
     pub(crate) fn warm_file(&mut self, path: &str) {
         if !yaml(path) {
@@ -57,7 +65,7 @@ impl Cache {
         if let Ok(text) = project.read_file(path) {
             self.warm(path, &text);
         } else {
-            self.clear();
+            self.evict(path);
         }
     }
     pub(crate) fn warm(&mut self, path: &str, text: &str) {
@@ -72,8 +80,8 @@ impl Cache {
         if text.len() > MAX_TEXT || project.read_file(path).is_err() {
             return;
         }
-        // Discovery happens only in index/open-save work, never provider calls.
-        let isolated = deployment_isolation(path).unwrap_or(true);
+        // Discovery runs only while warming (index, open, save, file changes), never in provider calls.
+        let isolated = deployment_isolation(path, &mut self.transformers).unwrap_or(true);
         let graph: Graph = edges_in(path, text, isolated).into();
         let bytes = graph.definitions.iter().chain(&graph.references).chain(&graph.markers).map(|(key, _)| key.len() + 128).sum::<usize>()
             + path.len()
@@ -82,14 +90,11 @@ impl Cache {
             return;
         }
         while self.files.len() >= MAX_FILES || self.bytes + bytes > MAX_BYTES {
-            let Some(old) = self.order.pop_front() else { break };
-            if let Some(old) = self.files.remove(&old) {
-                self.bytes = self.bytes.saturating_sub(old.bytes);
-            }
+            let Some((_, old)) = self.files.pop_oldest() else { break };
+            self.bytes = self.bytes.saturating_sub(old.bytes);
         }
         self.bytes += bytes;
-        self.order.push_back(key.clone());
-        self.files.insert(key, Cached { graph, isolated, bytes });
+        self.files.insert(key, Cached { graph, isolated, bytes }, usize::MAX);
     }
     fn source(&self, doc: &openidea_plugin::providers::Document) -> Option<(Project, String, Graph)> {
         if doc.language != "yaml" || !yaml(&doc.path) || doc.text.len() > MAX_TEXT {
@@ -163,7 +168,7 @@ impl Cache {
             })
             .markers(&source);
         for marker in &mut markers {
-            marker.tooltip = format!("Read-only source candidate · {} · deployment/cluster identity unresolved", marker.tooltip);
+            marker.tooltip = format!("{} · in project files; the cluster may differ", marker.tooltip);
         }
         markers
     }
@@ -175,7 +180,6 @@ mod tests {
     use crate::KubeExplorer;
     use openidea_plugin::{
         Event, Plugin,
-        indexing::{Document as Indexed, DocumentIndexer},
         mock::MockHost,
         providers::{Document, Providers},
         text,
@@ -189,8 +193,7 @@ mod tests {
         Document { path: format!("/project/{path}"), language: "yaml".into(), version: 4, text: source.into() }
     }
     fn warm(kube: &mut KubeExplorer, path: &str, source: &str) {
-        let edges = kube.index(&Indexed { path: format!("/project/{path}"), text: source.into(), symbols: Vec::new() });
-        assert!(edges.definitions.is_empty() && edges.references.is_empty() && edges.aliases.is_empty() && edges.markers.is_empty());
+        kube.navigation.warm(&format!("/project/{path}"), source);
     }
     fn host() -> MockHost {
         MockHost::install().with_capabilities(&["project.read"])
@@ -213,7 +216,7 @@ mod tests {
         let found = kube.definition(&src, namespace);
         assert_eq!(found.len(), 1);
         assert!(found[0].path.ends_with("namespace.yaml"));
-        assert!(kube.line_markers(&src).iter().all(|m| m.tooltip.contains("Read-only source candidate")));
+        assert!(kube.line_markers(&src).iter().all(|m| m.tooltip.contains("the cluster may differ")));
         let config = doc("config.yaml", CONFIG);
         let pos = text::position(CONFIG, CONFIG.find("namespace: app").unwrap() + 12);
         assert_eq!(kube.definition(&config, pos).len(), 1);
@@ -298,7 +301,8 @@ mod tests {
             warm(&mut kube, &path, SECRET);
         }
         assert!(kube.navigation.files.len() <= MAX_FILES && kube.navigation.bytes <= MAX_BYTES);
-        kube.handle_events(&[Event::FilesChanged(Default::default())], &h.invocation());
+        let removed = (0..MAX_FILES + 3).map(|n| format!("/project/s{n}.yaml")).collect();
+        kube.handle_events(&[Event::FilesChanged(openidea_plugin::FilesChanged { removed, ..Default::default() })], &h.invocation());
         assert!(kube.navigation.files.is_empty());
         let huge = format!("{}{SECRET}", " ".repeat(MAX_TEXT));
         h.add_file("huge.yaml", &huge);
@@ -310,6 +314,55 @@ mod tests {
         warm(&mut kube, "unknown.yaml", &custom);
         assert!(kube.navigation.files.is_empty());
         assert!(h.process_runs().is_empty());
+    }
+    #[test]
+    fn files_changed_evicts_only_named_paths() {
+        let h = host();
+        let mut kube = KubeExplorer::default();
+        for path in ["a.yaml", "b.yaml"] {
+            h.add_file(path, SECRET);
+            warm(&mut kube, path, SECRET);
+        }
+        assert_eq!(kube.navigation.files.len(), 2);
+        let changed = openidea_plugin::FilesChanged { removed: vec!["/project/a.yaml".into()], ..Default::default() };
+        kube.handle_events(&[Event::FilesChanged(changed)], &h.invocation());
+        let left: Vec<_> = kube.navigation.files.keys().map(|(_, path)| path.as_str()).collect();
+        assert_eq!(left, ["/project/b.yaml"]);
+    }
+    #[test]
+    fn definition_into_a_never_opened_file_works_after_index() {
+        use openidea_plugin::indexing::{Document as Indexed, DocumentIndexer};
+        let h = host();
+        h.add_file("secret.yaml", SECRET);
+        h.add_file("ingress.yaml", INGRESS);
+        let mut kube = KubeExplorer::default();
+        let edges = kube.index(&Indexed { path: "/project/secret.yaml".into(), text: SECRET.into(), symbols: Vec::new() });
+        assert!(edges.definitions.is_empty() && edges.references.is_empty() && edges.markers.is_empty());
+        kube.handle_events(&[Event::FileOpened("/project/ingress.yaml".into())], &h.invocation());
+        let at = text::position(INGRESS, INGRESS.rfind("cert").unwrap() + 1);
+        let found = kube.definition(&doc("ingress.yaml", INGRESS), at);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, "/project/secret.yaml");
+    }
+    #[test]
+    fn transformer_flag_cached_until_files_changed() {
+        let h = host();
+        let mut kube = KubeExplorer::default();
+        let isolated = |kube: &KubeExplorer, path: &str| kube.navigation.files.get(&("/project".to_owned(), format!("/project/{path}"))).map(|c| c.isolated);
+        h.add_file("a.yaml", SECRET);
+        warm(&mut kube, "a.yaml", SECRET);
+        assert_eq!(isolated(&kube, "a.yaml"), Some(false));
+
+        h.add_file("overlays/kustomization.yaml", "namespace: prod\n");
+        h.add_file("b.yaml", SECRET);
+        warm(&mut kube, "b.yaml", SECRET);
+        assert_eq!(isolated(&kube, "b.yaml"), Some(false), "the per-root flag is not searched again");
+
+        let changed = openidea_plugin::FilesChanged { created: vec!["/project/overlays/kustomization.yaml".into()], ..Default::default() };
+        kube.handle_events(&[Event::FilesChanged(changed)], &h.invocation());
+        h.add_file("c.yaml", SECRET);
+        warm(&mut kube, "c.yaml", SECRET);
+        assert_eq!(isolated(&kube, "c.yaml"), Some(true));
     }
     #[test]
     fn many_equal_source_candidates_do_not_turn_target_validation_into_an_unbounded_read() {

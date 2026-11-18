@@ -20,6 +20,9 @@ try{
  assert.deepEqual(await keys(),['g:user','u:.gitignore','u:api.php','g:lang','g:community','g:nested','t:community'],'children follow their real parent, regardless of source order');
  assert.equal(await page.locator('th').count(),1);assert.equal(await page.locator('thead').isVisible(),false,'no empty Details column or redundant single-column header');
  const parent=page.locator('tr[data-resource-key="g:user"]'),child=page.locator('tr[data-resource-key="u:.gitignore"]');
+ assert.equal(await page.locator('table').getAttribute('role'),'treegrid');
+ assert.deepEqual([await parent.getAttribute('aria-level'),await child.getAttribute('aria-level'),await page.locator('tr[data-resource-key="t:community"]').getAttribute('aria-level')],['1','2','3'],'tree rows expose their depth');
+ assert.deepEqual([await parent.getAttribute('aria-expanded'),await page.locator('tr[data-resource-key="g:lang"]').getAttribute('aria-expanded'),await child.getAttribute('aria-expanded')],['true','false',null],'only expandable rows expose expansion state');
  assert.equal(await parent.evaluate(n=>n.getBoundingClientRect().height),24);assert.equal(await child.evaluate(n=>n.getBoundingClientRect().height),24);
  const px=await parent.locator('.tree-label').boundingBox(),cx=await child.locator('.tree-label').boundingBox();assert.equal(cx.x-px.x,20,'leaf and disclosure gutters align with one indentation step');
  assert.equal(await child.locator('svg[data-ui-native-name="file-ignored"]').count(),1,'ordinary user templates are files, not favorites');

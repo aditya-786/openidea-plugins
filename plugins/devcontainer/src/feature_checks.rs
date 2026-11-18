@@ -5,6 +5,26 @@ use serde_json::Value;
 
 use crate::checks::{Finding, FEATURES_MALFORMED, feature_members};
 
+thread_local! {
+    static MANIFESTS: std::cell::RefCell<std::collections::HashMap<String, (u64, Option<Value>)>> = Default::default();
+}
+
+/// Parsed manifest, cached per path and content hash.
+fn manifest_value(path: &str, source: &str) -> Option<Value> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    let hash = hasher.finish();
+    if let Some((cached, value)) = MANIFESTS.with(|cache| cache.borrow().get(path).cloned()) {
+        if cached == hash {
+            return value;
+        }
+    }
+    let value = serde_json::from_str::<Value>(source).ok();
+    MANIFESTS.with(|cache| cache.borrow_mut().insert(path.to_owned(), (hash, value.clone())));
+    value
+}
+
 pub(crate) fn local_feature_findings(doc_path: &str, text: &str) -> Vec<Finding> {
     let features = feature_members(text);
     if !features.iter().any(|(f, _)| f.key.starts_with("./") || f.key.starts_with("../")) {
@@ -23,7 +43,7 @@ pub(crate) fn local_feature_findings(doc_path: &str, text: &str) -> Vec<Finding>
         let Some(dir) = crate::compose::resolve(folder, &feature.key, &prefix) else { continue };
         let manifest_path = format!("{dir}/devcontainer-feature.json");
         let manifest = match project.read_file(&manifest_path) {
-            Ok(source) if source.len() <= 256 * 1024 => serde_json::from_str::<Value>(&source).ok(),
+            Ok(source) if source.len() <= 256 * 1024 => manifest_value(&manifest_path, &source),
             Ok(_) => None,
             Err(Error::NotFound(_) | Error::Invalid(_)) => {
                 findings.push(Finding::warning(feature.key_range.clone(), FEATURES_MALFORMED, format!("Local feature `{}` has no devcontainer-feature.json.", feature.key)));

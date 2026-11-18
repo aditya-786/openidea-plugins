@@ -103,7 +103,7 @@ fn exclusive_choice_problems(text:&str,all:&[Element],i:usize)->Vec<Diagnostic> 
 #[cfg(test)]
 pub fn problems(text:&str)->Vec<Diagnostic> {configured_problems(text,None)}
 pub fn configured_problems(text:&str,compatibility:Option<&str>)->Vec<Diagnostic> {
-    if !crate::xml_namespaces::document_valid(text) {return Vec::new();}
+    if !spring_text::xml::analysis_valid(text) {return Vec::new();}
     let compatibility=match compatibility {Some("5")=>Some(Schema::Five),Some("6")=>Some(Schema::Six),_=>None};
     let all=xml::elements(text);let mut out=Vec::new();let mut deprecated=false;
     for (i,element) in all.iter().enumerate().filter(|(i,_)|xml::namespace(&all,*i)==Some(NAMESPACE)) {

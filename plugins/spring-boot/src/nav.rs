@@ -16,8 +16,6 @@ pub const PROFILE_KEYS: &[&str] = &[
     "spring.profiles.include",
     "spring.config.activate.on-profile",
 ];
-pub const SOURCE_GLOBS: &[&str] = &["**/*.java", "**/*.kt"];
-
 /// The package of a Java or Kotlin source.
 pub fn package_of(_path: &str, text: &str) -> Option<String> {
     let line = text
@@ -206,7 +204,7 @@ pub fn completion(cx: &Context) -> Vec<CompletionItem> {
         return Vec::new();
     };
     match cursor {
-        Cursor::Key { path, .. } => {
+        Cursor::Key { path, typed_at } => {
             let Some(prefix) = path
                 .get(..path.len().min("logging.level.".len()))
                 .filter(|p| p.eq_ignore_ascii_case("logging.level."))
@@ -214,7 +212,11 @@ pub fn completion(cx: &Context) -> Vec<CompletionItem> {
                 return Vec::new();
             };
             let key_in_yaml = !cx.path.ends_with(".properties");
-            let seg_start = cx.at - path[prefix.len()..].len();
+            let after_prefix = &path[prefix.len()..];
+            if key_in_yaml && !cx.text[typed_at..cx.at].ends_with(after_prefix) {
+                return Vec::new();
+            }
+            let seg_start = cx.at - after_prefix.len();
             let replace = range(cx.text, seg_start, cx.at);
             let suffix = if key_in_yaml { ": " } else { "=" };
             with_parents(cx.packages.iter().map(String::as_str))
@@ -495,5 +497,64 @@ mod tests {
             package_of("A.java", "// x\npackage com.acme;\nclass A {}").as_deref(),
             Some("com.acme")
         );
+    }
+    #[test]
+    fn nested_yaml_logging_level_completion_keeps_indent() {
+        let packages = ["com.acme".to_owned()];
+        let text = "logging:\n  level:\n    ac";
+        let cx = |text: &str| {
+            let lookup = Lookup(vec![]);
+            let facts = Summary::default();
+            let resources = || Vec::new();
+            let at = text.len();
+            let cx = Context {
+                path: "application.yml",
+                text,
+                at,
+                lookup: &lookup,
+                packages: &packages,
+                profiles: &[],
+                facts: &facts,
+                resources: &resources,
+            };
+            completion(&cx)
+        };
+        let items = cx(text);
+        let item = items.iter().find(|i| i.label == "com.acme").unwrap();
+        let replace = item.replace.unwrap();
+        assert_eq!(replace.start, openidea_plugin::Position::new(2, 4));
+        let nested = cx("logging:\n  level:\n    com:\n      ac");
+        assert!(nested.is_empty());
+    }
+    #[test]
+    fn flat_dotted_yaml_logging_level_completion_replaces_only_the_package() {
+        let packages = ["com.acme".to_owned()];
+        let run = |text: &str| {
+            let lookup = Lookup(vec![]);
+            let facts = Summary::default();
+            let resources = || Vec::new();
+            completion(&Context {
+                path: "application.yml",
+                text,
+                at: text.len(),
+                lookup: &lookup,
+                packages: &packages,
+                profiles: &[],
+                facts: &facts,
+                resources: &resources,
+            })
+        };
+        for (text, line, character) in [
+            ("logging.level.ac", 0, 14),
+            ("logging:\n  level.ac", 1, 8),
+        ] {
+            let items = run(text);
+            let item = items.iter().find(|i| i.label == "com.acme").unwrap();
+            assert_eq!(
+                item.replace.unwrap().start,
+                openidea_plugin::Position::new(line, character),
+                "{text}"
+            );
+        }
     }
 }

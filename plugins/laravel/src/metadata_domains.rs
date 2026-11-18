@@ -443,13 +443,13 @@ pub(super) fn cache_package_icons(
     let mut attempts = 0usize;
     if sources.len() > 128 {
         scan.issues.push(
-            "Blade icon provider source count exceeds128; remaining providers withheld".into(),
+            "Blade icon provider source count exceeds 128; remaining providers withheld".into(),
         );
     }
     for (path, source) in sources.iter().take(128) {
         source_bytes = source_bytes.saturating_add(source.len());
         if source_bytes > TOTAL {
-            scan.issues.push("Blade icon provider sources exceed aggregate4MiB budget; remaining providers withheld".into());
+            scan.issues.push("Blade icon provider sources exceed aggregate 4MiB budget; remaining providers withheld".into());
             break;
         }
         let full = format!("{}/{path}", scan.root);

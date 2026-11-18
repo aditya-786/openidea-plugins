@@ -19,6 +19,7 @@ pub(crate) const MODEL_SUPPORT_MARKER: &str = "icons/marker-model-support.svg";
 pub(crate) const LISTENER_MARKER: &str = "icons/marker-listener.svg";
 pub(crate) const EVENT_MARKER: &str = "icons/marker-event.svg";
 pub(crate) const ROUTE_MARKER: &str = "icons/marker-route.svg";
+pub(crate) const RELATED_MARKER: &str = "icons/laravel.svg";
 
 mod actions;
 mod about;
@@ -115,7 +116,6 @@ mod unused;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, Instant};
 
 use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Document, LineMarker, Providers};
 use openidea_plugin::views::{Body, Button, TreeItem, View, ViewEvent, Viewport, Views};
@@ -132,6 +132,10 @@ const PLUGIN_ID: &str = "aritti.laravel";
 const DEFAULT_BASE_URL: &str = "http://localhost:8000";
 const SOURCE: &str = "Laravel";
 const CONTROLLERS_DIRECTORY: &str = "app/Http/Controllers/";
+
+pub(crate) fn still_indexing() -> Error {
+    Error::Invalid(ui_text::t("native.lib.stillIndexing", "Laravel is still indexing. Try again in a moment."))
+}
 
 /// Whether a saved file (project-relative) feeds the index.
 fn affects_index(relative: &str) -> bool {
@@ -649,6 +653,14 @@ fn missing_translation(index: &Index, name: &str) -> bool {
 
 const SEARCH_LIMIT: usize = 5000;
 
+/// The Models row key a model command was given, or one the user picks when it runs from the palette.
+fn model_key_or_pick(index: &Index, project: &Project, arg: Option<&str>, title: &str) -> Result<Option<String>, Error> {
+    if let Some(key) = arg { return Ok(Some(key.to_owned())); }
+    let choices: Vec<_> = model_overview::rows(index, project).into_iter().filter(|row|row["cells"][1] == "Model").filter_map(|row|Some(openidea_plugin::PickItem::new(row["key"].as_str()?, row["cells"][0].as_str()?))).collect();
+    if choices.is_empty() { return Err(Error::Invalid(crate::ui_text::t("native.lib.noModels", "No Eloquent models found in this project."))); }
+    host::pick(title, &choices)
+}
+
 /// One picker over every route name, view, component, config key, translation and env key.
 fn search_names(index: &Index) -> Result<(), Error> {
     let sections: [(&str, &Names); 6] = [
@@ -711,8 +723,6 @@ pub struct Main {
     index_rechecks: BTreeMap<String, std::collections::VecDeque<String>>,
     /// Files with published problems, checked again when the index changes.
     checked: BTreeSet<String>,
-    /// Project root and time `migrate-fresh` was first asked for.
-    fresh_asked: Option<(String, Instant)>,
     route_list: Option<RouteList>,
     runtime_routes: BTreeMap<String, route_runtime::Snapshot>,
     artisan_workspace: artisan_workspace::State,
@@ -725,6 +735,37 @@ pub struct Main {
     runtime_inspection: runtime_inspection::State,
     index_ticks: u32,
     model_rows: std::cell::RefCell<BTreeMap<String, Vec<serde_json::Value>>>,
+}
+
+/// First `KEY=value` of the project's `.env`, unquoted; `None` when unset or unreadable.
+fn dotenv_value(project: &Project, key: &str) -> Option<String> {
+    let text = project.read_file(".env").ok()?;
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(key)?.strip_prefix('='))
+        .map(|value| value.trim().trim_matches(['"', '\'']).to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Confirmation body for a command that changes the project's database.
+fn database_command_prompt(project: &Project, body_key: &str, body: &str) -> Result<String, Error> {
+    let root = project.root()?;
+    let mut prompt = crate::ui_text::format(body_key, body, &[("root", &root)]);
+    let connection = dotenv_value(project, "DB_CONNECTION");
+    let environment = dotenv_value(project, "APP_ENV");
+    if connection.is_some() || environment.is_some() {
+        let unknown = crate::ui_text::text("native.lib.unknownEnvValue", "not set");
+        prompt.push_str(&crate::ui_text::format(
+            "native.lib.databaseTarget",
+            "\nDatabase connection: {connection}. Environment: {environment}.",
+            &[("connection", connection.as_deref().unwrap_or(unknown)), ("environment", environment.as_deref().unwrap_or(unknown))],
+        ));
+    }
+    Ok(prompt)
+}
+
+fn confirm_database_command(ctx: &Invocation, title: &str, body_key: &str, body: &str) -> Result<bool, Error> {
+    let project = ctx.project().ok_or(crate::ui_text::text("native.lib.6d0169b3b4", "No project is open."))?;
+    host::confirm(title, &database_command_prompt(&project, body_key, body)?)
 }
 
 fn refresh_laravel() {
@@ -796,7 +837,7 @@ impl Main {
 
         let output = match project.run_process("php", &args, None) {
             Err(Error::Denied(_)) => {
-                return Err(crate::ui_text::text("native.lib.a4c063bde3", "Allow the process:php capability in Settings › Plugins.").into());
+                return Err("Running PHP needs the process:php permission. Allow it in Settings › Plugins › Laravel, and make sure php is on your PATH.".into());
             }
             result => result?,
         };
@@ -836,7 +877,13 @@ impl Main {
             "generate-for-model" => {
                 let runner=self.artisan_workspace.runner(ctx)?;
                 let runtime=self.runtime_inspection.schema_for_generation(&project,runner).ok().map(|snapshot|(runner,snapshot));
-                generate::for_model(&self.artisan_terminals, ctx, index, runtime)
+                let before=bulk::pending_generation(&self.artisan_terminals.model_plans,&root);
+                let result=generate::for_model(&self.artisan_terminals, ctx, index, runtime)?;
+                let Some((key,anchor))=bulk::pending_generation(&self.artisan_terminals.model_plans,&root).filter(|after|before.as_ref()!=Some(after)) else {return Ok(result)};
+                if let Some(count)=self.apply_editor_action(&anchor,&format!("bulk-generate:{key}:"))? {
+                    host::notify(NotificationLevel::Info,SOURCE,&crate::ui_text::format("native.lib.filesWritten","Created or updated {count} files.",&[("count",&count.to_string())]));
+                }
+                Ok(None)
             },
             _ => generate::create_missing(&self.artisan_terminals, ctx, index),
         }
@@ -954,7 +1001,7 @@ impl Plugin for Main {
                 let runner=self.artisan_workspace.runner(ctx)?;
                 let value=self.helper_automation.handle(ctx,&serde_json::json!({"op":id}).to_string(),runner)?;
                 host::output_clear("Laravel Helper Automation")?;
-                host::output_append("Laravel Helper Automation",&serde_json::to_string_pretty(&value).map_err(|error|Error::Invalid(error.to_string()))?)?;
+                host::output_append("Laravel Helper Automation",&helper_automation::summary(&value))?;
                 host::output_reveal("Laravel Helper Automation")?;Ok(None)
             }
             "index-issues" => {
@@ -965,17 +1012,17 @@ impl Plugin for Main {
             }
             "runtime-application-mcp" => {
                 let extra=self.view_index(ctx).map(|index|index.metadata.route_files.clone()).unwrap_or_default();let value=self.application_mcp.connect(ctx,self.artisan_workspace.runner(ctx)?,&extra)?;
-                host::notify(NotificationLevel::Info,SOURCE,&value.to_string());refresh_laravel();Ok(None)
+                host::notify(NotificationLevel::Info,SOURCE,&mcp::application::summary(&value));refresh_laravel();Ok(None)
             }
             "runtime-model-connections" => {
                 let project=ctx.project().ok_or(Error::Stale)?;
                 self.advance_index(&project);
-                let index=self.view_index(ctx).ok_or(Error::Stale)?;
-                if !index::index_sources_current(&project,index){return Err(Error::Stale);}
+                let index=self.view_index(ctx).ok_or_else(still_indexing)?;
+                if !index::index_sources_current(&project,index){return Err(still_indexing());}
                 let models=eloquent_members::model_identities(&index.eloquent_models).into_iter().filter(|(_,path)|owns_current_path(&project,path)).collect::<Vec<_>>();
                 let items=models.iter().map(|(full,_)|openidea_plugin::PickItem::new(full,full)).collect::<Vec<_>>();
-                let Some(selected)=host::pick_many(crate::ui_text::text("native.lib.a45892eede", "Models to inspect connection/table bindings (up to 32)"),&items)?else{return Ok(None)};
-                if selected.is_empty()||selected.len()>32||selected.iter().any(|name|!models.iter().any(|(full,_)|full==name)){return Err(Error::Invalid(crate::ui_text::text("native.lib.ab12ffa832", "Select 1–32 owned models").into()));}
+                let Some(selected)=host::pick_many(&crate::ui_text::t("native.lib.modelConnectionsPick", "Models to read the database connection and table of (up to 32)"),&items)?else{return Ok(None)};
+                if selected.is_empty()||selected.len()>32||selected.iter().any(|name|!models.iter().any(|(full,_)|full==name)){return Err(Error::Invalid(crate::ui_text::t("native.lib.pickModels", "Select between 1 and 32 models of this project.")));}
                 let models=models.into_iter().filter(|(full,_)|selected.contains(full)).collect::<Vec<_>>();
                 self.runtime_inspection.capture_model_connections(ctx,self.artisan_workspace.runner(ctx)?,&models)?;refresh_laravel();Ok(None)
             }
@@ -986,8 +1033,11 @@ impl Plugin for Main {
             }
             "regenerate-model-helpers" => {
                 self.advance_context_index(ctx);
-                let index=self.view_index(ctx).ok_or(Error::Stale)?;
-                model_actions::begin_project(ctx,index)?;
+                let index=self.view_index(ctx).ok_or_else(still_indexing)?;
+                let anchor=model_actions::helper_anchor(ctx,index)?;
+                if let Some(count)=self.apply_editor_action(&anchor,"model-native:helpers-all:")? {
+                    host::notify(NotificationLevel::Info,SOURCE,&crate::ui_text::format("native.lib.helpersWritten","Updated {count} model helper files.",&[("count",&count.to_string())]));
+                }
                 Ok(None)
             }
             "model-from-database" => {
@@ -999,8 +1049,9 @@ impl Plugin for Main {
             }
             "model-open-source" => {
                 let project = ctx.project().ok_or(Error::Stale)?;
-                let index = self.view_index(ctx).ok_or(Error::Stale)?;
-                model_overview::open(index, &project, arg.ok_or(Error::Stale)?)?;
+                let index = self.view_index(ctx).ok_or_else(still_indexing)?;
+                let Some(key) = model_key_or_pick(index, &project, arg, &crate::ui_text::t("native.lib.openModelPick", "Open Model Source"))? else { return Ok(None) };
+                model_overview::open(index, &project, &key)?;
                 Ok(None)
             }
             "model-create-fields" => {
@@ -1008,24 +1059,23 @@ impl Plugin for Main {
                 let root = project.root()?;
                 if self.view_index(ctx).is_none() { return Err(Error::Stale); }
                 let index = self.indexes.get(&root).ok_or(Error::Stale)?;
-                let key = match arg {
-                    Some(key) => key.to_owned(),
-                    None => {
-                        let choices: Vec<_> = model_overview::rows(index, &project).into_iter().filter(|row|row["cells"][1] == "Model").filter_map(|row|Some(openidea_plugin::PickItem::new(row["key"].as_str()?, row["cells"][0].as_str()?))).collect();
-                        let Some(key) = host::pick(crate::ui_text::text("native.lib.85e965dc3e", "Add fields to model"), &choices)? else { return Ok(None) };
-                        key
-                    }
-                };
+                let Some(key) = model_key_or_pick(index, &project, arg, &crate::ui_text::t("native.lib.createFieldsPick", "Create Model Fields"))? else { return Ok(None) };
                 let path = model_overview::source_path(index, &project, &key)?;
                 self.generator_workspace.seed_existing(ctx, index, &path)?;
                 Ok(None)
             }
             "runtime-open-frame" => {
-                self.runtime_inspection.open_log_frame(ctx, self.artisan_workspace.runner(ctx)?, arg.ok_or(crate::ui_text::text("native.lib.e834db5b60", "Select a captured Errors row first."))?)?;
+                let runner = self.artisan_workspace.runner(ctx)?;
+                let Some(key) = self.runtime_row_or_pick(ctx, runner, arg, |row| row.get("error").is_some(), &crate::ui_text::t("native.lib.errorPick", "Open Error Stack Frame"), &crate::ui_text::t("native.lib.noErrors", "No errors have been read yet. Click Logs in the Runtime tab and pick a log first."))? else { return Ok(None) };
+                self.runtime_inspection.open_log_frame(ctx, runner, &key)?;
                 Ok(None)
             }
             "console-command-open" => {
-                let name=console_editor::resolve(ctx,arg.ok_or(Error::Stale)?)?;
+                let Some(target)=arg.map(str::to_owned).or_else(||console_editor::editor_target(ctx)) else {
+                    ui_kit::web::reveal_view(artisan_workspace::VIEW,include_str!("ui_config.json"))?;
+                    return Ok(None);
+                };
+                let name=console_editor::resolve(ctx,&target)?;
                 if !self.artisan_workspace.run_entry(ctx,&name,&self.artisan_terminals,false)? {
                     ui_kit::web::reveal_view(artisan_workspace::VIEW,include_str!("ui_config.json"))?;
                     host::notify(NotificationLevel::Info,SOURCE,&crate::ui_text::format("root.formatted.79812948ba", "Refresh Artisan command metadata to configure {name}.", &[("name", &format!("{}", name))]));
@@ -1035,20 +1085,11 @@ impl Plugin for Main {
             "search-names" => {
                 let project = ctx.project().ok_or(Error::Stale)?;
                 self.advance_index(&project);
-                let index = self.view_index(ctx).ok_or(Error::Stale)?;
+                let index = self.view_index(ctx).ok_or_else(still_indexing)?;
                 search_names(index)?;
                 Ok(None)
             }
-            "route-search" => {
-                let project = ctx.project().ok_or(Error::Stale)?;
-                self.advance_index(&project);
-                let index=self.view_index(ctx).ok_or(Error::Stale)?;
-                if index.partial {return Err(Error::Failed(crate::ui_text::text("native.lib.3b27ad675b", "Laravel route index is incomplete; reindex before searching.").into()));}
-                if !index::index_sources_current(&project,index){return Err(Error::Stale);}
-                let initial = self.search_routes_from_index(ctx,index);
-                route_search::run(ctx, initial, || { if !index::index_sources_current(&project,index) {return Err(Error::Stale);} Ok(self.search_routes_from_index(ctx,index)) })?;
-                Ok(None)
-            }
+            "route-search" => self.search_routes(ctx),
             "runtime-database-list" => {
                 let root = ctx.project().ok_or(Error::Stale)?.root()?;
                 let ids = self.runtime_inspection.database_sources(ctx)?;
@@ -1069,13 +1110,15 @@ impl Plugin for Main {
                 refresh_laravel(); Ok(None)
             }
             "route-editor-open" => {
+                let Some(raw) = arg else { return self.search_routes(ctx) };
                 let index = self.view_index(ctx).ok_or(Error::Stale)?;
-                route_editor::open(index, ctx, arg.ok_or(Error::Stale)?)?;
+                route_editor::open(index, ctx, raw)?;
                 Ok(None)
             }
             "route-editor-action" => {
+                let Some(raw) = arg else { return self.search_routes(ctx) };
                 let index = self.view_index(ctx).ok_or(Error::Stale)?;
-                route_editor::action(index, ctx, arg.ok_or(Error::Stale)?, DEFAULT_BASE_URL)?;
+                route_editor::action(index, ctx, raw, DEFAULT_BASE_URL)?;
                 Ok(None)
             }
             "find-literal-source-matches" => crate::source_matches::run(ctx),
@@ -1110,9 +1153,15 @@ impl Plugin for Main {
             "view-clear" => self.artisan(ctx, "view:clear"),
             "migrate" => self.artisan(ctx, "migrate"),
             "storage-link" => self.artisan(ctx, "storage:link"),
-            "db-seed" => self.artisan(ctx, "db:seed"),
+            "db-seed" => {
+                if !confirm_database_command(ctx, crate::ui_text::text("native.lib.seedTitle", "Seed Database"), "native.lib.seedBody", "Run the database seeders for {root}?")? {
+                    return Ok(None);
+                }
+                self.artisan(ctx, "db:seed")
+            }
             "route-send-request" => {
-                let Some(route) = arg.and_then(|key| self.route_at(key, ctx)) else {
+                let Some(key) = self.route_key_or_pick(ctx, arg)? else { return Ok(None) };
+                let Some(route) = self.route_at(&key, ctx) else {
                     return Ok(None);
                 };
                 let project = ctx.project().ok_or(Error::Stale)?;
@@ -1124,7 +1173,8 @@ impl Plugin for Main {
                 Ok(None)
             }
             "route-copy-curl" | "route-create-http" => {
-                let Some(mut route) = arg.and_then(|key| self.route_at(key, ctx)) else {
+                let Some(key) = self.route_key_or_pick(ctx, arg)? else { return Ok(None) };
+                let Some(mut route) = self.route_at(&key, ctx) else {
                     return Ok(None);
                 };
                 if route.method.contains('|') {
@@ -1134,24 +1184,13 @@ impl Plugin for Main {
                     route.method=method;
                 }
                 match id {
-                    "route-copy-curl" => copy_as_curl(&route, DEFAULT_BASE_URL)?,
-                    _ => create_http_file_for_project(&route, DEFAULT_BASE_URL, None, &ctx.project().ok_or(Error::Stale)?)?,
+                    "route-copy-curl" => copy_as_curl(&route, DEFAULT_BASE_URL, "Laravel")?,
+                    _ => create_http_file_for_project(&route, DEFAULT_BASE_URL, None, &ctx.project().ok_or(Error::Stale)?, "Laravel")?,
                 }
                 Ok(None)
             }
             "migrate-fresh" => {
-                let root = ctx.project().and_then(|project| project.root().ok()).unwrap_or_default();
-                let confirmed = self
-                    .fresh_asked
-                    .take()
-                    .is_some_and(|(asked_root, asked)| asked_root == root && asked.elapsed() < Duration::from_secs(30));
-                if !confirmed {
-                    self.fresh_asked = Some((root, Instant::now()));
-                    host::notify(
-                        NotificationLevel::Warning,
-                        SOURCE,
-                        crate::ui_text::text("native.lib.859d1d6ee2", "Fresh migration drops all tables. Run Laravel: Fresh Migration (drops all tables) again within 30 seconds to confirm."),
-                    );
+                if !confirm_database_command(ctx, crate::ui_text::text("native.lib.freshTitle", "Fresh Migration"), "native.lib.freshBody", "Drop every table in the database of {root} and run all migrations again?")? {
                     return Ok(None);
                 }
                 self.artisan(ctx, "migrate:fresh")
@@ -1171,7 +1210,7 @@ impl Plugin for Main {
             },
             "runtime-logs" => {
                 let files=self.runtime_inspection.log_files(ctx)?;
-                if files.is_empty(){host::notify(NotificationLevel::Info,SOURCE,crate::ui_text::text("native.lib.0eb8f8b258", "No owned log files found under storage/logs."));return Ok(None);}
+                if files.is_empty(){host::notify(NotificationLevel::Info,SOURCE,crate::ui_text::text("native.lib.noLogFiles", "No log files found under storage/logs. They appear once the application writes a log."));return Ok(None);}
                 let choices:Vec<_>=files.iter().map(|file|openidea_plugin::PickItem::new(file,file)).collect();
                 if let Some(file)=host::pick(crate::ui_text::text("native.lib.21923a348b", "Read Laravel log"),&choices)? {
                     self.runtime_inspection.capture_log(ctx,self.artisan_workspace.runner(ctx)?,&file)?;
@@ -1179,8 +1218,9 @@ impl Plugin for Main {
                 } Ok(None)
             },
             "runtime-retry-failed" => {
-                let key=arg.ok_or(crate::ui_text::text("native.lib.ca9f750672", "Select a captured failed-job row and choose Retry Failed Job."))?;
-                let result=self.runtime_inspection.retry_failed(ctx,self.artisan_workspace.runner(ctx)?,key)?;
+                let runner=self.artisan_workspace.runner(ctx)?;
+                let Some(key)=self.runtime_row_or_pick(ctx,runner,arg,|row|row["key"].as_str().is_some_and(|key|key.starts_with("failedjob:")),&crate::ui_text::t("native.lib.failedJobPick","Retry Failed Job"),&crate::ui_text::t("native.lib.noFailedJobs","No failed jobs have been read yet. Click Failed Jobs in the Runtime tab first."))? else {return Ok(None)};
+                let result=self.runtime_inspection.retry_failed(ctx,runner,&key)?;
                 host::notify(NotificationLevel::Info,SOURCE,&result);
                 refresh_laravel();
                 Ok(None)
@@ -1202,8 +1242,17 @@ impl Plugin for Main {
             "artisan-browse-docker-metadata" => artisan_docker::browse(ctx),
             "make" | "new-model" | "generate-for-model" | "create-missing" => self.generator(id, ctx),
             "remove-phpdocs" => {
-                let root = ctx.project().and_then(|project| project.root().ok()).unwrap_or_default();
-                bulk::remove_phpdocs(ctx, self.indexes.get(&root))
+                let project = ctx.project().ok_or(Error::Stale)?;
+                self.advance_index(&project);
+                let index = self.view_index(ctx).filter(|index| !index.partial).ok_or_else(still_indexing)?;
+                let Some(anchor) = bulk::phpdoc_anchor(index, &project) else {
+                    host::notify(NotificationLevel::Info, SOURCE, &crate::ui_text::t("native.lib.noHelperPhpdoc", "No model has IDE helper PHPDoc to remove."));
+                    return Ok(None);
+                };
+                if let Some(count) = self.apply_editor_action(&anchor, "bulk-phpdocs:")? {
+                    host::notify(NotificationLevel::Info, SOURCE, &crate::ui_text::format("native.lib.phpdocRemoved", "Removed IDE helper PHPDoc from {count} models.", &[("count", &count.to_string())]));
+                }
+                Ok(None)
             }
             "reveal" => {
                 host::reveal_view(VIEW)?;
@@ -1939,14 +1988,16 @@ fn php_markers(index: &Index, project: &Project, doc: &Document) -> Vec<LineMark
     };
 
     let Some(full)=eloquent_members::declaration(&doc.text)else{return markers;};
+    // Every route of a method shares one icon: the host lists several targets in
+    // its anchored chooser and opens a single one directly.
     for (method, offset) in &controller.methods {
-        let route = index.route_defs.iter().find(|r|index.route_controller_full(r).is_some_and(|target|target.eq_ignore_ascii_case(&full))&&r.def.controller.as_ref().is_some_and(|(_,m)|m.eq_ignore_ascii_case(method)));
-        let Some(route) = route else { continue };
-
-        let end = Position::new(route.at.line, route.at.character + route.width);
-        let tooltip = crate::ui_text::format("root.formatted.c960019874", "Route {methods} {uri}", &[("methods", &format!("{}", route.def.methods)), ("uri", &format!("{}", route.def.uri))]);
-        let target = Location { path: route.path.clone(), range: Range::new(route.at, end) };
-        markers.push(LineMarker { line: line_of(*offset), icon: Some("run".into()), tooltip, target: Some(target) });
+        let routes = index.route_defs.iter().filter(|r|r.width>0&&index.route_controller_full(r).is_some_and(|target|target.eq_ignore_ascii_case(&full))&&r.def.controller.as_ref().is_some_and(|(_,m)|m.eq_ignore_ascii_case(method)));
+        for route in routes {
+            let end = Position::new(route.at.line, route.at.character + route.width);
+            let tooltip = crate::ui_text::format("root.formatted.c960019874", "Route {methods} {uri}", &[("methods", &route.def.methods), ("uri", &route.def.uri)]);
+            let target = Location { path: route.path.clone(), range: Range::new(route.at, end) };
+            markers.push(LineMarker { line: line_of(*offset), icon: Some(RELATED_MARKER.into()), tooltip, target: Some(target) });
+        }
     }
 
     markers
@@ -2224,7 +2275,7 @@ impl Main {
             ViewEvent::Button(id) if id == "request-copy-curl" => {
                 let request = self.route_requests.request(&root)?;
                 host::copy_to_clipboard(&request.curl(DEFAULT_BASE_URL))?;
-                host::notify(NotificationLevel::Info, SOURCE, crate::ui_text::text("request.curlCopied", "Copied the request as cURL. Act as user is not part of a cURL request, and web routes still need their CSRF token against a real server."));
+                host::notify(NotificationLevel::Info, SOURCE, crate::ui_text::text("request.curlCopied", "Copied the request as curl. Act as user is not part of a curl request, and web routes still need their CSRF token against a real server."));
             }
             ViewEvent::Button(id) if id == "request-send" => {
                 let runner = self.artisan_workspace.runner(ctx)?;
@@ -2235,6 +2286,58 @@ impl Main {
             _ => {}
         }
         Ok(())
+    }
+
+    fn search_routes(&mut self, ctx: &Invocation) -> Result<Option<String>, Error> {
+        let project = ctx.project().ok_or(Error::Stale)?;
+        self.advance_index(&project);
+        let index=self.view_index(ctx).ok_or_else(still_indexing)?;
+        if index.partial {return Err(Error::Failed(crate::ui_text::text("native.lib.3b27ad675b", "Laravel route index is incomplete; reindex before searching.").into()));}
+        if !index::index_sources_current(&project,index){return Err(still_indexing());}
+        let initial = self.search_routes_from_index(ctx,index);
+        route_search::run(ctx, initial, || { if !index::index_sources_current(&project,index) {return Err(Error::Stale);} Ok(self.search_routes_from_index(ctx,index)) })?;
+        Ok(None)
+    }
+
+    /// The row key a route command was given, or one the user picks when it runs from the palette.
+    fn route_key_or_pick(&self, ctx: &Invocation, arg: Option<&str>) -> Result<Option<String>, Error> {
+        if let Some(key) = arg { return Ok(Some(key.to_owned())); }
+        let routes = self.active_routes(ctx);
+        if routes.is_empty() { return Err(Error::Invalid(crate::ui_text::t("native.lib.noRoutesToPick", "No routes found. Open a Laravel project and let indexing finish, then try again."))); }
+        let choices: Vec<_> = routes.iter().enumerate().map(|(i, route)| openidea_plugin::PickItem::new(&format!("route:{i}"), &route_search::label(route))).collect();
+        host::pick(crate::ui_text::text("routeSearch.matches", "Matching Laravel routes"), &choices)
+    }
+
+    /// The row key a Runtime command was given, or one the user picks from the read rows when it runs from the palette.
+    fn runtime_row_or_pick(&self, ctx: &Invocation, runner: artisan_runner::Runner, arg: Option<&str>, keep: impl Fn(&serde_json::Value) -> bool, title: &str, empty: &str) -> Result<Option<String>, Error> {
+        if let Some(key) = arg { return Ok(Some(key.to_owned())); }
+        let snapshot = self.runtime_inspection.cached(ctx, runner)?;
+        let choices: Vec<_> = snapshot["snapshots"].as_array().into_iter().flatten()
+            .flat_map(|snapshot| snapshot["rows"].as_array().into_iter().flatten())
+            .filter(|row| keep(row))
+            .filter_map(|row| {
+                let label = row["cells"].as_array()?.iter().filter_map(|cell| cell.as_str()).filter(|cell| !cell.is_empty()).collect::<Vec<_>>().join(" · ");
+                Some(openidea_plugin::PickItem::new(row["key"].as_str()?, &label.chars().take(160).collect::<String>()))
+            })
+            .collect();
+        if choices.is_empty() { return Err(Error::Invalid(empty.into())); }
+        host::pick(title, &choices)
+    }
+
+    /// Runs an editor action's own review from a command and writes its result, since a command
+    /// can't hand the host a workspace edit. `None` when the user cancels the review.
+    fn apply_editor_action(&mut self, path: &str, data: &str) -> Result<Option<usize>, Error> {
+        use openidea_plugin::file_actions::FileActions;
+        let project = host::project_of(path).ok_or(Error::Stale)?;
+        let doc = Document { path: path.into(), language: "php".into(), version: 0, text: project.read_file(path)? };
+        let action = self.file_actions(&doc, Range::default()).into_iter()
+            .find(|action| action.data.as_deref().is_some_and(|key| key.starts_with(data)))
+            .ok_or_else(|| Error::Invalid(crate::ui_text::t("native.lib.actionUnavailable", "This can't run right now. Save open files, wait for indexing to finish and try again.")))?;
+        match self.resolve_file_action(&doc, action) {
+            Ok(resolved) => bulk::write_action(&project, &resolved).map(Some),
+            Err(Error::Cancelled) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn route_at(&self, key: &str, ctx: &Invocation) -> Option<Route> {
@@ -2293,7 +2396,7 @@ impl Main {
 
 impl Views for Main {
     fn render(&mut self, view: &str, _viewport: Option<Viewport>, ctx: &Invocation) -> Result<View, Error> {
-        if !matches!(view,"laravel-about"|"laravel-artisan"|"laravel-generators"|"laravel-processes"|"laravel-runtime"|"laravel-database"|"laravel-schema"|route_request::VIEW) && self.view_index(ctx).is_none() {
+        if !matches!(view,"laravel-about"|"laravel-artisan"|"laravel-generators"|"laravel-processes"|"laravel-runtime"|"laravel-database"|route_request::VIEW) && self.view_index(ctx).is_none() {
             if let Some(pending)=self.pending_index_view(ctx) { return Ok(pending); }
         }
         (|| -> Result<View, Error> {
@@ -2314,8 +2417,8 @@ impl Views for Main {
             if view == generator_workspace::VIEW {
                 return Ok(View::new(Body::Html(generator_workspace::html())));
             }
-        if matches!(view, database_workspace::DATABASE_VIEW | database_workspace::SCHEMA_VIEW) {
-                return Ok(View::new(Body::Html(database_workspace::html(view))));
+        if view == database_workspace::DATABASE_VIEW {
+                return Ok(View::new(Body::Html(database_workspace::html())));
             }
         if view == managed_processes::VIEW {
                 return Ok(View::new(Body::Html(managed_processes::html())));
@@ -2331,9 +2434,9 @@ impl Views for Main {
                     .button(Button::new("new-model", crate::ui_text::text("native.lib.c52a01384f", "New Model…")).icon("add"))
                     .button(Button::new("helper-parameters", crate::ui_text::text("native.lib.902d026067", "Helper Parameters…")).icon("settings"))
                     .button(Button::new("helper-source-automation", crate::ui_text::text("native.lib.d6933a0cc5", "Helper Source & Automation…")).icon("settings"))
-                    .button(Button::new("helper-automation-poll", crate::ui_text::text("action.helper-automation-poll", "Helper Automation Status")).icon("terminal"))
-                    .button(Button::new("helper-automation-stop", crate::ui_text::text("action.helper-automation-stop", "Stop Helper Automation")).icon("stop"))
-                    .button(Button::new("runtime-model-connections", crate::ui_text::text("native.lib.962e0d9471", "Refresh Model Connections…")).icon("database"))
+                    .button(Button::new("helper-automation-poll", crate::ui_text::text("action.runPendingHelperCommands", "Run Pending Model Helper Commands")).icon("terminal"))
+                    .button(Button::new("helper-automation-stop", crate::ui_text::text("action.stopHelperCommands", "Stop Model Helper Commands")).icon("stop"))
+                    .button(Button::new("runtime-model-connections", crate::ui_text::text("native.lib.readModelConnections", "Read Model Database Connections…")).icon("database"))
                     .button(Button::new("regenerate-model-helpers", crate::ui_text::text("native.lib.f1ce4d1777", "Regenerate Helpers…")).icon("refresh"))
                     .button(Button::new("runtime-schema", crate::ui_text::text("native.lib.f1c6a224e5", "Refresh Database Metadata")).icon("database"))
                     .button(Button::new("model-from-database", crate::ui_text::text("native.lib.52b406bd26", "Model from Table…")).icon("class"))
@@ -2381,7 +2484,7 @@ impl Views for Main {
             let toolbar = |body| {
                 let mut view = View::new(body);
                 if routes_active {
-                    view = view.button(Button::new("routes-runtime-refresh", crate::ui_text::text("native.lib.ec05187d0a", "Refresh Routes (PHP)")).icon("refresh"));
+                    view = view.button(Button::new("routes-runtime-refresh", crate::ui_text::text("native.lib.refreshRegisteredRoutes", "Refresh Registered Routes")).icon("refresh"));
                     view = view.button(Button::new("route-list", crate::ui_text::text("native.lib.ed2e28eb59", "Route List")).icon("terminal"));
                 } else {
                     view = view.button(reindex);
@@ -2417,7 +2520,7 @@ impl Views for Main {
                 toolbar(Body::Tree(self.tree(index, group)))
             };
             if routes_active {
-                let provenance=ctx.project().and_then(|p|p.root().ok()).and_then(|root|self.runtime_routes.get(&root)).map(route_runtime::Snapshot::provenance).unwrap_or_else(||crate::ui_text::text("root.formatted.09263027dd", "Static source index · Refresh Routes (PHP) for registered routes").into());
+                let provenance=ctx.project().and_then(|p|p.root().ok()).and_then(|root|self.runtime_routes.get(&root)).map(route_runtime::Snapshot::provenance).unwrap_or_else(||crate::ui_text::text("native.lib.routesFromSource", "Routes read from source files · Refresh Registered Routes to include package routes").into());
                 view.status=Some(format!("{} · {provenance}",view.status.as_deref().unwrap_or(crate::ui_text::text("root.formatted.0dbc380315", "No routes"))));
             }
             if group == "config" && config_incomplete > 0 {
@@ -2478,7 +2581,7 @@ impl Views for Main {
             }
             return Ok(());
         }
-        if matches!(view, database_workspace::DATABASE_VIEW | database_workspace::SCHEMA_VIEW) {
+        if view == database_workspace::DATABASE_VIEW {
             if let ViewEvent::Message(message) = event {
                 let result = self.artisan_workspace.runner(ctx).and_then(|runner| {
                     let index = ctx.project().and_then(|project| project.root().ok()).and_then(|root| self.indexes.get(&root));
@@ -2520,7 +2623,15 @@ impl Views for Main {
                     } else {
                         return Err(Error::Failed(crate::ui_text::text("native.lib.3d4beff9da","This project is not indexed as Laravel.").into()));
                     }
-                    self.generator_workspace.handle(ctx, &message)
+                    let before = self.generator_workspace.prepared(&root);
+                    let mut reply = self.generator_workspace.handle(ctx, &message)?;
+                    let Some((key, anchor)) = self.generator_workspace.prepared(&root).into_iter().find(|entry| !before.contains(entry)) else { return Ok(reply) };
+                    reply["prepared"] = false.into();
+                    reply["instruction"] = match self.apply_editor_action(&anchor, &key)? {
+                        Some(count) => crate::ui_text::format("native.lib.filesWritten", "Created or updated {count} files.", &[("count", &count.to_string())]),
+                        None => crate::ui_text::t("native.lib.nothingWritten", "Nothing was written."),
+                    }.into();
+                    Ok(reply)
                 })();
                 let reply = match result {
                     Ok(value) => value,
@@ -2652,7 +2763,6 @@ impl openidea_plugin::language_features::LanguageFeatures for Main {
         let owns=|path:&str| owns_current_path(&project,path);
         let mut gutters=console_editor::gutters(doc,&owns);
         if let Some(index)=self.index_for(&doc.path) {
-            gutters.extend(route_editor::gutters(index,doc,&owns));
             gutters.extend(model_gutter(index,doc));
         }
         gutters
@@ -2705,7 +2815,7 @@ mod marker_icon_guard {
     #[test]
     fn marker_icons_are_declared_in_the_manifest() {
         let manifest = include_str!("../plugin.toml");
-        for icon in [crate::VIEW_MARKER, crate::CONTROLLER_MARKER, crate::CONFIG_DEFAULTS_MARKER, crate::USED_BY_MARKER, crate::RENDERED_BY_MARKER, crate::SECTION_PARENT_MARKER, crate::SECTION_CHILD_MARKER, crate::STACK_PARENT_MARKER, crate::STACK_PUSH_MARKER, crate::MIGRATION_MARKER, crate::MODEL_MARKER, crate::MODEL_SUPPORT_MARKER, crate::LISTENER_MARKER, crate::EVENT_MARKER, crate::ROUTE_MARKER] {
+        for icon in [crate::VIEW_MARKER, crate::CONTROLLER_MARKER, crate::CONFIG_DEFAULTS_MARKER, crate::USED_BY_MARKER, crate::RENDERED_BY_MARKER, crate::SECTION_PARENT_MARKER, crate::SECTION_CHILD_MARKER, crate::STACK_PARENT_MARKER, crate::STACK_PUSH_MARKER, crate::MIGRATION_MARKER, crate::MODEL_MARKER, crate::MODEL_SUPPORT_MARKER, crate::LISTENER_MARKER, crate::EVENT_MARKER, crate::ROUTE_MARKER, crate::RELATED_MARKER] {
             assert!(manifest.contains(&format!("icon = \"{icon}\"")), "{icon}");
             assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(icon).is_file(), "{icon}");
         }

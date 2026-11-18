@@ -36,7 +36,7 @@ fn collect(project: &Project, doc: &Document, key: &str) -> Result<Vec<Found>, E
         if stat.kind != openidea_plugin::FileKind::File || stat.size > MAX_SOURCE as u64
             || stat.size > (MAX_TOTAL - total) as u64
         {
-            return Err("Source usage search exceeds its file-kind, 128 KiB/file or 8 MiB total admission limit.".into());
+            return Err("A source file is too large to search (over 128 KiB, or over 8 MiB in total).".into());
         }
         let text = project.read_file(&path)?;
         total += text.len();
@@ -152,7 +152,7 @@ mod tests {
         let (host, doc) = setup();
         host.add_file("src/main/java/Large.java", &"x".repeat(MAX_SOURCE + 1));
         let failure = collect(&project_for(&doc.path).unwrap(), &doc, "hello").err().unwrap();
-        assert!(failure.to_string().contains("admission limit"));
+        assert!(failure.to_string().contains("too large to search"));
         assert!(Properties::default().index.is_none());
         host.open_editor(&doc.path, "properties", &"x".repeat(MAX_SOURCE + 1), &[(0,0,0,0)]);
         assert!(run(&host.invocation()).is_err());

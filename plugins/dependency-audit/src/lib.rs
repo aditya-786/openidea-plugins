@@ -64,7 +64,7 @@ fn validate_report_sources(report: &Report, mut owned: impl FnMut(&str)->bool) -
     let mut paths=HashSet::new();
     for row in &report.rows {
         for path in std::iter::once(row.path.as_str()).chain(row.sources.iter().map(|s|s.path.as_str())) {
-            if paths.insert(path) && paths.len()>MAX_REPORT_OWNER_PATHS { return Err(Error::Invalid("Saved report exceeds512 unique evidence paths; owner proof unavailable.".into())); }
+            if paths.insert(path) && paths.len()>MAX_REPORT_OWNER_PATHS { return Err(Error::Invalid("Saved report exceeds 512 unique evidence paths; owner proof unavailable.".into())); }
         }
         if Instant::now()>=deadline { return Err(Error::Stale); }
     }
@@ -92,6 +92,7 @@ pub struct DependencyAudit {
     targets: HashMap<String, Target>,
     display: Display,
     live: live::Live,
+    auto_resolve_reported: HashSet<String>,
 }
 
 enum Target {
@@ -162,6 +163,10 @@ enum StoredReport {
 }
 
 const CALL_BUDGET: Duration = Duration::from_secs(45);
+const COMMAND_BUDGET: Duration = Duration::from_secs(55);
+const EVENT_BUDGET: Duration = Duration::from_secs(10);
+const EVENT_COORDINATES: usize = 1000;
+const MIN_RESOLVE_TIME: Duration = Duration::from_secs(10);
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
@@ -189,11 +194,11 @@ fn diagnostic(finding: &Finding, text: &str) -> Diagnostic {
     }
 }
 
-fn check(path: &str, deadline: Instant, live: &mut live::Live) -> Result<(), Error> {
+fn check(path: &str, deadline: Instant, uncached: &mut usize, live: &mut live::Live) -> Result<(), Error> {
     let project = project_of(path).ok_or_else(|| Error::NotFound(format!("project of {path}")))?;
     let (text, deps) = read_deps(&project, path)?;
     let _task = host::begin_task("Checking dependencies with OSV.dev", false);
-    audit(&deps, true, now(), deadline)?;
+    osv::audit_within(&deps, true, now(), deadline, uncached)?;
     live.remember(&project.root()?, path, &text, &deps);
     Ok(())
 }
@@ -213,7 +218,86 @@ fn persist_report(project: &Project, report: &Report) -> Result<(), Error> {
     if stored.len() > MAX_REPORT_BYTES {
         return Err(Error::Invalid("The new report exceeds the 8 MiB saved-report limit; previous report retained.".into()));
     }
-    host::storage::set(&rows_key(project)?, &stored)
+    host::storage::set(&rows_key(project)?, &stored)?;
+    present_findings(project);
+    Ok(())
+}
+
+/// One project's tree-note and editor decoration set: clearing a set reaches every project.
+fn findings_set(root: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    format!("osv-{:016x}", hasher.finish())
+}
+
+/// Replaces this project's project-tree notes ("2 vulnerabilities (1 high or critical)") on files
+/// with findings and the inline advisory text on their declaration lines. Reads the stored
+/// report, so ignores apply; nothing is shown without one.
+fn present_findings(project: &Project) {
+    let Ok(root) = project.root() else { return };
+    let set = findings_set(&root);
+    let _ = host::clear_file_decorations(&set);
+    let _ = host::clear_decorations(&set);
+    let Ok(Some(report)) = stored_report(project) else { return };
+    let mut counts: std::collections::BTreeMap<&str, (usize, usize)> = std::collections::BTreeMap::new();
+    let mut lines: std::collections::BTreeMap<&str, std::collections::BTreeMap<u32, (Vec<String>, Vec<String>)>> = std::collections::BTreeMap::new();
+    for row in &report.rows {
+        let details: Vec<Option<osv::Advisory>> =
+            row.advisories.iter().map(|id| row.details.iter().find(|a| a.id == *id).cloned().or_else(|| cached_advisory(id))).collect();
+        let high = details.iter().filter(|a| level(a.as_ref().and_then(|a| a.severity.as_deref())) == Severity::Error).count();
+        let count = counts.entry(&row.path).or_default();
+        count.0 += row.advisories.len();
+        count.1 += high;
+        let Some(first) = row.advisories.first() else { continue };
+        let shown = details[0].as_ref().and_then(|a| a.aliases.iter().find(|alias| alias.starts_with("CVE-"))).unwrap_or(first);
+        let more = if row.advisories.len() > 1 { format!(" +{}", row.advisories.len() - 1) } else { String::new() };
+        let fix = row.fix.as_ref().map_or_else(|| "no fix".to_owned(), |fix| format!("fixed in {fix}"));
+        let text = format!("{shown}{more} · {fix}");
+        let hover = format!("{} {}: {}", row.name, row.version, row.advisories.join(", "));
+        // Exact spans only: manifest declarations from the scan and declarations bound by name.
+        let declared = row.sources.iter().filter(|s| {
+            s.evidence.contains(binding::DECLARED) || s.evidence.starts_with("Manifest declaration") && !s.evidence.contains("not bound")
+        });
+        for source in declared {
+            // A transitive finding sits on its direct dependency's line: name the vulnerable package.
+            let text = if source.evidence.contains("transitive") || source.evidence.contains("workspace") {
+                format!("{} {}: {text}", row.name, row.version)
+            } else {
+                text.clone()
+            };
+            let (texts, hovers) = lines.entry(&source.path).or_default().entry(source.line).or_default();
+            if !texts.contains(&text) {
+                texts.push(text);
+                hovers.push(hover.clone());
+            }
+        }
+    }
+    for (path, (total, high)) in counts.iter().take(500) {
+        let noun = if *total == 1 { "vulnerability" } else { "vulnerabilities" };
+        let note = if *high > 0 { format!("{total} {noun} ({high} high or critical)") } else { format!("{total} {noun}") };
+        if host::set_file_note(path, &set, &note, Some("From the last Dependency Audit scan")).is_err() {
+            break;
+        }
+    }
+    for (path, by_line) in lines.iter().take(200) {
+        let Ok(text) = project.read_file(path) else { continue };
+        let source: Vec<&str> = text.lines().collect();
+        let items: Vec<_> = by_line
+            .iter()
+            .take(1000)
+            .filter_map(|(line, (texts, hovers))| {
+                let end = openidea_plugin::Position::new(*line, source.get(*line as usize)?.encode_utf16().count() as u32);
+                Some(openidea_plugin::Decoration {
+                    range: Range::new(end, end),
+                    style: "warning".into(),
+                    hover: Some(hovers.join("\n")),
+                    after: Some(format!("  {}", texts.join("; "))),
+                })
+            })
+            .collect();
+        let _ = host::set_decorations(path, &set, &items);
+    }
 }
 
 fn stored_report(project: &Project) -> Result<Option<Report>, Error> {
@@ -269,8 +353,8 @@ fn last_failure(project: &Project) -> Option<ScanFailure> {
     host::storage::get(&failure_key(project).ok()?).ok().flatten().and_then(|json| serde_json::from_str(&json).ok())
 }
 
-fn scan(project: &Project, live: &mut live::Live) -> Result<String, Error> {
-    let result = scan_report(project, live);
+fn scan(project: &Project, live: &mut live::Live, deadline: Instant) -> Result<String, Error> {
+    let result = scan_report(project, live, deadline);
     if let Ok(key) = failure_key(project) {
         match &result {
             Ok((_, true)) => {
@@ -291,7 +375,7 @@ fn scan(project: &Project, live: &mut live::Live) -> Result<String, Error> {
     result.map(|(body, _)| body)
 }
 
-fn scan_report(project: &Project, live: &mut live::Live) -> Result<(String, bool), Error> {
+fn scan_report(project: &Project, live: &mut live::Live, deadline: Instant) -> Result<(String, bool), Error> {
     live.clear();
     let root = project.root()?;
     let task = host::begin_task("Scanning dependencies", true);
@@ -373,7 +457,7 @@ fn scan_report(project: &Project, live: &mut live::Live) -> Result<(String, bool
     if !files.is_empty() && texts.is_empty() {
         return Err(Error::Failed("No discovered dependency file could be read; previous report retained.".into()));
     }
-    let findings = audit(&deps, true, now(), Instant::now() + CALL_BUDGET)?;
+    let findings = audit(&deps, true, now(), deadline)?;
 
     let mut rows: Vec<Row> = findings
         .iter()
@@ -399,7 +483,7 @@ fn scan_report(project: &Project, live: &mut live::Live) -> Result<(String, bool
         })
         .collect();
     binding::annotate(&mut rows, &texts);
-    imports::scan(project, &mut rows);
+    imports::scan(project, &mut rows, deadline);
     let report = Report {
         rows,
         scanned_at: Some(now()),
@@ -427,18 +511,19 @@ fn scan_report(project: &Project, live: &mut live::Live) -> Result<(String, bool
         host::log(LogLevel::Warn, &format!("Scan results not stored: {e}"));
     }
     let mut body = match visible == 0 {
+        true if files.is_empty() => no_dependency_files(),
         true => format!("No known vulnerabilities in {} dependencies ({} files).", deps.len(), texts.len()),
         false => format!(
-            "Vulnerable dependencies: {} of {} ({} files). See the Vulnerable Dependencies tool window.",
+            "Vulnerable dependencies: {} of {} ({} files). See the Dependency Audit window.",
             visible,
             deps.len(),
             texts.len()
         ),
     };
     let scoped_count = scoped::load(&root).len();
-    if scoped_count > 0 { body.push_str(&format!(" ({scoped_count} project-scoped ignores configured; retained findings are filtered.)")); }
+    if scoped_count > 0 { body.push_str(&format!(" ({scoped_count} ignored findings in this project are hidden.)")); }
     if kept.is_err() {
-        body.push_str(" (New results could not be stored; any previous report remains in the tool window.)");
+        body.push_str(" (New results could not be stored; any previous report remains in the Dependency Audit window.)");
     }
 
     if discovery_limited {
@@ -448,6 +533,11 @@ fn scan_report(project: &Project, live: &mut live::Live) -> Result<(String, bool
         body.push_str(&format!(" (Partial report: {skipped} dependency files could not be read.)"));
     }
     Ok((body, kept.is_ok()))
+}
+
+fn no_dependency_files() -> String {
+    let names: Vec<&str> = GLOBS.iter().map(|glob| glob.trim_start_matches("**/")).collect();
+    format!("No supported dependency files found. Supported: {}.", names.join(", "))
 }
 
 fn dep_key(dep: &Dep) -> (manifest::Ecosystem, String, String) {
@@ -506,8 +596,8 @@ pub(crate) fn notify_project(project: &Project, level: NotificationLevel, title:
     }
 }
 
-fn scan_and_notify(project: &Project, live: &mut live::Live) -> Result<(), Error> {
-    let body = scan(project, live)?;
+fn scan_and_notify(project: &Project, live: &mut live::Live, deadline: Instant) -> Result<(), Error> {
+    let body = scan(project, live, deadline)?;
     notify_project(project, NotificationLevel::Info, "Dependency Audit", &body);
 
     Ok(())
@@ -532,6 +622,7 @@ fn overlaps(dep: &Dep, text: &str, selection: &Range) -> bool {
 fn upgrade_actions(findings: &[Finding], doc: &Document) -> Vec<CodeAction> {
     // Deps sharing a `${property}` share one range: one action, the highest fix.
     let mut upgrades: Vec<((usize, usize), String, String)> = Vec::new();
+    let declared = parse(&doc.path, &doc.text, None);
 
     for finding in findings {
         let Some(at) = finding.dep.version_at else {
@@ -541,6 +632,9 @@ fn upgrade_actions(findings: &[Finding], doc: &Document) -> Vec<CodeAction> {
             continue;
         };
         if !doc.text.get(at.0..at.1).is_some_and(is_single_constraint) {
+            continue;
+        }
+        if declared.iter().any(|other| other.version_at == Some(at) && dep_key(other) != dep_key(&finding.dep)) {
             continue;
         }
 
@@ -576,6 +670,15 @@ impl DependencyAudit {
 
 impl Plugin for DependencyAudit {
     fn run_command(&mut self, id: &str, ctx: &Invocation, arg: Option<&str>) -> Result<Option<String>, Error> {
+        let picked;
+        let arg = match arg {
+            None if matches!(id, "preview-upgrade" | "open-declaration" | "open-advisory" | "ignore-finding") => {
+                let Some(key) = actions::pick_row(ctx)? else { return Ok(None); };
+                picked = key;
+                Some(picked.as_str())
+            }
+            arg => arg,
+        };
         let selected;
         let arg = if matches!(id, "open-advisory" | "ignore-finding") && arg.is_some_and(|key|key.starts_with("dep:")) {
             let Some(key) = actions::choose_advisory(ctx, arg.unwrap(), id == "ignore-finding")? else { return Ok(None); };
@@ -585,16 +688,17 @@ impl Plugin for DependencyAudit {
         if matches!(id,"preview-upgrade" | "open-advisory" | "open-declaration") { return self.resource_command(id,ctx,arg); }
         if id == "resolve-sbt-dependencies"{self.sbt_resolution.start(ctx)?;return Ok(None);}
         if id == "analyze-vulnerable-calls"{self.call_analysis.start(ctx)?;return Ok(None);}
-        if id == "resolve-build-dependencies"{self.build_resolution.start(ctx,true)?;return Ok(None);}
+        if id == "resolve-build-dependencies"{self.build_resolution.resolve(ctx,true,true)?;return Ok(None);}
         if id == "inspect-npm-graph" { self.npm_graph=Some(npm_graph::Snapshot::capture(ctx)?);reveal(npm_graph::VIEW)?;return Ok(None); }
         if id != "scan" {
             return Err(Error::NotFound(format!("command {id}")));
         }
 
+        let deadline = Instant::now() + COMMAND_BUDGET;
         let project = ctx.project().ok_or("Open a project first.")?;
         self.clear_presentation();
-        scan_and_notify(&project, &mut self.live)?;
-        self.auto_resolve(ctx);
+        scan_and_notify(&project, &mut self.live, deadline)?;
+        self.auto_resolve(ctx, deadline);
 
         Ok(None)
     }
@@ -607,11 +711,18 @@ impl Plugin for DependencyAudit {
 
     fn handle_events(&mut self, events: &[Event], ctx: &Invocation) {
         let cleared=events.iter().any(|event| matches!(event, Event::FileSaved(_) | Event::FilesChanged(_)));
+        let dependency_files_changed=events.iter().any(|event| match event {
+            Event::FileSaved(path) => kind(path).is_some(),
+            Event::FilesChanged(changed) => changed.created.iter().chain(&changed.modified).chain(&changed.removed).any(|path| kind(path).is_some()),
+            _ => false,
+        });
         let owner=ctx.project().and_then(|p|p.root().ok()).filter(|root|!root.is_empty());
         let owner_changed=events.iter().any(|event|matches!(event,Event::EditorFocused(_))) && owner!=self.display_owner;
         if (cleared || owner_changed) && self.npm_graph.is_some() {refresh(npm_graph::VIEW);}
         if cleared || owner_changed {
-            self.live.clear();
+            if dependency_files_changed || owner_changed {
+                self.live.clear();
+            }
             self.display_owner=owner;
             self.invalidate_report();
         }
@@ -629,10 +740,11 @@ impl Plugin for DependencyAudit {
             }
         }
 
-        let deadline = Instant::now() + CALL_BUDGET;
+        let deadline = Instant::now() + EVENT_BUDGET;
+        let mut uncached = EVENT_COORDINATES;
         let mut refreshed_cache=false;
         for path in paths {
-            if let Err(e) = check(path, deadline, &mut self.live) {
+            if let Err(e) = check(path, deadline, &mut uncached, &mut self.live) {
                 host::log(LogLevel::Warn, &format!("OSV check of {path}: {e}"));
                 if refreshed_cache && !cleared && !owner_changed { self.invalidate_report(); }
                 return;
@@ -724,13 +836,13 @@ impl Views for DependencyAudit {
             };
             let Some(root)=project.root().ok().filter(|root|!root.is_empty()) else {
                 self.clear_presentation();self.display_owner=None;
-                return Ok(View::message("Project identity/access is unavailable. No cached report is displayed."));
+                return Ok(View::message("Can't read this project's folder. Reopen the project, then run Dependency Audit: Scan Project."));
             };
             if self.display_owner.as_deref()!=Some(root.as_str()) { self.clear_presentation();self.display_owner=Some(root.clone()); }
             let failure = last_failure(&project);
             let report=match stored_report(&project) {
                 Ok(report)=>report,
-                Err(_)=> { self.clear_presentation(); return Ok(View::message("Saved report access or bounded source ownership proof is unavailable. No cached report is displayed; restore access or rescan explicitly.")); }
+                Err(_)=> { self.clear_presentation(); return Ok(View::message("Can't read the saved report. Run Dependency Audit: Scan Project.")); }
             };
             let Some(report) = report else {
                 self.clear_presentation();
@@ -738,23 +850,24 @@ impl Views for DependencyAudit {
                     Some(failure) => format!("The last scan failed: {}. Run Dependency Audit: Scan Project to retry.", failure.message),
                     None => "Run Dependency Audit: Scan Project to check this project's dependencies against OSV.dev.".into(),
                 };
-                return Ok(View::message(&message).button(scan_button("Scan")).button(Button::new("review-ignores","Review Scoped Ignores").icon("list")));
+                return Ok(View::message(&message).button(scan_button("Scan")).button(Button::new("review-ignores","Review Ignored Findings").icon("list")));
             };
             let status = report_status(&report, failure.as_ref());
             if report.rows.is_empty() {
                 self.clear_presentation();
-                return Ok(View::message("The last successful scan found no known vulnerabilities (after configured ignores).")
-                    .button(scan_button("Rescan")).button(Button::new("review-ignores","Review Scoped Ignores").icon("list"))
+                let message = if report.files_scanned == Some(0) { no_dependency_files() } else { "The last successful scan found no known vulnerabilities (after configured ignores).".into() };
+                return Ok(View::message(&message)
+                    .button(scan_button("Rescan")).button(Button::new("review-ignores","Review Ignored Findings").icon("list"))
                     .status(&status));
             }
             if ui_kit::web::is_rendering() {
                 self.targets.clear();
-                return Ok(View::new(resource_body(&root, &report, failure.as_ref())).button(scan_button("Rescan")).button(Button::new("review-ignores","Review Scoped Ignores").icon("list")).status(&status));
+                return Ok(View::new(resource_body(&root, &report, failure.as_ref())).button(scan_button("Rescan")).button(Button::new("review-ignores","Review Ignored Findings").icon("list")).status(&status));
             }
             let (mut items, targets) = tree_of(&root, &report.rows, Some(&mut self.display));
             self.targets = targets;
             self.expansion.apply(&mut items);
-            Ok(View::new(Body::Tree(items)).button(scan_button("Rescan")).button(Button::new("review-ignores","Review Scoped Ignores").icon("list")).status(&status))
+            Ok(View::new(Body::Tree(items)).button(scan_button("Rescan")).button(Button::new("review-ignores","Review Ignored Findings").icon("list")).status(&status))
         })().map(ui_kit::actions::available)
     }
 
@@ -790,10 +903,11 @@ impl Views for DependencyAudit {
                 Ok(())
             }
             ViewEvent::Button(id) if id == "scan" => {
+                let deadline = Instant::now() + COMMAND_BUDGET;
                 let project = ctx.project().ok_or("Open a project first.")?;
                 self.clear_presentation();
-                scan_and_notify(&project, &mut self.live)?;
-                self.auto_resolve(ctx);
+                scan_and_notify(&project, &mut self.live, deadline)?;
+                self.auto_resolve(ctx, deadline);
                 Ok(())
             }
             ViewEvent::Activate(key) => {
@@ -822,11 +936,27 @@ register_plugin!(DependencyAudit, providers, views, diagnostics, commit_checks);
 mod tests;
 
 impl DependencyAudit {
-    fn auto_resolve(&mut self, ctx: &Invocation) {
-        if host::setting_bool("autoResolveBuilds") == Some(false) {
+    fn auto_resolve(&mut self, ctx: &Invocation, deadline: Instant) {
+        let run_tool = host::setting_bool("autoResolveBuilds") == Some(true)
+            && deadline.saturating_duration_since(Instant::now()) >= MIN_RESOLVE_TIME;
+        let Err(error) = self.build_resolution.resolve(ctx, run_tool, false) else { return };
+        // NotFound: no Maven or Gradle build in this project, so there was nothing to resolve.
+        if matches!(error, Error::Stale | Error::Cancelled | Error::NotFound(_)) {
             return;
         }
-        let _ = self.build_resolution.start(ctx, false);
+        let root = ctx.project().and_then(|project| project.root().ok()).unwrap_or_default();
+        if !self.auto_resolve_reported.insert(root) {
+            return;
+        }
+        let reason = match error {
+            Error::Invalid(message) | Error::Failed(message) | Error::NotFound(message) => message,
+            other => other.to_string(),
+        };
+        host::notify(
+            NotificationLevel::Warning,
+            "Dependency Audit",
+            &format!("Automatic build resolution didn't run: {reason} Run Dependency Audit: Resolve Effective Build Dependencies… to retry."),
+        );
     }
     fn resolution_tick(&mut self, raw: &str, ctx: &Invocation) -> Result<(), Error> {
         let request: serde_json::Value = serde_json::from_str(raw).map_err(|_| Error::Stale)?;

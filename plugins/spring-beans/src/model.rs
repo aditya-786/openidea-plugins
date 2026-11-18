@@ -444,7 +444,7 @@ fn java_model(text: &str) -> FileModel {
     for (index, t) in file.types.iter().enumerate() {
         let supers: Vec<String> = t.supers().map(|s| s.name.clone()).collect();
         out.types.push(type_info(&file, index, text));
-        let repository = is_repository(&t.kind, supers.iter().map(String::as_str));
+        let repository = !t.has(&["NoRepositoryBean"]) && is_repository(&t.kind, supers.iter().map(String::as_str));
         let bean =
             if t.kind == "@interface" { None } else { class_bean(text, &t.name, &short_name(&file, t), t.at, &t.annotations, repository) };
         let class_profiles = bean.as_ref().map(|b| b.profiles.clone()).unwrap_or_default();

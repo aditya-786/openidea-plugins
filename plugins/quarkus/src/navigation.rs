@@ -2,6 +2,7 @@
 use super::*;
 use openidea_plugin::Location;
 use spring_text::java as source;
+pub(crate) const CONFIG_MARKER: &str = "icons/quarkus.svg";
 #[derive(Clone)]
 pub(crate) struct Target {
     pub key: String,
@@ -115,88 +116,115 @@ fn annotation_target(a: &source::Annotation, text: &str) -> Option<Target> {
     }
     Some(Target { key: literal.value.clone(), range: range(text, literal.at, literal.end) })
 }
+/// Literal `prefix` of a `@ConfigMapping` owned by SmallRye: every key below it belongs to the mapping.
+pub(crate) fn mapping_prefixes(path: &str, text: &str) -> Vec<Target> {
+    if !path.ends_with(".java") || text.len() > live::MAX_TEXT || !text.contains("ConfigMapping") {
+        return vec![];
+    }
+    let file = source::parse(text);
+    let mut targets = Vec::new();
+    for t in &file.types {
+        let Some(a) = t.annotation("ConfigMapping").filter(|a| crate::java::annotation_owned(&file, text, a, "io.smallrye.config.ConfigMapping")) else {
+            continue;
+        };
+        let Some(arg) = a.arg("prefix").or_else(|| a.arg("value")) else {
+            continue;
+        };
+        let [literal] = arg.strings.as_slice() else {
+            continue;
+        };
+        if arg.text.trim() == format!("\"{}\"", literal.value) && literal.value.len() == literal.end - literal.at && literal_key(&literal.value) {
+            targets.push(Target { key: literal.value.clone(), range: range(text, literal.at, literal.end) });
+        }
+    }
+    targets
+}
+const MAX_LINE_TARGETS: usize = 200;
+/// Every exact target of the module's cached facts, `None` when they are incomplete, stale or over budget.
+fn module_targets<T: Clone>(index: &spring_text::index::Index<T>, root: &str, module: &str, info: impl Fn(&T) -> (&[Target], bool)) -> Option<Vec<(String, Target)>> {
+    if !index.fresh() || index.iter().take(513).count() > 512 || index.iter().any(|(_, i)| !info(i).1) {
+        return None;
+    }
+    let mut found = Vec::new();
+    let mut records = 0usize;
+    for (path, i) in index.iter() {
+        let (locations, _) = info(i);
+        records += locations.len();
+        if records > 4096 {
+            return None;
+        }
+        if owned(root, path) && self::module(path).as_deref() == Some(module) {
+            found.extend(locations.iter().map(|t| (path.to_owned(), t.clone())));
+        }
+    }
+    Some(found)
+}
 impl QuarkusTools {
-    pub(crate) fn source_definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
+    /// The current document's literal keys and the other side's exact targets in the same module.
+    fn source_links(&mut self, doc: &Document) -> Option<(bool, Vec<Target>, Vec<(String, Target)>)> {
         let java = doc.language == "java" && doc.path.ends_with(".java");
         let config = matches!(doc.language.as_str(), "properties" | "quarkus-properties" | "yaml") && is_quarkus_config(&doc.path);
         if !(java || config) || doc.path.split('/').any(|p| matches!(p, "." | "..")) {
-            return vec![];
+            return None;
         }
         // Observe even unsupported/oversized current source before preflight:
         // a rejected new document must not leave its previous destination alive.
         let _ = self.sources.for_cached_document(&doc.path, &doc.text);
         let _ = self.configs.for_cached_document(&doc.path, &doc.text);
-        let Some(root) = self.cached_module(doc) else {
-            return vec![];
-        };
+        let root = self.cached_module(doc)?;
         if !self.live.watching {
-            return vec![];
+            return None;
         }
-        let candidates = if java {
-            java_targets(&doc.path, &doc.text)
-        } else if config {
-            config_targets(&doc.path, &doc.text)
-        } else {
+        let module = module(&doc.path)?;
+        if java {
+            let index = self.configs.for_cached_document(&doc.path, &doc.text)?;
+            let targets = module_targets(index, &root, &module, |i| (&i.locations, i.complete))?;
+            return Some((true, java_targets(&doc.path, &doc.text), targets));
+        }
+        let index = self.sources.for_cached_document(&doc.path, &doc.text)?;
+        let targets = module_targets(index, &root, &module, |i| (&i.locations, i.complete))?;
+        Some((false, config_targets(&doc.path, &doc.text), targets))
+    }
+    pub(crate) fn source_definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
+        let Some((_, candidates, targets)) = self.source_links(doc) else {
             return vec![];
         };
         let Some(selected) = candidates.iter().find(|t| t.range.start <= at && at < t.range.end) else {
             return vec![];
         };
-        let Some(module) = module(&doc.path) else {
+        targets.into_iter().filter(|(_, t)| t.key == selected.key).map(|(path, t)| Location { path: path.into(), range: t.range }).collect()
+    }
+    /// One marker per exact target on the key's line; the IDE merges a line's markers into one chooser.
+    pub(crate) fn source_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
+        let Some((java, candidates, targets)) = self.source_links(doc) else {
             return vec![];
         };
-        let mut locations = Vec::new();
-        let mut records = 0usize;
+        let tooltip = if java { "Config key declarations" } else { "Injection points" };
+        let mut lines: BTreeMap<u32, Vec<Location>> = BTreeMap::new();
+        for c in &candidates {
+            let found = targets.iter().filter(|(_, t)| t.key == c.key);
+            lines.entry(c.range.start.line).or_default().extend(found.map(|(path, t)| Location { path: path.into(), range: t.range }));
+        }
         if java {
-            let Some(index) = self.configs.for_cached_document(&doc.path, &doc.text) else {
-                return vec![];
-            };
-            if !index.fresh() || index.iter().take(513).count() > 512 || index.iter().any(|(_, i)| !i.complete) {
-                return vec![];
-            }
-            for (path, info) in index.iter() {
-                records += info.locations.len();
-                if records > 4096 {
-                    return vec![];
-                }
-                if !owned(&root, path) || self::module(path).as_deref() != Some(module.as_str()) {
-                    continue;
-                }
-                for target in &info.locations {
-                    if target.key == selected.key {
-                        locations.push(Location { path: path.into(), range: target.range });
-                    }
-                }
-                if locations.len() > 1 {
-                    return vec![];
-                }
-            }
-        } else {
-            let Some(index) = self.sources.for_cached_document(&doc.path, &doc.text) else {
-                return vec![];
-            };
-            if !index.fresh() || index.iter().take(513).count() > 512 || index.iter().any(|(_, i)| !i.complete) {
-                return vec![];
-            }
-            for (path, info) in index.iter() {
-                records += info.locations.len();
-                if records > 4096 {
-                    return vec![];
-                }
-                if !owned(&root, path) || self::module(path).as_deref() != Some(module.as_str()) {
-                    continue;
-                }
-                for target in &info.locations {
-                    if target.key == selected.key {
-                        locations.push(Location { path: path.into(), range: target.range });
-                    }
-                }
-                if locations.len() > 1 {
-                    return vec![];
-                }
+            for prefix in mapping_prefixes(&doc.path, &doc.text) {
+                let below = format!("{}.", prefix.key);
+                let found = targets.iter().filter(|(_, t)| t.key.starts_with(&below));
+                lines.entry(prefix.range.start.line).or_default().extend(found.map(|(path, t)| Location { path: path.into(), range: t.range }));
             }
         }
-        locations
+        let mut markers = Vec::new();
+        for (line, mut found) in lines {
+            found.sort_by(|a, b| (&a.path, a.range.start).cmp(&(&b.path, b.range.start)));
+            found.dedup();
+            let tooltip = match found.len() {
+                n if n > MAX_LINE_TARGETS => format!("{tooltip} (first {MAX_LINE_TARGETS} of {n})"),
+                _ => tooltip.to_owned(),
+            };
+            for target in found.into_iter().take(MAX_LINE_TARGETS) {
+                markers.push(LineMarker { line, icon: Some(CONFIG_MARKER.into()), tooltip: tooltip.clone(), target: Some(target) });
+            }
+        }
+        markers
     }
 }
 fn owned(root: &str, path: &str) -> bool {
@@ -310,14 +338,64 @@ mod tests {
         assert!(p.definition(&c, at(&c, "greeting.message")).is_empty());
     }
     #[test]
-    fn duplicate_targets_and_foreign_modules_are_not_guessed() {
+    fn duplicate_targets_are_all_listed_and_foreign_modules_are_not_guessed() {
         let (h, mut p) = setup();
         h.add_file("src/main/java/app/Duplicate.java", &JAVA.replace("Greeting", "Duplicate"));
         p.live_events(&[Event::FileSaved("/project/src/main/java/app/Duplicate.java".into())]);
         let c = doc(CONFIG_PATH, "greeting.message=x\n");
-        assert!(p.definition(&c, at(&c, "greeting.message")).is_empty());
+        let found: Vec<_> = p.definition(&c, at(&c, "greeting.message")).into_iter().map(|l| l.path).collect();
+        assert_eq!(found, ["/project/src/main/java/app/Duplicate.java", JAVA_PATH]);
         let foreign = doc("/project/child/src/main/resources/application.properties", "greeting.message=x\n");
         assert!(p.definition(&foreign, at(&foreign, "greeting.message")).is_empty());
+    }
+    fn targets(markers: &[LineMarker], line: u32) -> Vec<(String, Range)> {
+        markers.iter().filter(|m| m.line == line).map(|m| {
+            let t = m.target.clone().unwrap();
+            (t.path, t.range)
+        }).collect()
+    }
+    #[test]
+    fn markers_link_exact_keys_both_ways() {
+        let (_h, mut p) = setup();
+        let java = p.line_markers(&doc(JAVA_PATH, JAVA));
+        assert_eq!(targets(&java, 3), [(CONFIG_PATH.to_owned(), range("greeting.message=hello\n", 0, 16))]);
+        assert_eq!(java.len(), 1);
+        let config = p.line_markers(&doc(CONFIG_PATH, "other.key=1\ngreeting.message=hello\n"));
+        let byte = JAVA.find("greeting.message").unwrap();
+        assert_eq!(targets(&config, 1), [(JAVA_PATH.to_owned(), range(JAVA, byte, byte + 16))]);
+        assert_eq!(config.len(), 1);
+        assert!(config.iter().chain(&java).all(|m| m.icon.as_deref() == Some(CONFIG_MARKER) && m.target.as_ref().unwrap().range.start < m.target.as_ref().unwrap().range.end));
+    }
+    #[test]
+    fn several_targets_give_several_same_icon_markers_on_one_line() {
+        let (h, mut p) = setup();
+        let dev = "/project/src/main/resources/application-dev.properties";
+        h.add_file(dev, "greeting.message=dev\n");
+        p.live_events(&[Event::FileSaved(dev.into())]);
+        let markers = p.line_markers(&doc(JAVA_PATH, JAVA));
+        assert_eq!(targets(&markers, 3).iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(), [dev, CONFIG_PATH]);
+        assert!(markers.iter().all(|m| m.line == 3 && m.icon == markers[0].icon && m.tooltip == markers[0].tooltip));
+    }
+    #[test]
+    fn config_mapping_prefix_lists_keys_below_it_only() {
+        let (h, mut p) = setup();
+        h.add_file(CONFIG_PATH, "server.host=a\nserver.port=1\nserverx.port=2\nserver=3\n");
+        p.live_events(&[Event::FileSaved(CONFIG_PATH.into())]);
+        let mapping = "package app;\nimport io.smallrye.config.ConfigMapping;\n@ConfigMapping(prefix = \"server\")\ninterface Server { String host(); }\n";
+        let markers = p.line_markers(&doc("/project/src/main/java/app/Server.java", mapping));
+        assert_eq!(targets(&markers, 2).iter().map(|(_, r)| r.start.line).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(markers.len(), 2);
+        let foreign = mapping.replace("io.smallrye.config.ConfigMapping", "other.ConfigMapping");
+        assert!(p.line_markers(&doc("/project/src/main/java/app/Server.java", &foreign)).is_empty());
+    }
+    #[test]
+    fn cold_cache_and_unmatched_keys_give_no_markers() {
+        let _h = setup().0;
+        let mut cold = QuarkusTools::default();
+        assert!(cold.line_markers(&doc(JAVA_PATH, JAVA)).is_empty());
+        assert!(cold.line_markers(&doc(CONFIG_PATH, "greeting.message=x\n")).is_empty());
+        let (_h, mut p) = setup();
+        assert!(p.line_markers(&doc(CONFIG_PATH, "unused.key=x\n%dev.greeting.message=y\n")).is_empty());
     }
     #[test]
     fn source_scope_denial_switch_removal_and_events_are_conservative() {

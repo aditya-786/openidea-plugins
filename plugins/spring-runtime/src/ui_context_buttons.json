@@ -1,6 +1,12 @@
 {
   "runtime": [],
-  "runtime-snapshot": [],
+  "runtime-snapshot": [
+    "snapshot-related-beans",
+    "snapshot-open-browser",
+    "snapshot-send-request",
+    "snapshot-create-request",
+    "snapshot-copy-request"
+  ],
   "runtime-graph": [],
   "runtime-controls": []
 }

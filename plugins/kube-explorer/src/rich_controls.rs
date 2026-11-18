@@ -2,7 +2,7 @@
 use crate::*;
 fn selected_button(key:&str)->bool {matches!(key,"describe"|"yaml"|"logs"|"log-view"|"shell"|"attach"|"show-secret"|"edit-secret"|"debug"|"port-forward"|"delete")}
 fn snapshot_button(key:&str)->bool {matches!(key,"log-filter"|"log-since"|"log-until"|"log-regex"|"log-case"|"log-wrap"|"log-time"|"log-source"|"log-end"|"log-clear"|"log-refresh"|"log-copy"|"log-download")}
-fn forward_button(key:&str)->bool {matches!(key,"start-forward"|"start-managed-forward"|"cancel-reviewed-forward"|"forward-status"|"stop-forward"|"restart-forward")}
+fn forward_button(key:&str)->bool {matches!(key,"start-forward"|"start-managed-forward"|"forward-status"|"stop-forward"|"restart-forward")}
 fn protected_button(key:&str)->bool {matches!(key,"back"|"create-secret")||selected_button(key)||snapshot_button(key)||forward_button(key)||matches!(key,"submit-secret"|"add-secret-key"|"submit-secret-edit"|"confirm-delete-manifest"|"apply"|"save-file"|"reload-yaml")}
 impl KubeExplorer {
     pub(crate) fn new_rich_callback(&mut self)->String {
@@ -25,17 +25,16 @@ impl KubeExplorer {
     }
     fn rich_control_available(&self,key:&str,field:bool)->bool {
         if field {return match key {
-            "ports"=>self.forward.is_some()&&self.prepared_forward.is_none()&&!self.show_forward_session,
+            "ports"=>self.forward.is_some()&&!self.show_forward_session,
             "secret-name"|"secret-key"|"secret-value"=>self.draft.is_some(),
             "secret-new-key"|"secret-new-value"|"secret-remove"=>self.editing_secret.is_some(),
             key if key.starts_with("secret-edit:")=>self.editing_secret.is_some(),
             _=>false,
         };}
         if key=="create-secret" {return !self.all_namespaces();}
-        if key=="back" {return self.has_rich_cache()||self.forward.is_some()||self.prepared_forward.is_some()||self.forward_session.is_some()||self.log_view.is_some()||self.show_forward_session;}
+        if key=="back" {return self.has_rich_cache()||self.forward.is_some()||self.forward_session.is_some()||self.log_view.is_some()||self.show_forward_session;}
         if forward_button(key){return match key {
-            "start-forward"|"start-managed-forward"=>self.forward.is_some()&&self.prepared_forward.is_none()&&!self.show_forward_session,
-            "cancel-reviewed-forward"=>self.prepared_forward.is_some(),
+            "start-forward"|"start-managed-forward"=>self.forward.is_some()&&!self.show_forward_session,
             _=>self.forward_session.is_some(),
         };}
         if selected_button(key){return self.selected.is_some();}

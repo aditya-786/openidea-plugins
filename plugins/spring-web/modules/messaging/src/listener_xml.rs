@@ -1,5 +1,6 @@
 use crate::file_name;
 use openidea_plugin::{Diagnostic, Location, Range, Severity};
+use crate::Facts;
 use spring_text::index::Index;
 use spring_text::xml::{self, Element};
 use spring_text::xml_check::{Rule, check};
@@ -143,13 +144,17 @@ fn source_info(path: &str, text: &str) -> Info {
     Info { beans, classes }
 }
 
-fn bean<'a>(index: &'a Index<Info>, name: &str) -> impl Iterator<Item = (&'a str, &'a BeanDef)> {
-    let name = name.to_owned();
-    index.iter().flat_map(move |(p, info)| info.beans.iter().filter(|b| b.name == name).map(move |b| (p, b)).collect::<Vec<_>>())
+fn infos(index: &Index<Facts>) -> impl Iterator<Item = (&str, &Info)> {
+    index.iter().filter_map(|(path, facts)| facts.beans.as_ref().map(|info| (path, info)))
 }
 
-fn class<'a>(index: &'a Index<Info>, fqn: &str) -> Option<(&'a str, &'a ClassDef)> {
-    index.iter().find_map(|(p, info)| info.classes.iter().find(|c| c.fqn == fqn).map(|c| (p, c)))
+fn bean<'a>(index: &'a Index<Facts>, name: &str) -> impl Iterator<Item = (&'a str, &'a BeanDef)> {
+    let name = name.to_owned();
+    infos(index).flat_map(move |(p, info)| info.beans.iter().filter(|b| b.name == name).map(move |b| (p, b)).collect::<Vec<_>>())
+}
+
+fn class<'a>(index: &'a Index<Facts>, fqn: &str) -> Option<(&'a str, &'a ClassDef)> {
+    infos(index).find_map(|(p, info)| info.classes.iter().find(|c| c.fqn == fqn).map(|c| (p, c)))
 }
 
 fn rules_of(namespace: &str) -> Option<&'static [Rule]> {
@@ -160,14 +165,14 @@ fn rules_of(namespace: &str) -> Option<&'static [Rule]> {
 }
 
 /// The class of the bean a listener's `ref` names, when the project has the bean and the class.
-fn listener_class<'a>(index: &'a Index<Info>, listener: &Element) -> Option<(&'a str, &'a ClassDef)> {
+fn listener_class<'a>(index: &'a Index<Facts>, listener: &Element) -> Option<(&'a str, &'a ClassDef)> {
     let name = listener.value("ref")?;
     let fqn = bean(index, name).find_map(|(_, b)| b.class.clone())?;
     class(index, &fqn)
 }
 
 /// Required attributes, enumerated values, unknown `ref` beans (Info: libraries and the container are invisible) and unknown `method`s of the Rabbit and JMS namespaces.
-pub fn problems(text: &str, index: &Index<Info>) -> Vec<Diagnostic> {
+pub fn problems(text: &str, index: &Index<Facts>) -> Vec<Diagnostic> {
     if !text.contains("/schema/rabbit") && !text.contains("/schema/jms") {
         return Vec::new();
     }
@@ -211,7 +216,7 @@ pub enum Target {
 }
 
 /// The `ref` or `method` of a listener under the byte offset: what it names, its value and bytes.
-pub fn target_at(text: &str, index: &Index<Info>, at: usize) -> Option<(Target, String, usize, usize)> {
+pub fn target_at(text: &str, index: &Index<Facts>, at: usize) -> Option<(Target, String, usize, usize)> {
     let all = xml::elements(text);
     let i = xml::element_at(&all, at)?;
     let e = &all[i];
@@ -231,18 +236,17 @@ fn rules_of_namespace(namespace: &str) -> bool {
     rules_of(namespace).is_some()
 }
 
-pub fn bean_locations(index: &Index<Info>, name: &str) -> Vec<Location> {
+pub fn bean_locations(index: &Index<Facts>, name: &str) -> Vec<Location> {
     bean(index, name).map(|(p, b)| Location { path: p.into(), range: b.range }).collect()
 }
 
-pub fn method_locations(index: &Index<Info>, class_fqn: &str, name: &str) -> Vec<Location> {
+pub fn method_locations(index: &Index<Facts>, class_fqn: &str, name: &str) -> Vec<Location> {
     let Some((path, class)) = class(index, class_fqn) else { return Vec::new() };
     class.methods.iter().filter(|(n, _)| n == name).map(|(_, r)| Location { path: path.into(), range: *r }).collect()
 }
 
-pub fn bean_names(index: &Index<Info>) -> Vec<(String, Option<String>)> {
-    let mut names: Vec<_> = index
-        .iter()
+pub fn bean_names(index: &Index<Facts>) -> Vec<(String, Option<String>)> {
+    let mut names: Vec<_> = infos(index)
         .flat_map(|(_, info)| info.beans.iter().map(|b| (b.name.clone(), b.class.as_deref().map(|c| file_name(&c.replace('.', "/")).to_owned()))))
         .collect();
     names.sort();
@@ -250,7 +254,7 @@ pub fn bean_names(index: &Index<Info>) -> Vec<(String, Option<String>)> {
     names
 }
 
-pub fn method_names(index: &Index<Info>, class_fqn: &str) -> Vec<String> {
+pub fn method_names(index: &Index<Facts>, class_fqn: &str) -> Vec<String> {
     let Some((_, class)) = class(index, class_fqn) else { return Vec::new() };
     let mut names: Vec<_> = class.methods.iter().map(|(n, _)| n.clone()).collect();
     names.sort();

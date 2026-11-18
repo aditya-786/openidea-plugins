@@ -1,143 +1,345 @@
 # GitLab
 
-gitlab.com merge requests in OpenIDEA. List them, follow their timeline, review the changes with comments on diff lines and pending reviews, and approve, merge, rebase, close or reopen them. The plugin also shows the current branch's merge request in the status bar and its unresolved threads in the editor, checks out merge request branches, clones and shares projects, links to the current lines on GitLab and creates snippets.
+GitLab merge requests in OpenIDEA. List them, follow their timeline, review the changes with comments on diff lines and pending reviews, and approve, merge, rebase, close or reopen them. The plugin also shows the current branch's merge request in the status bar and its unresolved threads in the editor. It checks out merge request branches, clones and shares projects, links to the current lines on GitLab and creates snippets. MIT; see `LICENSE`.
 
-MIT; see `LICENSE`.
+## Requirements
 
-## Setup
+- OpenIDEA with plugin API 1.10 or newer.
+- A gitlab.com account, or a self-hosted GitLab served over HTTPS.
+- A personal access token with the `api` and `read_user` scopes.
+- A project with a git remote on that server (`https://`, `ssh://` or `git@gitlab.com:`). When several remotes point there, `origin` wins.
+- `git` on the `PATH` for checkout, worktrees, clone and Share Project.
+- Optional: `glab` 1.x, authenticated on its own, for **Follow Job Log (glab)** and **GitLab: Check Out Merge Request Source (glab)…**.
 
-1. Run **GitLab: Create Access Token** (or click *Create Access Token* in any GitLab tool window). It opens gitlab.com's personal access token page with the name `OpenIDEA GitLab` and the scopes `api` and `read_user` filled in.
-2. Paste the token into Settings › Plugins › GitLab (the `token` secret).
+## Quick start
 
-The IDE puts the token in the `Authorization` header itself; the plugin never reads it. A 401 response means the token was rejected.
+1. Install the plugin ([how](../../README.md#install-a-plugin)).
+2. Run **GitLab: Create Access Token** (or click **Create Access Token** in the GitLab tool window). It opens GitLab's token page with the name `OpenIDEA GitLab` and the `api` and `read_user` scopes filled in.
+3. Paste the token into Settings › Plugins › GitLab (**GitLab personal access token**).
+4. Self-hosted GitLab: set **GitLab server** to its HTTPS URL. The IDE asks you to approve the host on first use.
+5. Open the **GitLab** tool window (left). Your merge requests appear; select one to see its details.
 
-The project needs a git remote on gitlab.com (`https://`, `ssh://` or `git@gitlab.com:`). When several remotes point there, `origin` wins.
+## Features
 
-By default the plugin talks to gitlab.com: the REST API under `https://gitlab.com/api/v4`, and `https://gitlab.com/api/graphql` for Mark as Draft / Mark as Ready. Set the **GitLab server** setting to an HTTPS URL to use a self-hosted instance instead; the IDE asks you to approve that host on first use (`net:ask`, revocable under Settings › Plugins). Plain-HTTP instances aren't supported, and an invalid value falls back to gitlab.com. The project needs a git remote on the configured server.
+### Browse merge requests
 
-Optional permissions:
+The **GitLab** tool window has three tabs: **Merge Requests**, **Details** and **Projects**. Commands select the tab they need.
 
-| Permission | Used for | Without it |
-|---|---|---|
-| `clipboard` | Copy Link, the snippet URL | the link is shown in a notification |
-| `project.read` | jumping to a thread's line, editor review | a thread's double-click opens its GitLab page |
-| `events` | status bar item and editor review | neither is shown |
-| `process:git` | Check Out Branch, creating or inspecting worktrees, clone, Share Project | those actions fail |
-| `process:glab` | Follow Job Log (glab), Check Out Merge Request Source (glab) | those actions fail |
+The **Merge Requests** tab lists the project's merge requests as `!iid title`, with author, branches and draft state.
 
-## Tool windows
+- **Filter** cycles through the quick filters: Open, Include my changes, Need my review, Assigned to me (the default) and Closed. It can also pick an author, reviewer, label or text filter.
+- Expand a merge request to load its timeline in date order: threads (author, reply count, resolved or not, `path:line`) with their replies, plus GitLab's system notes and state, label and milestone changes.
+- **Hide Events** / **Show Events** toggles the system notes and changes.
+- Select an item to show it in **Details**. A selected thread or reply is the one you reply to.
+- Diff threads open their local source line when available. Other threads keep their GitLab links.
 
-One shared UI-kit window contains the GitLab, Details and Projects tabs; commands select their corresponding custom tab.
+### Review a merge request
 
-- **GitLab** (requests tab in the left GitLab window): the project's merge requests (50 per page, up to 10 pages) as `!iid title`, with author, branches and draft state. *Filter* cycles through the quick filters Open, Include my changes, Need my review, Assigned to me (the default) and Closed, or picks an author, reviewer, label or text filter. Expanding a merge request loads its timeline in date order: threads (author, reply count, resolved or not, `path:line`) with their replies, plus GitLab's system notes and state, label and milestone changes; *Hide Events* / *Show Events* toggles the system notes and changes. Selecting an item shows it in the Merge Request view (a selected thread or reply is the one you reply to). Diff threads open their local source line when available; other discussion targets keep their GitLab links. Open on GitLab remains available in Details.
-- **Details** (tab in the same window): a form with the comment field, or a reply field under the note you reply to, the *Add to my review* checkbox (on by default) that keeps it as a pending review comment, the merge options and the description (bounded CommonMark — see below). The status line sums up state, draft, branches, author, merge status, pipeline and approvals. Buttons, shown when they apply: Comment, Reply or Add to Review; Submit Review (n) (publishes the pending comments, and posts the comment field's text as a summary if it isn't empty); Resolve Thread / Unresolve Thread; Approve / Revoke Approval; Merge (enabled when you can merge and GitLab reports `mergeable`, with *Delete source branch* and *Squash commits* checkboxes); Rebase (when GitLab reports `need_rebase`); Add Me as Reviewer, Mark as Draft / Mark as Ready, Close, Reopen; Check Out Branch (when the merge request isn't merged and isn't the current branch); Labels, Assignees, Reviewers, Milestone and Title (open the attribute choices directly; the combined Edit action remains available); Open Existing Worktree, Open on GitLab, Copy Link, Refresh. Your own comments (not system notes) get Edit, Delete (second click) and an award emoji from a fixed list of eight (`thumbsup`, `thumbsdown`, `heart`, `tada`, `laughing`, `confused`, `rocket`, `eyes`).
-- A row of section buttons switches the window between **Overview** (the form above), **Changes**, **Commits**, **Files**, **Pipelines** and **Timeline**; the active one is marked with a dot and the others carry counts from cached data. The choice is remembered; selecting a merge request keeps the active section. A failing section keeps the section buttons and shows the error with Refresh.
-  - **Changes**: the cumulative diff, one block per file with `+added −removed`, existing threads and pending comments under their lines. Click a line number to comment (*Add to Review* or *Comment Now*); threads have Reply and Resolve / Unresolve. *Viewed* collapses a file and is remembered until the file changes again (compared with the last merge request commit touching it, read from the local git history; without `process:git` or the commits locally, the head commit). Clicking a file name opens it locally; clicking the header folds it. Binary and very large files have no diff here; open them on GitLab.
-  - **Commits**: the merge request's commits. A double click shows that commit's diff, read-only, in Changes; commit mode has no comments and no viewed marks.
-  - **Files**: the changed files as a tree or a list (Tree/List button). Double-click a file to toggle Viewed, or use Mark All Viewed and Clear Viewed; it works without page scripts and shares the marks of Changes.
-  - **Pipelines**: the newest 20 pipelines with their jobs by stage. Retry a job or pipeline, cancel a pipeline (second click) or open it on GitLab. Job traces: see Snapshots below; no live log or manual play.
-  - **Timeline**: Kind, Author, When, Status and Summary columns, search/facets, and selected bounded plain-text body facts, from cached discussions and optional activity data. Opening, filtering and rendering a cached timeline make no HTTP requests; **Refresh Timeline** reads explicitly and commits only after rechecking the merge request owner and head. Presentation is capped at 500 rows and 384 KiB with 4 KiB bodies; an untruncated snapshot is still labelled bounded/historical. **Open** opens the MR/comment page on gitlab.com; **Reply in Overview** selects the cached discussion and returns to the reply form without posting or clearing an unsent draft.
-- **GitLab Projects** (left): the projects you're a member of (100 per page, up to 10 pages, most recently active first). Double-clicking one runs `git clone` in a terminal, into the clone directory; open the clone with File › Open when it finishes.
+**Details** shows the selected merge request. A row of section buttons switches between **Overview**, **Description**, **Changes**, **Commits**, **Files**, **Pipelines**, **Timeline** and **Local Drafts**. The active one has a dot; the others show counts from cached data. The choice is remembered, even when you select another merge request. A failing section shows the error with **Refresh**.
 
-The Details **Description** and diff comments render bounded CommonMark: tables, task lists, strikethrough and code blocks. Raw HTML is displayed as text; only HTTP(S) links without embedded credentials survive, and clicks must belong to the selected MR snapshot before opening externally. Images display their alternative text and are never fetched. Large inputs are visibly truncated. GitLab-specific mentions, custom emoji, math and server-side markup extensions are not rendered.
+**Overview** is the main form.
 
-## Prompts
+- A comment field, or a reply field under the note you reply to.
+- **Add to my review** (on by default) keeps the comment as a pending review comment.
+- The status line sums up state, draft, branches, author, merge status, pipeline and approvals.
+- Buttons appear when they apply:
+  - **Comment**, **Reply** or **Add to Review**.
+  - **Submit Review (n)** publishes pending comments. Text in the comment field is posted as a summary.
+  - **Resolve Thread** / **Unresolve Thread**, **Approve** / **Revoke Approval**.
+  - **Merge**, when you can merge and GitLab reports `mergeable`. Options: **Delete source branch** and **Squash commits**. Click twice: the second click reads *Confirm Merge !iid into target* with the chosen options. If the request is ready but you lack the rights, the status line says *You cannot merge this merge request*.
+  - **Rebase**, when GitLab reports `need_rebase`.
+  - **Edit Labels, People, Milestone…** (same as **GitLab: Edit Merge Request**), **Close** (click twice), **Reopen**.
+  - **Check Out Branch**, when the merge request isn't merged and isn't the current branch.
+  - **Open on GitLab**, **More…**, **Refresh**.
+- **More…** holds the less frequent actions that apply: **React**, **Add Me as Reviewer**, **Re-request Review…**, **Mark as Draft** / **Mark as Ready**, **Open MR Snapshot**, **Open Diff Snapshot**, **Open Existing Worktree** and **Copy Link**.
+- Your own comments (not system notes) get **Edit**, **Delete** (click twice) and an award emoji (**More…** › **React**) from eight: `thumbsup`, `thumbsdown`, `heart`, `tada`, `laughing`, `confused`, `rocket`, `eyes`.
 
-Create Merge Request, Create Snippet and Share Project are prompt sequences, not windows. The `commitsView` and `pipelineView` settings turn the Commits and Pipelines sections off, and `noteActions` the comment actions.
+**Changes** shows the full diff, one block per file with `+added −removed`. Existing threads and pending comments sit under their lines.
 
-- **Create Merge Request** (command): asks for the source branch (local branches, current first), the target branch (project branches, default first), the title (prefilled with the last commit subject), a one-line description and whether it is a draft. Dismissing any of the first four prompts creates nothing. If GitLab refuses, a notification says so and you can open the new-MR page for that branch. No assignee, reviewers, labels or milestone here; GitLab: Edit Merge Request picks those from lists.
-- **Create Snippet** (command): asks for the title, the visibility (a public snippet needs a confirm) and more project files, one path per prompt until an empty answer. It uses the focused file or its selection, or the files selected in the Project view. Dismissing any prompt creates nothing.
-- **Share Project** (command): asks for the name and the visibility. A repository without a commit is initialised and committed after a confirm that lists the files; files that look secret (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`) are refused.
+- Click a line number to comment (**Add to Review** or **Comment Now**). Threads have **Reply** and **Resolve** / **Unresolve**.
+- **Viewed** collapses a file until it changes again.
+- Click a file name to open it locally, or to open it in the IDE's side-by-side diff viewer. An added or deleted file shows as added or deleted, with no empty side. Click the header to fold it.
+- Binary and very large files have no diff here; open them on GitLab.
 
-Values that go into a URL or a git command (branch and ref names, remote names, usernames, commit SHAs, repository paths, clone URLs) are checked first and refused when they fail, so a branch or path outside `[A-Za-z0-9._/@+-]` can't be pushed or cloned through the plugin. Project paths longer than 64 characters can't be cloned.
+**Commits** lists the merge request's commits. Double-click one to see its diff, read-only, in **Changes**. Commit diffs have no comments and no viewed marks.
 
-## Current branch
+**Files** shows the changed files as a tree or a list (**Tree** / **List**). Double-click a file to toggle Viewed, or use **Mark All Viewed** and **Clear Viewed**. It shares the marks of **Changes** and works without page scripts.
 
-When the branch's upstream is on a gitlab.com remote, the status bar shows `!iid on <branch>` for its open merge request (forks are skipped). Clicking it selects the merge request in the Merge Request view. A branch other than the default branch with no open merge request shows *GitLab: Create Merge Request* instead. The lookup runs again on every repository change, and when a file opens if the commit changed or the last lookup is more than 5 minutes old.
+**Pipelines** shows the newest 20 pipelines with their jobs by stage. Retry a job or pipeline, cancel a pipeline (click twice), or open it on GitLab. See [job logs](#read-only-snapshots-and-job-logs).
 
-With `editorReview` on, the merge request's unresolved threads appear in the open files as gutter markers and `Info` problems (source `GitLab`) on their line on the new side. They're hidden while the local branch is behind its upstream.
+**Timeline** lists discussions and activity with Kind, Author, When, Status and Summary columns, plus search and facets.
 
-With a review thread's suggestion block (` ```suggestion:-N+M `) on a line of an open file, *GitLab: Apply suggestion* appears in the quick fixes there. It replaces the N lines above, the commented line and the M lines below with the suggestion (a plain ` ```suggestion ` replaces the commented line; an empty one deletes it). It's offered for the unresolved threads shown in the editor and isn't offered when the Changes section's cached diff shows a different text on any line of the replaced range that appears in that diff (lines outside the diff aren't checked); without a cached diff it doesn't check at all, so look at the lines before applying. It only edits the open file; nothing is posted to GitLab, and applying doesn't mark the suggestion as applied on GitLab.
+- **Refresh Timeline** reads new data from GitLab. Opening and filtering use cached data only.
+- **Open** opens the merge request or comment page on GitLab.
+- **Reply in Overview** selects the discussion and returns to the reply form. It doesn't post or clear an unsent draft.
 
-## Read-only content snapshots
+**Local Drafts** keeps up to 50 unsent review comments per merge request, saved in the plugin.
 
-The Merge Request overview offers **Open MR Snapshot** and **Open Diff Snapshot**; Changes also offers the diff snapshot action. These open plugin-backed editor tabs: the overview contains the MR title, description and branch metadata; the diff tab contains the existing unified text diffs. Each is explicitly bound to the current GitLab project/root/remote, selected MR and complete head commit; a fresh ownership/head check after loading prevents publishing a snapshot when those facts change. Snapshot content never supplies write or review authority: save and unknown actions are rejected as read-only, and the review pane remains the place for comments, drafts, viewed files and review submission. There is no inline commenting in these tabs.
+- **Add Draft**, **Edit**, **Delete**, **Clear All**.
+- **Submit All to Review** adds them to your pending review.
+- A draft is bound to the project, merge request and head commit. After a new push it is flagged stale and never submitted. **Rebind to Current Head** fixes that.
 
-**Reload Cached Snapshot** reads only the in-memory snapshot; no API or process calls. **Refresh Snapshot** re-reads GitLab explicitly, retains the previous snapshot on failure, and refuses to rebind an old tab to a changed head; retry it after a transient failure, or open a new snapshot for a new head. **Return to Review** reveals the existing pane without clearing draft text. Content opens are tied to the originating packaged-view frame, so two windows with the same local request ID cannot resolve each other's replies; the frame routing is UI correlation, not an authentication boundary — the project/MR/head checks remain separate.
+The `commitsView` and `pipelineView` settings turn off **Commits** and **Pipelines**. `noteActions` turns off the comment actions.
 
-Snapshots are capped at 384 KiB of UTF-8 text with a visible truncation marker; NUL/control characters are replaced and Unicode boundaries preserved. At most four snapshots are cached per plugin instance (oldest evicted); eviction makes old callbacks report expiration — reopen from the current MR view. API pagination/server limits and binary files can omit diff content, so a diff snapshot does not claim to be complete. Refresh is subject to the host's content-action timeout and the request budget; a slow refresh may need to be retried.
+### Read descriptions and comments
 
-**Open Job Trace Snapshot (API1.4)** on a selected listed pipeline job uses the GitLab REST trace route (never a process or browser request). It requires a native API 1.4 host and the declared GitLab network grant; the selected MR/pipeline/job membership and owner/head guards are re-established before fetching. The result is a historical read-only plain-text tab, not a managed/live log. Up to 1 MiB of UTF-8 response is accepted and displayed within the 384 KiB snapshot cap with a truncation marker; HTTP reads share the request budget with a bounded timeout (up to 20 s). No automatic polling or retry.
+The **Description** and diff comments render CommonMark: tables, task lists, strikethrough and code blocks.
 
-**Follow Job Log (glab)** is an optional adapter for a live log: it requires an approved `glab` 1.x executable (`process:glab`) authenticated separately from the plugin token. It verifies current MR/pipeline/job membership, checks the CLI version and confirms the exact repository/job before opening a native managed log tab running `glab ci trace <job-id> --repo <repository-url>`; the tab owns output, restart and cancellation. The CLI uses its own credentials and configuration; the plugin does not export its token. Native log tabs do not run in remote projects.
+- Raw HTML is shown as text.
+- Only HTTP(S) links without embedded credentials are kept.
+- Images show their alternative text and are never fetched.
+- `@mentions` show as highlighted plain text, never links. A small set of `:emoji:` shortcodes is shown, outside code.
+- `$math$`, `$$math$$` and ` ```math ` blocks show as labelled source, not rendered.
+- Large inputs are visibly truncated.
 
-## Ownership and caching
+### Work with the current branch
 
-MR caches belong to the exact repository root, GitLab project path and selected remote. A changed or unavailable owner clears list/details/thread/diff/commit/job/pipeline and branch caches; equal numeric MR IDs in different projects or worktrees cannot reuse an old cache. A nonempty unsent overview comment blocks cross-scope selection rather than exposing or discarding it; finish or clear it in the original project first. Refresh of the review pane also invalidates the list cache so the next model reloads current rows; MR data itself is never broadcast in invalidation messages.
+When the branch's upstream is on a GitLab remote, the status bar shows `!iid on <branch>` for its open merge request. Forks are skipped. Click it to select the merge request in **Details**.
 
-The **GitLab.com account slot** setting selects the existing primary token or the optional secondary token. Each is a declared IDE secret; the plugin receives only secret placeholders. Switching slots expires account identity, project lists, selected-MR ownership and snapshot caches, so an old account's controls cannot act as the new account. Finish or clear an unsent comment before switching; restoring the previous slot lets you finish that draft. This covers two declared accounts on the configured server.
+A branch other than the default branch with no open merge request shows **GitLab: Create Merge Request** instead. The lookup runs again on every repository change. It also runs when a file opens, if the commit changed or the last lookup is over 5 minutes old.
+
+With **Show the current branch's unresolved merge request threads in the editor** on, unresolved threads appear in open files. Each shows as a gutter marker and an `Info` problem (source `GitLab`) on its line, new side. They're hidden while the local branch is behind its upstream.
+
+### Apply a review suggestion
+
+When a review thread has a suggestion block (` ```suggestion:-N+M `) on a line of an open file, press ⌥⏎ there and choose **GitLab: Apply suggestion**.
+
+- It replaces the N lines above, the commented line and the M lines below with the suggestion.
+- A plain ` ```suggestion ` replaces the commented line. An empty one deletes it.
+- It is offered only for unresolved threads shown in the editor.
+- It edits the open file only. Nothing is posted, and GitLab doesn't mark the suggestion as applied.
+- Check the lines first: the plugin compares them with the cached **Changes** diff only when it has one.
+
+### Check out a merge request
+
+- **Check Out Branch** (Details button) fetches the source branch and checks it out, creating a tracking branch if needed. An existing local branch is fast-forwarded, or left alone if it has diverged. Fork merge requests are fetched from `refs/merge-requests/<iid>/head` into `fork/<author>/<branch>`.
+- **GitLab: Open Merge Request in Worktree** fetches the selected merge request (else the current branch's) and runs `git worktree add --detach` in a sibling folder `<repository>-<branch>`. Git refuses a folder that already holds files. A notification shows the path and offers **Open Worktree**.
+- **GitLab: Open Existing Merge Request Worktree** lists your local worktrees that match the merge request's head, and opens the one you pick in a new window. It creates nothing.
+- **GitLab: Check Out Merge Request Source (glab)…** checks out the source branch with `glab` in a terminal. See [Commands](#commands).
+- **GitLab: Rebase Merge Request** asks GitLab to rebase the selected merge request (else the current branch's) onto its target, after you confirm which one. It is the same call as **Rebase** and reports conflicts.
+
+### Create merge requests, snippets and projects
+
+These ask a few questions in a row instead of opening a window.
+
+- **GitLab: Create Merge Request** asks for the source branch (local branches, current first), the target branch (project branches, default first), the title (the last commit subject), a one-line description and draft or not. Dismissing any of the first four prompts creates nothing. If GitLab refuses, a notification offers to open the new-MR page on GitLab. Set assignee, reviewers, labels and milestone afterwards with **GitLab: Edit Merge Request**.
+- **GitLab: Create Snippet** uses the focused file or its selection, or the files selected in the Project view. It asks for the title, the visibility (public needs a confirm) and more project files, one path per prompt until an empty answer. Dismissing any prompt creates nothing. The URL is copied and shown.
+- **GitLab: Share Project** asks for the name and visibility. When the project has no git repository or no GitLab remote, the tool window offers it as **Share Project on GitLab…**. It creates the project in your namespace, adds it as `origin` (or `gitlab` if `origin` exists) and runs `git push -u` in a terminal. A repository without a commit is initialised and committed after a confirm that lists the files. Files that look secret (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`) are refused.
+
+### Clone a project
+
+The **Projects** tab lists the projects you're a member of, most recently active first. Double-click one to run `git clone` in a terminal, into the **Clone directory**. When none is set, the plugin asks for a directory. A notification offers **Open Clone** once the clone has started.
+
+### Link to code
+
+- **GitLab: Open on GitLab** opens the file at the current commit, with the selected lines (`#L3-L5`). It is in the editor, editor tab and Project view context menus.
+- **GitLab: Copy Link** copies the same link.
+
+### Read-only snapshots and job logs
+
+**Open MR Snapshot** and **Open Diff Snapshot** (Overview › **More…**; Changes has the diff one) open read-only editor tabs. The MR snapshot holds the title, description and branch details. The diff snapshot holds the unified text diffs. You can't save or comment in these tabs.
+
+- **Reload Cached Snapshot** shows the cached copy again, without contacting GitLab.
+- **Refresh Snapshot** re-reads GitLab. It keeps the old snapshot on failure. Retry after a transient failure, or open a new snapshot after a new push.
+- **Return to Review** goes back to **Details** without clearing your draft.
+
+**Open Job Trace Snapshot** (on a selected pipeline job) opens the job's log as it is now, read-only. It doesn't follow new output or retry on its own.
+
+**Follow Job Log (glab)** opens a live log tab running `glab ci trace <job-id> --repo <repository-url>`. It needs an approved `glab` 1.x (`process:glab`), signed in on its own. The plugin checks the CLI version and asks you to confirm the repository and job. The tab owns output, restart and cancel. Live log tabs don't run in remote projects.
+
+### Use two accounts
+
+Settings › Plugins › GitLab has two tokens: **GitLab personal access token** and **Secondary GitLab.com personal access token**. **GitLab.com account slot** picks which one to use. Switching clears the old account's cached data. Finish or clear an unsent comment before switching; switching back lets you finish it.
+
+### Edit GitLab CI files
+
+In `.gitlab-ci.yml` and the other CI file names below, problems appear on open and save:
+
+- `needs`, `dependencies`, `extends` or `!reference` naming a job that isn't in the file.
+- A job `stage` that isn't in `stages` (or the default stages).
+- A job listed twice in one `needs`, `dependencies` or `extends`.
+- `$VAR` inside `echo '…'` / `printf '…'` script lines, which the shell doesn't expand.
+
+Cmd+click a job name in `needs`, `dependencies`, `extends` or `!reference` to open the job. Cmd+click a `stage` value to open its entry in `stages`.
+
+Completion offers:
+
+- top-level keywords, and job keywords one level inside a job or `default`;
+- the predefined `CI_*` variables after `$` or `${`;
+- values for `when`, `stage` (from `stages`), `allow_failure` and `interruptible`;
+- job names for `extends`, `needs` and `dependencies` (inline, flow or list items);
+- the job, then the key, inside `!reference [`.
+
+The popup opens on letters, not on `$`.
+
+`include: local:` files are read (up to three levels), so their jobs and stages count.
+
+The GitLab icon is shown on `.gitlab-ci.yml`, `.gitlab-ci.yaml`, `*.gitlab-ci.yml`, `*.gitlab-ci.yaml`, `*.gitlab-ci.*.yml` and `*.gitlab-ci.*.yaml`.
 
 ## Commands
 
-| Command | Does | Menus |
+Find them in Search Everywhere › Actions (⇧⇧) under **GitLab**; bind keys in Settings › Keymap. No shortcuts are set by default.
+
+**Edit Merge Request**, **Re-request Review…**, **Open Existing Merge Request Worktree** and **Check Out Merge Request Source (glab)…** stay disabled until you select a merge request. **Open Cloned or Worktree Folder** stays disabled until a clone or worktree is offered.
+
+| Command | What it does | Menus |
 |---|---|---|
-| GitLab: Open on GitLab | opens the file at the current commit on gitlab.com, with the selected lines (`#L3-L5`) | editor, editor tab and Project view context (first selected file or folder, linked at the current commit) |
-| GitLab: Copy Link | copies the same link | none |
-| GitLab: Create Snippet | asks for title, visibility and more files, then creates the snippet from the selection, or the whole file; the URL is copied and shown | editor and editor tab context |
-| GitLab: Create Merge Request | opens gitlab.com's new merge request page for the current branch | Tools |
-| GitLab: Edit Merge Request | opens the existing attribute choices (labels, assignees, reviewers, milestone, title) from the project's lists | Merge Request overview |
-| GitLab: Share Project | asks for name and visibility, creates the project in your namespace, adds it as `origin` (or `gitlab` if `origin` exists) and runs `git push -u` in a terminal; needs a commit, a checked-out branch and no gitlab.com remote yet | none |
-| GitLab: Show Current Branch's Merge Request | selects the current branch's merge request (the status bar item runs it) | none |
-| GitLab: Open Merge Request in Worktree | fetches the selected merge request (else the current branch's) and runs `git worktree add --detach` in a sibling folder `<repository>-<branch>`; git refuses a folder that already holds files; the path is shown in a notification and no editor is opened | none |
-| GitLab: Open Existing Merge Request Worktree | lists registered local worktrees, asks which exact-head match to open, and requests the normal project-open/trust flow in a new window; creates nothing | Merge Request overview button |
-| GitLab: Update Merge Request Branch | asks GitLab to rebase the selected merge request (else the current branch's) onto its target (the same `rebase` API call as the Rebase button) and reports a conflict | none |
-| GitLab: Re-request Review… | selects an assigned reviewer, confirms the request, rechecks current repository/MR/head and reviewer membership, then uses GitLab's re-review mutation; cancellation sends nothing | open MR details toolbar |
-| GitLab: Check Out Merge Request Source (glab)… | selects a merge request, saves editor buffers and commits/stashes local changes, reviews the target project, source project ID/branch and complete head, then opens a native terminal running `glab mr checkout <iid> --repo https://gitlab.com/<target> --branch review/mr-<iid>-<head-prefix>` (official glab 1.130.0 checkout profile; no `--force`; it may update branch tracking/configuration and prompt about conflicts). This is source-branch checkout, not an exact-head snapshot; Native Stop cancels the process, but already fetched refs/configuration may remain | none |
-| GitLab: Create Access Token | opens the token page (see Setup) | none |
+| **GitLab: Open on GitLab** | Opens the file at the current commit, with the selected lines (`#L3-L5`). In the Project view, the first selected file or folder. | Editor, editor tab and Project view context |
+| **GitLab: Copy Link** | Copies the same link; in the Project view, the selected file or folder's link. | Editor and Project view context |
+| **GitLab: Edit Merge Request** | Picks labels, assignees, reviewers, milestone and title from the project's lists. | Details button **Edit Labels, People, Milestone…** |
+| **GitLab: Create Snippet** | Creates a snippet from the selection, the file or the selected files. | Editor, editor tab and Project view context |
+| **GitLab: Create Merge Request** | Asks for branches, title, description and draft, then creates the merge request. | Tools |
+| **GitLab: Share Project** | Creates a GitLab project and pushes this repository to it. Needs a commit, a checked-out branch and no GitLab remote yet. | Tool window button, when there is no GitLab remote |
+| **GitLab: Show Current Branch's Merge Request** | Selects the current branch's merge request (the status bar item runs it). | — |
+| **GitLab: Open Merge Request in Worktree** | Adds a detached worktree for the merge request in a sibling folder. | — |
+| **GitLab: Open Existing Merge Request Worktree** | Opens a local worktree that matches the merge request's head, in a new window. Creates nothing. | Details › **More…** |
+| **GitLab: Open Cloned or Worktree Folder** | Opens the folder from the last clone or new worktree in a new window. The **Open Clone** / **Open Worktree** notification buttons run it. | — |
+| **GitLab: Rebase Merge Request** | Asks GitLab to rebase the merge request onto its target, after you confirm; reports conflicts. | — |
+| **GitLab: Create Access Token** | Opens GitLab's token page with name and scopes filled in. | Tool window button |
+| **GitLab: Re-request Review…** | Picks an assigned reviewer, confirms, and asks GitLab for a new review. Cancelling sends nothing. | Details › **More…** |
+| **GitLab: Check Out Merge Request Source (glab)…** | Checks out the merge request's source branch with `glab` in a terminal. | — |
 
-Check Out Branch (Details button) fetches the source branch from the gitlab.com remote and checks it out, creating a tracking branch if needed. An existing local branch is fast-forwarded, or left alone if it has diverged. Fork merge requests are fetched from `refs/merge-requests/<iid>/head` into `fork/<author>/<branch>`.
+**GitLab: Check Out Merge Request Source (glab)…** in detail: it needs a clean working tree and saved editors. It asks you to confirm the merge request, source branch and new local branch. Then it opens a terminal running `glab mr checkout <iid> --repo https://gitlab.com/<target> --branch review/mr-<iid>-<head-prefix>` (any glab 1.x; no `--force`). It may update branch tracking and configuration, and prompt about conflicts. This is a source-branch checkout, not an exact-head snapshot. Stop cancels the process, but fetched refs and configuration may remain.
 
-The existing-worktree action requires selecting the merge request in the current project's list; selection is bound to the GitLab project path, repository root and remote (the project root must equal the repository root; nested project folders are rejected). Fresh GitLab reads verify the merge request's target project and current head. Only `git worktree list --porcelain -z` is run: no fetch, checkout, clone or worktree creation. A branch checkout must match the merge request's local branch (including `fork/<author>/` ownership); a detached checkout must have its exact full head commit. Locked, prunable, ambiguous and malformed records are excluded or rejected; lists are bounded to 1 MiB and 256 records. Picker dismissal and observed task cancellation open nothing. Selection, project, remote, head and worktree registration are checked again before requesting a new window; the host performs its normal trust flow. The worktree paths must belong to the UI machine, as required by `open_project`; no local-to-remote filesystem mapping is inferred.
+Editor quick fix (⌥⏎): **GitLab: Apply suggestion**.
 
 ## Settings
 
-Settings › Plugins › GitLab:
+Settings › Plugins › GitLab.
 
-| Key | Default | Effect |
+| Setting | Key | Default | What it changes |
+|---|---|---|---|
+| GitLab personal access token | `token` (secret) | — | The token for gitlab.com or your server (`api`, `read_user`). |
+| Secondary GitLab.com personal access token | `secondary-token` (secret) | — | Optional second account. |
+| GitLab.com account slot | `accountSlot` | `primary` | Which token to use: `primary` or `secondary`. |
+| GitLab server | `server` | empty (`https://gitlab.com`) | HTTPS URL of a self-hosted GitLab. Approved on first use. |
+| Show the current branch's unresolved merge request threads in the editor | `editorReview` | `true` | Threads as gutter markers and problems. |
+| Edit and delete your own comments and react with emoji in the merge request details | `noteActions` | `true` | Comment actions in **Details**. |
+| Show the commits of the selected merge request and each commit's changes | `commitsView` | `true` | The **Commits** section. |
+| Show the pipelines and jobs of the selected merge request, with retry and cancel | `pipelineView` | `true` | The **Pipelines** section. |
+| Clone and share using SSH | `cloneUsingSsh` | `false` | SSH URL instead of HTTPS. |
+| Clone directory | `cloneDirectory` | empty | Where clones go. Empty: next to the current project, or ask. |
+| Report needs, dependencies and extends that name a job missing from .gitlab-ci.yml | `ciJobReferences` | `true` | Also covers `!reference`. |
+| Report a job stage that is not in stages | `ciStages` | `true` | |
+| Report a job listed twice in needs, dependencies or extends | `ciDuplicateJobUsage` | `true` | |
+| Report $VARIABLE inside single quotes in script lines | `ciSingleQuotedVariables` | `true` | |
+
+## Permissions
+
+Optional permissions are off until you allow them in Settings › Plugins › GitLab.
+
+| Permission | Used for | Without it |
 |---|---|---|
-| `editorReview` | `true` | show the current branch's unresolved threads in the editor |
-| `noteActions` | `true` | edit, delete and react on your own comments |
-| `commitsView` | `true` | the merge request's commits and each commit's changes |
-| `pipelineView` | `true` | the merge request's pipelines and jobs, with retry and cancel |
-| `ciJobReferences` | `true` | `.gitlab-ci.yml`: report `needs`, `dependencies` and `extends` naming a job that is not in the file |
-| `ciStages` | `true` | `.gitlab-ci.yml`: report a job `stage` that is not in `stages` (or the default stages) |
-| `ciDuplicateJobUsage` | `true` | `.gitlab-ci.yml`: report a job listed twice in one `needs`, `dependencies` or `extends` |
-| `ciSingleQuotedVariables` | `true` | `.gitlab-ci.yml`: report `$VAR` in `echo '…'` / `printf '…'` script lines, which the shell does not expand |
-| `cloneUsingSsh` | `false` | clone and share with the SSH URL instead of HTTPS |
-| `cloneDirectory` | empty | where clones go; empty means next to the current project |
-| GitLab.com account slot | primary | use the primary or the optional secondary token (see Ownership and caching) |
+| `clipboard` | **Copy Link**, the snippet URL | The link is shown in a notification that says the permission is off. |
+| `project.read` | Jumping to a thread's line, threads in the editor | A thread's double-click opens its GitLab page. |
+| `events` | Status bar item and threads in the editor | Neither is shown. |
+| `process:git` | **Check Out Branch**, worktrees, clone, **Share Project**, Viewed tracking | Those actions fail with a message to allow git. Viewed compares with the head commit. |
+| `process:glab` | **Follow Job Log (glab)**, **Check Out Merge Request Source (glab)…** | Those actions fail. |
+| `net:ask` | A self-hosted server set in **GitLab server** | Only gitlab.com works. |
 
-## CI files
+The token is added to requests by the IDE; the plugin never reads it ([how tokens work](../../README.md#tokens-and-secrets)).
 
-In the CI files below, problems appear on open and save, and Cmd+click on a job name in `needs`, `dependencies` or `extends` opens the job, and on a `stage` value opens its entry in `stages`. `include: local:` files are read (up to three levels) so their jobs and stages count; checks stay quiet when the file has a remote, project, template or component include, a glob, or a local file that can't be read, and for `needs` entries with `project:` or `pipeline:`, and for names built from variables. The reader is a line scanner, not a YAML parser: unusual shapes are skipped.
+## Troubleshooting
 
-Completion in these files: top-level keywords, job keywords one level inside a job or `default`, the predefined `CI_*` variables after `$` or `${`, values for `when`, `stage` (from `stages`), `allow_failure`, `interruptible`, job names for `extends`, `needs` and `dependencies` (inline, flow or list items), and the job then the key inside `!reference [`. A `!reference` naming a job that is not in the file is reported with `needs` (setting `ciJobReferences`) and Go to Definition jumps to that job. The lists are typed from the GitLab docs as of November 2026 and may miss newer names; the popup opens on letters, not on `$`.
+| Problem | What to do |
+|---|---|
+| "Enter a GitLab personal access token…" | Run **GitLab: Create Access Token**, then paste the token in Settings › Plugins › GitLab. |
+| "GitLab rejected the access token." (401) | The token is wrong, expired or missing `api` / `read_user`. Make a new one. Check **GitLab.com account slot** points at the token you set. |
+| "The repository has no remote on the configured GitLab server…" | Click **Share Project on GitLab…** to publish it, add a remote on your GitLab server, or set **GitLab server** to match your remote. Plain-HTTP servers aren't supported. |
+| A self-hosted server isn't used | The value must be an HTTPS URL; an invalid value falls back to gitlab.com. Approve the host when asked (revocable in Settings › Plugins). |
+| "Checking out a branch needs the process:git permission. Allow it in Settings › Plugins › GitLab." (or "Adding a worktree needs…") | Allow `process:git`. |
+| "… needs GitLab CLI glab 1.x (found …)" | Install glab 1.x, sign in with `glab auth login`, and allow `process:glab`. |
+| "The commit list is off" / "The pipeline view is off" | Turn on `commitsView` / `pipelineView` in Settings › Plugins › GitLab. |
+| "Select a merge request in the GitLab window." | Select one in the **Merge Requests** tab first. |
+| "Finish or clear … unsent comment before switching…" | Post or clear the comment in the original project or account first. |
+| "The IDE shows pickers only for commands." | Run **GitLab: Edit Merge Request** from Search Everywhere. |
+| Clicking a diff line does nothing in **Changes** | The desktop IDE blocks scripts in plugin pages. Comment from **Overview** or on GitLab. Use **Files** for Viewed. |
+| "Snapshot … budget exhausted; retry explicitly." | Wait a moment, then **Refresh Snapshot** again. |
+| Lists look incomplete | Long lists stop after 10 pages or 35 s. Use **Filter** to narrow them. |
 
-## File icons
+More: [repository troubleshooting](../../README.md#troubleshooting).
 
-The GitLab icon on `.gitlab-ci.yml`, `.gitlab-ci.yaml`, `*.gitlab-ci.yml`, `*.gitlab-ci.yaml`, `*.gitlab-ci.*.yml` and `*.gitlab-ci.*.yaml`.
+## Limitations
 
-## Limits
-
-- gitlab.com only, with the two declared account slots; no OAuth login and no unbounded account manager.
-- Lists are read page by page up to 10 pages, all the lists of one command or refresh sharing a 35 s budget (lists after it are partial or empty): 500 merge requests, 1,000 threads per merge request, 1,000 projects, 1,000 diff files.
-- No side-by-side diff in the IDE's diff viewer, and no commenting from the editor gutter. Per-commit diffs are read-only.
-- Line comments, replies, resolving and Viewed in the Changes section need scripts, which the desktop IDE currently blocks in plugin pages; comment from the Merge Request view or on GitLab instead. Viewed also works in the Files section.
+- One server at a time (gitlab.com or one HTTPS self-hosted instance), with two account slots. No OAuth login and no account manager.
+- Lists stop at 10 pages: 500 merge requests, 1,000 threads per merge request, 1,000 projects, 1,000 diff files.
+- No commenting from the editor gutter. Per-commit diffs are read-only.
+- Line comments, replies, resolving and Viewed in **Changes** need scripts, which the desktop IDE currently blocks in plugin pages. Comment from **Overview** or on GitLab instead. Viewed also works in **Files**.
 - Threads in the editor don't move with unsaved edits.
-- Notes have no `@mention` completion or attachments; raw HTML is shown as text.
-- The prompts have no pickers (users, labels, milestone), no file chooser and no file-selection tree; extra snippet files are typed as paths.
-- A file counts as viewed until a later merge request commit touches it; that needs the commits in the local checkout, else the head commit is used.
-- Not implemented: usage statistics, `.gitlab-ci.yml` schema validation, completion and inspections beyond the four listed under CI files; `include: local:` files are followed, remote, project, template and component includes are not.
+- No `@mention` completion or attachments in notes. GitLab custom emoji, math and server-side markup extensions are not rendered.
+- The prompts have no user, label or milestone pickers, no file chooser and no file tree. Extra snippet files are typed as paths.
+- Branch names, refs and paths must use `[A-Za-z0-9._/@+-]`. Project paths over 64 characters can't be cloned.
+- Pipelines have no live log in the plugin (use glab) and no manual job play.
+- CI files: only the four checks listed. No schema validation. Remote, project, template and component includes are not followed. Keyword lists date from November 2026 and may miss newer names.
+- No usage statistics.
+
+## Technical details
+
+<details>
+<summary>Limits, caching and safety checks</summary>
+
+### Connection
+
+- REST API under `https://gitlab.com/api/v4` (or `<server>/api/v4`). `https://gitlab.com/api/graphql` is used for Mark as Draft / Mark as Ready.
+- The IDE puts the token in the `Authorization` header; the plugin only gets secret placeholders.
+- A self-hosted server uses `net:ask`, revocable under Settings › Plugins.
+- Lists are read page by page: merge requests 50 per page, projects 100 per page, up to 10 pages each. All the lists of one command or refresh share a 35 s budget; lists after it are partial or empty.
+
+### Input checks
+
+Values that go into a URL or a git command (branch and ref names, remote names, usernames, commit SHAs, repository paths, clone URLs) are checked first and refused when they fail. A branch or path outside `[A-Za-z0-9._/@+-]` can't be pushed or cloned through the plugin. Clones outlast the 60 s call limit and may ask for credentials, so they run in a terminal.
+
+### Ownership and caching
+
+- MR caches belong to the exact repository root, GitLab project path and selected remote. A changed or unavailable owner clears list, details, thread, diff, commit, job, pipeline and branch caches. Equal MR IDs in different projects or worktrees can't reuse an old cache.
+- A non-empty unsent comment blocks selecting in another scope, rather than exposing or discarding it.
+- Refreshing the review pane also invalidates the list cache. MR data is never broadcast in invalidation messages.
+- Switching account slots expires account identity, project lists, selected-MR ownership and snapshot caches, so an old account's controls can't act as the new one.
+- Viewed marks are compared with the last merge request commit touching the file, read from local git history. Without `process:git` or the commits locally, the head commit is used.
+- Local drafts are stored in plugin storage (up to 50 per merge request, 8 KiB each), bound to project, MR and head commit.
+
+### Suggestions
+
+**Apply suggestion** isn't offered when the cached **Changes** diff shows different text on any line of the replaced range that appears in that diff. Lines outside the diff aren't checked. Without a cached diff it doesn't check at all.
+
+### Markdown
+
+Rendering is bounded CommonMark with shared native tokens. Link clicks must belong to the selected MR snapshot before opening externally.
+
+### Timeline
+
+Built from cached discussions and optional activity data, with selected bounded plain-text body facts. **Refresh Timeline** commits only after rechecking the merge request owner and head. Display is capped at 500 rows and 384 KiB with 4 KiB bodies. An untruncated snapshot is still labelled bounded/historical.
+
+### Snapshots
+
+- Each snapshot is bound to the current GitLab project, root and remote, the selected MR and its full head commit. A fresh owner/head check after loading blocks publishing when those change. Refresh refuses to rebind an old tab to a changed head.
+- Snapshot content never grants write or review authority: save and unknown actions are rejected as read-only.
+- Content opens are tied to the packaged-view frame that started them, so two windows with the same local request ID can't resolve each other's replies. Frame routing is UI correlation, not an authentication boundary.
+- Capped at 384 KiB of UTF-8 text with a visible truncation marker. NUL and control characters are replaced; Unicode boundaries are kept.
+- At most four snapshots per plugin instance; the oldest is evicted, and its callbacks report expiration. Reopen from the current MR view.
+- API pagination, server limits and binary files can omit diff content, so a diff snapshot doesn't claim to be complete. Refresh is subject to the host's content-action timeout and the request budget.
+- Job trace snapshots (API 1.4) use the REST trace route, never a process or browser. MR, pipeline and job membership and owner/head guards are rechecked before fetching. Up to 1 MiB of response is accepted (host transfer cap 8 MiB) and shown within the 384 KiB cap. HTTP reads share the request budget, with a timeout up to 20 s. No polling or retry.
+- **Follow Job Log (glab)** verifies MR, pipeline and job membership before opening the tab. glab uses its own credentials and configuration; the plugin doesn't export its token.
+
+### Existing worktrees
+
+- The merge request must be selected in the current project's list. Selection is bound to the GitLab project path, repository root and remote. The project root must equal the repository root; nested project folders are rejected.
+- Fresh GitLab reads verify the target project and current head.
+- Only `git worktree list --porcelain -z` runs: no fetch, checkout, clone or worktree creation.
+- A branch checkout must match the merge request's local branch (including `fork/<author>/` ownership). A detached checkout must have the exact full head commit.
+- Locked, prunable, ambiguous and malformed records are excluded or rejected. Lists are bounded to 1 MiB and 256 records.
+- Dismissing the picker or cancelling opens nothing. Selection, project, remote, head and worktree registration are rechecked before requesting a new window; the host runs its normal trust flow.
+- Worktree paths must be on the UI machine, as `open_project` requires. No local-to-remote path mapping is inferred.
+
+### Re-request Review
+
+Rechecks the current repository, MR, head and reviewer membership before using GitLab's re-review mutation.
+
+### CI files
+
+The reader is a line scanner, not a YAML parser: unusual shapes are skipped. Checks stay quiet when the file has a remote, project, template or component include, a glob, or a local include that can't be read. They also stay quiet for `needs` entries with `project:` or `pipeline:`, and for names built from variables. Keyword and variable lists are typed from the GitLab docs as of November 2026.
+
+</details>
 
 ## Development
 

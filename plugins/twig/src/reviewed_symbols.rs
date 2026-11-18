@@ -146,9 +146,10 @@ pub fn lenses(state: &mut State, doc: &Document) -> Vec<CodeLens> {
     }
     for a in edges.definitions.iter().take(64) {
         if let Some(token) = lease(state, doc, &a.key, a.range) {
+            let count = spans(&edges, &a.key).len();
             out.push(CodeLens {
                 range: a.range,
-                title: format!("{} local source occurrences", spans(&edges, &a.key).len()),
+                title: if count == 1 { "1 occurrence in this file".into() } else { format!("{count} occurrences in this file") },
                 command: "source-symbol-occurrences".into(),
                 argument: Some(token),
             });
@@ -364,7 +365,7 @@ struct Plan {
 fn plan(p: &Pending, inventory: &Inventory, new_name: &str) -> Result<Plan, Error> {
     let old = text_at(&p.doc.text, p.range).ok_or(Error::Stale)?;
     if !valid_name(new_name) || new_name == old {
-        return Err(Error::Invalid("Choose a different non-reserved Twig identifier (letters/digits/underscore, leading letter/underscore; at most64 UTF-8 bytes). Quotes, whitespace and interpolation are not names.".into()));
+        return Err(Error::Invalid("Choose a different non-reserved Twig identifier (letters/digits/underscore, leading letter/underscore; at most 64 UTF-8 bytes). Quotes, whitespace and interpolation are not names.".into()));
     }
     let mut edited = inventory.files.clone();
     let mut edits = vec![];
@@ -386,7 +387,7 @@ fn plan(p: &Pending, inventory: &Inventory, new_name: &str) -> Result<Plan, Erro
             .filter(|(at, _)| !covered.contains(&(*at, *at + old.len())))
             .count();
         if other > 0 {
-            preview.push_str(&format!("UNCHANGED outside admitted symbol scope: {} ({other} other spellings; may be unrelated/dynamic)\n",path.strip_prefix(&format!("{}/",p.root)).unwrap_or(path)));
+            preview.push_str(&format!("Not renamed in {}: {other} other matches of the same text (probably unrelated or dynamic)\n",path.strip_prefix(&format!("{}/",p.root)).unwrap_or(path)));
         }
         if ranges.is_empty() {
             continue;
@@ -472,7 +473,7 @@ fn plan(p: &Pending, inventory: &Inventory, new_name: &str) -> Result<Plan, Erro
         }
         Ok(())
     })?;
-    preview.push_str(&format!("\n{} admitted source files scanned; {} files / {total} exact physical spans edited. Review these edits before applying.\nNo automatic native Rename or runtime-completeness claim.",inventory.files.len(),edits.len()));
+    preview.push_str(&format!("\n{} Twig files scanned; {total} changes in {} files. Review them before applying.\nUsages built at runtime are not found.",inventory.files.len(),edits.len()));
     if preview.len() > 15 << 10 {
         return Err(Error::Invalid(
             "The exact rename preview exceeds its review bound.".into(),
@@ -520,14 +521,14 @@ impl FileActions for Twig {
         let old = text_at(&doc.text, pending.range).ok_or(Error::Stale)?;
         let new=host::input("New static Twig identifier (letters/digits/underscore; no quotes, whitespace, reserved names or collisions)",Some(old))?.ok_or(Error::Cancelled)?;
         let planned = plan(&pending, &inventory, &new)?;
-        if !host::confirm("Apply reviewed static Twig rename?", &planned.preview)? {
+        if !host::confirm("Rename Twig symbol?", &planned.preview)? {
             return Err(Error::Cancelled);
         }
         fresh(doc, &pending)?;
         unchanged(&project, &pending, &inventory)?;
         self.reviewed_symbols.pending.remove(token);
         Ok(FileAction {
-            title: "Rename admitted static Twig source symbol".into(),
+            title: "Rename Static Twig Symbol".into(),
             kind: Some("refactor.rename".into()),
             edits: planned.edits,
             ..FileAction::default()
@@ -535,21 +536,24 @@ impl FileActions for Twig {
     }
 }
 pub fn occurrences_at_caret(state: &mut State, ctx: &Invocation) -> Result<Option<String>, Error> {
-    let _scope = delimiters::Syntax::scope().ok_or(Error::Stale)?;
-    let editor = ctx.editor().ok_or(Error::Stale)?;
-    let current = editor.document()?;
+    let _scope = delimiters::Syntax::scope()
+        .ok_or_else(|| Error::Invalid("Correct the Twig delimiter settings first.".into()))?;
+    let editor = ctx.editor().ok_or_else(|| Error::Invalid("Open a Twig template first.".into()))?;
+    let denied = |e: Error| ui_kit::denied::map(e, "Show Occurrences", "editor.read", "Twig");
+    let current = editor.document().map_err(denied)?;
     let doc = Document {
         path: editor.path(),
         language: editor.language(),
         text: current.text,
         version: current.version,
     };
-    let at = editor.selections()?.first().ok_or(Error::Stale)?.start;
+    let at = editor.selections().map_err(denied)?.first().ok_or_else(|| Error::Invalid("Put the caret on a symbol first.".into()))?.start;
     let edges = graph(&doc);
     let (key, range) = selected(&edges, at).ok_or_else(|| {
-        Error::Invalid("Place the caret on an admitted Twig source symbol.".into())
+        Error::Invalid("Put the caret on a loop variable, import alias, macro or block name.".into())
     })?;
-    let token = lease(state, &doc, key, range).ok_or(Error::Stale)?;
+    let token = lease(state, &doc, key, range)
+        .ok_or_else(|| Error::Invalid("Show Occurrences works on Twig files inside the open project.".into()))?;
     occurrences(state, ctx, &token)
 }
 
@@ -578,7 +582,7 @@ pub fn occurrences(
         for range in spans(&graph(&model(path, text)), &pending.key) {
             found.push((path.clone(), range));
             if found.len() > 256 {
-                return Err(Error::Invalid("Occurrence review exceeds256 spans.".into()));
+                return Err(Error::Invalid("Occurrence review exceeds 256 spans.".into()));
             }
         }
     }
@@ -598,7 +602,7 @@ pub fn occurrences(
         })
         .collect();
     let Some(key) = host::pick(
-        "Static Twig source occurrences (runtime/dynamic usages excluded)",
+        "Occurrences (usages built at runtime are not listed)",
         &items,
     )?
     else {
@@ -616,7 +620,7 @@ pub fn occurrences(
 mod tests {
     use super::*;
     use openidea_plugin::{
-        indexing::DocumentIndexer, language_features::LanguageFeatures, mock::MockHost,
+        language_features::LanguageFeatures, mock::MockHost,
     };
     fn doc(path: &str, text: &str) -> Document {
         Document {
@@ -632,6 +636,13 @@ mod tests {
         host.open_editor(&format!("/project/{path}"), "twig", text, &[(0, 0, 0, 0)]);
         host
     }
+    #[test]
+    fn show_occurrences_off_a_symbol_explains_where_to_put_the_caret() {
+        let host = install("templates/a.twig", "plain text");
+        let host = host.with_capabilities(&["project.read", "editor.read"]);
+        let err = occurrences_at_caret(&mut State::default(), &host.invocation()).unwrap_err();
+        assert!(matches!(err, Error::Invalid(m) if m.starts_with("Put the caret on a loop variable")));
+    }
     fn action(plugin: &mut Twig, doc: &Document, needle: &str) -> FileAction {
         let at = position(&doc.text, doc.text.find(needle).unwrap() + 1);
         let actions = plugin.file_actions(doc, EditorRange::new(at, at));
@@ -640,17 +651,11 @@ mod tests {
         actions[0].clone()
     }
     #[test]
-    fn public_index_is_empty_but_loop_navigation_highlights_lenses_and_reviewed_rename_work() {
+    fn loop_navigation_highlights_lenses_and_reviewed_rename_work() {
         let source = "😀 {% for item in items %}{{ item.name }}{% endfor %}";
         let host = install("a.twig", source);
         let d = doc("/project/a.twig", source);
         let mut plugin = Twig::default();
-        let public = plugin.index(&IndexedDocument {
-            path: d.path.clone(),
-            text: d.text.clone(),
-            symbols: vec![],
-        });
-        assert!(public.definitions.is_empty() && public.references.is_empty());
         let at = position(source, source.rfind("item.name").unwrap() + 1);
         assert_eq!(
             plugin.definition(&d, at)[0].range.start,
@@ -658,6 +663,7 @@ mod tests {
         );
         assert_eq!(plugin.document_highlights(&d, at).len(), 2);
         let lens = plugin.code_lenses(&d).remove(0);
+        assert_eq!(lens.title, "2 occurrences in this file");
         host.answer_next_prompt(Some(&["1"]));
         plugin
             .run_command(

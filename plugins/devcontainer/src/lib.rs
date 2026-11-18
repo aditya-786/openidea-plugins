@@ -26,6 +26,8 @@ use checks::{Context, FEATURES_MALFORMED, UNKNOWN_PROPERTY};
 const MAX_BYTES: usize = 256 * 1024;
 
 const LOGIN_SHELL: &str = "command -v bash >/dev/null && exec bash -l; exec sh -l";
+/// Stopping a container also unregisters the project's run targets.
+const RUN_TARGET_REMOVED: &str = "Any Dev Container run target for this project was removed.";
 
 #[derive(Default)]
 pub struct Main {
@@ -42,10 +44,31 @@ impl Plugin for Main {
         self.run_target.clear();
         Ok(())
     }
-    fn run_command(&mut self, id: &str, ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
+    fn run_command(&mut self, id: &str, ctx: &Invocation, arg: Option<&str>) -> Result<Option<String>, Error> {
+        self.command(id, ctx, arg).map_err(explain_denial)
+    }
+}
+
+/// Process denials become the standard "allow this permission" message.
+pub(crate) fn explain_denial(error: Error) -> Error {
+    let Error::Denied(capability) = &error else { return error };
+    let feature = match capability.as_str() {
+        "process:devcontainer" => "Running the devcontainer CLI",
+        "process:docker" => "Listing, starting and stopping containers",
+        "process:git" => "Cloning a repository",
+        _ => return error,
+    };
+    Error::Invalid(ui_kit::denied::message(feature, capability, "Dev Container CLI"))
+}
+
+impl Main {
+    fn command(&mut self, id: &str, ctx: &Invocation, arg: Option<&str>) -> Result<Option<String>, Error> {
         if id == "managed-output" {
             host::reveal_view(operations::VIEW)?;
             return Ok(None);
+        }
+        if id == "start-cloned" {
+            return start_cloned(arg);
         }
         let project = ctx.project().ok_or("No project is open.")?;
         let root = project.root()?;
@@ -62,7 +85,7 @@ impl Plugin for Main {
             self.operations.idle()?;
             let Some(config) = configs::choose(&project, false)? else { return Ok(None); };
             let plan = launch::Plan::prepare(&project, if id == "up-managed" { "up" } else { "rebuild" }, &config)?;
-            if !ui_kit::prompts::confirm_exact(plan.title(), &format!("{}\n\nFinite managed mode: one CLI client is retained only while this plugin instance lives (normally about300seconds idle). Refresh Status reads bounded progress; Cancel closes that client handle. CLI exit/cancellation does not establish container or Docker-build termination, rollback or IDE ownership. Output stays in memory, latest64KiB only. Existing Start/Rebuild terminal commands remain available.", plan.preview()))? {
+            if !ui_kit::prompts::confirm_exact(plan.title(), &format!("Runs the Dev Container CLI in the background. Refresh Status reads its progress and Cancel stops it.\nCancelling does not undo a container or build that already started.\nOutput keeps the latest 64 KiB.\n\nDetails\n{}\n\nThe CLI client closes after about 300 seconds idle or when the plugin stops.", plan.preview()))? {
                 return Ok(None);
             }
             plan.launch_managed(ctx, &mut self.operations)?;
@@ -83,10 +106,7 @@ impl Plugin for Main {
         }
 
         if id == "stop" {
-            self.run_target.clear_for(&root);
-            host::unregister_run_target(&project, run_target::ID);
-            host::unregister_run_target(&project, run_target::MAPPED_ID);
-            return stop(&project, &root);
+            return stop(&mut self.run_target, &project, &root);
         }
 
         if id == "info" {
@@ -98,11 +118,16 @@ impl Plugin for Main {
         }
 
         if id == "clone" {
-            return clone(&project, &root);
+            return clone(&root);
         }
 
         if !matches!(id, "up" | "rebuild" | "shell") {
             return Err(Error::NotFound(format!("command {id}")));
+        }
+        // Open Shell on the Started notification names the container it started.
+        if id == "shell" && let Some(container) = arg {
+            self.shell_into(ctx, container)?;
+            return Ok(None);
         }
         let Some(config) = configs::choose(&project, false)? else {
             return Ok(None);
@@ -115,12 +140,20 @@ impl Plugin for Main {
             self.run_target.clear_for(&root);
             plan.launch(ctx)?;
         } else {
-            let args = ["exec", "--workspace-folder", &root, "--config", &config, "sh", "-c", LOGIN_SHELL].map(str::to_owned);
-            host::open_terminal("Dev Container: Open Shell in Container", "devcontainer", &args)?;
+            let command = host::Command::new("devcontainer").args(["exec", "--workspace-folder", &root, "--config", &config, "sh", "-c", LOGIN_SHELL]);
+            host::open_terminal_session(&shell_key(&root, &config), "Dev Container: Open Shell in Container", &command)?;
         }
 
         Ok(None)
     }
+}
+
+/// One shell terminal per project folder and configuration (at most 128 bytes).
+fn shell_key(root: &str, config: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (root, config).hash(&mut hasher);
+    format!("shell-{:016x}", hasher.finish())
 }
 
 fn is_devcontainer_file(path: &str) -> bool {
@@ -248,7 +281,7 @@ fn repository_name(url: &str) -> &str {
     name.strip_suffix(".git").unwrap_or(name)
 }
 
-fn clone(project: &Project, root: &str) -> Result<Option<String>, Error> {
+fn clone(root: &str) -> Result<Option<String>, Error> {
     let Some(url) = host::input("Repository URL to clone", None)? else {
         return Ok(None);
     };
@@ -269,52 +302,77 @@ fn clone(project: &Project, root: &str) -> Result<Option<String>, Error> {
         return Ok(None);
     }
 
-    let cloned = {
-        let _task = host::begin_task("Cloning the repository", false);
-        project.run_process("git", &["clone".into(), "--".into(), url.into(), target.into()], None)?
-    };
-    if cloned.status != Some(0) {
-        return Err(format!("git clone failed: {}", cloned.stderr.trim()).into());
-    }
+    let args = ["clone".to_owned(), "--".to_owned(), url.to_owned(), target.to_owned()];
+    host::open_terminal("Dev Container: Clone Repository", "git", &args)?;
+    let start = openidea_plugin::NotificationAction::new("Start Container", "start-cloned").argument(target);
+    host::notify_with_actions(NotificationLevel::Info, "Dev Container", "Cloning in a terminal. When it finishes, start the container for the new folder.", &[start])?;
 
+    Ok(None)
+}
+
+fn start_cloned(target: Option<&str>) -> Result<Option<String>, Error> {
+    let picked;
+    let target = match target.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(target) => target,
+        None => {
+            let Some(folder) = host::pick_directory("Choose the cloned folder to start", None)? else {
+                return Ok(None);
+            };
+            picked = folder;
+            picked.as_str()
+        }
+    };
+    if target.starts_with('-') {
+        return Err("Choose a cloned folder to start.".into());
+    }
     let args = ["up".to_owned(), "--workspace-folder".to_owned(), target.to_owned()];
+    let body = format!("Run devcontainer with arguments:\n{}", serde_json::to_string_pretty(&args).unwrap_or_default());
+    if !ui_kit::prompts::confirm_exact("Start cloned Dev Container", &body)? {
+        return Ok(None);
+    }
     host::open_terminal("Dev Container: Start Cloned Container", "devcontainer", &args)?;
 
     Ok(None)
 }
 
 /// The CLI has no stop command; its containers carry the workspace folder as a label.
-fn stop(project: &Project, root: &str) -> Result<Option<String>, Error> {
-    let label = format!("label=devcontainer.local_folder={root}");
-    let listed = project.run_process("docker", &["ps".into(), "-q".into(), "--filter".into(), label], None)?;
+fn stop(run_target: &mut run_target::State, project: &Project, root: &str) -> Result<Option<String>, Error> {
+    let running: Vec<dashboard::Container> = dashboard::list(project, root)?.into_iter().filter(|c| c.running).collect();
 
-    if listed.status != Some(0) {
-        return Err(format!("docker ps failed: {}", listed.stderr.trim()).into());
-    }
-
-    let ids: Vec<String> = listed.stdout.split_whitespace().map(str::to_owned).collect();
-
-    if ids.is_empty() {
+    if running.is_empty() {
         host::notify(NotificationLevel::Info, "Dev Container", "No running container for this project.");
         return Ok(None);
     }
 
-    let stopped = project.run_process("docker", &[vec!["stop".to_owned()], ids.clone()].concat(), None)?;
+    let names = running.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ");
+    let body = format!("Runs docker stop on {names}. Unsaved work in a container shell is lost.\nAny Dev Container run target for this project is removed too.");
+    if !host::confirm(&format!("Stop {names}?"), &body)? {
+        return Ok(None);
+    }
+
+    let ids: Vec<String> = running.into_iter().map(|c| c.id).collect();
+    let stopped = project.run_process("docker", &[vec!["stop".to_owned()], ids].concat(), None)?;
 
     if stopped.status != Some(0) {
         return Err(format!("docker stop failed: {}", stopped.stderr.trim()).into());
     }
 
-    let stopped = match ids.len() {
-        1 => "Stopped 1 container.".to_owned(),
-        count => format!("Stopped {count} containers."),
-    };
-    host::notify(NotificationLevel::Info, "Dev Container", &stopped);
+    run_target.clear_for(root);
+    host::unregister_run_target(project, run_target::ID);
+    host::unregister_run_target(project, run_target::MAPPED_ID);
+    host::notify(NotificationLevel::Info, "Dev Container", &format!("Stopped {names}. {RUN_TARGET_REMOVED}"));
 
     Ok(None)
 }
 
 impl Providers for Main {
+    fn line_markers(&mut self, doc: &Document) -> Vec<openidea_plugin::providers::LineMarker> {
+        if !is_devcontainer_file(&doc.path) || doc.text.len() > MAX_BYTES {
+            return vec![];
+        }
+        compose::file_markers(&doc.path, &doc.text)
+    }
+
     fn completion(&mut self, doc: &Document, at: Position, _trigger: Option<&str>) -> Vec<CompletionItem> {
         if !is_devcontainer_file(&doc.path) || doc.text.len() > MAX_BYTES || !host::setting_bool("completeProperties").unwrap_or(true) {
             return vec![];
@@ -419,8 +477,8 @@ fn feature_items(text: &str, key: std::ops::Range<usize>) -> Vec<CompletionItem>
 }
 
 impl openidea_plugin::RunTargetValidation for Main {
-    fn validate(&mut self, project: &str, _target_id: &str, _launch: &openidea_plugin::RunTargetLaunch) -> Result<(), String> {
-        run_target::validate_running(project)
+    fn validate(&mut self, project: &str, target_id: &str, _launch: &openidea_plugin::RunTargetLaunch) -> Result<(), String> {
+        run_target::validate_running(project, target_id)
     }
 }
 
@@ -541,11 +599,12 @@ mod tests {
         host.add_file(".devcontainer/python/devcontainer.json", "{}");
 
         Main::default().run_command("shell", &host.invocation(), None).unwrap();
+        Main::default().run_command("shell", &host.invocation(), None).unwrap();
 
-        assert_eq!(
-            host.terminals()[0].args,
-            ["exec", "--workspace-folder", "/work/app", "--config", ".devcontainer/python/devcontainer.json", "sh", "-c", LOGIN_SHELL]
-        );
+        assert!(host.terminals().is_empty());
+        let key = shell_key("/work/app", ".devcontainer/python/devcontainer.json");
+        assert!(host.finish_terminal(&key).is_some());
+        assert!(host.finish_terminal(&key).is_none(), "the second Open Shell focused the first terminal");
     }
 
     #[test]
@@ -558,13 +617,12 @@ mod tests {
         assert!(host.terminals().is_empty());
     }
 
-    #[test]
-    fn stop_stops_the_project_containers() {
+    fn stop_host() -> MockHost {
         let host = host();
         host.on_process("docker", |args, _| match args[0].as_str() {
             "ps" => {
                 assert_eq!(args[3], "label=devcontainer.local_folder=/work/app");
-                ok("abc\ndef\n")
+                ok("{\"ID\":\"abc\",\"Names\":\"web\",\"State\":\"running\"}\n{\"ID\":\"def\",\"Names\":\"db\",\"State\":\"running\"}\n{\"ID\":\"0ff\",\"Names\":\"old\",\"State\":\"exited\"}\n")
             }
             "stop" => {
                 assert_eq!(args, ["stop", "abc", "def"]);
@@ -572,31 +630,96 @@ mod tests {
             }
             other => panic!("unexpected docker {other}"),
         });
-
-        Main::default().run_command("stop", &host.invocation(), None).unwrap();
-
-        assert_eq!(host.notifications()[0].body, "Stopped 2 containers.");
+        host
     }
 
     #[test]
-    fn clone_clones_next_to_the_project_then_starts_the_container() {
-        let host = host().with_capabilities(&["project.read", "process:devcontainer", "process:git"]);
-        host.on_process("git", |args, _| {
-            assert_eq!(args, ["clone", "--", "https://example.com/acme/tool.git", "/work/tool"]);
-            ok("")
-        });
+    fn stop_names_the_running_containers_and_stops_them_after_confirming() {
+        let host = stop_host();
+        host.answer_next_prompt(Some(&[]));
+
+        Main::default().run_command("stop", &host.invocation(), None).unwrap();
+
+        assert!(host.process_runs().iter().any(|r| r.args[0] == "stop"));
+        assert_eq!(host.notifications()[0].body, format!("Stopped web, db. {RUN_TARGET_REMOVED}"));
+    }
+
+    #[test]
+    fn declining_stop_stops_nothing_and_keeps_run_targets() {
+        let host = stop_host();
+        let project = host.invocation().project().unwrap();
+        let target = openidea_plugin::PluginRunTarget { id: run_target::ID.into(), name: "t".into(), program: "docker".into(), args: vec![], workdir_args: vec![], container_root: None, commands: vec![] };
+        host::register_run_target(&project, &target).unwrap();
+
+        Main::default().run_command("stop", &host.invocation(), None).unwrap();
+
+        assert!(host.process_runs().iter().all(|r| r.args[0] == "ps"));
+        assert_eq!(host.run_targets().len(), 1);
+    }
+
+    #[test]
+    fn stop_without_running_container_keeps_run_targets() {
+        let host = host();
+        host.on_process("docker", |_, _| ok(""));
+        let project = host.invocation().project().unwrap();
+        let target = openidea_plugin::PluginRunTarget { id: run_target::ID.into(), name: "t".into(), program: "docker".into(), args: vec![], workdir_args: vec![], container_root: None, commands: vec![] };
+        host::register_run_target(&project, &target).unwrap();
+
+        Main::default().run_command("stop", &host.invocation(), None).unwrap();
+
+        assert_eq!(host.notifications()[0].body, "No running container for this project.");
+        assert_eq!(host.run_targets().len(), 1);
+    }
+
+    #[test]
+    fn clone_opens_terminal() {
+        let host = host().with_capabilities(&["project.read", "process:git"]);
 
         host.answer_next_prompt(Some(&["https://example.com/acme/tool.git"]));
         host.answer_next_prompt(Some(&["/work/tool"]));
         Main::default().run_command("clone", &host.invocation(), None).unwrap();
 
-        assert_eq!(host.terminals()[0].args, ["up", "--workspace-folder", "/work/tool"]);
+        let terminals = host.terminals();
+        assert_eq!(terminals[0].program, "git");
+        assert_eq!(terminals[0].args, ["clone", "--", "https://example.com/acme/tool.git", "/work/tool"]);
+        assert!(host.process_runs().is_empty());
+
+        let action = &host.notifications_with_actions()[0].actions[0];
+        assert_eq!((action.command.as_str(), action.argument.as_deref()), ("start-cloned", Some("/work/tool")));
     }
 
     #[test]
-    fn clone_stops_on_dismissal_bad_url_or_failed_git() {
-        let host = host().with_capabilities(&["project.read", "process:devcontainer", "process:git"]);
-        host.on_process("git", |_, _| Ok(ProcessOutput { status: Some(128), stdout: String::new(), stderr: "fatal: nope".into() }));
+    fn start_cloned_confirms_then_opens_the_container_terminal() {
+        let host = host().with_capabilities(&["project.read", "process:devcontainer"]);
+
+        host.answer_next_prompt(Some(&["yes"]));
+        Main::default().run_command("start-cloned", &host.invocation(), Some("/work/tool")).unwrap();
+        assert_eq!(host.terminals()[0].program, "devcontainer");
+        assert_eq!(host.terminals()[0].args, ["up", "--workspace-folder", "/work/tool"]);
+
+        let before = host.terminals().len();
+        assert!(Main::default().run_command("start-cloned", &host.invocation(), Some("--x")).is_err());
+        assert_eq!(host.terminals().len(), before);
+    }
+
+    #[test]
+    fn start_cloned_without_argument_asks_for_a_folder() {
+        let host = host().with_capabilities(&["project.read", "process:devcontainer"]);
+
+        host.answer_next_prompt(Some(&["/work/picked"]));
+        host.answer_next_prompt(Some(&["yes"]));
+        Main::default().run_command("start-cloned", &host.invocation(), None).unwrap();
+        assert_eq!(host.terminals()[0].args, ["up", "--workspace-folder", "/work/picked"]);
+
+        host.answer_next_prompt(None);
+        let before = host.terminals().len();
+        Main::default().run_command("start-cloned", &host.invocation(), None).unwrap();
+        assert_eq!(host.terminals().len(), before);
+    }
+
+    #[test]
+    fn clone_stops_on_dismissal_or_bad_url() {
+        let host = host().with_capabilities(&["project.read", "process:git"]);
 
         host.answer_next_prompt(None);
         Main::default().run_command("clone", &host.invocation(), None).unwrap();
@@ -605,14 +728,9 @@ mod tests {
         host.answer_next_prompt(Some(&["https://example.com/acme/tool.git"]));
         host.answer_next_prompt(None);
         Main::default().run_command("clone", &host.invocation(), None).unwrap();
+
         assert!(host.process_runs().is_empty() && host.terminals().is_empty());
         assert_eq!(host.notifications().len(), 1);
-
-        host.answer_next_prompt(Some(&["https://example.com/acme/tool.git"]));
-        host.answer_next_prompt(Some(&["/work/tool"]));
-        let error = Main::default().run_command("clone", &host.invocation(), None).unwrap_err();
-        assert!(error.to_string().contains("fatal: nope"));
-        assert!(host.terminals().is_empty());
     }
 
     #[test]
@@ -621,7 +739,7 @@ mod tests {
 
         let error = Main::default().run_command("stop", &host.invocation(), None).unwrap_err();
 
-        assert!(matches!(error, Error::Denied(cap) if cap == "process:docker"));
+        assert!(matches!(error, Error::Invalid(m) if m == "Listing, starting and stopping containers needs the process:docker permission. Allow it in Settings › Plugins › Dev Container CLI."));
     }
 
     fn strip_line_comments(text: &str) -> String {
@@ -775,12 +893,20 @@ mod tests {
     }
 
     #[test]
-    fn manifest_activates_on_file_events() {
+    fn escaped_key_recognised() {
+        let host = host();
+        open(&host, ".devcontainer.json", "{\"\\u0069mage\": \"x\"}");
+        assert!(host.provider_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn manifest_activates_on_views_only() {
         let manifest = include_str!("../plugin.toml");
 
-        for activation in ["on-event:file-opened", "on-event:file-saved", "on-view:containers", "on-view:run-target-review"] {
+        for activation in ["on-view:containers", "on-view:run-target-review"] {
             assert!(manifest.contains(&format!("\"{activation}\"")));
         }
+        assert!(!manifest.contains("on-event:") && !manifest.contains("\"events\""));
     }
 
     #[test]
@@ -1012,7 +1138,7 @@ mod tests {
 
         let error = Main::default().run_command("info", &host.invocation(), None).unwrap_err();
 
-        assert!(matches!(error, Error::Denied(cap) if cap == "process:devcontainer"));
+        assert!(matches!(error, Error::Invalid(m) if m.starts_with("Running the devcontainer CLI needs the process:devcontainer permission.")));
     }
 
     fn complete_in(path: &str, marked: &str) -> Vec<openidea_plugin::providers::CompletionItem> {
@@ -1243,10 +1369,10 @@ mod tests {
     }
 
     #[test]
-    fn manifest_registers_the_completion_provider() {
+    fn manifest_registers_the_completion_and_line_marker_provider() {
         let manifest = include_str!("../plugin.toml");
 
-        assert!(manifest.contains("kinds = [\"completion\", \"code-actions\"]"));
+        assert!(manifest.contains("kinds = [\"completion\", \"code-actions\", \"line-markers\"]"));
         assert!(manifest.contains("languages = [\"json\", \"jsonc\"]"));
     }
 
@@ -1343,13 +1469,14 @@ mod tests {
         let Body::List(items) = view.body else { panic!("a list") };
         assert_eq!(items[0].key, "abc123");
         assert_eq!(items[0].detail.as_deref(), Some("node:20 - Up 2 minutes"));
-        assert_eq!(view.toolbar.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["refresh", "configuration"]);
+        assert_eq!(view.toolbar.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["refresh", "rebuild", "configuration"]);
 
         plugin.handle("containers", ViewEvent::Select("abc123".into()), &host.invocation()).unwrap();
         assert!(plugin.render("containers", None, &host.invocation()).unwrap().toolbar.iter().any(|b| b.id == "shell"));
         plugin.handle("containers", ViewEvent::Button("shell".into()), &host.invocation()).unwrap();
-        assert_eq!(host.terminals()[0].args, ["exec", "-it", "abc123", "sh", "-c", LOGIN_SHELL]);
+        assert!(host.finish_terminal("docker-shell-abc123").is_some());
 
+        host.answer_next_prompt(Some(&[]));
         plugin.handle("containers", ViewEvent::Button("stop".into()), &host.invocation()).unwrap();
         assert!(host.process_runs().iter().any(|run| run.args == ["stop", "abc123"]));
         assert!(plugin.selected.is_none());
@@ -1369,18 +1496,24 @@ mod tests {
 
         plugin.handle("containers", ViewEvent::Select("def456".into()), &host.invocation()).unwrap();
         let toolbar = plugin.render("containers", None, &host.invocation()).unwrap().toolbar;
-        assert_eq!(toolbar.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["refresh", "start", "configuration"]);
+        assert_eq!(toolbar.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["refresh", "start", "rebuild", "configuration"]);
 
         plugin.handle("containers", ViewEvent::Button("start".into()), &host.invocation()).unwrap();
         assert!(host.process_runs().iter().any(|run| run.args == ["start", "def456"]));
+        let started = &host.notifications_with_actions()[0];
+        assert_eq!(started.actions, [openidea_plugin::NotificationAction::new("Open Shell", "shell").argument("def456")]);
 
         plugin.handle("containers", ViewEvent::Activate("abc123".into()), &host.invocation()).unwrap();
-        assert_eq!(host.terminals()[0].args[2], "abc123");
+        assert!(host.finish_terminal("docker-shell-abc123").is_some());
+        plugin.run_command("shell", &host.invocation(), Some("abc123")).unwrap();
+        assert!(host.finish_terminal("docker-shell-abc123").is_some());
+        assert!(plugin.run_command("shell", &host.invocation(), Some("def456")).is_err(), "the mock still lists def456 as stopped");
     }
 
     #[test]
     fn view_explains_empty_denied_and_failed_listings() {
         let host = docker_host("");
+        host.add_file(".devcontainer/devcontainer.json", "{}");
         let message = |host: &MockHost| match Main::default().render("containers", None, &host.invocation()).unwrap().body {
             Body::List(rows) if rows.len() == 1 && rows[0].key == "devcontainer:status" => rows[0].detail.clone().unwrap(),
             _ => panic!("a status row visible in Services"),

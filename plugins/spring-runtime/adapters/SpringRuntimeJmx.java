@@ -3,7 +3,7 @@ import javax.management.*;
 import javax.management.openmbean.CompositeData;
 import javax.management.remote.*;
 
-/** Read-only JMX probe: localhost only, no credentials, getAttribute/getMBeanInfo only. */
+/** Read-only JMX probe: localhost only, no credentials. Reads fixed attributes and invokes only the Spring Boot health and info operations. */
 public class SpringRuntimeJmx {
     static final String[][] ALLOWED = {
         {"java.lang:type=Runtime", "Uptime", "VmName", "VmVersion", "InputArguments"},
@@ -11,9 +11,9 @@ public class SpringRuntimeJmx {
         {"java.lang:type=Threading", "ThreadCount"},
         {"java.lang:type=OperatingSystem", "SystemLoadAverage", "AvailableProcessors"},
     };
-    static final String[] SPRING = {
-        "org.springframework.boot:type=Endpoint,name=Health",
-        "org.springframework.boot:type=Endpoint,name=Info",
+    static final String[][] SPRING = {
+        {"org.springframework.boot:type=Endpoint,name=Health", "health"},
+        {"org.springframework.boot:type=Endpoint,name=Info", "info"},
     };
 
     static String esc(String s) {
@@ -47,6 +47,35 @@ public class SpringRuntimeJmx {
         }
     }
 
+    /** One output entry per leaf (`bean#op().path.to.leaf`), so the plugin can mask by the leaf key. */
+    static void flatten(StringBuilder out, String key, Object v, int depth) {
+        if (out.length() > 20000 || v == null) return;
+        if ((v instanceof Map<?, ?> || v instanceof Iterable<?>) && depth >= 6) {
+            out.append(out.length() > 1 ? "," : "").append(esc(key)).append(':').append(esc("(nested too deep, not shown)"));
+        } else if (v instanceof Map<?, ?> m) {
+            for (Map.Entry<?, ?> e : m.entrySet()) flatten(out, key + "." + e.getKey(), e.getValue(), depth + 1);
+        } else if (v instanceof Iterable<?> items) {
+            int i = 0;
+            for (Object item : items) {
+                if (i >= 64) break;
+                flatten(out, key + "[" + i + "]", item, depth + 1);
+                i++;
+            }
+        } else if (v instanceof String || v instanceof Number || v instanceof Boolean || v instanceof Enum<?>) {
+            out.append(out.length() > 1 ? "," : "").append(esc(key)).append(':').append(esc(String.valueOf(v)));
+        } else {
+            out.append(out.length() > 1 ? "," : "").append(esc(key)).append(':').append(esc("(value not shown)"));
+        }
+    }
+
+    static void operation(StringBuilder out, MBeanServerConnection c, String bean, String name) {
+        try {
+            Object v = c.invoke(new ObjectName(bean), name, new Object[0], new String[0]);
+            flatten(out, bean + "#" + name + "()", v, 0);
+        } catch (Exception e) {
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         int port = args.length == 1 ? Integer.parseInt(args[0]) : 0;
         if (port < 1024 || port > 65535) {
@@ -60,13 +89,8 @@ public class SpringRuntimeJmx {
             for (String[] entry : ALLOWED) {
                 for (int i = 1; i < entry.length; i++) add(out, c, entry[0], entry[i]);
             }
-            for (String name : SPRING) {
-                ObjectName on = new ObjectName(name);
-                if (!c.isRegistered(on)) continue;
-                int taken = 0;
-                for (MBeanAttributeInfo info : c.getMBeanInfo(on).getAttributes()) {
-                    if (info.isReadable() && taken++ < 16) add(out, c, name, info.getName());
-                }
+            for (String[] entry : SPRING) {
+                if (c.isRegistered(new ObjectName(entry[0]))) operation(out, c, entry[0], entry[1]);
             }
         }
         System.out.println(out.append('}'));

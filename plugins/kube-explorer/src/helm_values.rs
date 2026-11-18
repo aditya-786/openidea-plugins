@@ -41,7 +41,7 @@ fn path_at(doc: &Document, caret: usize) -> Option<Vec<String>> {
     ok.then_some(parts)
 }
 
-fn find_key(values: &str, path: &[String]) -> Option<Range> {
+pub(crate) fn find_key(values: &str, path: &[String]) -> Option<Range> {
     let mut stack: Vec<(usize, String)> = vec![];
     let mut skip_deeper = None;
     let mut at = 0;

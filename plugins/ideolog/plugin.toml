@@ -5,15 +5,18 @@ description = "Log file viewer. Detects the log format (IntelliJ IDEA, TeamCity 
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 homepage = "https://github.com/arnaud-ritti/openidea-plugins/tree/main/plugins/ideolog"
 license = "MIT"
-change-notes = "Unreleased: owned bounded JVM live-tail/filter panel with secure read handles, rotation grace, cancel/expiry/source invalidation; API1.4 builtin Log folding and nested selection ranges with Extend Log Selection command. Unreleased: exact-source cached JVM timestamp/severity/category semantic tokens and reviewed source marks, UTF16 unique-range admission and lifecycle/config/source invalidation; no provider child processes or storage reads. Unreleased: optional approved-Java17+ regex/SimpleDateFormat observation snapshots with explicit locale/timezone, reviewed bounded source, cancellation/deadline, Java capture semantics and source-guarded navigation; editor providers never launch Java. Unreleased: numeric variable-width timestamp fields, k/K hour conventions, explicit UTC/GMT and GMT offsets. Unreleased: custom hh:mm:ss a timestamp parsing with AM/PM midnight/noon normalization, numeric offsets and preview/import consistency. Native Patterns table and structured forms replace the packaged web panel; enabled-state column and bidirectional pattern ordering; existing draft identities, validation and preview remain. Numeric custom level suffixes no longer become false error navigation/outline entries. ISO offsets normalized for time-gap calculations; malformed suffixes refused. Fallback source ranking excludes foreign project owners and refuses tied candidates. Jump source owner checks and strict UTF16 caret admission. Custom syntax language admission and complete-line cutoff safety. Owned bounded stack-frame definitions; ambiguous/capped candidates and invalid line numbers refuse navigation. Unreleased: semantic newline search is confined to a UTF8-safe64KiB source prefix, withholding partial cutoff lines.  built-in Log semantic requests reuse warmed configuration and check cooperative deadlines during detection/grouping and lazy event parsing.  optional paged snapshots now check cooperative Task cancellation/deadline between format regex attempts and physical event-grouping lines; no streaming or native semantic-renderer fix.  Ideolog: Highlight Selection (editor menu) adds the selected text as a highlighting pattern; Remove Custom Highlightings; the Patterns view edits a pattern in place (Edit) and reorders (Move Up). Ideolog Patterns view to add and remove custom formats and highlighting patterns without XML; status bar item naming the detected log format; timeGapSeconds setting colours the time of events that follow a long pause. 0.2.0: custom formats and highlighting patterns (Ideolog XML, lookaround supported); Jump to Source (F7) for stack frames and logging lines; Go to Next Error (Shift+F7), Go to Previous / Next Entry; Cmd+click on stack frames; Log (Ideolog) remains a manual lexical/fold/outline fallback; built-in Log owns *.log with the semantic overlay. 0.1.0: first release."
+change-notes = """\
+Next release: A Log Levels panel beside log editors counts errors, warnings, exceptions, info, debug and trace entries with previous and next buttons and filters the log snapshot by level; Highlight Selection and log navigation appear only in log files, large logs say how much is highlighted, and Remove Custom Highlightings asks first; live tail and a patterns table, and live tail no longer stops on the JVM's Picked up JAVA_TOOL_OPTIONS message, with plain confirmations, status and permission messages for live tail and JVM capture; whole logs are coloured and folded, changed patterns apply right away, and custom timestamp formats and numeric level suffixes no longer show false errors; Jump to Source searches only source files, file changes keep Mark Current Log Source marks, log commands are enabled only in log editors, and the patterns tab is now Formats and Highlighting everywhere. \
+0.3.0: new hub window with live tail. \
+0.2.0: plugin icon and audit improvements."""
 categories = ["languages", "tools"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-language:ideolog", "on-language:log", "on-event:editor-focused", "on-event:file-opened", "on-event:file-saved", "on-event:files-changed", "on-event:settings-changed", "on-event:file-closed", "on-view:patterns"]
 
 # Highlighting needs none; the navigation commands read the log and open files,
-# the status item follows the focused editor, the Patterns view keeps its patterns in storage.
+# the status item follows the focused editor, the Formats and Highlighting tab keeps its patterns in storage.
 [capabilities]
 optional = ["editor.read", "project.read", "events", "storage", "process:java"]
 
@@ -34,6 +37,13 @@ languages = ["log"]
 schema = "settings.schema.json"
 title = "Ideolog"
 
+# Beside log editors; shown only with the optional editor.read grant.
+[[contributes.editorPanels]]
+id = "levels"
+web = "web/levels.html"
+width = 220
+when = "editorLangId == log || editorLangId == ideolog"
+
 [[contributes.views]]
 id = "patterns"
 title = "Ideolog"
@@ -43,14 +53,14 @@ web = "web/resources/hub.html"
 
 [[contributes.commands]]
 id = "patterns"
-title = "Ideolog: Custom Formats and Highlighting"
+title = "Ideolog: Formats and Highlighting"
 category = "Ideolog"
 
 [[contributes.commands]]
 id = "highlight-selection"
 title = "Ideolog: Highlight Selection"
 category = "Ideolog"
-when = "editorFocus"
+when = "editorFocus && (editorLangId == log || editorLangId == ideolog)"
 
 [[contributes.commands]]
 id = "remove-highlightings"
@@ -61,37 +71,37 @@ category = "Ideolog"
 id = "jump-to-source"
 title = "Ideolog: Jump to Source"
 category = "Ideolog"
-when = "editorFocus"
+when = "editorFocus && (editorLangId == log || editorLangId == ideolog)"
 
 [[contributes.commands]]
 id = "next-error"
 title = "Ideolog: Go to Next Error"
 category = "Ideolog"
-when = "editorFocus"
+when = "editorFocus && (editorLangId == log || editorLangId == ideolog)"
 
 [[contributes.commands]]
 id = "next-warning"
 title = "Ideolog: Go to Next Warning"
 category = "Ideolog"
-when = "editorFocus"
+when = "editorFocus && (editorLangId == log || editorLangId == ideolog)"
 
 [[contributes.commands]]
 id = "next-exception"
 title = "Ideolog: Go to Next Exception"
 category = "Ideolog"
-when = "editorFocus"
+when = "editorFocus && (editorLangId == log || editorLangId == ideolog)"
 
 [[contributes.commands]]
 id = "next-entry"
 title = "Ideolog: Go to Next Entry"
 category = "Ideolog"
-when = "editorFocus"
+when = "editorFocus && (editorLangId == log || editorLangId == ideolog)"
 
 [[contributes.commands]]
 id = "previous-entry"
 title = "Ideolog: Go to Previous Entry"
 category = "Ideolog"
-when = "editorFocus"
+when = "editorFocus && (editorLangId == log || editorLangId == ideolog)"
 
 [[contributes.keymaps]]
 command = "jump-to-source"
@@ -104,12 +114,13 @@ key = "Shift+F7"
 [[contributes.menus]]
 menu = "editor.context"
 command = "highlight-selection"
+when = "editorLangId == log || editorLangId == ideolog"
 
 [[contributes.commands]]
 id = "capture-log"
 title = "Ideolog: Capture Active Log Snapshot"
 category = "Ideolog"
-when = "editorFocus"
+when = "editorFocus && (editorLangId == log || editorLangId == ideolog)"
 
 [[contributes.commands]]
 id = "log-snapshot"
@@ -120,6 +131,7 @@ category = "Ideolog"
 id = "mark-log-source"
 title = "Ideolog: Mark Current Log Source"
 category = "Ideolog"
+when = "editorFocus && editorLangId == log"
 
 [[contributes.commands]]
 id = "clear-log-source"
@@ -130,7 +142,7 @@ category = "Ideolog"
 id = "capture-jvm"
 title = "Ideolog: Capture JVM Regex and Date Observations"
 category = "Ideolog"
-when = "editorFocus"
+when = "editorFocus && (editorLangId == log || editorLangId == ideolog)"
 
 [[contributes.providers]]
 kinds = ["folding"]

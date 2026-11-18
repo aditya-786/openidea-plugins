@@ -15,6 +15,8 @@ const EVENT_LISTENER: &str = "org.springframework.context.event.EventListener";
 const MAX_CHOICES: usize = 500;
 const MAX_CHECKED: usize = 1000;
 const TITLE: &str = "Spring Beans";
+/// Source reading inside the check's task, which may run for 60 s.
+const TASK_SCAN: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 pub enum Generate {
@@ -29,8 +31,16 @@ pub fn active_profiles() -> Vec<String> {
     stored.split(',').filter(|p| !p.is_empty()).map(str::to_owned).collect()
 }
 
+fn storage_denied() -> String {
+    ui_kit::denied::message("Remembering active profiles", "storage", "Spring Beans Navigator")
+}
+
 pub fn change_active_profiles(nav: &mut Navigator, ctx: &Invocation) -> Result<Option<String>, Error> {
     let project = ctx.project().ok_or("Open a project first.")?;
+    if let Err(Error::Denied(_)) = host::storage::get(ACTIVE_PROFILES) {
+        host::notify(NotificationLevel::Warning, TITLE, &storage_denied());
+        return Ok(None);
+    }
     let mut names: BTreeSet<String> = active_profiles().into_iter().collect();
     let world = World::new(nav.indexes.get(&project, COMMAND_BUDGET));
     let declared = world.beans().flat_map(|(_, b)| &b.profiles);
@@ -60,8 +70,9 @@ pub fn change_active_profiles(nav: &mut Navigator, ctx: &Invocation) -> Result<O
         format!("Active Spring profiles (now: {})", current.join(", "))
     };
     let Some(chosen) = host::pick_many(&title, &items)? else { return Ok(None) };
-
-    host::storage::set(ACTIVE_PROFILES, &chosen.join(","))?;
+    if !save_profiles(&chosen)? {
+        return Ok(None);
+    }
     let message = if chosen.is_empty() {
         "No active profile: every bean is considered.".to_owned()
     } else {
@@ -71,13 +82,22 @@ pub fn change_active_profiles(nav: &mut Navigator, ctx: &Invocation) -> Result<O
     Ok(None)
 }
 
+/// Stores the chosen profiles; `false` (with a notice) when storage is denied.
+pub(crate) fn save_profiles(chosen: &[String]) -> Result<bool, Error> {
+    match host::storage::set(ACTIVE_PROFILES, &chosen.join(",")) {
+        Ok(()) => Ok(true),
+        Err(Error::Denied(_)) => {
+            host::notify(NotificationLevel::Warning, TITLE, &storage_denied());
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn generate(nav: &mut Navigator, ctx: &Invocation, kind: Generate) -> Result<Option<String>, Error> {
     let editor = ctx.editor().ok_or("Open a Java class first.")?;
     let path = editor.path();
     let (initial_version, text, _, _) = locate(&editor)?;
-    if text.len() > 12 * 1024 {
-        return Err("The source is too large for a complete generation preview.".into());
-    }
     let project = host::project_of(&path).ok_or("Open the Java source inside a project.")?;
     let root = project.root()?;
     if root.is_empty() || root.len() > 512 || path.len() > 512 || !crate::cache::owned(&path, &root)
@@ -174,19 +194,8 @@ pub fn generate(nav: &mut Navigator, ctx: &Invocation, kind: Generate) -> Result
         for edit in &mut edits { edit.text = edit.text.replace("\r\n", "\n").replace('\n', "\r\n"); }
     }
 
-    let mut ranges = edits.iter().map(|edit| {
-        let start = offset(&text, edit.range.start).ok_or(Error::Stale)?;
-        let end = offset(&text, edit.range.end).ok_or(Error::Stale)?;
-        if start > end { return Err(Error::Stale); }
-        Ok((start, end, &edit.text))
-    }).collect::<Result<Vec<_>, Error>>()?;
-    ranges.sort_by_key(|(start, end, _)| (*start, *end));
-    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) { return Err(Error::Stale); }
-    let mut proposed = text.clone();
-    for (start, end, replacement) in ranges.into_iter().rev() {
-        proposed.replace_range(start..end, replacement);
-    }
-    let body = format!("Project: {root}\nSource: {path}\n\nApply this complete proposed Java source in one versioned editor edit?\n\n{proposed}");
+    let (_, changes) = crate::reviewed(&text, &edits)?;
+    let body = format!("Project: {root}\nSource: {path}\n\nApply these changes in one versioned editor edit?\n\n{changes}");
     if !ui_kit::prompts::confirm_exact("Review Spring Java generation", &body)? {
         return Ok(None);
     }
@@ -199,7 +208,7 @@ pub fn generate(nav: &mut Navigator, ctx: &Invocation, kind: Generate) -> Result
     match editor.apply_edits(version, &edits) {
         Ok(_) => {}
         Err(Error::Denied(_)) => {
-            host::notify(NotificationLevel::Warning, TITLE, "Allow editor changes for Spring Beans in Settings › Plugins to add code.")
+            host::notify(NotificationLevel::Warning, TITLE, &ui_kit::denied::message("Adding code", "editor.write", "Spring Beans Navigator"))
         }
         Err(e) => return Err(e),
     }
@@ -308,16 +317,23 @@ fn capitalize(name: &str) -> String {
 
 pub fn check_configuration(nav: &mut Navigator, ctx: &Invocation) -> Result<Option<String>, Error> {
     let project = ctx.project().ok_or("Open a project first.")?;
-    let index = nav.indexes.get(&project, COMMAND_BUDGET);
-    let mut complete = index.complete() && index.files().len() <= MAX_CHECKED;
+    let task = host::begin_task("Checking Spring configuration", false);
+    let index = nav.indexes.get(&project, TASK_SCAN);
     let world = World::new(index);
+    let sources: Vec<(&String, &str)> = world
+        .files
+        .keys()
+        .filter_map(|path| match path.rsplit('.').next() {
+            Some("java") => Some((path, "java")),
+            Some("kt") => Some((path, "kotlin")),
+            Some("xml") => Some((path, "xml")),
+            _ => None,
+        })
+        .collect();
+    let mut complete = world.complete && sources.len() <= MAX_CHECKED;
     let mut found = Vec::new();
-    for path in world.files.keys().take(MAX_CHECKED) {
-        let language = match path.rsplit('.').next() {
-            Some("kt") => "kotlin",
-            Some("xml") => "xml",
-            _ => "java",
-        };
+    for (done, (path, language)) in sources.into_iter().take(MAX_CHECKED).enumerate() {
+        task.report(done as u32, None, Some(file_name(path)));
         let Ok(text) = project.read_file(path) else {
             complete = false;
             continue;

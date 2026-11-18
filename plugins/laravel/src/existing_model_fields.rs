@@ -761,6 +761,10 @@ impl State {
             json!({"prepared":true,"instruction":"In the model editor, choose Apply prepared model fields…; one undo reverses the migration and source update."}),
         )
     }
+    pub(crate) fn prepared(&self, root: &str) -> Option<(String, String)> {
+        let session = self.projects.get(root)?;
+        session.pending.as_ref().map(|pending| (pending.key.clone(), session.context.path.clone()))
+    }
     pub(crate) fn actions(&self, doc: &Document) -> Vec<FileAction> {
         self.projects
             .iter()

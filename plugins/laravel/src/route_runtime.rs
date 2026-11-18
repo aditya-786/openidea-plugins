@@ -470,7 +470,7 @@ pub fn capture(ctx: &Invocation, index: &Index) -> Result<Snapshot, Error> {
             crate::ui_text::text("native.dockerRoute.d22791bd83","Refresh registered Laravel routes (executes project PHP)"),
             true,
         );
-        let child = crate::artisan_runner::start_background("php", &ARGS.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(), project)?;
+        let child = crate::artisan_runner::start_background(crate::artisan_runner::Runner::Php, &ARGS.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(), project)?;
         if let Err(error) = child.close_stdin() {
             let _ = child.kill();
             return Err(error);
@@ -558,7 +558,7 @@ mod tests {
         host.add_file("artisan", "<?php");
         assert!(matches!(
             capture(&host.invocation(), &Index::default()),
-            Err(Error::Denied(_))
+            Err(Error::Invalid(message)) if message.contains("process:php permission")
         ));
         assert!(parse(&sample().replace("GET|HEAD", "SHELL"), &Index::default()).is_err());
     }

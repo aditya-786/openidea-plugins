@@ -8,4 +8,5 @@ publish = false
 [workspace]
 
 [dependencies]
-openidea-plugin = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
+openidea-plugin = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
+quick-xml = "0.42"

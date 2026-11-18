@@ -157,6 +157,23 @@ pub fn best_line(message: &str, text: &str) -> Option<(usize, u32)> {
     best
 }
 
+fn find_sources(project: &Project) -> Result<Vec<String>, Error> {
+    #[cfg(not(test))]
+    {
+        let glob = format!("**/*.{{{}}}", SOURCE_EXTENSIONS.join(","));
+        project.find_files(&glob, MAX_SOURCE_FILES as u32)
+    }
+    // MockHost's glob has no braces; the host's does.
+    #[cfg(test)]
+    {
+        let mut files = Vec::new();
+        for extension in SOURCE_EXTENSIONS {
+            files.extend(project.find_files(&format!("**/*.{extension}"), MAX_SOURCE_FILES as u32)?);
+        }
+        Ok(files)
+    }
+}
+
 /// The source line that most likely logged `message`: files must contain its
 /// longest word; the longest shared substring wins, then the file name score.
 pub fn find_logging_line(
@@ -168,12 +185,13 @@ pub fn find_logging_line(
     let owner_root=project.root()?;
     let anchor = words(message).filter(|w| w.len() >= 4).max_by_key(|w| w.len());
     let task = host::begin_task("Finding the source of the log event", true);
-    let files: Vec<String> = project
-        .find_files("**/*", 200_000)?
-        .into_iter()
-        .filter(|path| path.rsplit_once('.').is_some_and(|(_, ext)| SOURCE_EXTENSIONS.contains(&ext)))
-        .take(MAX_SOURCE_FILES)
-        .collect();
+    if task.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let files = find_sources(project)?;
+    if task.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
 
     let mut best: Option<((usize, u32), String, u32)> = None;
     let mut ambiguous=false;

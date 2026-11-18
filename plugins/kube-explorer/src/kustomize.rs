@@ -280,6 +280,9 @@ impl Cache {
     pub(crate) fn clear(&mut self) {
         self.paths.clear();
     }
+    pub(crate) fn evict(&mut self, path: &str) {
+        self.paths.retain(|(_, p)| p != path);
+    }
     pub(crate) fn warm(&mut self, path: &str) {
         if path.len() > 4096
             || !(path.ends_with(".yaml")

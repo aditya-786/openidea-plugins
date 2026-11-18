@@ -4,31 +4,31 @@
       "type": "boolean",
       "title": "Colour additional ignore files (shared)",
       "default": true,
-      "description": "Shared colouring for the additional dotignore file family; built-in IDE grammar is unchanged. Used when Ignore preferences select Inherit."
+      "description": "Colours ignore files the IDE does not recognise. Ignore: Dialect Checks and Preferences overrides this unless set to Inherit."
     },
     "missingGitignore": {
       "type": "boolean",
       "title": "Warn about a Git project without a .gitignore file",
       "default": true,
-      "description": "Used when Ignore > Dialect Checks and Preferences selects Inherit. Explicit application-global form overrides take precedence."
+      "description": "Ignore: Dialect Checks and Preferences overrides this unless set to Inherit."
     },
     "ignoredEditing": {
       "type": "boolean",
       "title": "Show Ignored in the status bar when editing an ignored file",
       "default": true,
-      "description": "Used when Ignore > Dialect Checks and Preferences selects Inherit. Explicit application-global form overrides take precedence."
+      "description": "Ignore: Dialect Checks and Preferences overrides this unless set to Inherit."
     },
     "insertAtCursor": {
       "type": "boolean",
       "title": "Insert templates at the caret instead of at the end of the file",
       "default": false,
-      "description": "Used when Ignore > Dialect Checks and Preferences selects Inherit. Explicit application-global form overrides take precedence."
+      "description": "Ignore: Dialect Checks and Preferences overrides this unless set to Inherit."
     },
     "unignoreActions": {
       "type": "boolean",
       "title": "Offer Add to .gitignore (unignore) in the quick-fix menu",
       "default": true,
-      "description": "Used when Ignore > Dialect Checks and Preferences selects Inherit. Explicit application-global form overrides take precedence."
+      "description": "Ignore: Dialect Checks and Preferences overrides this unless set to Inherit."
     }
   }
 }

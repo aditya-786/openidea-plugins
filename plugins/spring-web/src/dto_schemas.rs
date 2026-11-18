@@ -9,32 +9,65 @@ pub struct Sources {
     files: BTreeMap<String, (String, JavaFile)>,
     uncertain_packages: BTreeSet<String>,
 }
+const MAX_FILE: usize = 256 << 10;
+const MAX_BYTES: usize = 8 << 20;
+const MAX_FILES: usize = 2000;
+const BUDGET: Duration = Duration::from_secs(30);
+
 impl Sources {
-    pub fn collect(project: &Project) -> Result<Self, Error> {
+    /// The `controllers` and, from them, the source files of the types they name: through
+    /// imports, and through same-directory files whose name appears in the text. Files that cannot
+    /// be read, are too large or fall outside the budget are listed in `skipped`.
+    pub fn collect(
+        project: &Project,
+        controllers: &[String],
+        skipped: &mut Vec<String>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, Error> {
         let start = Instant::now();
-        let mut paths = BTreeSet::new();
+        let mut by_dir: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for glob in ["**/*.java", "**/*.kt"] {
             let found = project.find_files(glob, 10_000)?;
             if found.len() >= 10_000 {
-                return Err(Error::Failed(
-                    "DTO source discovery was capped; export requires a complete source snapshot."
-                        .into(),
-                ));
+                skipped.push("some source files (more than 10 000 found)".into());
             }
-            paths.extend(found);
+            for path in found {
+                let (dir, name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
+                let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+                by_dir.entry(dir.to_owned()).or_default().push((stem.to_owned(), path.clone()));
+            }
         }
+        let mut queue = controllers.to_vec();
+        let mut seen: BTreeSet<String> = queue.iter().cloned().collect();
         let mut files = BTreeMap::new();
         let mut bytes = 0usize;
-        for path in paths {
-            let text = project.read_file(&path)?;
-            bytes += text.len();
-            if text.len() > 256 << 10 || bytes > 8 << 20 || start.elapsed() > Duration::from_secs(3)
-            {
-                return Err(Error::Failed(
-                    "DTO source snapshot exceeded its bounded export budget.".into(),
-                ));
+        while let Some(path) = queue.pop() {
+            if cancelled() {
+                return Err(Error::Cancelled);
             }
+            if start.elapsed() > BUDGET || files.len() >= MAX_FILES || bytes > MAX_BYTES {
+                skipped.push("the remaining files (export budget reached)".into());
+                break;
+            }
+            let name = path.rsplit('/').next().unwrap_or(&path);
+            let text = match project.read_file(&path) {
+                Ok(text) if text.len() <= MAX_FILE => text,
+                Ok(_) => {
+                    skipped.push(format!("{name} (over 256 KiB)"));
+                    continue;
+                }
+                Err(_) => {
+                    skipped.push(format!("{name} (unreadable)"));
+                    continue;
+                }
+            };
+            bytes += text.len();
             let parsed = spring_text::parse_source(&path, &text);
+            for related in related_files(&path, &text, &parsed, &by_dir) {
+                if seen.insert(related.clone()) {
+                    queue.push(related);
+                }
+            }
             files.insert(path, (text, parsed));
         }
         Ok(Self::new(files))
@@ -83,67 +116,53 @@ impl Sources {
     pub fn text(&self, path: &str) -> Option<String> {
         self.files.get(path).map(|(text, _)| text.clone())
     }
-    pub fn routes(&self) -> Vec<ui_kit::routes::Route> {
-        let mut routes = Vec::new();
-        for (path, (text, _)) in &self.files {
-            let Some(info) = crate::endpoints::file_info(path, text) else {
-                continue;
-            };
-            for endpoint in info.endpoints {
-                let class = info
-                    .methods
-                    .iter()
-                    .find(|m| m.range == endpoint.range)
-                    .map(|m| m.ty.clone())
-                    .or_else(|| endpoint.handler.as_ref().and_then(|h| h.ty.clone()))
-                    .unwrap_or_else(|| {
-                        path.rsplit(['/', '\\'])
-                            .next()
-                            .unwrap_or(path)
-                            .split('.')
-                            .next()
-                            .unwrap_or_default()
-                            .to_owned()
-                    });
-                routes.push(ui_kit::routes::Route {
-                    method: if endpoint.verb.is_empty() {
-                        "ANY".into()
-                    } else {
-                        endpoint.verb
-                    },
-                    path: endpoint.path,
-                    handler: ui_kit::routes::Handler {
-                        class,
-                        member: endpoint
-                            .handler
-                            .as_ref()
-                            .map(|h| h.method.clone())
-                            .or_else(|| {
-                                info.methods
-                                    .iter()
-                                    .find(|m| m.range == endpoint.range)
-                                    .map(|m| m.name.clone())
-                            }),
-                    },
-                    name: None,
-                    location: Some(openidea_plugin::Location {
-                        path: path.clone(),
-                        range: endpoint.range,
-                    }),
-                });
-            }
-        }
-        routes.sort_by(|a, b| {
-            (&a.path, &a.method, &a.handler.class).cmp(&(&b.path, &b.method, &b.handler.class))
-        });
-        routes
-    }
     pub fn schemas(&self) -> Schemas<'_> {
         Schemas {
             sources: self,
             components: serde_json::Map::new(),
         }
     }
+}
+fn related_files(
+    path: &str,
+    text: &str,
+    file: &JavaFile,
+    by_dir: &BTreeMap<String, Vec<(String, String)>>,
+) -> Vec<String> {
+    let words: BTreeSet<&str> = spring_text::java::tokens(text).into_iter().map(|t| t.s).collect();
+    fn dir_of<'a>(
+        by_dir: &'a BTreeMap<String, Vec<(String, String)>>,
+        suffix: &'a str,
+    ) -> impl Iterator<Item = &'a (String, String)> {
+        by_dir.iter().filter(move |(dir, _)| dir.ends_with(suffix)).flat_map(|(_, files)| files)
+    }
+    let mut out = Vec::new();
+    let own_dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+    if let Some(siblings) = by_dir.get(own_dir) {
+        out.extend(siblings.iter().filter(|(stem, _)| words.contains(stem.as_str())).map(|(_, path)| path.clone()));
+    }
+    for import in file.imports.iter().filter(|i| !i.is_static) {
+        let slashed = import.path.replace('.', "/");
+        if let Some(package) = slashed.strip_suffix("/*") {
+            let suffix = format!("/{package}");
+            out.extend(
+                dir_of(by_dir, &suffix).filter(|(stem, _)| words.contains(stem.as_str())).map(|(_, path)| path.clone()),
+            );
+            continue;
+        }
+        let mut class = slashed.as_str();
+        for _ in 0..3 {
+            let Some((package, stem)) = class.rsplit_once('/') else { break };
+            let suffix = format!("/{package}");
+            let found: Vec<_> = dir_of(by_dir, &suffix).filter(|(candidate, _)| candidate == stem).map(|(_, path)| path.clone()).collect();
+            if !found.is_empty() {
+                out.extend(found);
+                break;
+            }
+            class = package;
+        }
+    }
+    out
 }
 pub struct Schemas<'a> {
     sources: &'a Sources,
@@ -544,7 +563,7 @@ fn apply_validation(annotations: &[spring_text::java::Annotation], file: &JavaFi
     };
     let numeric = matches!(kind.as_str(), "integer" | "number");
     let mut required = false;
-    let mut set = |shape: &mut Value, key: &str, value: Value| {
+    let set = |shape: &mut Value, key: &str, value: Value| {
         if !key.is_empty() {
             shape[key] = value;
         }
@@ -832,7 +851,7 @@ mod tests {
         );
     }
     #[test]
-    fn media_unknown_shapes_are_extensions_and_oversized_snapshot_cannot_export() {
+    fn media_unknown_shapes_are_extensions_and_unreferenced_oversized_file_is_not_read() {
         use openidea_plugin::{Plugin, mock::MockHost};
         let host = MockHost::install();
         host.add_file(
@@ -855,14 +874,28 @@ mod tests {
         );
         assert!(op.get("requestBody").is_none());
         assert!(op["responses"]["default"].get("content").is_none());
-        let previous = host.clipboard();
         host.add_file("src/TooLarge.java", &" ".repeat((256 << 10) + 1));
-        assert!(
-            crate::WebTools::default()
-                .run_command("copy-endpoints-openapi", &host.invocation(), None)
-                .is_err()
-        );
-        assert_eq!(host.clipboard(), previous);
+        crate::WebTools::default()
+            .run_command("copy-endpoints-openapi", &host.invocation(), None)
+            .unwrap();
+        assert!(host.clipboard().unwrap().contains("/items"), "a file no endpoint refers to is never read");
+    }
+    #[test]
+    fn openapi_export_skips_unreadable_file() {
+        use openidea_plugin::{Plugin, mock::MockHost};
+        let host = MockHost::install();
+        host.add_file("src/demo/Dto.java", "package demo; public record Dto(String name) {}");
+        host.add_file("src/demo/Api.java","package demo; @RestController class Api {@PostMapping(\"/items\") Dto save(@RequestBody Dto body){return body;}}");
+        let big = format!("package demo; @RestController class Big {{@GetMapping(\"/big\") String big(){{return \"\";}}}}{}", " ".repeat((256 << 10) + 1));
+        host.add_file("src/demo/Big.java", &big);
+        crate::WebTools::default()
+            .run_command("copy-endpoints-openapi", &host.invocation(), None)
+            .unwrap();
+        assert!(!host.tasks().is_empty(), "the long work runs inside a task");
+        let exported: Value = serde_json::from_str(&host.clipboard().unwrap()).unwrap();
+        assert_eq!(exported["paths"]["/items"]["post"]["x-spring-source-request-schema"]["$ref"], "#/components/schemas/demo.Dto");
+        let notes: Vec<_> = host.notifications().into_iter().map(|n| n.body).collect();
+        assert!(notes.iter().any(|m| m.contains("Big.java (over 256 KiB)")), "{notes:?}");
     }
     #[test]
     fn fresh_registered_openapi_command_attaches_declared_dto_media_shapes() {

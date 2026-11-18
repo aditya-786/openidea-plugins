@@ -386,6 +386,7 @@ fn extract_json_schema(text: &str, keys: &[Key], line: u32) -> Option<Vec<TextEd
 
 struct Bundle<'r> {
     json: bool,
+    main: &'r str,
     read: &'r dyn Fn(&str) -> Fetched,
     assigned: HashMap<(String, String), (String, String)>,
     taken: HashMap<String, HashSet<String>>,
@@ -448,6 +449,10 @@ impl Bundle<'_> {
         for r in found {
             let Some((target_file, fragment)) = spec::split_ref(&r.target) else { continue };
             let next_file = if target_file.is_empty() { file.to_owned() } else { crate::resolve_path(file, target_file) };
+            if next_file == self.main {
+                rewritten.replace_range(r.at..r.end, &format!("#{fragment}"));
+                continue;
+            }
             let (next_section, next_name) = self.import(&next_file, fragment)?;
             rewritten.replace_range(r.at..r.end, &format!("#/components/{next_section}/{next_name}"));
         }
@@ -497,7 +502,7 @@ fn pointed_body(content: &str, pointer: &str) -> Option<Vec<String>> {
 pub fn bundle(text: &str, path: &str, read: &dyn Fn(&str) -> Fetched) -> Result<Option<String>, String> {
     let json = spec::is_json(text);
     let keys = spec::scan(text);
-    let mut bundle = Bundle { json, read, assigned: HashMap::new(), taken: HashMap::new(), entries: Vec::new() };
+    let mut bundle = Bundle { json, main: path, read, assigned: HashMap::new(), taken: HashMap::new(), entries: Vec::new() };
     for k in &keys {
         let Some(rest) = k.key.strip_prefix("components.") else { continue };
         if let Some((section, name)) = rest.split_once('.') {
@@ -517,7 +522,14 @@ pub fn bundle(text: &str, path: &str, read: &dyn Fn(&str) -> Fetched) -> Result<
             continue;
         }
 
-        let (section, name) = bundle.import(&crate::resolve_path(path, file), fragment)?;
+        let target = crate::resolve_path(path, file);
+        if target == path {
+            result.replace_range(r.at..r.end, &format!("#{fragment}"));
+            changed = true;
+            continue;
+        }
+
+        let (section, name) = bundle.import(&target, fragment)?;
         result.replace_range(r.at..r.end, &format!("#/components/{section}/{name}"));
         changed = true;
     }
@@ -650,6 +662,16 @@ components:
         assert!(spec::refs(&out).iter().all(|r| r.target.starts_with("#/components/schemas/")));
         let keys = spec::scan(&out);
         assert!(spec::refs(&out).iter().all(|r| spec::target(&keys, &r.target[1..]).is_some()));
+    }
+
+    #[test]
+    fn bundle_ref_back_to_main_not_duplicated() {
+        const MAIN: &str = "openapi: 3.0.0\npaths:\n  /p:\n    get:\n      responses:\n        '200':\n          content:\n            a/b:\n              schema:\n                $ref: './c.yaml#/Pet'\ncomponents:\n  schemas:\n    X:\n      type: string\n";
+        let main = MAIN;
+        let read = files(&[("/p/c.yaml", "Pet:\n  type: object\n  properties:\n    x:\n      $ref: './api.yaml#/components/schemas/X'\n"), ("/p/api.yaml", MAIN)]);
+        let out = bundle(main, "/p/api.yaml", &read).unwrap().unwrap();
+        assert!(out.contains("$ref: '#/components/schemas/X'"), "{out}");
+        assert!(!out.contains("X_2"), "{out}");
     }
 
     #[test]

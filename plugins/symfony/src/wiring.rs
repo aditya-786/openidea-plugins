@@ -397,7 +397,7 @@ fn blank_comments(text: &str) -> String {
     while let Some(open) = text[from..].find("<!--") {
         let start = from + open;
         let end = text[start..].find("-->").map_or(text.len(), |close| start + close + 3);
-        visible.replace_range(start..end, &text[start..end].chars().map(|c| if c == '\n' || c == '\r' { c } else { ' ' }).collect::<String>());
+        visible.replace_range(start..end, &text[start..end].chars().map(|c| if c == '\n' || c == '\r' { c.to_string() } else { " ".repeat(c.len_utf8()) }).collect::<String>());
         from = end;
     }
 

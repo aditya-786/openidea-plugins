@@ -136,7 +136,11 @@ fn open(ctx: &Invocation, id: &str, launch: &Launch) -> Result<(), Error> {
     let key = format!("symfony-{id}-{hash:016x}");
     let command = host::Command::new(launch.program).args(&launch.args);
     match host::open_terminal_session(&key, &launch.line(), &command) {
-        Err(Error::Denied(_)) => Err(Error::Denied(format!("Allow the process:{} capability in Settings › Plugins.", launch.program))),
+        Err(Error::Denied(_)) => Err(Error::Invalid(ui_kit::denied::message(
+            "Running this command",
+            &format!("process:{}", launch.program),
+            "Symfony",
+        ))),
         other => other.map(|_| ()),
     }
 }
@@ -180,7 +184,7 @@ mod tests {
         let mut processes = Processes::default();
         processes.handle(&ViewEvent::Button("process-start".into()), &host.invocation()).unwrap();
         let denied = MockHost::install().with_capabilities(&["project.read"]);
-        assert!(matches!(Processes::default().handle(&ViewEvent::Button("process-start".into()), &denied.invocation()), Err(Error::Denied(_))));
+        assert!(matches!(Processes::default().handle(&ViewEvent::Button("process-start".into()), &denied.invocation()), Err(Error::Invalid(m)) if m.contains("process:symfony")));
     }
 
     #[test]

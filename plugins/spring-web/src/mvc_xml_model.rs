@@ -15,7 +15,6 @@ const MVC: &str = "http://www.springframework.org/schema/mvc";
 const BEANS: &str = "http://www.springframework.org/schema/beans";
 const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 const XML: &str = "http://www.w3.org/XML/1998/namespace";
-const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
 struct Rule {
     path: &'static str,
     profiles: u16,
@@ -27,18 +26,6 @@ struct Rule {
 }
 #[path = "mvc_xml_tables.rs"]
 mod tables;
-fn name(s: &str) -> bool {
-    let mut parts = s.split(':');
-    let first = parts.next().unwrap_or("");
-    let valid = |p: &str| {
-        p.as_bytes()
-            .first()
-            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
-            && p.bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
-    };
-    valid(first) && parts.next().is_none_or(valid) && parts.next().is_none()
-}
 fn uri<'a>(es: &'a [Element], mut i: usize, prefix: &str) -> Option<&'a str> {
     if prefix == "xml" {
         return Some(XML);
@@ -56,153 +43,7 @@ fn uri<'a>(es: &'a [Element], mut i: usize, prefix: &str) -> Option<&'a str> {
     }
 }
 fn closed(text: &str, es: &[Element]) -> bool {
-    if text.len() > 256 << 10
-        || text
-            .chars()
-            .any(|c| (c as u32) < 32 && !matches!(c, '\t' | '\n' | '\r'))
-        || text.contains('&')
-        || es.is_empty()
-        || es.len() > 2048
-    {
-        return false;
-    }
-    let mut stack = vec![];
-    let mut at = 0;
-    let mut element = 0;
-    let mut roots = 0;
-    while let Some(next) = text[at..].find('<').map(|v| at + v) {
-        if text[at..next].contains("]]>") || stack.is_empty() && !text[at..next].trim().is_empty() {
-            return false;
-        }
-        let tail = &text[next..];
-        if tail.starts_with("<!--") {
-            let Some(end) = tail.find("-->") else {
-                return false;
-            };
-            if tail[4..end].contains("--") {
-                return false;
-            }
-            at = next + end + 3;
-            continue;
-        }
-        if tail.starts_with("<?") {
-            let Some(end) = tail.find("?>") else {
-                return false;
-            };
-            let target = tail[2..end].split_whitespace().next().unwrap_or("");
-            if target.eq_ignore_ascii_case("xml") && (target != "xml" || next != 0) {
-                return false;
-            }
-            at = next + end + 2;
-            continue;
-        }
-        if tail.starts_with("<![CDATA[") {
-            if stack.is_empty() {
-                return false;
-            }
-            let Some(end) = tail.find("]]>") else {
-                return false;
-            };
-            at = next + end + 3;
-            continue;
-        }
-        if tail.starts_with("<!") {
-            return false;
-        }
-        if tail.starts_with("</") {
-            let Some(end) = tail.find('>') else {
-                return false;
-            };
-            let written = tail[2..end].trim_end();
-            if !name(written) || stack.pop() != Some(written) {
-                return false;
-            }
-            at = next + end + 1;
-            continue;
-        }
-        let Some(e) = es.get(element).filter(|e| e.start == next) else {
-            return false;
-        };
-        let i = element;
-        element += 1;
-        if !name(&e.name)
-            || e.tag_end > text.len()
-            || text.as_bytes().get(e.tag_end.saturating_sub(1)) != Some(&b'>')
-        {
-            return false;
-        }
-        let prefix = e.name.split_once(':').map_or("", |p| p.0);
-        if !prefix.is_empty() && uri(es, i, prefix).is_none() {
-            return false;
-        }
-        if prefix == "xmlns" {
-            return false;
-        }
-        let mut seen = BTreeSet::new();
-        let mut cursor = e.at + e.name.len();
-        for a in &e.attrs {
-            if !name(&a.name)
-                || !text[cursor..a.at].trim().is_empty()
-                || a.value_at == 0
-                || a.value_end >= e.tag_end
-            {
-                return false;
-            }
-            let quote = text.as_bytes()[a.value_at - 1];
-            if !matches!(quote, b'\'' | b'"')
-                || text.as_bytes()[a.value_end] != quote
-                || text[a.at + a.name.len()..a.value_at - 1].trim() != "="
-                || a.value.contains('<')
-            {
-                return false;
-            }
-            let (prefix, local) = a.name.split_once(':').unwrap_or(("", &a.name));
-            let namespace = if a.name == "xmlns" || prefix == "xmlns" {
-                if local == "xmlns" && prefix == "xmlns"
-                    || local == "xml" && prefix == "xmlns" && a.value != XML
-                    || a.value == XMLNS
-                    || a.value == XML && (prefix != "xmlns" || local != "xml")
-                    || prefix == "xmlns" && a.value.is_empty()
-                {
-                    return false;
-                }
-                XMLNS
-            } else if prefix.is_empty() {
-                ""
-            } else {
-                let Some(value) = uri(es, i, prefix) else {
-                    return false;
-                };
-                value
-            };
-            if !seen.insert((namespace, local)) {
-                return false;
-            }
-            cursor = a.value_end + 1;
-        }
-        let rest = text[cursor..e.tag_end - 1].trim();
-        if !matches!(rest, "" | "/") {
-            return false;
-        }
-        if stack.is_empty() {
-            roots += 1;
-            if roots > 1 {
-                return false;
-            }
-        }
-        if rest != "/" {
-            stack.push(e.name.as_str());
-            if stack.len() > 64 {
-                return false;
-            }
-        }
-        at = e.tag_end;
-    }
-    stack.is_empty()
-        && roots == 1
-        && element == es.len()
-        && text[at..].trim().is_empty()
-        && !text[at..].contains("]]>")
+    text.len() <= 256 << 10 && !es.is_empty() && es.len() <= 2048 && !text.contains("<!DOCTYPE") && spring_text::xml::analysis_valid(text)
 }
 fn profile(es: &[Element]) -> Option<u16> {
     let mut selected = None;
@@ -388,21 +229,16 @@ fn ref_sites(es: &[Element], profile: u16) -> Vec<(String, usize, usize)> {
 }
 #[path = "mvc_xml_context.rs"]
 mod context;
-/// Findings needing file access: `read` returns a file's text, `find` the files matching a glob (None when the host cannot say).
+/// Findings needing file access: `read` returns a file's text, `find` the files matching a glob (None when the host cannot say),
+/// `imported_elsewhere` whether another file may import this one (true when unknown).
 pub(super) fn context_findings(
     path: &str,
     text: &str,
     read: &dyn Fn(&str) -> Option<String>,
     find: &dyn Fn(&str) -> Option<Vec<String>>,
+    imported_elsewhere: &dyn Fn() -> bool,
 ) -> Vec<Finding> {
-    let file = path.rsplit('/').next().unwrap_or(path);
-    let imported_elsewhere = || {
-        let Some(files) = find("**/*.xml") else {
-            return true;
-        };
-        files.iter().filter(|f| f.as_str() != path).any(|f| read(f).is_none_or(|t| t.contains(file) && t.contains("import")))
-    };
-    let mut out = context::check(path, text, read, &imported_elsewhere);
+    let mut out = context::check(path, text, read, imported_elsewhere);
     if path.contains("/src/main/") {
         for (location, start, end) in context::resource_locations(text) {
             let Some(globs) = context::location_globs(&location) else {

@@ -117,7 +117,7 @@ pub fn server(base: &str) -> Option<&str> {
 pub fn profiles() -> Result<Vec<Profile>, Error> {
     let raw = host::setting("selfHostedProfiles").unwrap_or_else(|| "[]".into());
     if raw.len() > 65536 {
-        return Err("Self-hosted tracker profile descriptors exceed64KiB.".into());
+        return Err("Self-hosted tracker profile descriptors exceed 64KiB.".into());
     }
     let profiles:Vec<Profile>=serde_json::from_str(&raw).map_err(|_|"Self-hosted profile descriptors must be an array of family/baseUrl/profilePath objects.")?;
     let mut seen = std::collections::BTreeSet::new();
@@ -129,7 +129,7 @@ pub fn profiles() -> Result<Vec<Profile>, Error> {
                 || !seen.insert((p.family.clone(), p.base_url.clone()))
         })
     {
-        return Err("Use at most16 unique Redmine/Mantis/Generic HTTPS DNS profile descriptors with normalized absolute credential paths.".into());
+        return Err("Use at most 16 unique Redmine/Mantis/Generic HTTPS DNS profile descriptors with normalized absolute credential paths.".into());
     }
     Ok(profiles)
 }
@@ -221,7 +221,7 @@ fn invoke(profile: &Profile, request: Value) -> Result<Value, Error> {
     let output = Private(format!("{directory}/self-hosted-{nonce}.out"));
     let text = request.to_string();
     if text.len() > 16384 {
-        return Err("Tracker bridge request exceeds16KiB.".into());
+        return Err("Tracker bridge request exceeds 16KiB.".into());
     }
     host::fs::write_file(&input.0, &text)?;
     let task = host::begin_task("Self-hosted tracker credential bridge", true);
@@ -252,18 +252,18 @@ fn invoke(profile: &Profile, request: Value) -> Result<Value, Error> {
         bytes += chunk.stdout.len() + chunk.stderr.len();
         if bytes > 8192 {
             let _ = child.kill();
-            return Err("Tracker bridge process output exceeds8KiB.".into());
+            return Err("Tracker bridge process output exceeds 8KiB.".into());
         }
         if let Some(status) = chunk.status {
             if status != 0 {
-                return Err("Tracker credential bridge failed; check private profile and approved Python3. No credential or remote body is displayed.".into());
+                return Err("Tracker credential bridge failed; check private profile and approved Python 3. No credential or remote body is displayed.".into());
             }
             break;
         }
     }
     let stat = host::fs::stat(&output.0)?;
     if stat.kind != openidea_plugin::FileKind::File || stat.size > 1 << 20 {
-        return Err("Tracker bridge result exceeds1MiB.".into());
+        return Err("Tracker bridge result exceeds 1MiB.".into());
     }
     let result: Value = serde_json::from_str(&host::fs::read_file(&output.0)?)
         .map_err(|_| "Invalid tracker bridge JSON.")?;
@@ -290,7 +290,7 @@ fn parse(result: &Value, profile: &Profile) -> Result<Vec<Task>, Error> {
     let items = result["issues"]
         .as_array()
         .filter(|a| a.len() <= 50)
-        .ok_or("Tracker result exceeds50issues.")?;
+        .ok_or("Tracker result exceeds 50 issues.")?;
     let mut seen = std::collections::BTreeSet::new();
     let mut tasks = Vec::new();
     for item in items {
@@ -372,12 +372,12 @@ pub fn search(scope: &Scope, family: &str) -> Result<Vec<Task>, Error> {
         .filter(|q| q.len() <= 4096 && !q.chars().any(char::is_control))
         .ok_or("Self-hosted bridges require an explicit bounded parameter search.")?;
     if !(1..=5).contains(&scope.page) {
-        return Err("Search supports at most5bounded pages.".into());
+        return Err("Search supports at most 5 bounded pages.".into());
     }
     if !ui_kit::prompts::confirm_exact(
         "Search this self-hosted tracker?",
         &format!(
-            "Approved Python3 reads the externally provisioned0600 credential profile and calls this exact HTTPS service; redirects are refused.\nFamily: {family}\nBase URL: {}\nProfile: {}\nQuery parameters: {}\nPage: {} (at most50results)\nRedmine supports documented issue filter parameters. Mantis requires project_id and optional filter_id. Generic sends the query text as the profile-declared search parameter. No unsupported free-text search is invented.",
+            "Approved Python 3 reads the externally provisioned 0600 credential profile and calls this exact HTTPS service; redirects are refused.\nFamily: {family}\nBase URL: {}\nProfile: {}\nQuery parameters: {}\nPage: {} (at most 50 results)\nRedmine supports documented issue filter parameters. Mantis requires project_id and optional filter_id. Generic sends the query text as the profile-declared search parameter. No unsupported free-text search is invented.",
             profile.base_url,
             serde_json::to_string(&profile.profile_path).unwrap_or_default(),
             serde_json::to_string(query).unwrap_or_default(),

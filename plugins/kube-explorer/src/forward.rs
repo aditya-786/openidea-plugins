@@ -37,10 +37,7 @@ impl Scope {
 
     pub(super) fn capture(context: Option<&str>, namespace: Option<&str>) -> Result<Self, Error> { Self::capture_in(context, namespace, None) }
     pub(super) fn capture_for_project(context: Option<&str>, namespace: Option<&str>, project: &Project) -> Result<Self, Error> {
-        Self::capture_in(context, namespace, Some(project)).map_err(|error| match error {
-            Error::Denied(_) | Error::Cancelled => error,
-            _ => Error::Failed("Selected Kubernetes scope could not be inspected; raw tool errors withheld.".into()),
-        })
+        Self::capture_in(context, namespace, Some(project)).map_err(|error| crate::tool_error("Reading the Kubernetes context", context, error))
     }
     fn capture_in(context: Option<&str>, namespace: Option<&str>, project: Option<&Project>) -> Result<Self, Error> {
         let config = config::kubeconfig();
@@ -182,15 +179,6 @@ struct Spec {
     row: String,
 }
 
-/// Approval is deliberately inert until a separate token-bearing native event.
-pub(super) struct Prepared {
-    spec: Spec,
-    token: String,
-    created: std::time::Instant,
-    restart: bool,
-}
-const APPROVAL_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-
 impl Spec {
     fn args(&self) -> Vec<String> {
         let mut rest = vec!["port-forward", self.target.as_str(), "--address=127.0.0.1"];
@@ -207,11 +195,9 @@ impl Spec {
     }
     fn preview(&self) -> String {
         format!(
-            "Project: {}\n{}\n\nProgram: kubectl\nExact arguments: {:?}\n\nLoopback only. Approval only prepares this command; a separate Launch Reviewed button event starts it after checking that event’s project. Listener availability is not confirmed by spawning. Managed ownership is this plugin instance/project; idle reclaim (normally about five idle minutes), invoking window close or plugin stop ends its process. Observed root, namespace, context, selection or kubeconfig changes retire the managed session; restart then requires a fresh draft. A kubeconfig/credential change after the final check remains outside atomic control.",
-            self.owner_root
-                .as_deref()
-                .unwrap_or("unbound terminal mode"),
+            "Forward {} to localhost only?\n\nProject: {}\nCommand: kubectl {:?}\n\nThe forward keeps running until you stop it, change the context or namespace, or close the project.",
             self.label(),
+            self.owner_root.as_deref().unwrap_or("none"),
             self.args()
         )
     }
@@ -369,33 +355,21 @@ fn ports(text: &str) -> Result<Vec<String>, Error> {
 
 impl KubeExplorer {
     pub(super) fn retire_forward(&mut self, reason: &str) {
-        let changed = self.forward.is_some() || self.prepared_forward.is_some() || self.show_forward_session
+        let changed = self.forward.is_some() || self.show_forward_session
             || self.forward_session.as_ref().is_some_and(|s| !s.retired);
         if let Some(session) = &mut self.forward_session {
             session.retire(reason);
         }
         self.forward = None;
-        self.prepared_forward = None;
         self.show_forward_session = false;
         if changed { crate::refresh_panel(); }
     }
     pub(super) fn expire_forward_context(&mut self, ctx: Option<&Invocation>) {
-        if self.forward_session.is_none()
-            && self.prepared_forward.is_none()
-            && self.forward.as_ref().is_none_or(|d| d.owner_root.is_none())
+        if self.forward_session.is_none() && self.forward.as_ref().is_none_or(|d| d.owner_root.is_none())
         {
             return;
         }
         let current = owner(ctx).ok().map(|(_, root)| root);
-        if self.prepared_forward.as_ref().is_some_and(|p| {
-            p.created.elapsed() >= APPROVAL_TTL
-                || p.spec.owner_root != current
-                || p.spec.selection != self.forward_selection()
-                || p.spec.scope.config != config::kubeconfig()
-        }) {
-            self.prepared_forward = None;
-            crate::refresh_panel();
-        }
         let changed = self.forward_session.as_ref().is_some_and(|s| {
             !s.retired
                 && (s.spec.owner_root != current
@@ -489,15 +463,11 @@ impl KubeExplorer {
         let args = draft.scope.args(&["get", &draft.kind, name, "-o", jsonpath, REQUEST_TIMEOUT]);
         if let Some(root) = &draft.owner_root {
             let project = host::projects()?.into_iter().find(|p|p.root().ok().as_deref()==Some(root)).ok_or(Error::Stale)?;
-            Scope::read_in(&args,Some(&project)).map_err(|error|match error {
-                Error::Denied(_) | Error::Cancelled => error,
-                _ => Error::Failed("Forwarding resource metadata could not be inspected; raw tool errors withheld.".into()),
-            })
+            Scope::read_in(&args,Some(&project)).map_err(|error|crate::tool_error("Reading the ports to forward",Some(&draft.scope.context),error))
         } else { Scope::read(&args) }
     }
 
     pub(super) fn start_terminal_forward(&mut self, ctx: Option<&Invocation>) -> Result<(), Error> {
-        self.prepared_forward = None;
         let Some(draft) = self.forward.clone() else {
             return Ok(());
         };
@@ -521,7 +491,7 @@ impl KubeExplorer {
         if !ui_kit::prompts::confirm_exact(
             "Start forwarding in terminal?",
             &format!(
-                "{}\n\nArguments: {:?}\n\nLoopback only. Stop it from the terminal; managed-session controls do not control this process.",
+                "{}\n\nCommand: kubectl {:?}\n\nThis listens on localhost only. Stop it from the terminal.",
                 spec.label(),
                 spec.args()
             ),
@@ -543,48 +513,8 @@ impl KubeExplorer {
         )
     }
 
-    fn stage_forward(&mut self, spec: Spec, restart: bool)->Result<(),Error> {
+    fn launch_forward(&mut self, spec: Spec, restart: bool, ctx: Option<&Invocation>) -> Result<(), Error> {
         self.ensure_panel_replace()?;
-        self.clear_panel_data();
-        self.retire_tree_callbacks();
-        self.new_rich_callback();
-        self.forward_nonce = self.forward_nonce.wrapping_add(1);
-        // Correlation token, not an authorization or encrypted window identity.
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        (
-            self.forward_nonce,
-            std::time::SystemTime::now(),
-            spec.preview(),
-        )
-            .hash(&mut hash);
-        self.prepared_forward = Some(Prepared {
-            spec,
-            token: format!(
-                "launch-reviewed-forward-{:016x}-{:016x}",
-                self.forward_nonce,
-                hash.finish()
-            ),
-            created: std::time::Instant::now(),
-            restart,
-        });
-        crate::refresh_views();
-        Ok(())
-    }
-
-    pub(super) fn prepared_forward_view(&self) -> Option<View> {
-        self.prepared_forward.as_ref().map(|p| View::message(&format!(
-            "PREPARED ONLY: approval has not started or replaced a process.\n{}\n\nChoose the separate Launch button within 60 seconds. Its new invocation must match this reviewed project and scope. A switch after that event begins remains outside atomic API1.3 control.", p.spec.preview()))
-            .button(Button::new(&p.token, if p.restart { "Launch Reviewed Restart" } else { "Launch Reviewed Forward" }))
-            .button(Button::new("cancel-reviewed-forward", "Cancel Prepared Forward")))
-    }
-
-    fn commit_forward(&mut self, token: &str, ctx: Option<&Invocation>) -> Result<(), Error> {
-        // Consume even on stale/error so approvals cannot be replayed.
-        let pending = self.prepared_forward.take().ok_or(Error::Stale)?;
-        if pending.token != token || pending.created.elapsed() >= APPROVAL_TTL {
-            return Err(Error::Stale);
-        }
-        let spec = pending.spec;
         self.check_forward(
             &spec.scope,
             &spec.selection,
@@ -593,12 +523,7 @@ impl KubeExplorer {
             spec.owner_root.as_deref(),
             ctx,
         )?;
-        if !pending.restart {
-            let draft = self.forward.as_ref().ok_or(Error::Stale)?;
-            if ports(&draft.ports)? != spec.ports || draft.target != spec.target {
-                return Err(Error::Stale);
-            }
-        } else {
+        if restart {
             let previous = self.forward_session.as_ref().ok_or(Error::Stale)?;
             if previous.retired || previous.running() || previous.spec.args() != spec.args() {
                 return Err(Error::Stale);
@@ -622,6 +547,7 @@ impl KubeExplorer {
                 "[Previous owned session output]\n{history}\n[New start failure]\n{failure}"
             ));
         }
+        self.clear_panel_data();
         self.retire_tree_callbacks();
         self.new_rich_callback();
         self.forward_session = Some(next);
@@ -631,7 +557,6 @@ impl KubeExplorer {
     }
 
     pub(super) fn start_managed_forward(&mut self, ctx: &Invocation) -> Result<(), Error> {
-        self.prepared_forward = None;
         let Some(draft) = self.forward.clone() else {
             return Ok(());
         };
@@ -659,23 +584,12 @@ impl KubeExplorer {
         };
         let replacing = self.forward_session.as_ref().is_some_and(Session::running);
         if !ui_kit::prompts::confirm_exact(
-            "Review managed port forward?",
-            &format!(
-                "{}{}",
-                spec.preview(),
-                if replacing {
-                    " The previous owned forwarding will be stopped first."
-                } else {
-                    ""
-                }
-            ),
+            "Start port forward?",
+            &format!("{}{}", spec.preview(), if replacing { "\n\nThe running forward will be stopped first." } else { "" }),
         )? {
             return Ok(());
         }
-        // ctx.project remains the original native call snapshot after the modal.
-        // Do not launch, stop or claim a fresh active-project check in this call.
-        self.stage_forward(spec, false)?;
-        Ok(())
+        self.launch_forward(spec, false, Some(ctx))
     }
 
     pub(super) fn forward_status(&mut self, ctx: Option<&Invocation>) -> View {
@@ -686,15 +600,15 @@ impl KubeExplorer {
             .as_ref()
             .is_some_and(|s| s.spec.owner_root != current || current.is_none())
         {
-            return View::message("No owned forwarding session for this project. Open a project with project.read permission to manage its session.").button(Button::new("back", "Back"));
+            return View::message("No port forward is running for this project.").button(Button::new("back", "Back"));
         }
         let selection = self.forward_selection();
         let Some(session) = &mut self.forward_session else {
-            return View::message("No owned forwarding session.");
+            return View::message("No port forward is running.");
         };
         session.poll();
         View::message(&format!(
-            "Project: {}\n{}\n{}\n\n{}\n\nCaptured scope, not continuously monitored. Only this plugin instance/project's process is controlled. Window close, scope change or idle reclamation ends it. Same-project windows share this instance; API1.3 exposes no stable window identity here.",
+            "Project: {}\n{}\n{}\n\n{}\n\nThe forward stops when you close the project or change the context or namespace.",
             session.spec.owner_root.as_deref().unwrap_or("unknown"),
             session.spec.label(),
             session.state,
@@ -711,16 +625,6 @@ impl KubeExplorer {
         button: &str,
         ctx: Option<&Invocation>,
     ) -> Result<bool, Error> {
-        if button.starts_with("launch-reviewed-forward-") {
-            self.expire_forward_context(ctx);
-            self.commit_forward(button, ctx)?;
-            return Ok(true);
-        }
-        if button == "cancel-reviewed-forward" {
-            self.prepared_forward = None;
-            crate::refresh_views();
-            return Ok(true);
-        }
         if !matches!(
             button,
             "forward-status" | "stop-forward" | "restart-forward"
@@ -736,7 +640,7 @@ impl KubeExplorer {
         match button {
             "forward-status" => {
                 self.ensure_panel_replace()?;
-                self.clear_panel_data();self.prepared_forward=None;self.new_rich_callback();
+                self.clear_panel_data();self.new_rich_callback();
                 if let Some(session) = &self.forward_session {
                     if !session.retired
                         && self
@@ -756,14 +660,12 @@ impl KubeExplorer {
                 self.show_forward_session = true;
             }
             "stop-forward" => {
-                self.prepared_forward = None;
                 if let Some(session) = &mut self.forward_session {
                     session.stop()?;
                 }
                 self.show_forward_session = true;
             }
             "restart-forward" => {
-                self.prepared_forward = None;
                 let Some(session) = &self.forward_session else {
                     return Ok(true);
                 };
@@ -782,11 +684,10 @@ impl KubeExplorer {
                     spec.owner_root.as_deref(),
                     ctx,
                 )?;
-                if !ui_kit::prompts::confirm_exact("Review port forward restart?", &spec.preview())?
-                {
+                if !ui_kit::prompts::confirm_exact("Restart port forward?", &spec.preview())? {
                     return Ok(true);
                 }
-                self.stage_forward(spec, true)?;
+                self.launch_forward(spec, true, ctx)?;
             }
             _ => return Ok(false),
         }
@@ -819,28 +720,14 @@ mod tests {
     fn start(host: &MockHost, kube: &mut KubeExplorer) {
         host.answer_next_prompt(Some(&[]));
         kube.start_managed_forward(&host.invocation()).unwrap();
-        commit(host, kube);
-    }
-    fn commit(host: &MockHost, kube: &mut KubeExplorer) {
-        let token = kube.prepared_forward.as_ref().unwrap().token.clone();
-        kube.forward_button(&token, Some(&host.invocation()))
-            .unwrap();
-    }
-
-    fn approve(host: &MockHost, kube: &mut KubeExplorer) -> String {
-        host.answer_next_prompt(Some(&[]));
-        kube.start_managed_forward(&host.invocation()).unwrap();
-        kube.prepared_forward.as_ref().unwrap().token.clone()
     }
 
     #[test]
-    fn panel_navigation_preserves_same_subject_child_but_retires_hidden_forward_review() {
-        let (host,mut kube)=setup();start(&host,&mut kube);let ticket=approve(&host,&mut kube);
+    fn panel_navigation_preserves_same_subject_child() {
+        let (host,mut kube)=setup();start(&host,&mut kube);
         let key=kube.test_resource_key("res:pods/web",&host.invocation());
         kube.run_command("resource-describe",&host.invocation(),Some(&key)).unwrap();
-        assert!(kube.details.is_some()&&kube.prepared_forward.is_none());
-        assert!(kube.forward_session.as_ref().unwrap().running());
-        assert!(matches!(kube.handle(PANEL,ViewEvent::Button(ticket),&host.invocation()),Err(Error::Stale)));
+        assert!(kube.details.is_some());
         assert!(kube.forward_session.as_ref().unwrap().running());
     }
     #[test]
@@ -892,28 +779,27 @@ mod tests {
         assert_eq!(host.terminals().len(),1);assert!(host.terminals()[0].args.iter().any(|arg|arg=="19090:80"));
     }
     #[test]
-    fn approval_only_prepares_and_separate_token_event_launches_once() {
+    fn port_forward_starts_after_one_confirm() {
         let (host, mut kube) = setup();
-        let token = approve(&host, &mut kube);
-        assert!(token.len() <= 128);
         assert!(kube.forward_session.is_none());
-        let view = kube.render(PANEL, None, &host.invocation()).unwrap();
-        assert!(
-            matches!(view.body, Body::Message(text) if text.contains("PREPARED ONLY") && text.contains("8080:80"))
-        );
-        assert!(
-            view.toolbar
-                .iter()
-                .any(|b| b.id == token && b.label == "Launch Reviewed Forward")
-        );
-        kube.handle(PANEL, ViewEvent::Button(token.clone()), &host.invocation())
-            .unwrap();
-        assert!(kube.forward_session.as_ref().unwrap().running());
-        assert!(kube.prepared_forward.is_none());
-        assert!(matches!(
-            kube.forward_button(&token, Some(&host.invocation())),
-            Err(Error::Stale)
-        ));
+        host.answer_next_prompt(Some(&[]));
+        kube.start_managed_forward(&host.invocation()).unwrap();
+        let session = kube.forward_session.as_ref().unwrap();
+        assert!(session.running());
+        assert!(session.spec.args().iter().any(|arg| arg == "port-forward"));
+        assert!(session.spec.args().iter().any(|arg| arg == "8080:80"));
+        assert!(host.terminals().is_empty());
+    }
+
+    #[test]
+    fn declined_confirm_never_starts_or_replaces_a_forward() {
+        let (host, mut kube) = setup();
+        host.answer_next_prompt(None);
+        kube.start_managed_forward(&host.invocation()).unwrap();
+        assert!(kube.forward_session.is_none());
+        start(&host, &mut kube);
+        host.answer_next_prompt(None);
+        kube.start_managed_forward(&host.invocation()).unwrap();
         assert!(kube.forward_session.as_ref().unwrap().running());
     }
 
@@ -945,94 +831,38 @@ mod tests {
         assert!(host.process_runs().last().unwrap().cwd.is_none(),"explicit unbound terminal mode retains its separate legacy inspection path");
     }
     #[test]
-    fn separate_launch_invocation_with_different_project_refuses() {
+    fn a_different_project_cannot_start_the_draft() {
         let (host, mut kube) = setup();
-        let token = approve(&host, &mut kube);
-        // This is a NEW event, not evidence that a native Invocation changes in a modal.
         host.set_project_root(Some("/other-project"));
-        let fresh_event = host.invocation();
-        assert!(matches!(
-            kube.handle(PANEL, ViewEvent::Button(token), &fresh_event),
-            Err(Error::Stale)
-        ));
+        host.answer_next_prompt(Some(&[]));
+        assert!(matches!(kube.start_managed_forward(&host.invocation()), Err(Error::Stale)));
         assert!(kube.forward_session.is_none());
-        assert!(kube.prepared_forward.is_none());
     }
 
     #[test]
-    fn stale_prepare_event_cannot_replace_or_consume_current_prepared_ticket() {
-        let (host,mut kube)=setup();let old=kube.test_control_key("start-managed-forward");
-        let token=approve(&host,&mut kube);
-        assert!(matches!(kube.handle(PANEL,ViewEvent::Button(old),&host.invocation()),Err(Error::Stale)));
-        assert!(kube.forward_session.is_none());
-        assert_eq!(kube.prepared_forward.as_ref().unwrap().token,token);
-        kube.handle(PANEL,ViewEvent::Button(token),&host.invocation()).unwrap();
-        assert!(kube.forward_session.as_ref().unwrap().running());
-    }
-
-    #[test]
-    fn prepared_approval_expires_without_sleep_and_is_consumed() {
-        let (host, mut kube) = setup();
-        let token = approve(&host, &mut kube);
-        kube.prepared_forward.as_mut().unwrap().created = std::time::Instant::now() - APPROVAL_TTL;
-        assert!(matches!(
-            kube.forward_button(&token, Some(&host.invocation())),
-            Err(Error::Stale)
-        ));
-        assert!(kube.prepared_forward.is_none() && kube.forward_session.is_none());
-    }
-
-    #[test]
-    fn cancellation_or_wrong_nonce_never_replaces_running_process() {
-        let (host, mut kube) = setup();
-        start(&host, &mut kube);
-        let token = approve(&host, &mut kube);
-        assert!(kube.forward_session.as_ref().unwrap().running());
-        kube.forward_button("cancel-reviewed-forward", Some(&host.invocation()))
-            .unwrap();
-        assert!(
-            kube.forward_button(&token, Some(&host.invocation()))
-                .is_err()
-        );
-        assert!(kube.forward_session.as_ref().unwrap().running());
-        let _ = approve(&host, &mut kube);
-        assert!(
-            kube.forward_button("launch-reviewed-forward-foreign", Some(&host.invocation()))
-                .is_err()
-        );
-        assert!(kube.prepared_forward.is_none());
-        assert!(kube.forward_session.as_ref().unwrap().running());
-    }
-
-    #[test]
-    fn stale_draft_ports_event_cannot_change_current_prepared_command() {
+    fn stale_draft_ports_event_cannot_change_a_running_forward() {
         let (host,mut kube)=setup();let old=kube.test_control_key("ports");
-        let token=approve(&host,&mut kube);
+        start(&host,&mut kube);
         assert!(matches!(kube.handle(PANEL,ViewEvent::Field(old,"9090:90".into()),&host.invocation()),Err(Error::Stale)));
-        assert_eq!(kube.prepared_forward.as_ref().unwrap().token,token);
         assert_eq!(kube.forward.as_ref().unwrap().ports,"8080:80");
-        assert!(kube.forward_session.is_none());
+        assert!(kube.forward_session.as_ref().unwrap().running());
     }
 
     #[test]
-    fn changed_fingerprint_consumes_approval_without_stopping_previous_handle() {
+    fn changed_fingerprint_refuses_without_stopping_the_running_forward() {
         let (host, mut kube) = setup();
         start(&host, &mut kube);
-        let token = approve(&host, &mut kube);
         host.on_process(KUBECTL, |_, _| Ok(openidea_plugin::ProcessOutput {
             status: Some(0), stderr: String::new(),
             stdout: r#"{"contexts":[{"name":"dev","context":{"cluster":"other","namespace":"team-a"}}],"clusters":[{"name":"other","cluster":{"server":"https://other.invalid"}}]}"#.into(),
         }));
-        assert!(matches!(
-            kube.forward_button(&token, Some(&host.invocation())),
-            Err(Error::Stale)
-        ));
-        assert!(kube.prepared_forward.is_none());
+        host.answer_next_prompt(Some(&[]));
+        assert!(matches!(kube.start_managed_forward(&host.invocation()), Err(Error::Stale)));
         assert!(kube.forward_session.as_ref().unwrap().running());
     }
 
     #[test]
-    fn restart_is_staged_and_requires_its_own_fresh_launch_event() {
+    fn restart_starts_after_its_own_single_confirm() {
         let (host, mut kube) = setup();
         start(&host, &mut kube);
         kube.forward_button("stop-forward", Some(&host.invocation()))
@@ -1040,40 +870,13 @@ mod tests {
         host.answer_next_prompt(Some(&[]));
         kube.forward_button("restart-forward", Some(&host.invocation()))
             .unwrap();
-        assert_eq!(kube.forward_session.as_ref().unwrap().state, "Stopped");
-        let view = kube.prepared_forward_view().unwrap();
-        let token = view
-            .toolbar
-            .iter()
-            .find(|b| b.label == "Launch Reviewed Restart")
-            .unwrap()
-            .id
-            .clone();
-        kube.forward_button(&token, Some(&host.invocation()))
-            .unwrap();
         assert!(kube.forward_session.as_ref().unwrap().running());
     }
 
     #[test]
-    fn replacing_prepare_changes_nonce_and_deactivation_invalidates_it() {
-        let (host, mut kube) = setup();
-        let first = approve(&host, &mut kube);
-        let second = approve(&host, &mut kube);
-        assert_ne!(first, second);
-        kube.deactivate();
-        assert!(kube.prepared_forward.is_none());
-        assert!(
-            kube.forward_button(&second, Some(&host.invocation()))
-                .is_err()
-        );
-        assert!(kube.forward_session.is_none());
-    }
-
-    #[test]
-    fn services_parent_collapse_preserves_current_session_and_reviewed_launch() {
+    fn services_parent_collapse_preserves_current_session() {
         let (host, mut kube) = setup();
         start(&host, &mut kube);
-        let token = approve(&host, &mut kube);
         let before = host.process_runs().len();
         kube.handle(
             TREE,
@@ -1088,10 +891,7 @@ mod tests {
         )
         .unwrap();
         assert!(kube.forward_session.as_ref().unwrap().running());
-        assert_eq!(kube.prepared_forward.as_ref().unwrap().token, token);
         assert_eq!(host.process_runs().len(), before);
-        commit(&host, &mut kube);
-        assert!(kube.forward_session.as_ref().unwrap().running());
     }
 
     #[test]
@@ -1212,7 +1012,6 @@ mod tests {
         host.answer_next_prompt(Some(&[]));
         kube.forward_button("restart-forward", Some(&host.invocation()))
             .unwrap();
-        commit(&host, &mut kube);
         let session = kube.forward_session.as_mut().unwrap();
         assert!(session.running());
         session.child.as_ref().unwrap().kill().unwrap();
@@ -1616,21 +1415,20 @@ mod tests {
     }
 
     #[test]
-    fn full_preview_identifies_owner_and_exact_argv_without_readiness_claim() {
+    fn preview_names_the_project_and_exact_command_in_plain_words() {
         let (host, mut kube) = setup();
         start(&host, &mut kube);
         let session = kube.forward_session.as_ref().unwrap();
         let preview = session.spec.preview();
         for expected in [
             "Project:",
-            "Program: kubectl",
+            "kubectl",
             "--context=dev",
             "--namespace=team-a",
             "pods/web",
             "127.0.0.1",
             "8080:80",
-            "idle reclaim",
-            "not confirmed",
+            "localhost only",
         ] {
             assert!(preview.contains(expected), "{expected}");
         }

@@ -78,8 +78,9 @@ fn is_dash(line: &str) -> bool {
 // but must not offer a refactor when its whitespace edits change scalar data.
 enum ValueFrame { Map(bool,std::collections::BTreeSet<String>), Sequence }
 #[derive(Default)]
-struct ValueGuard {frames:Vec<ValueFrame>,nodes:usize,docs:usize,bad:bool}
+pub(crate) struct ValueGuard {frames:Vec<ValueFrame>,nodes:usize,docs:usize,bad:bool}
 impl ValueGuard {
+    pub(crate) fn rejected(&self)->bool {self.bad}
     fn value(&mut self) {
         if let Some(ValueFrame::Map(key,_))=self.frames.last_mut() {
             if *key {self.bad=true;}else{*key=true;}

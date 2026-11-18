@@ -2,7 +2,6 @@ use super::*;
 impl GraphQlTools {
     pub fn live_diagnostics(&mut self, doc: &Document, allow_absence: bool) -> Vec<Diagnostic> {
         let _ = self.java.for_cached_document(&doc.path, &doc.text);
-        let _ = self.wiring.for_cached_document(&doc.path, &doc.text);
         let mut out = Vec::new();
         let Some(schemas) = self.schemas.for_cached_document(&doc.path, &doc.text) else {
             return out;
@@ -49,10 +48,7 @@ impl GraphQlTools {
             let Some(java) = self.java.for_cached_document(&doc.path, &doc.text) else {
                 return out;
             };
-            let Some(wiring) = self.wiring.for_cached_document(&doc.path, &doc.text) else {
-                return out;
-            };
-            if !allow_absence || !java.fresh() || !schemas.fresh() || !wiring.fresh() || wiring.iter().any(|(_, wired)| *wired) {
+            if !allow_absence || !java.fresh() || !schemas.fresh() || java.iter().any(|(_, f)| f.wired) {
                 return out;
             }
             let roots: Vec<_> = ROOTS.iter().map(|r| root_type(schemas, r.1)).collect();
@@ -61,7 +57,7 @@ impl GraphQlTools {
                     continue;
                 }
                 for field in ty.fields {
-                    if !java.iter().flat_map(|(_, hs)| hs).any(|h| h.field == field.name && type_of(h, schemas) == ty.name) {
+                    if !java.iter().flat_map(|(_, f)| &f.handlers).any(|h| h.field == field.name && type_of(h, schemas) == ty.name) {
                         out.push(
                             Diagnostic::new(
                                 field.range,

@@ -1,34 +1,43 @@
 id = "aritti.liquibase"
 name = "Liquibase Changelogs"
 version = "0.3.0" # x-release-please-version
-description = "Liquibase changelog support for XML, YAML and formatted SQL. Versioned source checks flag local duplicate/incomplete changesets, unknown YAML change types and missing formatted SQL headers; cached source hover and include navigation are bounded; completes change types and their attributes in YAML and changeset comments in SQL; Go to Definition on include; New › Liquibase Changelog templates; status, validate, update-sql and update run configurations for projects with a liquibase.properties."
+description = "Liquibase changelog support for XML, YAML, JSON and formatted SQL: flags duplicate or incomplete changesets, unknown YAML change types and missing SQL headers; hover and include navigation; completes change types and their attributes; Go to Definition on include; New › Liquibase Changelog templates; a changeset browser with pending status; status, validate and update-sql run configurations for projects with a liquibase.properties."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Unreleased: changelog include gutter markers use their own icon. Unreleased: structural changelog checks from the Liquibase XSD rules, offline: include/includeAll/sqlFile without path, sqlFile path existence (relative or classpath, quiet when ambiguous), invalid preConditions onFail/onError (root changelog accepts only HALT or WARN, changeSet HALT, CONTINUE, MARK_RAN or WARN, per the XSD), unknown XML precondition elements (uniqueConstraintExists now accepted), YAML preConditions not a list, formatted SQL non-boolean changeset attributes and --rollback before the first changeset. Unreleased: generated changeset groups, move/ignore/restore and operation-class selection; exact atomic multi-file XML group export. Unreleased: JSON key and formatted-SQL changeset attribute completion; expanded core change attributes; real OSS4.29.2 serializer fixtures and XML1.1-compatible generated source capture; command-specific offline URL/output environment binding with inherited-key collision rejection. Unreleased: native migration browser with source navigation, scoped Filter/Clear and reviewed Actions picker; no packaged web wrapper. Unreleased: Browser source selections reject ambiguous decoded JSON owners before adoption or replacement/deletion. XML namespace admission rejects duplicate expanded attribute names while retaining distinct namespace attributes. XML admission checks qualified names with Unicode XML1.0 NCName ranges before accepting source edits or generated candidates. Include navigation validates XML before scanner fallback and refuses opaque ownership while preserving legacy unnamespaced read-only support. XML mutation and generated-candidate admission validate declaration context/shape and reserved processing-instruction targets. XML source mutation rejects prefixed namespace undeclarations and malformed qualified/reserved bindings while preserving legal xml attributes and Liquibase prefixes. Offline diff cleanup preserves changed/unreadable staged input slots rather than truncating source it can no longer match; unchanged owned bytes still clear on finish/Stop. Versioned local diagnostics and cached source hover replace gutter diagnostic publishing. Unknown include/property absence stays quiet; unproved automatic table Rename anchors are withheld. Confirmed atomic editor FileActions add XML/formatted-SQL changesets, create standalone changelogs in four formats or create a child plus XML parent include as one workspace action. XML mutation validates well-formed Liquibase namespaces; paths, collisions, snapshots and identities are guarded. Removed tee/direct command writes; generator commands guide to editor intentions. gutter link on each include to its changelog file; Liquibase icon on db.changelog-* files. JSON changelogs (checks, changesets view, Go to Definition on include, project index). completion of include file paths (XML, YAML), changeSet author names (setting or git user.name) and, in XML changesets without a declared schema, change type elements and attributes. Project-wide Go to Declaration from the document index: include to the changelog file, rollback changeSetId to its changeSet, table names to createTable. Liquibase: Update (Asks First)… and Liquibase: Rollback Count… commands, with confirmation and a changeset count. 0.1.0: first release. Live checks (duplicate and incomplete changesets, unknown change types in YAML, unresolved include and includeAll, formatted SQL header), YAML and formatted SQL completion, Go to Definition on include, changelog templates and Liquibase CLI run configurations."
+change-notes = """\
+Next release: Update Database… and Rollback Count… confirmations name the database and host, now also for SQL Server, Oracle, Db2, H2 and SQLite, and ask you to type the command when the database cannot be read, and Show Pending Changesets marks pending and applied changesets in the browser and notes changelog files. New Changeset and New Changelog create the entry on the open changelog, and New Changelog… without an open changelog creates a first one at a path you choose; changelog include markers have their own icon and list every changelog of an includeAll directory, Go to Definition offers each matching include file, and missing include, includeAll and sqlFile targets are flagged in the editor; undeclared ${property} placeholders are flagged, with a setting to turn this off; offline structure checks for XML changelogs, faster on large changelogs and also for a changelog open before the plugin starts, and completion for JSON keys and SQL attributes; one name per action, a shorter offline diff toolbar with icons, plainer messages, and hover shows facts only. \
+0.3.0: migration browser and generated changeset groups. \
+0.2.0: plugin icon and audit improvements."""
 categories = ["tools", "linters"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-language:xml", "on-language:yaml", "on-language:json", "on-language:sql", "on-view:changesets"]
 
 [capabilities]
 required = ["project.read"]
-# process: reviewed offline diff and Update/Rollback commands; git: the author name offered in changesets.
-optional = ["process:liquibase", "process:git", "storage", "events"]
+# process: reviewed offline diff, Update/Rollback and Show Pending Changesets (status) commands; git: the author name offered in changesets.
+# editor.*, project.write: New Changeset edits the open changelog; New Changelog… creates the file (and the parent include).
+optional = ["process:liquibase", "process:git", "storage", "events", "editor.read", "editor.write", "project.write"]
 
 [[contributes.commands]]
 id = "choose-sources"
-title = "Liquibase: Choose Browser Root and Configuration…"
+title = "Liquibase: Choose Sources…"
 category = "Liquibase"
 
 [[contributes.commands]]
 id = "clear-sources"
-title = "Liquibase: Browse All Project Changelogs"
+title = "Liquibase: Browse All Changelogs"
 category = "Liquibase"
 
 [[contributes.commands]]
 id = "update-confirmed"
-title = "Liquibase: Update (Asks First)…"
+title = "Liquibase: Update Database…"
+category = "Liquibase"
+
+[[contributes.commands]]
+id = "show-pending"
+title = "Liquibase: Show Pending Changesets…"
 category = "Liquibase"
 
 [[contributes.commands]]
@@ -60,14 +69,11 @@ languages = ["xml", "yaml", "json", "sql"]
 
 [[contributes.providers]]
 kinds = ["completion"]
-languages = ["xml", "yaml", "sql"]
+languages = ["xml", "yaml", "json", "sql"]
 
 # Database-writing operations remain freshly reviewed commands; never native Rerun.
 [[contributes.runConfigurations]]
 files = ["liquibase.properties"]
-
-[[contributes.documentIndexers]]
-extensions = ["xml", "yaml", "yml", "json", "sql"]
 
 [[contributes.views]]
 id = "changesets"
@@ -114,7 +120,7 @@ category = "Liquibase"
 
 [[contributes.commands]]
 id = "offline-diff-run"
-title = "Liquibase: Run Reviewed Offline Snapshot Diff…"
+title = "Liquibase: Run Offline Diff…"
 category = "Liquibase"
 
 [[contributes.markerIcons]]

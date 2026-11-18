@@ -3,7 +3,7 @@
 
 use crate::xml_namespace::CoreAttributes;
 use crate::aop;
-use crate::checks::{Groups, capitalised, coexist, names_of, same_scope, weaving_plugin_in_build};
+use crate::checks::{Groups, capitalised, coexist, names_of, weaving_plugin_in_build};
 use crate::model::{is_xml_ref, name_tokens};
 use crate::{Found, World};
 use openidea_plugin::TextEdit;
@@ -46,7 +46,7 @@ fn check_xml_mode(path: &str, text: &str, world: &World, groups: Groups, externa
         name_conventions(&els, &mut out);
     }
     if groups.duplicate_names {
-        duplicate_names(path, &els, &by_name, &mut out);
+        duplicate_names(path, &els, &by_name, world, &mut out);
     }
     if groups.xml {
         out.extend(xml_check::check(&crate::xml_namespace::plain_attributes(&els), SCAN_RULES, |_| true));
@@ -240,7 +240,7 @@ fn profiles_of(els: &[xml::Element], i: usize) -> Vec<String> {
 }
 
 /// Same-file clashes inside one `<beans>` element, and clashes with beans declared in code.
-fn duplicate_names(path: &str, els: &[xml::Element], by_name: &ByName, out: &mut Vec<Finding>) {
+fn duplicate_names(path: &str, els: &[xml::Element], by_name: &ByName, world: &World, out: &mut Vec<Finding>) {
     let mut seen: Vec<(Option<usize>, &str)> = Vec::new();
     for (i, e) in beans_elements(els, "bean").filter(|(_, e)| e.parent.is_some_and(|p| els[p].local() == "beans")) {
         let profiles = profiles_of(els, i);
@@ -258,7 +258,7 @@ fn duplicate_names(path: &str, els: &[xml::Element], by_name: &ByName, out: &mut
                     && !other.conditional
                     && names_of(other).any(|n| n == name)
                     && coexist(&profiles, &other.profiles)
-                    && same_scope(path, other_path)
+                    && world.same_scope(path, other_path)
             });
             if let Some(&(other_path, _)) = clash {
                 let message = format!(
@@ -528,7 +528,7 @@ fn sibling_text(path: &str, relative: &str) -> Option<Option<String>> {
 /// Whether the project's sources declare a package under the first two segments of `qualified`, so a miss is not a library class.
 fn owns_package_root(world: &World, qualified: &str) -> bool {
     let root = qualified.split('.').take(2).collect::<Vec<_>>().join(".");
-    qualified.contains('.') && world.files.values().flat_map(|m| &m.types).any(|t| t.qualified.starts_with(&format!("{root}.")))
+    qualified.contains('.') && world.declares_under(&format!("{root}."))
 }
 
 fn unresolved_classes(els: &[xml::Element], world: &World, out: &mut Vec<Finding>) {

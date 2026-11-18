@@ -4,10 +4,13 @@ version = "0.3.0" # x-release-please-version
 description = "Spring Structure window and editor support for Spring Integration, Spring Batch and Spring Modulith. Integration: channel index for Java and XML, navigation and completion of channel names and bean refs, producer/consumer gutter arrows, unconsumed channel warnings. Batch: XML job navigation, completion and transition/bean checks, spring.batch.job.name navigation, Spring Batch 5 migration hints. Modulith: application module checks, allowedDependencies completion, open-module quick fix. One Spring Structure tool window switches between the integration channels, batch jobs, modulith modules and the module diagram; modules whose dependency the build files do not mention stay idle. Replaces aritti.spring-batch and aritti.spring-modulith: uninstall them to avoid duplicate windows and completions."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Unreleased: custom gutter icon for channel producer/consumer markers. Unreleased: SpEL syntax check also covers the remaining XSD *-expression attributes (payload, default-payload, request-payload, correlation-strategy, release-strategy, group-timeout, null-result, time-to-live, value-type, key, on-success, on-failure) and literal XPath 1.0 in int-xml xpath-expression attributes and elements (warning with exact range; placeholders stay quiet). Unreleased: strict SpEL syntax check of literal expressions in Integration XML (expression, value-expression, selector-expression) and Java DSL filter/route/transform/split string arguments (warning with exact range; #{} and ${} placeholders stay quiet), with @bean references navigating to bean definitions and an info only when the bean index is complete. Unreleased: Modulith warns at use sites (extends/implements, annotations, generic arguments, parameter/return types, new, Foo.member) of types imported by exact single-type import that are module-internal or not in allowedDependencies; wildcard/static imports, shadowed names and type parameters stay quiet. Unreleased: effective context ownership for channel/bean usages: literal @Import(X.class), @ImportResource(\"classpath:x.xml\"), @ComponentScan(basePackages) and XML <import resource> edges (classpath: maps to src/main/resources, file:, placeholders, patterns, profiles/conditions and Kotlin are withheld; a bare @ComponentScan/@SpringBootApplication scans its own package and subpackages, scanBasePackages/scanBasePackageClasses/basePackageClasses are followed, while @ComponentScans, ImportSelector/ImportBeanDefinitionRegistrar imports and non-classpath: @ImportResource paths stay unprovable) narrow Go to Definition and gutter targets to the file's context closure; usages whose definitions sit in several unrelated contexts get a 'defined in N contexts' info instead of picking one; unowned files and unprovable imports stay global and quiet. Unreleased: reviewed Spring Batch launch command generation for source-proved jobs: pick a literal job, choose --spring.batch.job.name= or -Dspring.batch.job.name=, add key=value job parameters (restart = same job name and all parameters, per Spring Boot docs), review the exact java -jar command and open it in a terminal only after confirmation; no datasource access, no execution without confirmation. Unreleased: Java DSL flows (IntegrationFlow.from chains through intermediate endpoints, .channel, .wireTap, filter/aggregate discardChannel, routeToRecipients recipient) and Kotlin integrationFlow(\"in\") { } builders add literal channel edges to the diagram, usages and definition navigation; dynamic, escaped or unproved names are withheld. Unreleased: Batch XML warns when a chunk sets both commit-interval and chunk-completion-policy, or a tasklet combines ref, chunk, bean or ref (parser-proved; placeholders, #{} and inherited steps stay quiet). Unreleased: optional exact-profile reviewed Batch CLI operations and persisted execution inspection, with artifact validation, managed output and independent control sessions. Unreleased: context-aware Batch XML identity/merge checks and explicit Batch 5/6 compatibility migration rules; modern operator/partition bean references. Unreleased: reviewed single-type NamedInterface annotation action for proved internal-module imports. Unreleased: native source-owned open/closed module badges; allowedDependencies wildcard completion and source navigation. Unreleased: reviewed multi-file channel rename and read-only occurrences across explicit relative XML import trees and alias chains; current-source Java channel definition and occurrences. Unreleased: reviewed local Batch step/decision rename from declarations or transition references; flat endpoint channel rename; Modulith qualified project type diagnostics and dependency edges. Add explicitly reviewed same-document literal XML channel/bridge rename with collision, source, scope and full-preview checks. Unreleased: explicit current-document Batch step usages picker lists proved declaration/reference kinds, paths and UTF-16 ranges with fresh read-only navigation. Unreleased: explicit same-document flat-job Batch step Rename previews a unique declaration and all direct literal next/to/restart links with source/collision/owner guards. Unreleased: parameter completion destinations reuse exact source/XML expression admission, including empty keys, and withhold foreign/comment contexts. Unreleased: indexed XML parameter expressions require complete owned attribute contexts and reject comments/foreign or malformed source. Unreleased: indexed source parameter expressions require owned Spring Value annotations and complete ordinary literals. Unreleased: parameter-adder completion facts require an owned contiguous Spring JobParametersBuilder constructor chain. Unreleased: embedded Batch bean/Boot facts share exact annotation-origin/literal-name admission; uncertain source names withhold missing-bean warnings. Unreleased: Batch source job/step facts require exact Spring builder constructor ownership; guessed factory receivers are unresolved and suppress missing-job warnings. Unreleased: creation retains conservative DSL channel-name collision candidates even when read-only ownership is unproved; dynamic names refuse availability checks. Unreleased: cached Integration/Batch facts are pruned against current innermost project ownership before provider/diagram publication. Unreleased: XML Bean aliases resolve at exact source spans; foreign/inner IDs remain candidates, and creation cannot treat withheld/legacy XML names as empty. Unreleased: Bean navigation/completion requires exact source annotation/name ownership; unproved spellings retain conservative collision/uncertainty checks and withhold unsupported absence warnings. Unreleased: cached Batch diagrams share the complete XML envelope admission used by current editor source facts. Unreleased: embedded Batch links refuse foreign prefixed attributes and foreign namespace scope owners. Unreleased: XML source facts require a complete bounded single-root envelope; malformed/DTD/entity contexts no longer leak Integration or Batch live facts. Unreleased: XML channel facts refuse foreign prefixed attributes and namespace lookalike suffixes. Unreleased: DSL channel facts require exact Spring static-factory ownership and contiguous proved chains; foreign/shadowed receivers and guessed lambda factories are withheld. Unreleased: channel Bean declarations require exact Spring Bean/MessageChannel interface ownership and literal aliases instead of a Channel type-name suffix. Unreleased: endpoint annotation facts require exact explicit Spring ownership and ordinary literal arguments; ambiguous, concatenated or escaped source contexts are withheld. Unreleased: positive current-file Java MessageChannel Bean/ServiceActivator hover without project discovery; explicit source-cache recovery, unavailable-watch provenance and packaged refresh invalidation; exact-reviewed local Batch step next insertion/replacement within its physical job/flow; optional atomic create-and-import Java/Kotlin channel configuration, with exact combined preview and narrow Kotlin action registration; current-file channel occurrence picker with optional editor.read and source/owner drift checks; local channel navigation refuses same-file bean ID/name/alias collisions and explains ambiguity in hover; combined versioned live diagnostics from current text and cached module facts, without duplicate gutter publication; optional watched-event warming. Absorbs aritti.spring-batch and aritti.spring-modulith into one Spring Structure window with Channels, Batch, Modules and Diagram sections; uninstall aritti.spring-batch and aritti.spring-modulith, the old ids are no longer maintained and would show duplicate windows and completions. Command and storage ids of the absorbed modules are prefixed with batch. and modulith.; their old settings values are not migrated. 0.1.0 (first release): channel index (Java annotations, Java DSL, XML), navigation and completion of channel names and bean refs, producer/consumer gutter arrows, unconsumed channel and unknown bean warnings."
+change-notes = """\
+Next release: The Spring Structure window now appears only in Maven or Gradle projects, with plainer empty states and messages. New icon for channel producer and consumer markers, which open a chooser when a channel has several, and a Channel Table section with search; SpEL and XPath expressions in Integration XML and the Java DSL are checked, and XML with character entities keeps its features; Go to Definition on an XML channel finds channels in other files, and the index survives saves and covers generic classes, Gradle subprojects and Windows project roots; Modulith warns about use of module-internal types, and an unreadable file silences missing-channel and missing-bean warnings only for its own names; new commands to show the window and for toolbar actions, Batch Poll and Cancel only while a CLI runs and Cancel asks first, one name per command, plainer messages and Batch setting titles, shorter hover text and clearer permission messages. \
+0.3.0: channel and bean navigation, flow checks. \
+0.2.0: plugin icon and channel markers."""
 categories = ["frameworks"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = [
     "on-language:java",
@@ -33,6 +36,7 @@ title = "Spring Structure"
 icon = "icons/structure.svg"
 location = "right"
 web = "web/resources/hub.html"
+when = "workspaceContains:pom.xml || workspaceContains:build.gradle || workspaceContains:build.gradle.kts || workspaceContains:settings.gradle || workspaceContains:settings.gradle.kts"
 
 [[contributes.commands]]
 id = "batch.current-file-step-usages"
@@ -41,13 +45,24 @@ category = "Spring Batch"
 
 [[contributes.commands]]
 id = "integration.current-file-channel-occurrences"
-title = "Spring Integration: Current File Channel Occurrences"
+title = "Spring Integration: Find Channel Usages in This File"
 category = "Spring Integration"
 
 [[contributes.commands]]
 id = "modulith.copy-docs"
 title = "Spring Modulith: Copy Module Diagram (PlantUML)"
 category = "Spring Modulith"
+
+[[contributes.commands]]
+id = "structure.refresh"
+title = "Spring Structure: Refresh"
+category = "Spring Structure"
+
+[[contributes.commands]]
+id = "structure.show"
+title = "Spring Structure: Show Spring Structure Window"
+category = "Spring Structure"
+when = "workspaceContains:pom.xml || workspaceContains:build.gradle || workspaceContains:build.gradle.kts || workspaceContains:settings.gradle || workspaceContains:settings.gradle.kts"
 
 [contributes.settings]
 schema = "settings.schema.json"
@@ -70,18 +85,20 @@ category = "Spring Batch"
 
 [[contributes.commands]]
 id = "batch.runtime-operate"
-title = "Spring Batch: Run Reviewed Job Operation"
+title = "Spring Batch: Run Job Operation…"
 category = "Spring Batch"
 
 [[contributes.commands]]
 id = "batch.runtime-poll"
 title = "Spring Batch: Poll CLI Output"
 category = "Spring Batch"
+when = "plugin.aritti.spring-integration.batchCliActive"
 
 [[contributes.commands]]
 id = "batch.runtime-cancel"
 title = "Spring Batch: Cancel CLI Process"
 category = "Spring Batch"
+when = "plugin.aritti.spring-integration.batchCliActive"
 
 [[contributes.commands]]
 id = "batch.runtime-inspect"

@@ -1,25 +1,25 @@
 {
   "properties": {
     "springBoot.checkPropertyValues": {
+      "title": "Warn about values that do not match the key type",
       "type": "boolean",
-      "title": "Warn when a configuration value cannot convert to its key's type (number, boolean, duration, data size, enum, project class, list items)",
       "default": true,
       "group": "Configuration files",
       "description": "Validates literal configuration values against declared metadata types; environment/profile/import precedence and runtime values are unresolved."
     },
     "springBoot.checkMetadataFiles": {
       "type": "boolean",
-      "title": "Check (additional-)spring-configuration-metadata.json files (shape, defaults, deprecation, hints, project classes)",
+      "title": "Check spring-configuration-metadata.json files",
       "default": true,
       "group": "Static metadata",
-      "description": "Checks metadata source shape/default declarations/hints. Declared defaults are static metadata, not effective application values."
+      "description": "Checks the shape, defaults, deprecations, hints and project classes in spring-configuration-metadata.json and additional-spring-configuration-metadata.json."
     },
     "springBoot.checkDriverDependency": {
       "type": "boolean",
-      "title": "Hint when a spring.datasource.url names a JDBC driver the build files do not declare (transitive drivers are not seen)",
+      "title": "Hint when the JDBC driver of spring.datasource.url is missing from the build",
       "default": false,
       "group": "Static build facts",
-      "description": "Uses explicit build declarations only; transitive/effective drivers are unknown. No database connection is opened."
+      "description": "Looks only at dependencies declared in the build files; a driver that arrives transitively still gets the hint. No database connection is opened."
     },
     "springBoot.nativeRunProfiles": {
       "type": "boolean",

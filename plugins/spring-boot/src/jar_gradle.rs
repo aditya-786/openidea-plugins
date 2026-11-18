@@ -124,10 +124,8 @@ pub(super) fn file(cache: &str, d: &Dependency, ext: &str) -> Result<Option<Stri
     }
     let base = format!("{cache}/{}/{}/{}", d.group, d.artifact, d.version);
     let name = format!("{}-{}{ext}", d.artifact, d.version);
-    let hashes = match host::fs::read_dir(&base) {
-        Ok(h) => h,
-        Err(Error::NotFound(_)) => return Ok(None),
-        Err(e) => return Err(e),
+    let Some(hashes) = super::versions::present(host::fs::read_dir(&base))? else {
+        return Ok(None);
     };
     let mut found = None;
     for hash in hashes

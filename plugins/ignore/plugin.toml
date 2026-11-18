@@ -5,16 +5,20 @@ description = "Support for ignore files (.gitignore, .dockerignore, .npmignore, 
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 homepage = "https://github.com/arnaud-ritti/openidea-plugins/tree/main/plugins/ignore"
 license = "MIT"
-change-notes = "Unreleased: template pickers list the up-to-16 most recently chosen templates first (stored locally, bounds-checked); writes remain exact-confirmed and non-overwriting. Unreleased: unused-entry snapshots now evaluate non-ASCII literal/glob patterns by exact bytes; misses are trusted only when no inventory path is non-ASCII, and non-ASCII patterns with ? or [ stay withheld. Unreleased: opt-in isolated complete-directory inventory with native cached unused-entry hints and reviewed removal; filesystem errors/bounds/drift never prove absence. Unreleased: retain bounded literal-directory observations across unchanged save/watcher echoes and irrelevant events without extending TTL; source/owner/target/preference guards remain. Unreleased: bounded event-cached literal project directory markers, source/ownership checks and expiry; no marker filesystem lookup. compact per-file editor-assistance/check/Create controls and shared additional-file colouring switch; separate v2 preferences preserve legacy data and revalidate owned mutation paths. explicit cached Git review revalidates successful historical source proof without collecting new paths; duplicate decoded preference keys are refused and preserved. explicitly reviewed bounded native-task Git ignored-file observations, partial/stale source-scoped cache and read-only sample coverage review; optional Git/VCS grants, no renderer/provider process or absence inference. exact dotfile New-menu templates and confirmed native FileActions for creation, bundled/user-template append and literal Add/Unignore entries; target/source conflict guards and LF/CRLF preservation. The tee writer and permission are removed. Legacy New Ignore File now guides to native creation. Existing selected-path and tool-window append commands keep version-checked editor edits. Templates from github/gitignore at 53cf2971."
+change-notes = """\
+Next release: The Git scan commands and Find Unused Entries have plainer names and messages. New Ignore File creates the file directly, in the folder selected in the Project view, and Add or Unignore Selected Paths writes the picked ignore file in one step, and template pickers list recently used templates first; whitelist patterns such as `*` with `!*/` get the right Ignored status, and an unclosed [ matches nothing, as in Git; patterns with many wildcards and large ignore files no longer slow the editor down, and path completion finds folders in large projects; unused-entry hints for non-ASCII patterns, problems show once instead of twice, and .hgignore no longer calls the same glob and regexp pattern a duplicate; one name per action and clearer messages. \
+0.3.0: consolidated panels and more complete duplicate and unused-entry checks. \
+0.2.0: plugin icon and expanded checks."""
 categories = ["vcs", "linters"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-view:templates", "on-event:file-opened", "on-event:file-saved", "on-event:editor-focused"]
 
 [capabilities]
 required = ["project.read", "editor.read", "editor.write", "events", "storage"]
-optional = ["clipboard", "process:git", "process:python3", "vcs.read"]
+# project.write: Ignore: New Ignore File… creates the chosen file; Add/Unignore Selected Paths writes an ignore file that is not open.
+optional = ["process:git", "process:python3", "vcs.read", "project.write"]
 
 # Ignore files the IDE doesn't know yet; .gitignore, .dockerignore, .npmignore…
 # are the built-in `ignore` language.
@@ -32,17 +36,17 @@ languages = ["*"]
 
 [[contributes.commands]]
 id = "add-selected"
-title = "Add Selected Paths to the Open Ignore File"
+title = "Ignore: Add Selected Paths to the Open Ignore File"
 category = "Ignore"
 
 [[contributes.commands]]
 id = "unignore-selected"
-title = "Unignore Selected Paths in the Open Ignore File"
+title = "Ignore: Unignore Selected Paths in the Open Ignore File"
 category = "Ignore"
 
 [[contributes.commands]]
 id = "new-file"
-title = "New Ignore File"
+title = "Ignore: New Ignore File…"
 category = "Ignore"
 
 [[contributes.menus]]
@@ -226,15 +230,15 @@ command = "preferences"
 
 [[contributes.commands]]
 id = "git-inventory-start"
-title = "Ignore: Start Git Ignored-File Observations (Asks First)…"
+title = "Ignore: Scan Git for Ignored Files…"
 category = "Ignore"
 [[contributes.commands]]
 id = "git-inventory-review"
-title = "Ignore: Review Cached Partial Git Observations"
+title = "Ignore: Show Last Git Scan of Ignored Files"
 category = "Ignore"
 [[contributes.commands]]
 id = "git-inventory-clear"
-title = "Ignore: Clear This Project’s Cached Git Observations"
+title = "Ignore: Clear Last Git Scan of Ignored Files"
 category = "Ignore"
 
 
@@ -250,16 +254,16 @@ iconDark = "icons/directory-pattern_dark.svg"
 
 [[contributes.commands]]
 id = "publish-git-sample-hints"
-title = "Ignore: Publish Cached Partial Git Sample Hints (API 1.4)"
+title = "Ignore: Mark Ignored Files from Last Git Scan"
 category = "Ignore"
 [[contributes.commands]]
 id = "clear-git-sample-hints"
-title = "Ignore: Clear Partial Git Sample Hints"
+title = "Ignore: Clear Ignored-File Marks"
 category = "Ignore"
 
 [[contributes.commands]]
 id = "find-unused-complete"
-title = "Ignore: Find Unused Entries from Complete Directory Snapshot…"
+title = "Ignore: Find Unused Entries…"
 category = "Ignore"
 
 [[contributes.providers]]

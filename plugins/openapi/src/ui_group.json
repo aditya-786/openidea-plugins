@@ -3,7 +3,7 @@
   "tabs": [
     {
       "id": "endpoints",
-      "label": "OpenAPI"
+      "label": "Endpoints"
     },
     {
       "id": "compare",

@@ -1,17 +1,17 @@
 id = "aritti.symfony"
 name = "Symfony"
 version = "0.3.0" # x-release-please-version
-description = """Symfony support in PHP, Twig, YAML and XML files. Completion and go to definition for routes, Twig templates and blocks, services, classes, translation keys (per domain), assets, Encore and AssetMapper entries, and roles, plus completion of the variables controllers pass to a Twig template. Reports missing routes, templates, services and translation keys, and routes defined twice in a file, with a quick fix that adds a missing key. Cached declaration hover shows source candidates; unsafe host-index Rename associations and graph-only gutter links are gated. A Symfony tool window lists routes, templates, services and translations, two commands run cache:warmup and cache:clear, and a Profiler view lists the latest requests. Twig files need the aritti.twig plugin."""
+description = """Symfony support in PHP, Twig, YAML and XML files. Completion and go to definition for routes, Twig templates and blocks, services, classes, translation keys (per domain), assets, Encore and AssetMapper entries, and roles, plus completion of the variables controllers pass to a Twig template. Reports missing routes, templates, services and translation keys, and routes defined twice in a file, with a quick fix that adds a missing key. Hover on a declaration shows the matching source candidates. A Symfony tool window lists routes, templates, services and translations, two commands run cache:warmup and cache:clear, and a Profiler view lists the latest requests. Twig files need the aritti.twig plugin."""
 authors = ["Arnaud Ritti <arnaud.ritti@gmail.com>"]
 homepage = "https://github.com/arnaud-ritti/openidea-plugins/tree/main/plugins/symfony"
 license = "MIT"
-change-notes = """Unreleased: About tab with project metadata, installed versions, index counts and a Run bin/console about button. Unreleased: Config, Env and Entities tabs (container parameter names, `.env` variable names without values, Doctrine entities with fields and relations) and matching MCP tools. Unreleased: Six read-only MCP tools (routes, services, commands, templates, template usage, profiler requests); Stimulus controller, Vite entry and AssetMapper path completion; `{% types %}`, `enum_cases()` and route-parameter completion; UX Twig component names, props, blocks and navigation. Unreleased: Member completion, Go to Definition and hover from inferred types, including `for` loops over typed collections, `$this->`, `container->get('service.id')`, query-builder results, and form fields and options: `variable.` in Twig (from `{# @var #}` comments and controller `render()` arguments) and `$variable->` in PHP (typed parameters and properties, `new`, repository and entity-manager finders, `container->get(Class::class)`). Unreleased: The window has separate Routes, Templates, Services and Translations tabs with counts, and a Processes tab that opens the Symfony CLI server, server log and Messenger/scheduler workers in terminal tabs. Unreleased: Unreleased: indexer gutter markers (services, events, validators, templates, blocks, routes) use dedicated icons. Unreleased form and column type checks (Info): EntityType `class` and CollectionType `entry_type` naming a missing project class, EntityType `choice_label` that is no property or getter of the class, CheckboxType on a property declared int/float/array (Symfony docs: a boolean value, and the `value` option does not change the object value; string is not flagged; Integer/Number/Date types are not checked because their docs allow several underlying types); literal `ORM Column type` attributes string/text/integer/boolean/float/datetime_immutable against a built-in property type per the DBAL types mapping, skipped with `enumType`. Unreleased autowiring and route references: Go to Definition on a constructor type-hint reaches the service definition (explicit service or `alias:`/`Interface: '@Class'` alias, `#[AsAlias]` on a class, or a `resource:`-loaded concrete class whose FQCN equals namespace plus path; plain-path `exclude` honoured, globs and `#[Autowire]`/`#[Target]` parameters stay quiet); `generateUrl()`/`redirectToRoute()`/router `generate()` of an unknown literal route name warns when the route set is provably literal (src/Controller attribute imports only, every `#[Route]` named by a string, no name_prefix, PHP route files or custom router resource) without needing compiled routes; `_` and FQCN/`Class::method` route names stay quiet. Unreleased Doctrine navigation: Go to Declaration from `repositoryClass:` and `targetEntity:` class literals to the class, and from `mappedBy:`/`inversedBy:` strings to the exact property declaration in the target entity (same file-indexed edges as service ids; quiet when unresolved). Unreleased Doctrine/forms reference checks: warns when an association `mappedBy`/`inversedBy` names a property missing from the readable `targetEntity` class chain, and reports Info for `$builder->add()` fields of a form with `data_class` that match no entity property or accessor (silent with mapped/property_path/data/inherit_data, traits, magic accessors or unreadable parents). Profiler details show up to 50 Time collector Stopwatch events (name, category, origin, duration, period count) decoded only from plain StopwatchEvent/StopwatchPeriod shapes with printable-ASCII allowlists; cloned or malformed periods omit the duration; additive to profile summary protocol v2. Unreleased profiler details: decodes Time (start time, stopwatch), Cache (calls/reads/writes/deletes/hits/misses/time totals) and Logger (deprecation/warning/scream counts) collector numbers from raw/GZIP profiles against Symfony 7.4 data shapes; adapter protocol is now version 2. Events/Request collectors stay count-only because their data is VarDumper-cloned. Unreleased profiler paging: the Profiler tab now browses all valid index rows (up to the 10000-record bound) 100 per page, newest first, through Newer/Older Requests buttons over the cached snapshot. Unreleased: fresh read-only source occurrence review for route/service/template literals, with exact source navigation and explicit partial coverage. Unreleased: selection-aware local raw/GZIP profiler collector overview through an optional isolated PHP adapter; modern virtual-type CSV support; endpoint labels retain handler methods. Unreleased profiler source ownership: explicit bounded project-relative CSV source setting, root/source-owned snapshots and source-scoped row keys; nested project ownership loss hides cached details. Unreleased service config workflow: explicit validated production PSR4 resource-load mode replaces the three native service-config template exports after reviewed atomic coverage; generic templates retained. Unreleased compiler workflow: reviewed Composer-owned compiler-pass creation replaces the native compiler template; selected production PSR4 directory/namespace and exact class preview. Unreleased file workflows: custom unambiguous production PSR4 sibling scaffolds and reviewed defaults-only YAML/XML/PHP service-config creation from composer.json, with source/target ownership and no guessed imports. Unreleased ownership audit: positive cached declaration hover, exact-domain fallback isolation and all unsafe host-index associations gated from automatic Rename; explicit source definition providers remain. 0.1.0: first release. This implementation works from a text index of the project, so the \
-features that need PhpStorm's PSI are missing (container type inference, Doctrine, forms, most inspections). \
-Unreleased: the Symfony tool window has Routes (a flat list: method icon, path, controller and route name, controller filter, flat or tree, Copy as curl and Create HTTP Request File on the row menu; optional clipboard and project.write) and Index sections; the unclosed-tag diagnostic moved to aritti.twig, which now reports it in Symfony projects too; project-wide Go to Declaration for service ids and route names (YAML and XML services, attribute, YAML and XML routes; @service, path() and generate() references) from the host's document index. \
-Also new in this release (unverified in the IDE): Twig checks (assets tags, enum() classes, content outside blocks in extending templates, hard-coded paths with a quick fix); container reference checks (unknown %parameters%, missing service classes, deprecated classes) and service wiring checks (argument count and types, tag interfaces, listener methods, !php/const); practice hints and more version-gated deprecations for PHP; Doctrine removed-API checks; typo quick fixes for routes, templates, keys and domains; rewrites (Doctrine alias to ::class, command to invokable, Twig extension to attributes); service definition, argument resync and tag generators; Extract translation and Add form fields actions; Twig variable collectors; attribute argument completion; index links for events, macros, voters and validators; extra file templates and the extraServiceFiles, extraRoutingFiles and practiceChecks settings. Unreleased (practice and wiring): 12 more constructor and controller practice hints, deprecation checks (Routing Annotation Route, first-class callables, renderForm, constraint option arrays), Doctrine QueryBuilder, lifecycle visibility and discriminator-map checks, PHP service configuration and XML constant checks, Autowire service type check, XML service tags and arguments, Move property to the constructor, imported macro and constraint message completion, event and role values for attributes, and the Make, Create Twig Template and Insert Form Rows commands; template creation now uses reviewed FileActions. Also from the index: console command names, %parameters%, filters, functions and tests of the project's Twig extensions, UX Twig components and Stimulus controllers; gutter markers moved onto the index, so a template lists all its controllers, a block all its overriding templates and a route its path() uses. New commands: Run Console Command, Go to Route, Service, Console Command and Template, Extend Twig Template. Fixed: the document indexer no longer burns the CPU budget on minified single-line files (quote scan was quadratic)."""
+change-notes = """\
+Next release: Copy Route as cURL and Create HTTP Request File ask which route to use when run from the command palette, Symfony commands only show in Symfony projects, Extend Twig Template and Insert Form Rows only show in Twig files, and Go to Route and Go to Service get Alt+Shift+U and Alt+Shift+S. Window with Routes, Templates, Services, Translations, Config, Env, Entities, About and Processes tabs, each listed as a searchable table with columns and filters; read-only MCP tools and completion for Stimulus controllers, Vite entries and Twig components, type-based completion in Twig and PHP; saving a file updates only its index entries so completion no longer stalls on large projects, route usages get a gutter icon, and controllers, entities and templates a Related files icon listing their routes, templates and entity family; renaming a route updates its declaration and every usage, console arguments keep quoted values, and no more crashes on accents or emoji; New commands create the file, short setting titles, plainer Profiler, occurrence, deprecation, create-file and permission messages. \
+0.3.0: indexer, Twig and Doctrine support. \
+0.2.0: plugin icon and route navigation."""
 categories = ["frameworks"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-view:symfony", "on-file:**/composer.json", "on-language:php", "on-language:twig", "on-language:yaml", "on-language:xml"]
 
@@ -28,86 +28,114 @@ optional = ["project.write", "process:php", "process:symfony", "events", "editor
 id = "reindex"
 title = "Symfony: Reindex Project"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "route-copy-curl"
-title = "Symfony: Copy Route as curl"
+title = "Symfony: Copy Route as cURL"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "route-create-http"
 title = "Symfony: Create HTTP Request File for Route"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "show-profiler"
 title = "Symfony: Show Profiler"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "cache-warmup"
 title = "Symfony: Warm Up Cache"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "cache-clear"
 title = "Symfony: Clear Cache"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "run-console-command"
-title = "Symfony: Run Console Command..."
+title = "Symfony: Run Console Command…"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "go-to-route"
-title = "Symfony: Go to Route..."
+title = "Symfony: Go to Route…"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "go-to-service"
-title = "Symfony: Go to Service..."
+title = "Symfony: Go to Service…"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "go-to-command"
-title = "Symfony: Go to Console Command..."
+title = "Symfony: Go to Console Command…"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "go-to-template"
-title = "Symfony: Go to Template..."
+title = "Symfony: Go to Template…"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "twig-extends"
-title = "Symfony: Extend Twig Template..."
+title = "Symfony: Extend Twig Template…"
 category = "Symfony"
+when = "editorLangId == twig && (workspaceContains:symfony.lock || workspaceContains:bin/console)"
 
 [[contributes.commands]]
 id = "make"
-title = "Symfony: Make..."
+title = "Symfony: Make…"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "create-template"
-title = "Symfony: Create Twig Template..."
+title = "Symfony: Create Twig Template…"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "twig-form-fields"
-title = "Symfony: Insert Form Rows from a Form Type..."
+title = "Symfony: Insert Form Rows from a Form Type…"
 category = "Symfony"
+when = "editorLangId == twig && (workspaceContains:symfony.lock || workspaceContains:bin/console)"
+
+[[contributes.keymaps]]
+command = "go-to-route"
+key = "Alt+Shift+U"
+
+[[contributes.keymaps]]
+command = "go-to-service"
+key = "Alt+Shift+S"
 
 [[contributes.menus]]
 menu = "editor.context"
 command = "twig-extends"
+when = "editorLangId == twig"
 
 
 
 [[contributes.providers]]
 kinds = ["completion", "definition", "code-actions", "hover"]
 languages = ["php", "twig", "yaml", "xml"]
+
+[[contributes.providers]]
+kinds = ["line-markers"]
+languages = ["php", "twig"]
 
 [[contributes.providers]]
 kinds = ["code-actions"]
@@ -252,77 +280,23 @@ files = ["config/**/*.yaml", "config/**/*.yml", "config/**/*.xml", "config/**/*.
 id = "twig-paths"
 title = "Symfony: Configure Twig Namespace Paths"
 category = "Symfony"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.commands]]
 id = "find-source-occurrences"
 title = "Symfony: Find Source Occurrences"
 category = "Symfony"
-
-[[contributes.markerIcons]]
-id = "service"
-icon = "icons/marker-service.svg"
-markers = ["class-service#"]
-tooltip = "Service definition"
-
-[[contributes.markerIcons]]
-id = "class"
-icon = "icons/marker-class.svg"
-markers = ["class#"]
-tooltip = "Service class"
-
-[[contributes.markerIcons]]
-id = "listener"
-icon = "icons/marker-listener.svg"
-markers = ["event#"]
-tooltip = "Event listeners"
-
-[[contributes.markerIcons]]
-id = "dispatch"
-icon = "icons/marker-dispatch.svg"
-markers = ["event-dispatch#"]
-tooltip = "Event dispatch sites"
-
-[[contributes.markerIcons]]
-id = "validator"
-icon = "icons/marker-validator.svg"
-markers = ["validator-of#"]
-tooltip = "Constraint validator"
-
-[[contributes.markerIcons]]
-id = "constraint"
-icon = "icons/marker-constraint.svg"
-markers = ["constraint-of#"]
-tooltip = "Constraint"
-
-[[contributes.markerIcons]]
-id = "render"
-icon = "icons/marker-render.svg"
-markers = ["render#"]
-tooltip = "Rendered by"
-
-[[contributes.markerIcons]]
-id = "block-child"
-icon = "icons/marker-block-child.svg"
-markers = ["override#"]
-tooltip = "Overriding blocks"
-
-[[contributes.markerIcons]]
-id = "block-parent"
-icon = "icons/marker-block-parent.svg"
-markers = ["block#"]
-tooltip = "Parent block"
+when = "workspaceContains:symfony.lock || workspaceContains:bin/console"
 
 [[contributes.markerIcons]]
 id = "route"
 icon = "icons/marker-route.svg"
-markers = ["route-use#"]
-tooltip = "Route usages"
+markers = ["route#"]
+tooltip = "Route definition"
 
 [[contributes.markerIcons]]
-id = "template"
-icon = "icons/marker-template.svg"
-markers = ["template#"]
-tooltip = "Template"
+id = "related"
+icon = "icons/symfony-logo.svg"
 
 [[contributes.mcpTools]]
 name = "routes"

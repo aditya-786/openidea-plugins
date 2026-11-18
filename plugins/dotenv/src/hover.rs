@@ -162,6 +162,7 @@ impl HoverProvider for DotEnv {
                 markdown.push('\n');
             }
         }
+        let mut masked = false;
         for declaration in candidates {
             let path = root
                 .as_deref()
@@ -189,7 +190,9 @@ impl HoverProvider for DotEnv {
                 declaration.location.range.start.character + 1
             );
             if show_values {
-                entry.push_str(&format!(" — {}", inline(&declaration.value, 256)));
+                let secret = index::is_secret_like(&key, &declaration.value);
+                masked |= secret;
+                entry.push_str(&format!(" — {}", inline(index::shown_value(&key, &declaration.value), 256)));
             }
             entry.push('\n');
             if markdown
@@ -206,6 +209,9 @@ impl HoverProvider for DotEnv {
         if !show_values {
             markdown.push_str("\nValues hidden by showValues.\n");
         }
+        if masked {
+            markdown.push_str("\nValue masked; run .env: Show Value at Caret to see it.\n");
+        }
         if index.is_none_or(|index| !index.complete) {
             markdown.push_str("\nSource cache is incomplete; only known declarations are shown.\n");
         }
@@ -214,7 +220,6 @@ impl HoverProvider for DotEnv {
                 "\nHover results are bounded; additional cached declarations may be omitted.\n",
             );
         }
-        markdown.push_str("\nCached source facts; runtime environment values are not evaluated.\n");
         Some(Hover::new(markdown).range(span))
     }
 }
@@ -228,12 +233,12 @@ mod tests {
             path: "/project/app.js".into(),
             language: "javascript".into(),
             version: 1,
-            text: "process.env.TOKEN".into(),
+            text: "process.env.DEBUG".into(),
         }
     }
     fn cached(host: &MockHost) -> DotEnv {
-        host.add_file(".env", "TOKEN=private-live-value\n");
-        host.add_file(".env.example", "TOKEN=private-example-value\n");
+        host.add_file(".env", "DEBUG=private-live-value\n");
+        host.add_file(".env.example", "DEBUG=private-example-value\n");
         let mut plugin = DotEnv::default();
         plugin.index_projects();
         plugin
@@ -254,7 +259,7 @@ mod tests {
             path: "/project/.env".into(),
             language: "dotenv".into(),
             version: 2,
-            text: "TOKEN=unsaved-secret\n".into(),
+            text: "DEBUG=unsaved-secret\n".into(),
         };
         let hover = plugin.hover(&doc, Position::new(0, 2)).unwrap();
         assert!(!hover.markdown.contains("unsaved-secret"));
@@ -284,11 +289,11 @@ mod tests {
     fn hover_never_warms_a_cold_index_or_reads_newly_added_declarations() {
         let host = MockHost::install();
         let mut plugin = DotEnv::default();
-        host.add_file(".env", "TOKEN=must-not-read\n");
+        host.add_file(".env", "DEBUG=must-not-read\n");
         assert!(plugin.hover(&code_doc(), Position::new(0, 13)).is_none());
         assert!(plugin.projects.is_empty());
         plugin.index_projects();
-        host.add_file(".env", "TOKEN=new-unindexed-value\n");
+        host.add_file(".env", "DEBUG=new-unindexed-value\n");
         let hover = plugin.hover(&code_doc(), Position::new(0, 13)).unwrap();
         assert!(hover.markdown.contains("must-not-read"));
         assert!(!hover.markdown.contains("new-unindexed-value"));
@@ -313,7 +318,7 @@ mod tests {
             path: "/project/.env".into(),
             language: "dotenv".into(),
             version: 2,
-            text: "PREFIX=😀${TOKEN}\nTOKEN=unsaved\n".into(),
+            text: "PREFIX=😀${DEBUG}\nDEBUG=unsaved\n".into(),
         };
         let hover = plugin.hover(&doc, Position::new(0, 12)).unwrap();
         assert!(hover.markdown.contains("unsaved"));
@@ -361,11 +366,7 @@ mod tests {
                 .markdown
                 .contains("additional cached declarations may be omitted")
         );
-        assert!(
-            bounded
-                .markdown
-                .ends_with("Cached source facts; runtime environment values are not evaluated.\n")
-        );
+        assert!(bounded.markdown.ends_with("additional cached declarations may be omitted.\n"));
 
         let mut long_key = code_doc();
         long_key.language = "dotenv".into();
@@ -396,5 +397,34 @@ mod tests {
         assert!(hover.markdown.contains("(` Dockerfile `:1, before FROM)"), "re-imported global ARG is linked too");
         let hover = plugin.hover(&doc("/project/web.env", "APP_KEY=2\n"), Position::new(0, 2)).unwrap();
         assert!(hover.markdown.contains("loaded by service ` web ` (` docker-compose.yml `:3)"));
+    }
+
+    #[test]
+    fn hover_has_no_footer_when_complete() {
+        let host = MockHost::install();
+        let mut plugin = cached(&host);
+        let hover = plugin.hover(&code_doc(), Position::new(0, 13)).unwrap();
+        assert!(!hover.markdown.contains("Cached source facts"));
+        assert!(!hover.markdown.contains("incomplete"));
+        plugin.projects.get_mut("/project").unwrap().complete = false;
+        let hover = plugin.hover(&code_doc(), Position::new(0, 13)).unwrap();
+        assert!(hover.markdown.contains("Source cache is incomplete"));
+        assert!(!hover.markdown.contains("Cached source facts"));
+    }
+
+    #[test]
+    fn hover_masks_secret_value_and_points_to_show_command() {
+        let host = MockHost::install();
+        host.add_file(".env", "DB_PASSWORD=hunter2\n");
+        let mut plugin = DotEnv::default();
+        plugin.index_projects();
+        let doc = Document { path: "/project/app.js".into(), language: "javascript".into(), version: 1, text: "process.env.DB_PASSWORD".into() };
+        let hover = plugin.hover(&doc, Position::new(0, 14)).unwrap();
+        assert!(!hover.markdown.contains("hunter2"));
+        assert!(hover.markdown.contains("••••"));
+        assert!(hover.markdown.contains(".env: Show Value at Caret"));
+        let env = Document { path: "/project/.env".into(), language: "dotenv".into(), version: 2, text: "DB_PASSWORD=unsaved-pw\n".into() };
+        let hover = plugin.hover(&env, Position::new(0, 3)).unwrap();
+        assert!(!hover.markdown.contains("unsaved-pw"));
     }
 }

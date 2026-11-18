@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 const MAX_CONTAINERS: usize = 128;
 const MAX_SCAN: usize = 4 * 1024 * 1024;
-const FORMAT: &str = r#"{"Id":{{json .Id}},"Image":{{json .Image}},"Running":{{json .State.Running}},"Paused":{{json .State.Paused}},"Restarting":{{json .State.Restarting}},"StartedAt":{{json .State.StartedAt}},"Mounts":{{json .Mounts}},"Name":{{json .Name}},"WorkingDir":{{json .Config.WorkingDir}},"ComposeProject":{{json (index .Config.Labels "com.docker.compose.project")}},"ComposeService":{{json (index .Config.Labels "com.docker.compose.service")}},"ComposeWorkdir":{{json (index .Config.Labels "com.docker.compose.project.working_dir")}},"DdevRoot":{{json (index .Config.Labels "com.ddev.approot")}},"DdevName":{{json (index .Config.Labels "com.ddev.site-name")}}"#;
+const FORMAT: &str = r#"{"Id":{{json .Id}},"Image":{{json .Image}},"Running":{{json .State.Running}},"Paused":{{json .State.Paused}},"Restarting":{{json .State.Restarting}},"StartedAt":{{json .State.StartedAt}},"Mounts":{{json .Mounts}},"Name":{{json .Name}},"WorkingDir":{{json .Config.WorkingDir}},"ComposeProject":{{json (index .Config.Labels "com.docker.compose.project")}},"ComposeService":{{json (index .Config.Labels "com.docker.compose.service")}},"ComposeWorkdir":{{json (index .Config.Labels "com.docker.compose.project.working_dir")}},"DdevRoot":{{json (index .Config.Labels "com.ddev.approot")}},"DdevName":{{json (index .Config.Labels "com.ddev.site-name")}}}"#;
 fn key(root: &str) -> String {
     format!("artisan-docker-target-v1:{}", metadata::hash(root))
 }
@@ -288,7 +288,7 @@ fn discover_with(
     }
     let candidates = candidates(&root, &socket, &values)?;
     if candidates.is_empty() {
-        return Err(Error::Invalid(crate::ui_text::text("native.dockerRoute.932d948d9f","No running container has a verifiable bind mapping for this project. Compose, Sail and DDEV bind mounts are supported; volume-only/Mutagen project roots and foreign shadowing mounts require a bind-mounted target.").into()));
+        return Err(Error::Invalid(crate::ui_text::text("native.dockerRoute.745a724077","No running container maps this project in a way that can be verified. Compose, Sail and DDEV bind mounts and DDEV synced project volumes are supported; other volume-only or Mutagen project roots, and mounts that hide the project, need a bind-mounted target.").into()));
     }
     let items: Vec<_> = candidates
         .iter()
@@ -324,15 +324,38 @@ fn discover_with(
         ));
     }
     host::storage::set(&key(&root), &raw)?;
-    host::notify(
-        NotificationLevel::Info,
-        "Laravel",
-        &crate::ui_text::format("native.dockerRoute.1471b62c63","Selected {label} at {workdir}. Refresh Docker commands to discover this target's Artisan definitions.",&[("label",&candidate_label_ui(candidate)),("workdir",&(candidate.target.workdir).to_string())]),
-    );
     Ok(None)
 }
 pub(crate) fn discover(ctx: &Invocation) -> Result<Option<String>, Error> {
-    discover_with(ctx, run).map_err(super::ui_error)
+    discover_then(ctx, run, super::refresh)
+}
+fn discover_then(
+    ctx: &Invocation,
+    run: impl FnMut(&Project, &[String]) -> Result<String, Error>,
+    refresh: impl FnOnce(&Invocation) -> Result<Option<String>, Error>,
+) -> Result<Option<String>, Error> {
+    let root = owner(ctx)?.1;
+    let before = host::storage::get(&key(&root))?;
+    let result = discover_with(ctx, run).map_err(super::ui_error)?;
+    if host::storage::get(&key(&root))? == before {
+        return Ok(result);
+    }
+    let error = match refresh(ctx) {
+        Ok(refreshed) => return Ok(refreshed),
+        Err(error) => error,
+    };
+    let reason = match error {
+        // A stale refresh has already said why (stale_reason); a second warning would repeat it.
+        Error::Cancelled | Error::Stale => return Ok(None),
+        Error::Failed(message) | Error::Invalid(message) | Error::NotFound(message) => message,
+        other => other.to_string(),
+    };
+    host::notify(
+        NotificationLevel::Warning,
+        "Laravel",
+        &crate::ui_text::format("native.dockerRoute.9617cadca8", "Saved the Docker target, but its Artisan commands could not be refreshed: {reason}", &[("reason", &reason)]),
+    );
+    Ok(None)
 }
 pub(crate) fn clear_discovered_target(ctx: &Invocation) -> Result<Option<String>, Error> {
     let (_, root) = owner(ctx)?;
@@ -381,6 +404,43 @@ mod tests {
         selected(&host.invocation().project().unwrap())
             .unwrap()
             .unwrap()
+    }
+    #[test]
+    fn docker_target_saved_when_refresh_fails() {
+        let host = setup();
+        host.answer_next_prompt(Some(&["target:0"]));
+        let mut calls = 0;
+        let result = discover_then(
+            &host.invocation(),
+            |_, _| {
+                calls += 1;
+                Ok(if calls == 1 { format!("{ID}\n") } else { raw().to_string() })
+            },
+            |_| Err(Error::Failed("php artisan list exited 255".into())),
+        );
+        assert_eq!(result, Ok(None));
+        assert!(host.storage().contains_key(&key("/project")));
+        let notices = host.notifications();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].level, NotificationLevel::Warning);
+        assert!(notices[0].body.contains("php artisan list exited 255"));
+    }
+    #[test]
+    fn stale_refresh_after_a_pick_warns_once() {
+        let host = setup();
+        host.answer_next_prompt(Some(&["target:0"]));
+        let mut calls = 0;
+        let result = discover_then(
+            &host.invocation(),
+            |_, _| {
+                calls += 1;
+                Ok(if calls == 1 { format!("{ID}\n") } else { raw().to_string() })
+            },
+            |_| Err(super::super::stale_reason("the container was restarted")),
+        );
+        assert_eq!(result, Ok(None));
+        assert!(host.storage().contains_key(&key("/project")));
+        assert_eq!(host.notifications().len(), 1, "{:?}", host.notifications());
     }
     #[test]
     fn explicit_metadata_discovery_picks_a_project_target_without_bootstrapping_php() {
@@ -447,6 +507,50 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[test]
+    fn inspect_templates_render_one_json_object_per_container() {
+        for template in [FORMAT, super::super::FORMAT] {
+            let rendered = render_with_nulls(template);
+            assert!(serde_json::from_str::<Value>(&rendered).is_ok(), "{rendered}");
+        }
+    }
+    fn render_with_nulls(template: &str) -> String {
+        let mut rendered = String::new();
+        let mut rest = template;
+        while let Some(start) = rest.find("{{") {
+            rendered.push_str(&rest[..start]);
+            let end = rest[start..].find("}}").unwrap() + start + 2;
+            rendered.push_str("null");
+            rest = &rest[end..];
+        }
+        rendered.push_str(rest);
+        rendered
+    }
+    #[test]
+    fn ddev_synced_volume_is_accepted_only_for_its_own_project_at_the_ddev_workdir() {
+        let _ui_host=openidea_plugin::mock::MockHost::install();
+        let mut ddev = raw();
+        ddev["DdevRoot"] = json!("/project");
+        ddev["DdevName"] = json!("project");
+        ddev["WorkingDir"] = json!("/var/www/html");
+        ddev["Mounts"] = json!([
+            {"Type":"volume","Source":"/var/lib/docker/volumes/project_mutagen/_data","Destination":"/var/www"},
+            {"Type":"bind","Source":"/project/.git","Destination":"/var/www/html/.git"}
+        ]);
+        let found = candidates("/project", "unix:///var/run/docker.sock", &[ddev.clone()]).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].target.workdir, "/var/www/html");
+        assert_eq!(found[0].proof["DdevRoot"], "/project");
+        let mut foreign = ddev.clone();
+        foreign["DdevRoot"] = json!("/other");
+        assert!(candidates("/project", "unix:///var/run/docker.sock", &[foreign]).unwrap().is_empty());
+        let mut elsewhere = ddev.clone();
+        elsewhere["WorkingDir"] = json!("/var/www/html/web");
+        assert!(candidates("/project", "unix:///var/run/docker.sock", &[elsewhere]).unwrap().is_empty());
+        let mut shadow = ddev;
+        shadow["Mounts"].as_array_mut().unwrap()[1]["Source"] = json!("/elsewhere/.git");
+        assert!(candidates("/project", "unix:///var/run/docker.sock", &[shadow]).unwrap().is_empty());
     }
     #[test]
     fn ancestor_and_compatible_nested_binds_preserve_the_exact_project_mapping() {

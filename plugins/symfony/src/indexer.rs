@@ -664,17 +664,76 @@ fn twig(path: &str, text: &str, out: &mut Collected) {
 
 const MAX_INDEXED_BYTES: usize = 1_000_000;
 
+/// Only routes are published: their declaration and every usage are anchors of one `route#` key with
+/// exact-name ranges, so a host Rename is closed. Other kinds would leave one side behind.
+const PUBLISHED_KINDS: [&str; 1] = ["route#"];
+
+fn published_kind(key: &str) -> bool {
+    PUBLISHED_KINDS.iter().any(|kind| key.starts_with(kind))
+}
+
+/// The renamable name of a key: a block name, or the class name when the range holds only its short form.
+fn covers_exactly_its_name(text: &str, anchor: &Anchor) -> bool {
+    let (Some(start), Some(end)) = (text::offset(text, anchor.range.start), text::offset(text, anchor.range.end)) else {
+        return false;
+    };
+    let Some(covered) = text.get(start..end).filter(|covered| !covered.is_empty()) else { return false };
+    let name = anchor.key.split_once('#').map_or("", |(_, name)| name);
+    let name = name.rsplit_once("::").map_or(name, |(_, block)| block);
+    covered == name || name.ends_with(&format!("\\{covered}"))
+}
+
+/// The routes this indexer declares in a file: what [`DocumentIndexer::index`] can publish as `route#` definitions.
+fn route_declarations(path: &str, text: &str) -> Vec<(String, Position)> {
+    let mut routes = Vec::new();
+    if path.contains("/vendor/") || path.contains("/var/cache/") || path.contains("/node_modules/") || text.len() > MAX_INDEXED_BYTES {
+        return routes;
+    }
+    match language(path) {
+        Some("php") => index::php_routes(path, text, &mut routes),
+        Some("yaml") if path.contains("/config/routes") => index::yaml_routes(path, text, &mut routes),
+        Some("xml") => index::xml_routes(path, text, &mut routes),
+        _ => {}
+    }
+    routes
+}
+
 impl DocumentIndexer for Main {
-    fn index(&mut self, _doc: &Document) -> Edges {
-        // Global equality/transformed navigation keys do not prove complete
-        // replaceable symbol ownership. API1.3 also uses this graph for Rename.
-        Edges::default()
+    fn index(&mut self, doc: &Document) -> Edges {
+        let all = self.navigation_associations(doc);
+        let exact = |anchor: &Anchor| published_kind(&anchor.key) && covers_exactly_its_name(&doc.text, anchor);
+        let definitions = all.definitions.into_iter().filter(exact).collect();
+        let mut closed = std::collections::BTreeMap::new();
+        let references: Vec<Anchor> = all
+            .references
+            .into_iter()
+            .filter(exact)
+            .filter(|anchor| {
+                let name = anchor.key.strip_prefix("route#").unwrap_or_default();
+                *closed.entry(name.to_owned()).or_insert_with(|| self.route_rename_closed(&doc.path, name))
+            })
+            .collect();
+        let markers = references.clone();
+        Edges { definitions, references, markers, ..Edges::default() }
+    }
+}
+
+impl Main {
+    /// Whether a host Rename of route `name` would reach its declaration: the cached index declares it in
+    /// a file this indexer publishes an exact-name `route#` definition for. Without an index, nothing is.
+    fn route_rename_closed(&self, path: &str, name: &str) -> bool {
+        let Some(entry) = self.index_for(path).and_then(|index| index.routes.get(name)) else {
+            return false;
+        };
+        let Some(text) = openidea_plugin::host::project_of(&entry.path).and_then(|project| project.read_file(&entry.path).ok()) else {
+            return false;
+        };
+        route_declarations(&entry.path, &text).into_iter().any(|(declared, at)| {
+            declared == name && covers_exactly_its_name(&text, &Anchor { key: format!("route#{declared}"), range: width_range(at, &declared) })
+        })
     }
 }
 impl Main {
-    // Retain the audited association parsers/tests as navigation-model evidence,
-    // never as automatic edits. Explicit definition providers remain available.
-    #[allow(dead_code)]
     fn navigation_associations(&mut self, doc: &Document) -> Edges {
         let path = doc.path.as_str();
         let text = doc.text.as_str();
@@ -690,21 +749,15 @@ impl Main {
         let mut services = Found::default();
         let mut routes: Vec<(String, Position)> = Vec::new();
         let mut out = Collected::default();
+        routes.extend(route_declarations(path, text));
         match language {
-            "php" => {
-                index::php_routes(path, text, &mut routes);
-                php(path, text, &mut out);
-            }
+            "php" => php(path, text, &mut out),
             "yaml" => {
                 index::yaml_services(path, text, &mut services);
-                if path.contains("/config/routes") {
-                    index::yaml_routes(path, text, &mut routes);
-                }
                 config(path, language, text, &services, &mut out);
             }
             "xml" => {
                 index::xml_services(path, text, &mut services);
-                index::xml_routes(path, text, &mut routes);
                 config(path, language, text, &services, &mut out);
             }
             "twig" => twig(path, text, &mut out),
@@ -762,6 +815,114 @@ mod tests {
 
     fn keys(anchors: &[Anchor]) -> Vec<&str> {
         anchors.iter().map(|a| a.key.as_str()).collect()
+    }
+
+    #[test]
+    fn indexer_publishes_route_markers() {
+        use openidea_plugin::indexing::DocumentIndexer;
+        let text = "<?php\nnamespace App;\nclass BlogController {\n  #[Route('/b', name: 'blog')]\n  function i() { return $this->render('blog/i.html.twig'); }\n}\n";
+        let edges = Main::default().index(&Document { path: "/p/src/BlogController.php".into(), text: text.into(), symbols: Vec::new() });
+        assert!(keys(&edges.definitions).contains(&"route#blog"));
+        assert!(edges.markers.is_empty());
+        let usage = published("/p/src/U.php", "<?php\nclass U { function f() { return $this->generateUrl('blog'); } }\n");
+        assert_eq!(keys(&usage.markers), ["route#blog"]);
+        assert!(keys(&usage.references).contains(&"route#blog"));
+    }
+
+    const USAGES: &str = "<?php\nclass U { function f() { return [$this->generateUrl('blog_index'), $this->generateUrl('vendor_route'), $this->generateUrl('blog')]; } }\n";
+
+    #[test]
+    fn route_references_need_an_indexed_exact_declaration() {
+        use openidea_plugin::indexing::DocumentIndexer;
+        let _host = openidea_plugin::mock::MockHost::install();
+        let without_index = Main::default().index(&Document { path: "/p/src/U.php".into(), text: USAGES.into(), symbols: Vec::new() });
+        assert!(without_index.references.is_empty() && without_index.markers.is_empty());
+
+        let usage = published("/p/src/U.php", USAGES);
+        assert_eq!(keys(&usage.references), ["route#blog"], "class-prefix and vendor routes are not Rename-closed");
+        assert_eq!(keys(&usage.markers), ["route#blog"]);
+    }
+
+    /// An indexer over the fixtures' project: the cached index declares `blog` in the controller,
+    /// `blog_index` behind a class prefix and `vendor_route` in vendor code.
+    fn published(path: &str, text: &str) -> Edges {
+        use openidea_plugin::indexing::DocumentIndexer;
+        let host = openidea_plugin::mock::MockHost::install();
+        host.set_project_root(Some("/p"));
+        let mut index = crate::index::Index::default();
+        let declarations = [
+            fixtures()[0],
+            ("/p/src/Controller/PrefixController.php", "<?php\n#[Route('/blog', name: 'blog_')]\nclass PrefixController {\n  #[Route('/', name: 'index')]\n  function i() {}\n}\n"),
+            ("/p/vendor/acme/Controller.php", "<?php\nclass Controller {\n  #[Route('/v', name: 'vendor_route')]\n  function v() {}\n}\n"),
+        ];
+        for (file, source) in declarations {
+            host.add_file(file, source);
+            index::php_routes(file, source, &mut index.routes);
+        }
+        let mut main = Main::default();
+        main.indexes.insert("/p".into(), index);
+        main.index(&Document { path: path.into(), text: text.into(), symbols: Vec::new() })
+    }
+
+    fn fixtures() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("/p/src/Controller/BlogController.php", "<?php\nnamespace App\\Controller;\nclass BlogController {\n  #[Route('/b', name: 'blog')]\n  function i() { return $this->generateUrl('blog'); }\n  function j() { return $this->redirectToRoute(\"blog\"); }\n}\n"),
+            ("/p/config/routes.yaml", "blog:\n    path: /b\n"),
+            ("/p/templates/a.html.twig", "{{ path('blog') }} <a href=\"{{ url('blog', {id: 1}) }}\">x</a>"),
+            ("/p/src/EventSubscriber/S.php", SUBSCRIBER),
+            ("/p/templates/blog/i.html.twig", "{% extends 'base.html.twig' %}\n{% block body %}{% endblock %}"),
+            ("/p/src/Validator/NoSpaces.php", "<?php\nnamespace App\\Validator;\n\nuse Symfony\\Component\\Validator\\Constraint;\n\nclass NoSpaces extends Constraint\n{\n}\n"),
+        ]
+    }
+
+    #[test]
+    fn published_kinds_are_rename_closed() {
+        let mut anchored = 0;
+        for (path, text) in fixtures() {
+            let edges = published(path, text);
+            let all: Vec<&Anchor> = edges.definitions.iter().chain(&edges.references).collect();
+            assert!(all.iter().all(|anchor| anchor.key == "route#blog"), "{path}: {:?}", keys_of(&all));
+            assert!(edges.markers.iter().all(|anchor| anchor.key == "route#blog"));
+            for (at, _) in text.match_indices("blog").filter(|(at, _)| {
+                *at > 0 && matches!(text.as_bytes()[at - 1], b'\'' | b'"') && text.as_bytes()[at + 4] == text.as_bytes()[at - 1]
+            }) {
+                let line = text[..at].matches('\n').count() as u32;
+                let start = text[..at].rfind('\n').map_or(0, |n| n + 1);
+                let column = text[start..at].encode_utf16().count() as u32;
+                assert!(
+                    all.iter().any(|anchor| anchor.range.start == Position::new(line, column) && anchor.range.end == Position::new(line, column + 4)),
+                    "{path}: occurrence at {line}:{column} is not an anchor"
+                );
+                anchored += 1;
+            }
+            let route_at_start = path.ends_with("routes.yaml");
+            if route_at_start {
+                assert!(edges.definitions.iter().any(|anchor| anchor.key == "route#blog" && anchor.range.start == Position::new(0, 0)));
+            }
+        }
+        assert_eq!(anchored, 5);
+    }
+
+    fn keys_of(anchors: &[&Anchor]) -> Vec<String> {
+        anchors.iter().map(|anchor| anchor.key.clone()).collect()
+    }
+
+    #[test]
+    fn every_published_definition_covers_exactly_its_name() {
+        for (path, text) in fixtures() {
+            let edges = published(path, text);
+            for anchor in edges.definitions.iter().chain(&edges.references) {
+                assert!(covers_exactly_its_name(text, anchor), "{path}: {}", anchor.key);
+            }
+        }
+    }
+
+    #[test]
+    fn route_markers_sit_on_usages_with_the_route_key() {
+        let (path, text) = fixtures()[2];
+        let edges = published(path, text);
+        assert_eq!(edges.markers.len(), 2);
+        assert!(edges.markers.iter().all(|anchor| anchor.key == "route#blog"));
     }
 
     #[test]
@@ -1006,6 +1167,7 @@ mod tests {
     }
     #[test]
     fn registered_indexer_never_exports_unproven_navigation_keys_to_rename() {
+        let _host = openidea_plugin::mock::MockHost::install();
         for (path, text) in [
             ("/p/config/services.yaml", "services:\n  shared:\n    class: App\\Shared\n    arguments: ['@shared']\n"),
             (
@@ -1016,7 +1178,7 @@ mod tests {
             ("/p/assets/controllers/x_controller.js", "export default class {}"),
         ] {
             let edges = Main::default().index(&Document { path: path.into(), text: text.into(), symbols: Vec::new() });
-            assert!(edges.definitions.is_empty() && edges.references.is_empty() && edges.aliases.is_empty() && edges.markers.is_empty());
+            assert!(edges.definitions.iter().chain(&edges.references).chain(&edges.markers).all(|anchor| published_kind(&anchor.key)) && edges.aliases.is_empty());
         }
     }
 }

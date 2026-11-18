@@ -1,0 +1,28 @@
+{
+  "properties": {
+    "checkUnknownElements": {
+      "type": "boolean",
+      "title": "Warn about @PayloadRoot elements missing from the schemas",
+      "default": true,
+      "description": "Warn when a @PayloadRoot localPart names no top-level element in the project schemas of its namespace."
+    },
+    "checkMissingResources": {
+      "type": "boolean",
+      "title": "Report schema files missing from the resources",
+      "default": true,
+      "description": "Info when a ClassPathResource or XML schema location is not in src/main/resources or src/test/resources. It may come from a dependency."
+    },
+    "checkRequestResponsePairs": {
+      "type": "boolean",
+      "title": "Report Request elements without a matching Response",
+      "default": true,
+      "description": "Info when an XxxRequest element has no XxxResponse element, which DefaultWsdl11Definition needs to build the Xxx operation."
+    },
+    "checkWsdlDefinitions": {
+      "type": "boolean",
+      "title": "Check DefaultWsdl11Definition beans and WSDL references",
+      "default": true,
+      "description": "Warn about a missing portTypeName or schema, a missing locationUri, and WSDL references that resolve to nothing."
+    }
+  }
+}

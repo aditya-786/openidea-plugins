@@ -31,7 +31,7 @@ impl Draft {
         if grid.keys.len() > 4096 || grid.keys.len().saturating_mul(grid.files.len()+1) > 32768
             || self.proposed.iter().any(|(_,t)| t.len() > 256 << 10)
             || self.proposed.iter().map(|(_,t)|t.len()).sum::<usize>() > 1 << 20 {
-            return Err("Locale grid exceeds its bounded source/key/cell limits.".into());
+            return Err("The bundle is too large to edit as a grid (over 4096 keys, 256 KiB per file or 1 MiB in total).".into());
         }
         Ok(())
     }
@@ -52,12 +52,12 @@ impl Draft {
         let grid = self.grid();
         let editable = self.current(doc).is_ok();
         let shown = Viewport::range(viewport, grid.keys.len() as u32, 200);
-        let mut status = format!("STAGED — {} keys · {} locales · source files unchanged until Apply staged bundle changes…", grid.keys.len(), grid.files.len());
-        if !editable { status = "Source changed — staged translations preserved. Discard this draft and reload before editing or applying.".into(); }
+        let mut status = format!("Editing all locales — {} keys · {} locales. Files change only when you apply the edits.", grid.keys.len(), grid.files.len());
+        if !editable { status = "A locale file changed outside this grid, so these edits can't be applied. Discard them and edit again.".into(); }
         View::new(Body::Table(Table { columns: grid.columns, total_rows: grid.keys.len() as u32, first_row: shown.start,
             rows: grid.rows[shown.start as usize..shown.end as usize].to_vec(), editable }))
-            .button(Button::new("bundle-stage-apply", "Continue to Apply…").icon("check").enabled(editable && self.changed()))
-            .button(Button::new("bundle-stage-discard", "Discard Staged Changes…").icon("undo"))
+            .button(Button::new("bundle-stage-apply", "Apply Locale Edits…").icon("check").enabled(editable && self.changed()))
+            .button(Button::new("bundle-stage-discard", "Discard Locale Edits…").icon("undo"))
             .status(&status)
     }
     pub fn stage(&mut self, event: &ViewEvent, serial: u64) -> Result<(), Error> {
@@ -65,7 +65,7 @@ impl Draft {
         let mut next = self.proposed.clone();
         let events: Vec<(usize, ViewEvent)> = match event {
             ViewEvent::Cell { row, column, value } => {
-                if value.len() > 16384 || value.contains('\0') { return Err("Cell value exceeds 16 KiB or contains NUL.".into()); }
+                if value.len() > 16384 || value.contains('\0') { return Err("A value can be at most 16 KiB and can't contain a NUL character.".into()); }
                 let key = grid.keys.get(*row as usize).ok_or(Error::Stale)?;
                 if *column == 0 {
                     if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) || value != key && grid.keys.contains(value) {
@@ -111,14 +111,14 @@ impl Draft {
     }
     pub fn action(&self, doc: &Document) -> Option<FileAction> {
         if !self.changed() || self.current(doc).is_err() { return None; }
-        Some(FileAction { title: "Apply staged bundle changes…".into(), kind: Some("refactor.rewrite".into()),
+        Some(FileAction { title: APPLY_TITLE.into(), kind: Some("refactor.rewrite".into()),
             data: Some(serde_json::json!([self.root,doc.path,doc.version,format!("apply-grid\n{}",self.serial)]).to_string()), ..FileAction::default() })
     }
     pub fn resolve(&self, doc: &Document, serial: u64) -> Result<FileAction, Error> {
         if self.serial!=serial || !self.changed() { return Err(Error::Stale); }
         self.current(doc)?;
         let edits = self.edits();
-        let mut review = format!("Project: {}\nApply staged translation grid edits atomically. Only the listed bundle sources change; code references remain unchanged. One native Undo reverses the workspace edit.\n",self.root);
+        let mut review = format!("Project: {}\nOnly the files below change; code that uses the keys is not updated. One Undo reverts all of it.\n",self.root);
         for (path, changes) in &edits {
             let before = &self.before.iter().find(|(p,_)|p==path).ok_or(Error::Stale)?.1;
             review.push_str(&format!("\nFile: {}\n",serde_json::to_string(path).unwrap_or_default()));
@@ -128,18 +128,24 @@ impl Draft {
                 review.push_str(&format!("Before: {}\nAfter: {}\n",serde_json::to_string(&before[start..end]).unwrap_or_default(),serde_json::to_string(&change.text).unwrap_or_default()));
             }
         }
-        if !ui_kit::prompts::confirm_exact("Apply staged locale grid?",&review)? { return Err(Error::Cancelled); }
+        if !ui_kit::prompts::confirm_exact("Apply locale edits?",&review)? { return Err(Error::Cancelled); }
         self.current(doc)?;
         // Preserve the draft until subsequent source observation proves its text is present.
-        Ok(FileAction { title: "Apply staged bundle changes".into(), edits, ..FileAction::default() })
+        Ok(FileAction { title: "Apply locale edits".into(), edits, ..FileAction::default() })
     }
+}
+/// Title of the ⌥⏎ action that applies the grid; the Apply button points to it.
+pub(crate) const APPLY_TITLE: &str = "Apply Locale Edits…";
+pub(crate) fn confirm_discard(path: &str) -> Result<bool, Error> {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    ui_kit::prompts::confirm_exact("Discard locale edits?", &format!("Throws away the unapplied edits of the {file} bundle. No file changes."))
 }
 impl Properties {
     pub(crate) fn draft_action(&self, doc: &Document) -> Option<FileAction> { self.bundle_draft.as_ref()?.action(doc) }
     pub(crate) fn discard_grid(&mut self, ctx: &openidea_plugin::Invocation) -> Result<Option<String>,Error> {
         let root=ctx.project().ok_or(Error::Stale)?.root()?;
-        let draft=self.bundle_draft.as_ref().filter(|draft|draft.root==root).ok_or("No staged locale draft belongs to this project.")?;
-        if !ui_kit::prompts::confirm_exact("Discard staged locale grid?",&format!("Discard only the memory-only draft for {}. No source files change.",serde_json::to_string(&draft.doc.path).unwrap_or_default()))? {return Ok(None);}
+        let draft=self.bundle_draft.as_ref().filter(|draft|draft.root==root).ok_or("There are no locale edits to discard in this project.")?;
+        if !confirm_discard(&draft.doc.path)? {return Ok(None);}
         self.bundle_draft=None;self.bundle=None;self.bundle_bindings.clear();
         openidea_plugin::host::refresh_view(views::BUNDLE);Ok(None)
     }
@@ -160,7 +166,7 @@ mod tests {
         (h,p)
     }
     fn action(p:&mut Properties,doc:&Document)->FileAction {
-        p.file_actions(doc,Range::default()).into_iter().find(|a|a.title=="Apply staged bundle changes…").expect("staged action")
+        p.file_actions(doc,Range::default()).into_iter().find(|a|a.title==APPLY_TITLE).expect("staged action")
     }
     fn document(ctx:&Invocation)->Document {
         let editor=ctx.editor().unwrap();let d=editor.document().unwrap();
@@ -176,7 +182,7 @@ mod tests {
         assert_eq!(ctx.project().unwrap().read_file("/project/messages_fr.properties").unwrap(),"hello=Bonjour\n");
         let view=p.render(views::BUNDLE,None,&ctx).unwrap();
         let Body::Table(table)=view.body else {panic!("editable native table")};
-        assert!(table.editable);assert!(view.status.unwrap().contains("STAGED"));
+        assert!(table.editable);assert!(view.status.unwrap().contains("Editing all locales"));
         assert_eq!(&table.rows[0][1..], &["Welcome😀","Salut😀"]);
         let doc=document(&ctx);let pending=action(&mut p,&doc);
         h.answer_next_prompt(None);
@@ -224,7 +230,7 @@ mod tests {
         h.add_file("/project/messages_fr.properties","hello=external\n");
         assert!(p.resolve_file_action(&doc,pending).is_err());
         let view=p.render(views::BUNDLE,None,&ctx).unwrap();
-        assert!(matches!(view.body,Body::Table(t) if !t.editable));assert!(view.status.unwrap().contains("Source changed"));
+        assert!(matches!(view.body,Body::Table(t) if !t.editable));assert!(view.status.unwrap().contains("changed outside this grid"));
         assert!(p.bundle_draft.is_some());
         h.answer_next_prompt(None);p.handle(views::BUNDLE,ViewEvent::Button("bundle-stage-discard".into()),&ctx).unwrap();
         assert!(p.bundle_draft.is_some());

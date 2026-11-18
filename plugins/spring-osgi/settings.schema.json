@@ -1,0 +1,28 @@
+{
+  "properties": {
+    "checkService": {
+      "type": "boolean",
+      "title": "Check that service beans implement their interfaces",
+      "default": true,
+      "description": "Report a service bean that does not implement an exported interface."
+    },
+    "checkListener": {
+      "type": "boolean",
+      "title": "Check listeners",
+      "default": true,
+      "description": "Report listener methods that are missing or have a wrong signature, and listeners that do not implement OsgiServiceLifecycleListener."
+    },
+    "checkUnresolvedRef": {
+      "type": "boolean",
+      "title": "Hint at unknown bean references",
+      "default": true,
+      "description": "Show an Info hint for a ref that no project source defines. Library beans are invisible, so it can over-report."
+    },
+    "checkElements": {
+      "type": "boolean",
+      "title": "Check OSGi elements and attribute values",
+      "default": true,
+      "description": "Report conflicting declarations, such as interface with interfaces, and invalid attribute values."
+    }
+  }
+}

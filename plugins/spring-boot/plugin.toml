@@ -4,10 +4,13 @@ version = "0.3.0" # x-release-please-version
 description = "Completion and checks for Spring Boot configuration files. Completes keys and values in application*.properties and application*.yml from a bundled Spring Boot fallback snapshot, explicitly selected version-qualified dependency JAR metadata, the project's configuration metadata files and its @ConfigurationProperties classes. Warns about deprecated keys (with a quick fix) and unknown keys in known groups, and checks cron expressions in @Scheduled(cron) and *.cron keys."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Unreleased: the Maven dependency JAR metadata command now resolves dependencies declared without a version when the root pom.xml's spring-boot-starter-parent or imported spring-boot-dependencies BOM (version literal or a ${property} defined in the same pom) manages them, reading the cached BOM POMs under ~/.m2/repository; ranges, SNAPSHOT versions and unresolved placeholders are refused, parent chains deeper than 4 and more than 8 imported BOMs are refused, and in-project parent POMs are not followed. Unreleased: the dependency JAR metadata confirmation names Gradle or Maven and its build file to match the selected source. Unreleased: the reviewed dependency JAR metadata command also reads build.gradle(.kts) literal group:artifact[:version] coordinates (explicit or Boot plugin/platform-BOM-managed versions; ranges, dynamic versions, classifiers and interpolation refused) from the optional read-only Gradle module cache (~/.gradle/caches/modules-2/files-2.1/<group>/<artifact>/<version>/<sha1>/); silently off when the grant is denied. Unreleased: reviewed Run with Profiles/Arguments command prompts per launch for validated profiles (offering application-<profile> files) and allowlisted --key=value arguments, shows the exact Maven (-Dspring-boot.run.profiles/arguments) or Gradle (bootRun --args) command, and opens it in a terminal only after confirmation; the profile pick list also offers literal profiles named by spring.profiles.include, spring.profiles.group and spring.config.activate.on-profile (plain names or a | b only) or declared in imported files. Unreleased: configuration-file recognition follows literal spring.config.import chains (import-relative locations resolve against the importing file; fixed file:/classpath: ones by path tail; optional: handled, configtree:, placeholders and wildcards refused; depth <= 8, files <= 64, cycle-safe) and <name>-<profile> variants of imported files for literal profiles, so their keys feed unknown-key, definition and usage checks; transitive hops through non-standard files are followed by command-time discovery only. Unreleased: opt-in native run profiles now also list Maven modules and Gradle subprojects declared by literal root modules/include entries whose own build file applies the Boot plugin; custom project dirs, profile modules and non-literal includes are withheld. Unreleased: opt-in native Maven/Gradle Boot run profiles for explicitly applied source build plugins; native process grants required, no automatic execution/wrapper/debugger integration. Unreleased: reviewed atomic exact static-source property Rename spans owned profile/properties/YAML and literal Java/Kotlin Value references, follows local imports/property sources, guards actual binding ownership and source completeness, previews every physical spelling change and revalidates before returning edits. Unreleased: reviewed native owned Database source setup from static current properties/YAML with secure credentials; no connect, introspection or SQL. Unreleased: project-scoped read-only property source occurrences preserve per-file/profile provenance and current editor text, bound discovery, exclude nested registered projects and revalidate target source before navigation; effective runtime binding remains unresolved; reviewed exact static-source Rename is separate. Unreleased: reviewed version-aware root-POM metadata selection resolves direct version properties and bounded approved official Boot parent/Cloud BOM catalogs from granted Maven-cache POMs; multiple dependency JAR snapshots coexist with hashes and version provenance. Selected Spring versions suppress authoritative bundled3.5 fallback and incomplete-catalog unknown-key negatives. No editor fetch/build execution. a Show Configuration Problems command that lists the project's configuration and metadata problems, class, enum and classpath resource completion in values, enum, class and list value checks, configuration files pointed at by spring.config.import, location and name, navigation from classpath resource values, constructor-binding checks for @ConfigurationProperties, deeper metadata file checks (defaults, deprecation, unresolved classes, hint names), plus the previously unlisted checks for early @EventListener events, @ConfigurationProperties prefixes, @SpringBootApplication in the default package, redundant @EnableAutoConfiguration/@ComponentScan, @DirtiesContext modes and transaction callbacks. Also: warns about property values that cannot convert to the key's type, navigation from spring.config.import and class-valued keys, completion of logger packages, profiles and ${} keys, checks and a define-key fix for additional-spring-configuration-metadata.json, a Reactor debug agent hint, an opt-in JDBC driver check and Spring Boot file templates. 0.1.0: 0.1.0: first release, with key and value completion, warnings for deprecated and unknown keys, a quick fix for deprecated keys and cron validation. Bundled metadata from Spring Boot 3.5.16."
+change-notes = """\
+Next release: Dependency metadata also works for versions managed by the Boot parent, a BOM, Gradle or a Spring Cloud release train, and stays until the POM changes; Run with Profiles/Arguments shows the exact command before it starts and ignores nested projects; completion, hover and checks share one project index and no longer drop out during scans; no false warnings for project enums named like library types or Kotlin @ConfigurationProperties, nested YAML logging.level completion keeps indentation, and Windows project roots are recognised; new commands and menu entries for toolbar actions, Find Property only in .properties editors, short setting titles, plainer JAR metadata messages and a notice when events is off, and every denied permission says what to allow. \
+0.3.0: configuration property support and Boot run commands. \
+0.2.0: plugin icon and property checks."""
 categories = ["frameworks"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = [
     "on-file:**/application*.properties",
@@ -68,7 +71,7 @@ title = "Configuration and Metadata"
 schema = "settings-configuration.schema.json"
 
 [[contributes.settings.pages.actions]]
-title = "Read static metadata from a selected Maven dependency JAR…"
+title = "Read Metadata from Dependency JAR…"
 command = "read-dependency-jar-metadata"
 
 [[contributes.fileIcons]]
@@ -115,18 +118,20 @@ path = "templates/ConfigurationProperties.kt"
 
 [[contributes.commands]]
 id = "read-dependency-jar-metadata"
-title = "Spring Boot: Read Metadata from Selected Maven Dependency JAR…"
+title = "Spring Boot: Read Metadata from Dependency JAR…"
 category = "Spring Boot"
 
 [[contributes.commands]]
 id = "current-file-placeholder-occurrences"
-title = "Spring Boot: Current-File Placeholder Occurrences…"
+title = "Spring Boot: Find Property in File…"
 category = "Spring Boot"
+when = "editorLangId == properties"
 
 [[contributes.commands]]
 id = "project-placeholder-occurrences"
-title = "Spring Boot: Project Property Source Occurrences…"
+title = "Spring Boot: Find Property in Project…"
 category = "Spring Boot"
+when = "editorLangId == properties"
 
 [[contributes.commands]]
 id = "run-with-options"
@@ -137,6 +142,16 @@ category = "Spring Boot"
 id = "configure-source-database"
 title = "Spring Boot: Configure Database from Current Source…"
 category = "Spring Boot"
+
+[[contributes.menus]]
+menu = "editor.context"
+command = "project-placeholder-occurrences"
+when = "editorLangId == properties"
+
+[[contributes.menus]]
+menu = "editor.context"
+command = "current-file-placeholder-occurrences"
+when = "editorLangId == properties"
 
 [[contributes.providers]]
 kinds = ["code-actions"]

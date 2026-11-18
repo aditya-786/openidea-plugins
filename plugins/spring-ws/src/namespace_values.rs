@@ -163,7 +163,7 @@ fn sites(doc:&Document)->Vec<(String,Range)> {
     if doc.language=="xml" {xml_sites(&doc.text)} else {xpath::namespace_sites(doc)}
 }
 fn inventory(nav: &mut WsTools, doc: &Document) -> Option<BTreeMap<String, BTreeSet<String>>> {
-    if !nav.watching || !nav.unreadable_schemas.is_empty() {
+    if !nav.watching {
         return None;
     }
     let root = project_of(&doc.path)?.root().ok()?;
@@ -182,9 +182,6 @@ fn inventory(nav: &mut WsTools, doc: &Document) -> Option<BTreeMap<String, BTree
     }
     let mut result: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (path, file) in cache.iter() {
-        if project_of(path).and_then(|p| p.root().ok()).as_deref() != Some(&root) {
-            continue;
-        }
         for schema in &file.schemas {
             if !schema.namespace.is_empty() && plain_uri(&schema.namespace) {
                 result

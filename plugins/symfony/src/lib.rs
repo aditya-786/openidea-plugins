@@ -16,6 +16,8 @@ mod hover;
 mod ownership;
 mod intentions;
 mod make_commands;
+
+const PHP_DENIED: &str = "Running PHP needs the process:php permission. Allow it in Settings › Plugins › Symfony, and make sure php is on your PATH.";
 mod mcp;
 mod live;
 mod namespace_paths;
@@ -32,6 +34,7 @@ mod profiler;
 mod profiler_details;
 mod query_builder_checks;
 mod refs;
+mod related;
 mod reference_model;
 mod rewrites;
 mod route_defs;
@@ -50,12 +53,14 @@ mod twig;
 mod twig_checks;
 mod wiring;
 mod yaml_quotes;
+#[cfg(test)]
+mod panic_regressions;
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
-use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Document, Providers};
-use openidea_plugin::views::{Body, Button, Table, TreeItem, View, ViewEvent, Viewport, Views};
+use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Document, LineMarker, Providers};
+use openidea_plugin::views::{Body, Button, Table, View, ViewEvent, Viewport, Views};
 use openidea_plugin::{Context, Diagnostic, Event, EventKind, Location, PickItem, Position, Range, Severity, TextEdit};
 use openidea_plugin::{Error, Invocation, LogLevel, NotificationLevel, Plugin, Project, StatusItem, host, text};
 
@@ -102,6 +107,16 @@ const MAX_PARENTS: usize = 8;
 
 fn under(path: &str, root: &str) -> bool {
     path.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Roots of the open projects nested inside `root`, read once per request.
+pub(crate) fn nested_roots(root: &str) -> Vec<String> {
+    host::projects()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|project| project.root().ok())
+        .filter(|inner| inner != root && under(inner, root))
+        .collect()
 }
 
 fn project_for(path: &str) -> Option<Project> {
@@ -850,6 +865,9 @@ fn route_is_missing(index: &Index, text: &str, start: usize, name: &str) -> bool
 }
 
 pub fn problems(index: &Index, path: &str, language: &str, text: &str) -> Vec<Diagnostic> {
+    if language == "twig" && index.custom_twig_lexer() {
+        return Vec::new();
+    }
     let mut problems = Vec::new();
     let mut problem = |start: usize, end: usize, code: &str, message: String| {
         let severity = match code {
@@ -991,6 +1009,7 @@ impl Groups {
 fn findings(index: &Index, groups: Groups, read: checks::Reader, path: &str, language: &str, text: &str) -> Vec<checks::Finding> {
     let ctx = checks::Context::new(index, read);
     let mut findings = Vec::new();
+    let groups = if language == "twig" && index.custom_twig_lexer() { Groups { twig: false, twig_syntax: false, ..groups } } else { groups };
 
     if groups.controllers {
         findings.extend(checks::check_routes(&ctx, path, language, text));
@@ -1061,7 +1080,7 @@ fn fixes(index: &Index, path: &str, language: &str, text: &str) -> Vec<checks::F
         found.extend(config_checks::yaml_scalars(path, language, text));
     }
 
-    if groups.twig && language == "twig" {
+    if groups.twig && language == "twig" && !index.custom_twig_lexer() {
         let read = |_: &str| None;
         found.extend(twig_checks::names(&checks::Context::new(index, &read), text));
     }
@@ -1120,8 +1139,6 @@ pub struct Main {
     indexes: BTreeMap<String, Index>,
     /// Files with published problems, checked again when the index changes.
     checked: BTreeSet<String>,
-    /// Expanded nodes of the tool window.
-    expanded: BTreeSet<String>,
 }
 
 fn concrete_method(route: &Route) -> Route {
@@ -1254,7 +1271,7 @@ impl Main {
 
         let output = match project.run_process("php", &args, None) {
             Err(Error::Denied(_)) => {
-                return Err("Allow the process:php capability in Settings › Plugins.".into());
+                return Err(PHP_DENIED.into());
             }
             result => result?,
         };
@@ -1275,7 +1292,10 @@ impl Main {
     fn run_console_command(&mut self, ctx: &Invocation) -> Result<Option<String>, Error> {
         let project = ctx.project().ok_or("No project is open.")?;
         let args = ["bin/console".to_owned(), "list".to_owned(), "--raw".to_owned()];
-        let listed = project.run_process("php", &args, None).ok().filter(|o| o.status == Some(0));
+        let listed = {
+            let _task = host::begin_task("Listing console commands", false);
+            project.run_process("php", &args, None).ok().filter(|o| o.status == Some(0))
+        };
 
         let mut descriptions: BTreeMap<String, Option<String>> = BTreeMap::new();
         for line in listed.iter().flat_map(|o| o.stdout.lines()) {
@@ -1291,7 +1311,7 @@ impl Main {
             }
         }
         if descriptions.is_empty() {
-            return Err("No console commands found. Allow process:php in Settings › Plugins or define a command in the project.".into());
+            return Err("No console commands found. Allow process:php in Settings › Plugins › Symfony or define a command in the project.".into());
         }
 
         let items: Vec<PickItem> = descriptions
@@ -1312,9 +1332,9 @@ impl Main {
         };
 
         let mut args = vec!["bin/console".to_owned(), name.clone()];
-        args.extend(arguments.split_whitespace().map(str::to_owned));
+        args.extend(shell_words::split(&arguments).map_err(|_| Error::Invalid("Unbalanced quote in the arguments.".into()))?);
         match host::open_terminal(&format!("console {name}"), "php", &args) {
-            Err(Error::Denied(_)) => Err("Allow the process:php capability in Settings › Plugins.".into()),
+            Err(Error::Denied(_)) => Err(PHP_DENIED.into()),
             result => result.map(|()| None),
         }
     }
@@ -1386,8 +1406,12 @@ impl Main {
     }
 
     fn summary_of(&self, root: &str, i: &Index) -> String {
-        if !i.settings_current() {return format!("{root}: source settings changed; Reindex to refresh cached facts.");}
-        let partial = if i.partial { " (index incomplete)" } else { "" };
+        if !i.settings_current() {return format!("{root}: source settings changed; Reindex to apply them.");}
+        let partial = match (i.partial, i.template_directories.is_empty()) {
+            (true, _) => " (index incomplete)",
+            (false, false) => " (templates in gitignored folders may not be listed)",
+            _ => "",
+        };
         let translations: usize = i.translations.values().map(Names::len).sum();
         format!(
             "{root}: {} routes, {} templates, {} services, {translations} translations{partial}",
@@ -1426,21 +1450,20 @@ impl Plugin for Main {
             "show-profiler" => {
                 self.profiler_snapshot.refresh(ctx);
                 ui_kit::web::reveal_view(PROFILER_VIEW, include_str!("ui_config.json"))?;
-                host::notify(NotificationLevel::Info, SOURCE, "The latest requests are in the Profiler tab.");
                 Ok(None)
             }
             "cache-warmup" => self.console(ctx, "cache:warmup"),
             "cache-clear" => self.console(ctx, "cache:clear"),
             "run-console-command" => self.run_console_command(ctx),
             "route-copy-curl" => {
-                if let Some(route) = self.selected_route(ctx) {
-                    routes::copy_as_curl(&concrete_method(route), DEFAULT_BASE_URL)?;
+                if let Some(route) = self.selected_route_or_pick(ctx)? {
+                    routes::copy_as_curl(&concrete_method(&route), DEFAULT_BASE_URL, "Symfony")?;
                 }
                 Ok(None)
             }
             "route-create-http" => {
-                if let Some(route) = self.selected_route(ctx) {
-                    routes::create_http_file(&concrete_method(route), DEFAULT_BASE_URL, None)?;
+                if let Some(route) = self.selected_route_or_pick(ctx)? {
+                    routes::create_http_file(&concrete_method(&route), DEFAULT_BASE_URL, None, "Symfony")?;
                 }
                 Ok(None)
             }
@@ -1461,6 +1484,7 @@ impl Plugin for Main {
         let roots: BTreeSet<_> = projects.iter().filter_map(|project| project.root().ok()).collect();
         // Do not retain stale facts after an oversized batch or perform unbounded callbacks.
         let mut changed = BTreeSet::new();
+        let mut added_or_removed = BTreeSet::new();
         let mut opened = BTreeSet::new();
         let mut count = 0usize;
         for event in events.iter().take(1025) {
@@ -1468,6 +1492,7 @@ impl Plugin for Main {
                 Event::FileSaved(path) => (Box::new(std::iter::once(path.as_str())), false),
                 Event::FileOpened(path) => (Box::new(std::iter::once(path.as_str())), true),
                 Event::FilesChanged(files) => {
+                    added_or_removed.extend(files.created.iter().chain(&files.removed).map(String::as_str));
                     (Box::new(files.created.iter().chain(&files.modified).chain(&files.removed).map(String::as_str)), false)
                 }
                 _ => continue,
@@ -1508,15 +1533,37 @@ impl Plugin for Main {
                 continue;
             };
             let directories = self.indexes.get(&root).filter(|index|index.settings_current()).map(|index| index.template_directories.clone()).unwrap_or_default();
-            let relevant = changed
+            let relevant: Vec<&str> = changed
                 .iter()
-                .filter_map(|path| path.strip_prefix(&format!("{root}/")))
-                .any(|relative| affects_index(relative) || index::affects_configured_index(relative, &configured_inputs)
-                    || namespace_paths::affects(relative, &directories));
+                .filter(|path| {
+                    path.strip_prefix(&format!("{root}/")).is_some_and(|relative| affects_index(relative) || index::affects_configured_index(relative, &configured_inputs)
+                        || namespace_paths::affects(relative, &directories))
+                })
+                .copied()
+                .collect();
             let unknown = !self.indexes.contains_key(&root) && opened.iter().any(|path| under(path, &root));
             let settings_changed=self.indexes.get(&root).is_some_and(|index|!index.settings_current());
-            if relevant || unknown || settings_changed {
+            let mut full_build = unknown || settings_changed;
+            let mut updated = false;
+            if !full_build && !relevant.is_empty() {
+                match self.indexes.get_mut(&root) {
+                    None => full_build = true,
+                    Some(index) => {
+                        for path in &relevant {
+                            let relative = &path[root.len() + 1..];
+                            if added_or_removed.contains(path) || !index.update_file(&project, &root, relative) {
+                                full_build = true;
+                                break;
+                            }
+                            updated = true;
+                        }
+                    }
+                }
+            }
+            if full_build {
                 self.index_project(&project);
+            } else if updated {
+                refresh_main_view();
             }
             for path in changed.iter().chain(&opened).filter(|path| under(path, &root)) {
                 self.check(&project, path);
@@ -1580,9 +1627,10 @@ impl Providers for Main {
         };
         let replace = range_of(&doc.text, reference.start, reference.end);
 
+        let nested = nested_roots(&root);
         let items=candidates(index, &doc.path, &doc.language, &doc.text, &reference)
             .iter()
-            .filter(|(_,entry)|entry.path.is_empty() || host::project_of(&entry.path).and_then(|project|project.root().ok()).as_deref()==Some(root.as_str()))
+            .filter(|(_,entry)|entry.path.is_empty() || (under(&entry.path, &root) && !nested.iter().any(|inner| under(&entry.path, inner))))
             .map(|(name, entry)| {
                 let mut item = CompletionItem::new(name, completion_kind(reference.kind));
                 item.detail = entry.detail.clone();
@@ -1592,6 +1640,11 @@ impl Providers for Main {
             .collect();
         if host::project_of(&doc.path).and_then(|project|project.root().ok()).as_deref()!=Some(root.as_str()) {return Vec::new();}
         items
+    }
+
+    fn line_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
+        let Some(index) = self.index_for(&doc.path) else { return Vec::new() };
+        related::markers(index, &doc.path, &doc.language, &doc.text)
     }
 
     fn definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
@@ -2012,8 +2065,7 @@ fn typo_fixes(index: &Index, doc: &Document, offset: usize, selection_end: usize
         .collect()
 }
 
-/// Tool window node keys: `group:<kind>`, `domain:<name>`, `<kind>:<name>`, `translation:<domain>:<key>`.
-/// The icon is the group's and, except for translations, its leaves'.
+/// Tool window row keys: `<kind>:<name>`, `translation:<domain>:<key>`; the icon is the rows'.
 const GROUPS: &[(&str, &str, &str)] = &[
     ("route", "Routes", "web"),
     ("template", "Templates", "file-html"),
@@ -2041,17 +2093,8 @@ fn entry_for<'a>(index: &'a Index, key: &str) -> Option<&'a Entry> {
         let (domain, name) = name.split_once(':')?;
         return index.translations.get(domain)?.get(name);
     }
-    match group {
-        "entity" => return index.entities.get(name).map(|entity| &entity.entry),
-        "field" => {
-            let (class, field) = name.rsplit_once(':')?;
-            return index.entities.get(class)?.fields.iter().find(|candidate| candidate.name == field).map(|candidate| &candidate.entry);
-        }
-        "relation" => {
-            let (class, relation) = name.rsplit_once(':')?;
-            return index.entities.get(class)?.relations.iter().find(|candidate| candidate.name == relation).map(|candidate| &candidate.entry);
-        }
-        _ => {}
+    if group == "entity" {
+        return index.entities.get(name).map(|entity| &entity.entry);
     }
     group_names(index, group)?.get(name)
 }
@@ -2079,77 +2122,85 @@ impl Main {
         config.to_string()
     }
 
-    fn names_table(index: &Index, group: &str, root: &str) -> Body {
+    /// Resource table of a non-route tab: one row per fact, keyed as `entry_for` expects.
+    fn inventory_table(index: &Index, group: &str, root: &str) -> Body {
+        use serde_json::json;
         let icon = GROUPS.iter().find(|(id, _, _)| *id == group).map_or("file", |(_, _, icon)| *icon);
-        let names = group_names(index, group).expect("parameter and env groups are name maps");
-        let items: Vec<serde_json::Value> = names
-            .iter()
-            .filter(|(name, _)| group != "parameter" || !name.starts_with('.'))
-            .map(|(name, entry)| {
-                let detail = entry.detail.as_deref().unwrap_or_default();
-                let file = entry.path.strip_prefix(root).unwrap_or(&entry.path).trim_start_matches(['/', '\\']);
-                let value = index.env_values.get(name).map_or("", String::as_str);
-                let cells = if group == "env" { vec![name.as_str(), value, detail.strip_prefix("defined in ").unwrap_or(detail)] } else { vec![name.as_str(), detail, file] };
-                serde_json::json!({"key":format!("{group}:{name}"),"cells":cells,"icon":icon})
-            })
-            .collect();
-        let data = if group == "env" {
-            serde_json::json!({"columns":["Variable","Value","File"],"columnStyles":["code","code","muted"],"showRowIcons":true,"searchPlaceholder":"Filter environment variables…","items":items})
-        } else {
-            serde_json::json!({"columns":["Key","Value","File"],"columnStyles":["code","code","muted"],"showRowIcons":true,"searchPlaceholder":"Filter parameters…","facetLabels":{"2":"All files"},"facets":[2],"items":items})
+        let file = |path: &str| path.strip_prefix(root).unwrap_or(path).trim_start_matches(['/', '\\']).to_owned();
+        let (items, data): (Vec<serde_json::Value>, serde_json::Value) = match group {
+            "env" => (
+                index.env.iter().map(|(name, entry)| {
+                    let value = index.env_values.get(name).map_or("", String::as_str);
+                    let detail = entry.detail.as_deref().unwrap_or_default();
+                    json!({"key":format!("env:{name}"),"cells":[name,value,detail.strip_prefix("defined in ").unwrap_or(detail)],"icon":icon})
+                }).collect(),
+                json!({"columns":["Variable","Value","File"],"columnStyles":["code","code","muted"],"searchPlaceholder":"Filter environment variables…"}),
+            ),
+            "parameter" => (
+                index.parameters.iter().filter(|(name, _)| !name.starts_with('.')).map(|(name, entry)| {
+                    json!({"key":format!("parameter:{name}"),"cells":[name,entry.detail.as_deref().unwrap_or_default(),file(&entry.path)],"icon":icon})
+                }).collect(),
+                json!({"columns":["Key","Value","File"],"columnStyles":["code","code","muted"],"searchPlaceholder":"Filter parameters…","facetLabels":{"2":"All files"},"facets":[2]}),
+            ),
+            "service" => (
+                index.services.iter().map(|(id, entry)| {
+                    let detail = entry.detail.as_deref().unwrap_or_default();
+                    let (class, kind) = match detail.strip_prefix("alias of ") {
+                        Some(target) => (format!("@{target}"), "Alias"),
+                        None if detail.is_empty() && id.contains('\\') => (id.clone(), "Service"),
+                        None => (detail.to_owned(), "Service"),
+                    };
+                    json!({"key":format!("service:{id}"),"cells":[id,class,kind,file(&entry.path)],"icon":icon})
+                }).collect(),
+                json!({"columns":["Service","Class","Kind","File"],"columnStyles":["code","code","text","muted"],"columnWeights":[3,3,1,3],
+                    "searchPlaceholder":"Filter services…","facetLabels":{"2":"All kinds","3":"All files"},"facets":[2,3]}),
+            ),
+            "template" => (
+                index.templates.iter().map(|(name, entry)| {
+                    let namespace = name.strip_prefix('@').and_then(|rest| rest.split_once('/')).map_or("(default)".to_owned(), |(namespace, _)| format!("@{namespace}"));
+                    let rendered_by = index.renders.iter().filter(|render| render.template == *name).count();
+                    let details: Vec<_> = entry.detail.iter().map(|detail| json!({"label":"Source","value":detail})).collect();
+                    json!({"key":format!("template:{name}"),"cells":[name,namespace,file(&entry.path),rendered_by.to_string()],"icon":icon,"details":details})
+                }).collect(),
+                json!({"columns":["Template","Namespace","File","Rendered by"],"columnStyles":["code","locale","muted","locale"],"columnWeights":[4,1.5,4,1],
+                    "searchPlaceholder":"Filter templates…","facetLabels":{"1":"All namespaces"},"facets":[1]}),
+            ),
+            "entity" => (
+                index.entities.iter().map(|(class, entity)| {
+                    let mut details = vec![json!({"label":"Class","value":class})];
+                    details.extend(entity.fields.iter().map(|field| {
+                        let value = format!("{}{}{}", field.type_name, if field.nullable { ", nullable" } else { "" }, if field.id { ", id" } else { "" });
+                        json!({"label":format!("${}", field.name),"value":value})
+                    }));
+                    details.extend(entity.relations.iter().map(|relation| {
+                        json!({"label":format!("${}", relation.name),"value":format!("{} \u{2192} {}", relation.kind, relation.target.as_deref().unwrap_or("?"))})
+                    }));
+                    let members: Vec<&str> = entity.fields.iter().map(|field| field.name.as_str()).chain(entity.relations.iter().map(|relation| relation.name.as_str())).collect();
+                    let cells = [
+                        php_text::short_name(class).to_owned(),
+                        entity.table.clone(),
+                        entity.fields.len().to_string(),
+                        entity.relations.len().to_string(),
+                        entity.repository.as_deref().map(php_text::short_name).unwrap_or_default().to_owned(),
+                        file(&entity.entry.path),
+                    ];
+                    json!({"key":format!("entity:{class}"),"cells":cells,"icon":"class","details":details,"searchText":format!("{class} {}", members.join(" "))})
+                }).collect(),
+                json!({"columns":["Entity","Table","Fields","Relations","Repository","File"],"columnStyles":["code","code","locale","locale","code","muted"],
+                    "columnWeights":[2.5,2,1,1,2.5,3],"searchPlaceholder":"Filter entities, tables or fields…"}),
+            ),
+            _ => (
+                index.translations.iter().flat_map(|(domain, names)| names.iter().map(move |(key, entry)| (domain, key, entry))).map(|(domain, key, entry)| {
+                    json!({"key":format!("translation:{domain}:{key}"),"cells":[key,domain,entry.detail.as_deref().unwrap_or_default(),file(&entry.path)],"icon":icon})
+                }).collect(),
+                json!({"columns":["Key","Domain","Value","File"],"columnStyles":["code","locale","text","muted"],"columnWeights":[3,1,3,2],
+                    "searchPlaceholder":"Filter translations…","facetLabels":{"1":"All domains"},"facets":[1]}),
+            ),
         };
+        let mut data = data;
+        data["showRowIcons"] = true.into();
+        data["items"] = items.into();
         Body::Other { kind: "resources".into(), data: data.to_string() }
-    }
-
-    fn group_tree(&self, index: &Index, group: &str) -> Vec<TreeItem> {
-        let icon = GROUPS.iter().find(|(id, _, _)| *id == group).map_or("file", |(_, _, icon)| *icon);
-        let leaf = |key: String, name: &str, entry: &Entry, icon: &str| {
-            let item = TreeItem::new(&key, name).icon(icon);
-            match &entry.detail {
-                Some(detail) if !detail.is_empty() => item.detail(detail),
-                _ => item,
-            }
-        };
-
-        if group == "entity" {
-            let mut items = Vec::new();
-            for (class, entity) in &index.entities {
-                let key = format!("entity:{class}");
-                let expanded = self.expanded.contains(&key);
-                let detail = format!("{} \u{b7} {} fields \u{b7} {} relations", entity.table, entity.fields.len(), entity.relations.len());
-                items.push(TreeItem::new(&key, php_text::short_name(class)).icon("class").detail(&detail).expandable(expanded));
-                if !expanded {
-                    continue;
-                }
-                for field in &entity.fields {
-                    let detail = format!("{}{}{}", field.type_name, if field.nullable { "?" } else { "" }, if field.id { " \u{b7} id" } else { "" });
-                    items.push(TreeItem::new(&format!("field:{class}:{}", field.name), &field.name).parent(&key).icon("property").detail(&detail));
-                }
-                for relation in &entity.relations {
-                    let detail = format!("{} \u{2192} {}", relation.kind, relation.target.as_deref().map_or("?", php_text::short_name));
-                    items.push(TreeItem::new(&format!("relation:{class}:{}", relation.name), &relation.name).parent(&key).icon("hierarchy").detail(&detail));
-                }
-            }
-            return items;
-        }
-
-        if let Some(names) = group_names(index, group) {
-            return names.iter().map(|(name, entry)| leaf(format!("{group}:{name}"), name, entry, icon)).collect();
-        }
-
-        let mut items = Vec::new();
-        for (domain, names) in &index.translations {
-            let domain_key = format!("domain:{domain}");
-            let expanded = self.expanded.contains(&domain_key);
-            items.push(TreeItem::new(&domain_key, &format!("{domain} ({})", names.len())).icon("folder").expandable(expanded));
-            if expanded {
-                for (name, entry) in names {
-                    let item = leaf(format!("translation:{domain}:{name}"), name, entry, "property");
-                    items.push(item.parent(&domain_key));
-                }
-            }
-        }
-        items
     }
 
     fn routes(&self, index: &Index) -> Vec<Route> {
@@ -2244,6 +2295,27 @@ impl Main {
         (route == expected && self.current_route_member(ctx, route)).then_some(route)
     }
 
+    /// The route selected in the tool window, or one the user picks when the command runs from the palette.
+    fn selected_route_or_pick(&self, ctx: &Invocation) -> Result<Option<Route>, Error> {
+        if let Some(route) = self.selected_route(ctx) {
+            return Ok(Some(route.clone()));
+        }
+        let index = self.view_index(ctx).ok_or("No Symfony project is indexed.")?;
+        let routes = self.routes(index);
+        if routes.is_empty() {
+            return Err("No routes are indexed.".into());
+        }
+        let items: Vec<PickItem> = routes
+            .iter()
+            .enumerate()
+            .map(|(i, route)| PickItem::new(&i.to_string(), &format!("{} {}", route.method, route.path)).description(route.name.as_deref().unwrap_or(&route.handler.class)))
+            .collect();
+        let Some(choice) = host::pick("Choose a route", &items)? else {
+            return Ok(None);
+        };
+        routes.into_iter().nth(choice.parse().map_err(|_| Error::Stale)?).map(Some).ok_or(Error::Stale)
+    }
+
     fn view_index(&self, ctx: &Invocation) -> Option<&Index> {
         let root = ctx.project()?.root().ok()?;
         self.indexes.get(&root).filter(|index|index.settings_current())
@@ -2289,7 +2361,7 @@ impl Views for Main {
             let stale_settings=ctx.project().and_then(|project|project.root().ok()).and_then(|root|self.indexes.get(&root)).is_some_and(|index|!index.settings_current());
             let Some(index) = self.view_index(ctx) else {
                 self.route_owner = None; self.route_selection = None; self.selected = None;
-                let message=if stale_settings {"Symfony source settings changed. Reindex to refresh cached facts."} else {"This project is not a Symfony application."};
+                let message=if stale_settings {"Symfony source settings changed. Reindex to apply them."} else {"This project is not a Symfony application."};
                 return Ok(View::message(message).button(reindex));
             };
 
@@ -2299,10 +2371,10 @@ impl Views for Main {
                 String::from("No compiled container: run Warm Up Cache to index bundle services and routes")
             };
             if index.template_paths_unknown {
-                status.push_str(" · Twig plugin hints are incomplete or runtime-unverified");
+                status.push_str(" · some Twig template paths may be missing");
             }
             if !index.ambiguous_templates.is_empty() {
-                status.push_str(" · ambiguous template hints suppressed");
+                status.push_str(" · templates with clashing names are skipped");
             }
             if index.partial {
                 status.push_str(" · Index incomplete (discovery, read or time limit)");
@@ -2312,22 +2384,18 @@ impl Views for Main {
                 .button(reindex)
                 .button(Button::new("cache-warmup", "Warm Up Cache").icon("build-project"))
                 .status(&status);
-            let (routes, tree) = match routes_active {
-                true => (self.routes(index), Vec::new()),
-                false => (Vec::new(), self.group_tree(index, group)),
-            };
+            let routes = if routes_active { self.routes(index) } else { Vec::new() };
             let root = ctx.project().and_then(|p| p.root().ok());
-            let names_table = matches!(group, "parameter" | "env").then(|| Self::names_table(index, group, root.as_deref().unwrap_or_default()));
+            let table = (!routes_active).then(|| Self::inventory_table(index, group, root.as_deref().unwrap_or_default()));
             if self.route_owner != root { self.selected = None; self.route_selection = None; }
             self.route_owner = root;
             let window = self.window.get_or_insert_with(Window::new);
-            let view = if routes_active {
-                window.routes.set_routes(routes);
-                window.routes.render(base)
-            } else if let Some(body) = names_table {
-                View { body, ..base }
-            } else {
-                View { body: Body::Tree(tree), ..base }
+            let view = match table {
+                Some(body) => View { body, ..base },
+                None => {
+                    window.routes.set_routes(routes);
+                    window.routes.render(base)
+                }
             };
             Ok(view)
         })().map(ui_kit::actions::available)
@@ -2417,14 +2485,6 @@ impl Views for Main {
         }
 
         match event {
-            ViewEvent::Expand(key) => {
-                self.expanded.insert(key);
-                refresh_main_view();
-            }
-            ViewEvent::Collapse(key) => {
-                self.expanded.remove(&key);
-                refresh_main_view();
-            }
             ViewEvent::Activate(key) => {
                 let entry = self.view_index(ctx).and_then(|index| entry_for(index, &key));
                 if let Some(entry) = entry.filter(|e| !e.path.is_empty()) {
@@ -2466,14 +2526,14 @@ mod tests {
         host.add_file("public/img/logo.png", "");
     }
 
-    fn activated(host: &MockHost) -> Main {
+    pub(crate) fn activated(host: &MockHost) -> Main {
         symfony_project(host);
         let mut plugin = Main::default();
         plugin.activate(&host.context("aritti.symfony")).unwrap();
         plugin
     }
 
-    fn doc(path: &str, language: &str, text: &str) -> Document {
+    pub(crate) fn doc(path: &str, language: &str, text: &str) -> Document {
         Document { path: path.into(), language: language.into(), version: 1, text: text.into() }
     }
 
@@ -2560,13 +2620,21 @@ mod tests {
         }
     }
     #[test]
+    fn route_copy_curl_without_selection_asks_and_copies_nothing_when_dismissed(){
+        let host=MockHost::install().with_capabilities(&["project.read","clipboard"]);let mut plugin=activated(&host);
+        plugin.render(VIEW,None,&host.invocation()).unwrap();
+        host.answer_next_prompt(None);
+        plugin.run_command("route-copy-curl",&host.invocation(),None).unwrap();
+        assert!(host.clipboard().is_none());
+    }
+    #[test]
     fn route_actions_reject_last_other_root_and_no_index_cached_rows(){
         let host=MockHost::install();let mut plugin=activated(&host);let ctx=host.invocation();
         let Body::List(rows)=plugin.render(VIEW,None,&ctx).unwrap().body else {panic!("routes expected")};let key=rows[0].key.clone();
         plugin.handle(VIEW,ViewEvent::Select(key.clone()),&ctx).unwrap();assert!(plugin.selected_route(&ctx).is_some());
-        host.set_project_root(Some("/other"));let other=host.invocation();plugin.run_command("route-copy-curl",&other,None).unwrap();assert!(host.clipboard().is_none());
+        host.set_project_root(Some("/other"));let other=host.invocation();assert!(plugin.run_command("route-copy-curl",&other,None).is_err());assert!(host.clipboard().is_none());
         assert!(matches!(plugin.handle(VIEW,ViewEvent::Activate(key),&other),Err(Error::Stale)));assert!(host.opened_locations().is_empty());
-        host.set_project_root(Some("/project"));plugin.indexes.clear();plugin.run_command("route-copy-curl",&host.invocation(),None).unwrap();assert!(host.clipboard().is_none());
+        host.set_project_root(Some("/project"));plugin.indexes.clear();assert!(plugin.run_command("route-copy-curl",&host.invocation(),None).is_err());assert!(host.clipboard().is_none());
     }
     #[test]
     fn cached_route_disappearance_refuses_old_selected_fact_without_io(){
@@ -3062,26 +3130,24 @@ mod tests {
         plugin.run_command("reindex", &host.invocation(), None).unwrap();
         let ctx = host.invocation();
 
-        let View { body: Body::Tree(items), .. } = plugin.render(ENTITIES_VIEW, None, &ctx).unwrap() else { panic!("not a tree") };
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "Post");
-        assert_eq!(items[0].detail.as_deref(), Some("blog_post \u{b7} 2 fields \u{b7} 1 relations"));
-
-        plugin.handle(ENTITIES_VIEW, ViewEvent::Expand("entity:App\\Entity\\Post".into()), &ctx).unwrap();
-        let View { body: Body::Tree(items), .. } = plugin.render(ENTITIES_VIEW, None, &ctx).unwrap() else { panic!("not a tree") };
-        let summary: Vec<_> = items.iter().map(|item| (item.label.as_str(), item.detail.clone().unwrap_or_default())).collect();
-        assert_eq!(
-            summary[1..],
-            [("id", "int \u{b7} id".to_owned()), ("title", "string?".to_owned()), ("author", "ManyToOne \u{2192} User".to_owned())]
-        );
-        plugin.handle(ENTITIES_VIEW, ViewEvent::Activate("field:App\\Entity\\Post:title".into()), &ctx).unwrap();
-        assert_eq!(host.opened_locations(), [("/project/src/Entity/Post.php".into(), 10, 21)]);
-
         let mut table = |view: &str| {
             let View { body: Body::Other { kind, data }, .. } = plugin.render(view, None, &ctx).unwrap() else { panic!("not a table") };
             assert_eq!(kind, "resources");
             serde_json::from_str::<serde_json::Value>(&data).unwrap()
         };
+        let entities = table(ENTITIES_VIEW);
+        assert_eq!(entities["columns"], serde_json::json!(["Entity", "Table", "Fields", "Relations", "Repository", "File"]));
+        let items = entities["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["key"], "entity:App\\Entity\\Post");
+        assert_eq!(items[0]["cells"], serde_json::json!(["Post", "blog_post", "2", "1", "", "src/Entity/Post.php"]));
+        assert!(items[0]["searchText"].as_str().unwrap().contains("title"), "{entities}");
+        let details: Vec<_> = items[0]["details"].as_array().unwrap().iter().map(|detail| (detail["label"].as_str().unwrap(), detail["value"].as_str().unwrap())).collect();
+        assert_eq!(
+            details,
+            [("Class", "App\\Entity\\Post"), ("$id", "int, id"), ("$title", "string, nullable"), ("$author", "ManyToOne \u{2192} App\\Entity\\User")]
+        );
+
         let config = table(CONFIG_VIEW);
         assert_eq!(config["columns"], serde_json::json!(["Key", "Value", "File"]));
         assert!(config["items"].as_array().unwrap().iter().any(|item| item["cells"][0] == "app.items_per_page"), "{config}");
@@ -3098,6 +3164,9 @@ mod tests {
         assert!(env.iter().all(|(_, detail)| !detail.contains("secret") && !detail.contains("postgresql")));
         let secret = env_table["items"].as_array().unwrap().iter().find(|item| item["cells"][0] == "APP_SECRET").unwrap();
         assert_eq!(secret["cells"][1], "••••••");
+
+        plugin.handle(ENTITIES_VIEW, ViewEvent::Activate("entity:App\\Entity\\Post".into()), &ctx).unwrap();
+        assert_eq!(host.opened_locations(), [("/project/src/Entity/Post.php".into(), 5, 6)]);
     }
 
     #[test]
@@ -3216,6 +3285,88 @@ mod tests {
         assert_eq!(terminal.args, ["bin/console", "app:sync", "--env=dev", "-v"]);
     }
 
+    #[test]
+    fn run_console_command_lists_inside_a_task() {
+        let (host, mut plugin) = console_host();
+        host.answer_next_prompt(Some(&["app:sync"]));
+        host.answer_next_prompt(Some(&[""]));
+        plugin.run_command("run-console-command", &host.invocation(), None).unwrap();
+        assert!(!host.tasks().is_empty());
+    }
+
+    #[test]
+    fn make_args_keep_quoted_value() {
+        let (host, mut plugin) = generator_host(&["project.read", "process:php"]);
+        host.on_process("php", |_, _| Err(Error::Invalid("no console".into())));
+        host.answer_next_prompt(Some(&["controller"]));
+        host.answer_next_prompt(Some(&["--message=\"a b\" Blog"]));
+        plugin.run_command("make", &host.invocation(), None).unwrap();
+        assert_eq!(host.terminals()[0].args, ["bin/console", "make:controller", "--message=a b", "Blog"]);
+        assert!(!host.tasks().is_empty());
+    }
+
+    #[test]
+    fn completion_excludes_nested_project_entries() {
+        let host = MockHost::install();
+        host.add_project("/project/packages/inner");
+        host.add_file("packages/inner/src/Controller/InnerController.php", "<?php\nclass InnerController\n{\n    #[Route('/inner', name: 'inner_route')]\n    public function i() {}\n}\n");
+        let mut plugin = activated(&host);
+        plugin.index_all();
+        assert!(!plugin.indexes["/project"].routes.contains_key("inner_route"));
+        assert!(plugin.indexes["/project"].routes.contains_key("blog_index"));
+        let doc = doc("/project/templates/a.twig", "twig", "{{ path('') }}");
+        let names: Vec<_> = plugin.completion(&doc, Position::new(0, 9), None).into_iter().map(|item| item.label).collect();
+        assert!(names.contains(&"blog_index".to_owned()) && !names.contains(&"inner_route".to_owned()));
+    }
+
+    #[test]
+    fn saving_controller_updates_index_without_full_build() {
+        let host = MockHost::install();
+        let mut plugin = activated(&host);
+        plugin.index_all();
+        host.add_file("templates/unrelated.html.twig", "x");
+        host.add_file(
+            "src/Controller/BlogController.php",
+            "<?php\nnamespace App\\Controller;\nclass BlogController\n{\n    #[Route('/blog', name: 'blog_renamed')]\n    public function index() {}\n}\n",
+        );
+        plugin.handle_events(&[Event::FileSaved("/project/src/Controller/BlogController.php".into())], &host.invocation());
+        let index = &plugin.indexes["/project"];
+        assert!(index.routes.contains_key("blog_renamed") && !index.routes.contains_key("blog_index"));
+        assert!(!index.templates.contains_key("unrelated.html.twig"));
+    }
+
+    #[test]
+    fn saving_unrelated_controller_stays_incremental_with_a_twig_lexer() {
+        let host = MockHost::install();
+        host.add_file("src/Twig/Custom.php", "<?php\nuse Twig\\Lexer;\n$twig->setLexer(new Lexer($twig));\n");
+        let mut plugin = activated(&host);
+        plugin.index_all();
+        assert!(plugin.indexes["/project"].custom_twig_lexer());
+        host.add_file("templates/unrelated.html.twig", "x");
+        host.add_file(
+            "src/Controller/BlogController.php",
+            "<?php\nnamespace App\\Controller;\nclass BlogController\n{\n    #[Route('/blog', name: 'blog_renamed')]\n    public function index() {}\n}\n",
+        );
+        plugin.handle_events(&[Event::FileSaved("/project/src/Controller/BlogController.php".into())], &host.invocation());
+        let index = &plugin.indexes["/project"];
+        assert!(index.routes.contains_key("blog_renamed") && !index.templates.contains_key("unrelated.html.twig"));
+        assert!(index.custom_twig_lexer());
+        host.add_file("src/Twig/Custom.php", "<?php\nclass Custom {}\n");
+        plugin.handle_events(&[Event::FileSaved("/project/src/Twig/Custom.php".into())], &host.invocation());
+        assert!(!plugin.indexes["/project"].custom_twig_lexer());
+        assert!(!plugin.indexes["/project"].templates.contains_key("unrelated.html.twig"));
+    }
+
+    #[test]
+    fn saving_composer_json_still_rebuilds() {
+        let host = MockHost::install();
+        let mut plugin = activated(&host);
+        plugin.index_all();
+        host.add_file("templates/unrelated.html.twig", "x");
+        plugin.handle_events(&[Event::FileSaved("/project/composer.json".into())], &host.invocation());
+        assert!(plugin.indexes["/project"].templates.contains_key("unrelated.html.twig"));
+    }
+
     fn generator_host(capabilities: &[&str]) -> (MockHost, Main) {
         let host = MockHost::install().with_capabilities(capabilities);
         let mut plugin = activated(&host);
@@ -3223,6 +3374,39 @@ mod tests {
         host.add_file("src/Form/PostType.php", "<?php\nnamespace App\\Form;\n\nclass PostType\n{\n    function f($builder) { $builder->add('title')->add('body', TextareaType::class); }\n}\n");
         plugin.index_all();
         (host, plugin)
+    }
+
+    fn assert_names_php_permission(error: &str) {
+        assert!(error.contains("needs the process:php permission"), "{error}");
+        assert!(error.contains("Settings › Plugins › Symfony"), "{error}");
+        assert!(error.contains("php is on your PATH"), "{error}");
+    }
+
+    #[test]
+    fn console_command_denied_names_permission() {
+        let host = MockHost::install().with_capabilities(&["project.read", "events"]);
+        let mut plugin = activated(&host);
+        let error = plugin.run_command("cache-clear", &host.invocation(), None).unwrap_err().to_string();
+        assert_names_php_permission(&error);
+    }
+
+    #[test]
+    fn console_terminal_denied_names_permission() {
+        let (host, mut plugin) = console_host();
+        host.answer_next_prompt(Some(&["app:sync"]));
+        host.answer_next_prompt(Some(&[""]));
+        let host = host.with_capabilities(&["project.read", "events"]);
+        let error = plugin.run_command("run-console-command", &host.invocation(), None).unwrap_err().to_string();
+        assert_names_php_permission(&error);
+    }
+
+    #[test]
+    fn make_terminal_denied_names_permission() {
+        let (host, mut plugin) = generator_host(&["project.read"]);
+        host.answer_next_prompt(Some(&["form"]));
+        host.answer_next_prompt(Some(&[""]));
+        let error = plugin.run_command("make", &host.invocation(), None).unwrap_err().to_string();
+        assert_names_php_permission(&error);
     }
 
     #[test]
@@ -3259,11 +3443,50 @@ mod tests {
     }
 
     #[test]
-    fn legacy_create_template_command_guides_to_atomic_intention_without_process_or_writes() {
-        let (host, mut plugin) = generator_host(&["project.read"]);
+    fn create_twig_template_command_writes_file() {
+        let (host, mut plugin) = generator_host(&["project.read", "project.write", "editor.read"]);
+        let source = "{% include 'blog/new.html.twig' %}\n";
+        host.add_file("templates/caller.html.twig", source);
+        host.open_editor("/project/templates/caller.html.twig", "twig", source, &[(0, 14, 0, 14)]);
+        host.answer_next_prompt(Some(&["empty"]));
+        host.answer_next_prompt(Some(&[]));
+
         plugin.run_command("create-template", &host.invocation(), None).unwrap();
+
+        assert_eq!(host.invocation().project().unwrap().read_file("templates/blog/new.html.twig").unwrap(), "");
+        assert_eq!(host.opened_locations(), [("/project/templates/blog/new.html.twig".to_owned(), 0, 0)]);
         assert!(host.process_runs().is_empty());
-        assert!(host.notifications().iter().any(|notification| notification.body.contains("Create missing Twig template")));
+    }
+
+    #[test]
+    fn create_twig_template_command_prompts_when_editor_read_is_denied() {
+        let (host, mut plugin) = generator_host(&["project.read", "project.write"]);
+        host.open_editor("/project/templates/caller.html.twig", "twig", "x\n", &[(0, 0, 0, 0)]);
+        host.answer_next_prompt(Some(&["blog/show.html.twig"]));
+        host.answer_next_prompt(Some(&[]));
+
+        plugin.run_command("create-template", &host.invocation(), None).unwrap();
+
+        assert_eq!(host.invocation().project().unwrap().read_file("templates/blog/show.html.twig").unwrap(), "");
+    }
+
+    #[test]
+    fn create_twig_template_command_prompts_without_caret_reference() {
+        let (host, mut plugin) = generator_host(&["project.read", "project.write"]);
+        for bad in ["../x.html.twig", "a\\b.html.twig", "a//b.html.twig", "/a.html.twig", "a.html"] {
+            host.answer_next_prompt(Some(&[bad]));
+            let error = plugin.run_command("create-template", &host.invocation(), None).unwrap_err().to_string();
+            assert!(error.contains(".twig"), "{bad}: {error}");
+        }
+        assert!(host.process_runs().is_empty());
+        assert!(!host.invocation().project().unwrap().exists("templates/a.html").unwrap());
+        assert!(!host.invocation().project().unwrap().exists("templates/x.html.twig").unwrap());
+
+        host.answer_next_prompt(Some(&["blog/show.html.twig"]));
+        host.answer_next_prompt(Some(&[]));
+        plugin.run_command("create-template", &host.invocation(), None).unwrap();
+
+        assert_eq!(host.invocation().project().unwrap().read_file("templates/blog/show.html.twig").unwrap(), "");
     }
 
     #[test]
@@ -3498,21 +3721,55 @@ mod tests {
         let mut plugin = activated(&host);
         let ctx = host.invocation();
 
-        for (view, count, icon) in [(TEMPLATES_VIEW, 2, "file-html"), (SERVICES_VIEW, 1, "class")] {
-            let View { body: Body::Tree(items), .. } = plugin.render(view, None, &ctx).unwrap() else { panic!("not a tree") };
-            assert_eq!(items.len(), count, "{view}");
-            assert!(items.iter().all(|item| item.icon.as_deref() == Some(icon) && item.parent.is_none()), "{view}");
-        }
+        let mut table = |view: &str| {
+            let View { body: Body::Other { kind, data }, .. } = plugin.render(view, None, &ctx).unwrap() else { panic!("not a table") };
+            assert_eq!(kind, "resources");
+            serde_json::from_str::<serde_json::Value>(&data).unwrap()
+        };
+        let rows = |table: &serde_json::Value| -> Vec<(String, serde_json::Value)> {
+            table["items"].as_array().unwrap().iter().map(|item| (item["key"].as_str().unwrap().to_owned(), item["cells"].clone())).collect()
+        };
 
-        plugin.handle(TRANSLATIONS_VIEW, ViewEvent::Expand("domain:admin".into()), &ctx).unwrap();
-        let View { body: Body::Tree(items), .. } = plugin.render(TRANSLATIONS_VIEW, None, &ctx).unwrap() else { panic!("not a tree") };
-        let icon = |key: &str| items.iter().find(|i| i.key == key).and_then(|i| i.icon.clone());
-        assert_eq!(icon("domain:admin").as_deref(), Some("folder"));
-        assert_eq!(icon("translation:admin:menu").as_deref(), Some("property"));
+        let templates = table(TEMPLATES_VIEW);
+        assert_eq!(templates["columns"], serde_json::json!(["Template", "Namespace", "File", "Rendered by"]));
+        assert_eq!(templates["facets"], serde_json::json!([1]));
+        assert_eq!(
+            rows(&templates),
+            [
+                ("template:base.html.twig".into(), serde_json::json!(["base.html.twig", "(default)", "templates/base.html.twig", "0"])),
+                ("template:blog/index.html.twig".into(), serde_json::json!(["blog/index.html.twig", "(default)", "templates/blog/index.html.twig", "1"])),
+            ]
+        );
 
+        let services = table(SERVICES_VIEW);
+        assert_eq!(services["columns"], serde_json::json!(["Service", "Class", "Kind", "File"]));
+        assert_eq!(services["facets"], serde_json::json!([2, 3]));
+        assert_eq!(rows(&services), [("service:app.mailer".into(), serde_json::json!(["app.mailer", "App\\Mailer", "Service", "config/services.yaml"]))]);
+
+        let translations = table(TRANSLATIONS_VIEW);
+        assert_eq!(translations["columns"], serde_json::json!(["Key", "Domain", "Value", "File"]));
+        assert_eq!(translations["facets"], serde_json::json!([1]));
+        assert_eq!(
+            rows(&translations),
+            [
+                ("translation:admin:menu".into(), serde_json::json!(["menu", "admin", "Menu", "translations/admin.en.yaml"])),
+                ("translation:messages:app.title".into(), serde_json::json!(["app.title", "messages", "Blog", "translations/messages.en.yaml"])),
+            ]
+        );
+        assert!(translations["items"].as_array().unwrap().iter().all(|item| item["icon"] == "text"));
+
+        plugin.handle(TRANSLATIONS_VIEW, ViewEvent::Activate("translation:admin:menu".into()), &ctx).unwrap();
+        plugin.handle(SERVICES_VIEW, ViewEvent::Activate("service:app.mailer".into()), &ctx).unwrap();
         plugin.render(VIEW, None, &ctx).unwrap();
         plugin.handle(VIEW, ViewEvent::Activate("route:blog_index".into()), &ctx).unwrap();
-        assert_eq!(host.opened_locations(), [("/project/src/Controller/BlogController.php".into(), 4, 28)]);
+        assert_eq!(
+            host.opened_locations(),
+            [
+                ("/project/translations/admin.en.yaml".into(), 0, 0),
+                ("/project/config/services.yaml".into(), 1, 4),
+                ("/project/src/Controller/BlogController.php".into(), 4, 28),
+            ]
+        );
     }
 
     fn toolbar_labels(view: &View) -> Vec<String> {
@@ -3613,6 +3870,19 @@ mod tests {
         let View { body: Body::List(rows), .. } = plugin.render(VIEW, None, &ctx).unwrap() else { panic!("not a list") };
 
         plugin.handle(VIEW, ViewEvent::Select(rows[0].key.clone()), &ctx).unwrap();
+        host.answer_next_prompt(Some(&["http://localhost:8000"]));
+        plugin.run_command("route-copy-curl", &ctx, None).unwrap();
+        assert_eq!(host.clipboard().as_deref(), Some("curl -X GET 'http://localhost:8000/blog'"));
+    }
+
+    #[test]
+    fn route_commands_from_the_palette_ask_which_route() {
+        let host = MockHost::install().with_capabilities(&["project.read", "clipboard"]);
+        let mut plugin = activated(&host);
+        let ctx = host.invocation();
+        plugin.render(VIEW, None, &ctx).unwrap();
+
+        host.answer_next_prompt(Some(&["0"]));
         host.answer_next_prompt(Some(&["http://localhost:8000"]));
         plugin.run_command("route-copy-curl", &ctx, None).unwrap();
         assert_eq!(host.clipboard().as_deref(), Some("curl -X GET 'http://localhost:8000/blog'"));
@@ -4019,14 +4289,14 @@ mod tests {
         plugin.handle_events(&[Event::FileSaved("/project/var/cache/dev/profiler".into())], &ctx);
         assert_eq!(&host.view_messages()[messages..], &[(VIEW.to_owned(), r#"{"channel":"ui-kit-refresh","targetView":"symfony-profiler"}"#.to_owned())]);
         let view = plugin.render(PROFILER_VIEW, None, &ctx).unwrap();
-        assert!(view.status.unwrap().contains("STALE filesystem change"));
+        assert!(view.status.unwrap().contains("profiler index changed"));
         let Body::Table(table) = view.body else { panic!("cached rows") };
         assert_eq!(table.rows[0][3], "/old", "event does not adopt changed record");
         assert_eq!(plugin.profiler_snapshot.row_key("abcdef"), key);
         assert!(plugin.handle(PROFILER_VIEW, ViewEvent::Activate(key), &ctx).is_err());
         plugin.run_command("show-profiler", &ctx, None).unwrap();
         let view = plugin.render(PROFILER_VIEW, None, &ctx).unwrap();
-        assert!(!view.status.unwrap().contains("STALE"));
+        assert!(!view.status.unwrap().contains("profiler index changed"));
         let Body::Table(table) = view.body else { panic!("refreshed rows") };
         assert_eq!(table.rows[0][3], "/new");
         for field in 0..3 {
@@ -4035,11 +4305,11 @@ mod tests {
             let list = match field { 0 => &mut files.created, 1 => &mut files.modified, _ => &mut files.removed };
             list.push(format!("/project/{}", profiler::INDEX_FILE));
             plugin.handle_events(&[Event::FilesChanged(files)], &ctx);
-            assert!(plugin.render(PROFILER_VIEW, None, &ctx).unwrap().status.unwrap().contains("STALE filesystem change"));
+            assert!(plugin.render(PROFILER_VIEW, None, &ctx).unwrap().status.unwrap().contains("profiler index changed"));
         }
         plugin.run_command("show-profiler", &ctx, None).unwrap();
         plugin.handle_events(&vec![Event::FileSaved("/unrelated".into()); 1025], &ctx);
-        assert!(plugin.render(PROFILER_VIEW, None, &ctx).unwrap().status.unwrap().contains("STALE filesystem change"));
+        assert!(plugin.render(PROFILER_VIEW, None, &ctx).unwrap().status.unwrap().contains("profiler index changed"));
         assert!(host.requests().is_empty() && host.process_runs().is_empty());
     }
 
@@ -4270,6 +4540,17 @@ mod tests {
 
         host.set_setting("yamlSyntaxChecks", "false");
         assert!(plugin.code_actions(&yaml, all).is_empty());
+    }
+
+    #[test]
+    fn every_command_is_scoped_and_twig_only_commands_need_a_twig_editor() {
+        let manifest = include_str!("../plugin.toml");
+        for block in manifest.split("[[contributes.commands]]").skip(1) {
+            let block = block.split("\n[").next().unwrap();
+            let when = block.lines().find_map(|l| l.strip_prefix("when = ")).unwrap_or_else(|| panic!("no when: {block}"));
+            let twig_only = block.contains("id = \"twig-extends\"") || block.contains("id = \"twig-form-fields\"");
+            assert_eq!(twig_only, when.contains("editorLangId == twig"), "{block}");
+        }
     }
 
     #[test]
@@ -4900,7 +5181,7 @@ mod marker_icon_guard {
             .lines()
             .filter_map(|line| line.strip_prefix("icon = \"icons/marker-"))
             .collect();
-        assert_eq!(declared.len(), 11);
+        assert_eq!(declared.len(), 1);
         for name in declared {
             let icon = format!("icons/marker-{}", name.trim_end_matches('"'));
             assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&icon).is_file(), "{icon}");

@@ -129,7 +129,7 @@ pub(crate) fn fragment(text: &str, base: &str) -> String {
     format!(
         "<article class=\"gl-markdown\">{body}{}</article>",
         if truncated {
-            "<p>Markdown truncated at128KiB.</p>"
+            "<p>Markdown truncated at 128KiB.</p>"
         } else {
             ""
         }

@@ -2,9 +2,9 @@
 //! (and `@SpringBootApplication`) annotations and XML `<import>` elements.
 //! Anything not provably literal taints the contexts containing it, and a tainted
 //! or unrelated file is never narrowed.
+use crate::shared::Refs;
 use crate::{Ref, Role};
 use openidea_plugin::Range;
-use spring_text::index::Index;
 use spring_text::java::{self, Arg, JavaFile};
 use spring_text::xml;
 use std::collections::{BTreeMap, BTreeSet};
@@ -234,7 +234,7 @@ pub(crate) struct Contexts {
     tainted: BTreeSet<usize>,
 }
 
-pub(crate) fn build(index: &Index<Vec<Ref>>) -> Contexts {
+fn build(index: &Refs<'_>) -> Contexts {
     let mut types: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (path, refs) in index.iter() {
         for r in refs.iter().filter(|r| r.role == Role::Edge && r.what == "type") {
@@ -243,16 +243,15 @@ pub(crate) fn build(index: &Index<Vec<Ref>>) -> Contexts {
     }
     let mut edges: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     let mut taint: BTreeSet<&str> = BTreeSet::new();
-    let files = index.files();
     for (path, refs) in index.iter() {
         for r in refs.iter().filter(|r| r.role == Role::Edge && r.what != "type") {
             let name = r.name.as_str();
             let targets: Option<Vec<&str>> = match r.what.as_str() {
                 "import-class" => types.get(name).filter(|v| v.len() == 1).cloned(),
                 "import-resource" => module(path).and_then(|m| {
-                    ["main", "test"].iter().find_map(|s| files.get_key_value(&format!("{m}/src/{s}/resources/{name}")).map(|(k, _)| vec![k.as_str()]))
+                    ["main", "test"].iter().find_map(|s| index.entry(&format!("{m}/src/{s}/resources/{name}")).map(|(k, _)| vec![k]))
                 }),
-                "xml-relative" => path.rsplit_once('/').and_then(|(dir, _)| files.get_key_value(&format!("{dir}/{name}")).map(|(k, _)| vec![k.as_str()])),
+                "xml-relative" => path.rsplit_once('/').and_then(|(dir, _)| index.entry(&format!("{dir}/{name}")).map(|(k, _)| vec![k])),
                 "scan" => module(path).map(|m| {
                     let prefix = format!("{m}/src/");
                     let dotted = format!("{name}.");
@@ -317,6 +316,21 @@ pub(crate) fn build(index: &Index<Vec<Ref>>) -> Contexts {
     contexts
 }
 
+thread_local! {
+    static CACHE: std::cell::RefCell<Option<((u64, u64), std::rc::Rc<Contexts>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The contexts of `index`, built once per state of it: an index id and generation are never reused, even after a reset.
+pub(crate) fn cached(index: &Refs<'_>) -> std::rc::Rc<Contexts> {
+    let key = (index.id(), index.generation());
+    if let Some(found) = CACHE.with_borrow(|cache| cache.as_ref().filter(|(k, _)| *k == key).map(|(_, contexts)| contexts.clone())) {
+        return found;
+    }
+    let contexts = std::rc::Rc::new(build(index));
+    CACHE.with_borrow_mut(|cache| *cache = Some((key, contexts.clone())));
+    contexts
+}
+
 impl Contexts {
     /// Definitions visible from `usage`'s effective contexts plus how many contexts
     /// they span (0 when no ownership claim is made).
@@ -346,9 +360,15 @@ impl Contexts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::{Record, refs_of};
+    use spring_text::index::Index;
 
-    fn index(files: &[(&str, &str)]) -> Index<Vec<Ref>> {
-        let mut index = Index::new(&spring_text::beans::GLOBS, crate::index_file);
+    fn build(index: &Index<Record>) -> Contexts {
+        super::build(&index.view(refs_of))
+    }
+
+    fn index(files: &[(&str, &str)]) -> Index<Record> {
+        let mut index = Index::new(&spring_text::beans::GLOBS, crate::shared::record);
         for (p, t) in files {
             index.update(p, t);
         }
@@ -366,8 +386,40 @@ mod tests {
     fn java(imp: &str, name: &str) -> String {
         format!("package a;\nimport org.springframework.context.annotation.Configuration;\nimport org.springframework.context.annotation.Import;\nimport org.springframework.context.annotation.ImportResource;\nimport org.springframework.context.annotation.ComponentScan;\nimport org.springframework.context.annotation.Profile;\nimport org.springframework.context.annotation.ComponentScans;\n{imp}\n@Configuration\npublic class {name} {{}}\n")
     }
-    fn def<'a>(index: &'a Index<Vec<Ref>>, path: &str) -> (&'a str, &'a Ref) {
-        index.iter().find(|(p, _)| *p == path).map(|(p, r)| (p, r.iter().find(|r| r.role == Role::Bean).unwrap())).unwrap()
+    fn def<'a>(index: &'a Index<Record>, path: &str) -> (&'a str, &'a Ref) {
+        index.view(refs_of).iter().find(|(p, _)| *p == path).map(|(p, r)| (p, r.iter().find(|r| r.role == Role::Bean).unwrap())).unwrap()
+    }
+
+    #[test]
+    fn a_reset_index_never_reuses_cached_contexts() {
+        let _host = openidea_plugin::mock::MockHost::install();
+        let (a, b, shared) = (format!("{R}a.xml"), format!("{R}b.xml"), format!("{R}shared.xml"));
+        let files = |import: &str, other: &str| vec![(a.clone(), xml_import(import)), (b.clone(), bean_xml("b")), (shared.clone(), bean_xml(other))];
+        let mut indexes = spring_text::index::Indexes::new(&spring_text::beans::GLOBS, crate::shared::record);
+        let project = openidea_plugin::host::projects().unwrap().remove(0);
+        for (path, text) in files("shared.xml", "s") {
+            indexes.get(&project, std::time::Duration::ZERO).update(&path, &text);
+        }
+        let first = cached(&indexes.get(&project, std::time::Duration::ZERO).view(refs_of));
+        assert!(first.member.get(&b).is_none());
+        indexes.reset();
+        let imports_b = "b.xml";
+        for (path, text) in files(imports_b, "s") {
+            indexes.get(&project, std::time::Duration::ZERO).update(&path, &text);
+        }
+        let second = cached(&indexes.get(&project, std::time::Duration::ZERO).view(refs_of));
+        assert!(!std::rc::Rc::ptr_eq(&first, &second));
+        assert!(second.member.get(&b).is_some(), "the new import closure reaches b.xml");
+    }
+
+    #[test]
+    fn contexts_are_built_once_per_generation() {
+        let _host = openidea_plugin::mock::MockHost::install();
+        let mut index = index(&[(&format!("{R}a.xml"), &bean_xml("a"))]);
+        let first = cached(&index.view(refs_of));
+        assert!(std::rc::Rc::ptr_eq(&first, &cached(&index.view(refs_of))));
+        index.update(&format!("{R}b.xml"), &bean_xml("b"));
+        assert!(!std::rc::Rc::ptr_eq(&first, &cached(&index.view(refs_of))));
     }
 
     #[test]
@@ -421,7 +473,7 @@ mod tests {
         let _ = xml_import("a");
     }
 
-    fn scan_fixture(annotation: &str) -> (Index<Vec<Ref>>, String, String, String) {
+    fn scan_fixture(annotation: &str) -> (Index<Record>, String, String, String) {
         let (a, sub, other) = (format!("{J}A.java"), format!("{J}sub/C.java"), format!("/p/src/main/java/z/D.java"));
         let cfg = |pkg: &str, name: &str| format!("package {pkg};\nimport org.springframework.context.annotation.Configuration;\nimport org.springframework.context.annotation.ComponentScan;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n@Configuration\npublic class {name} {{}}\n");
         let head = format!("package a;\nimport org.springframework.context.annotation.Configuration;\nimport org.springframework.context.annotation.ComponentScan;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n{annotation}\n@Configuration\npublic class A {{}}\n");

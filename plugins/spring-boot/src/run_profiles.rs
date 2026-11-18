@@ -4,54 +4,7 @@ use openidea_plugin::{Error, PickItem, PluginRunConfiguration, RunConfigurations
 const SETTING: &str = "springBoot.nativeRunProfiles";
 const MAX_BUILD: usize = 128 * 1024;
 
-fn namespace_valid<R>(
-    reader: &quick_xml::reader::NsReader<R>,
-    element: &quick_xml::events::BytesStart<'_>,
-) -> bool {
-    use quick_xml::name::ResolveResult;
-    const XML: &str = "http://www.w3.org/XML/1998/namespace";
-    const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
-    let qualified = |name: &str| {
-        let parts: Vec<_> = name.split(':').collect();
-        parts.len() <= 2 && parts.iter().all(|p| !p.is_empty())
-    };
-    if !qualified(element.name().as_ref())
-        || element.name().as_ref().starts_with("xmlns:")
-        || matches!(
-            reader.resolver().resolve_element(element.name()).0,
-            ResolveResult::Unknown(_)
-        )
-    {
-        return false;
-    }
-    for attribute in element.attributes() {
-        let Ok(attribute) = attribute else {
-            return false;
-        };
-        let key = attribute.key.as_ref();
-        if !qualified(key) {
-            return false;
-        }
-        if key == "xmlns" || key.starts_with("xmlns:") {
-            let Ok(value) = attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0) else {
-                return false;
-            };
-            if key == "xmlns:xmlns"
-                || key.starts_with("xmlns:") && value.is_empty()
-                || key == "xmlns:xml" && value != XML
-                || key != "xmlns:xml" && matches!(value.as_ref(), XML | XMLNS)
-            {
-                return false;
-            }
-        } else if matches!(
-            reader.resolver().resolve_attribute(attribute.key).0,
-            ResolveResult::Unknown(_)
-        ) {
-            return false;
-        }
-    }
-    true
-}
+use spring_text::xml::namespace_valid;
 fn maven_boot(text: &str) -> bool {
     use quick_xml::{events::Event, name::ResolveResult};
     if text.len() > MAX_BUILD {
@@ -587,21 +540,40 @@ fn display(program: &str, args: &[String]) -> String {
     std::iter::once(program.to_owned()).chain(quoted).collect::<Vec<_>>().join(" ")
 }
 fn discovered_profiles(project: &openidea_plugin::Project) -> Vec<String> {
+    let (Some(roots), Ok(root)) = (crate::live::current_roots(), project.root()) else {
+        return Vec::new();
+    };
+    let owned = |path: &str| {
+        spring_text::scope::current_owner(path, &roots).as_deref() == Some(root.as_str())
+    };
     let files = project.find_files("**/application-*.*", 200).unwrap_or_default();
     let names: std::collections::BTreeSet<String> = files
         .iter()
+        .filter(|f| owned(f))
         .filter_map(|f| crate::nav::profile_of(f))
         .collect();
     let seeds: Vec<_> = crate::fileset::GLOBS
         .iter()
         .flat_map(|g| project.find_files(g, 64).unwrap_or_default())
+        .filter(|path| owned(path))
         .filter_map(|path| {
             let text = project.read_file(&path).ok()?;
             crate::fileset::read(&path, &text).map(|set| (path, set))
         })
         .take(crate::fileset::MAX_FILES)
         .collect();
-    let discovered = crate::fileset::discover_in(project, &seeds);
+    let discovered = crate::fileset::discover(
+        &seeds,
+        &|glob| {
+            project
+                .find_files(glob, 20)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|path| owned(path))
+                .collect()
+        },
+        &|path| owned(path).then(|| project.read_file(path).ok()).flatten(),
+    );
     let names: std::collections::BTreeSet<String> = names
         .into_iter()
         .chain(discovered.profiles)
@@ -615,7 +587,7 @@ pub(crate) fn run_with_options(ctx: &openidea_plugin::Invocation) -> Result<Opti
     let root = project.root()?;
     let mut runs = discover(&root);
     let run = match runs.len() {
-        0 => return Err(Error::Invalid("no source-owned Spring Boot Maven/Gradle run found".into())),
+        0 => return Err(Error::Invalid("No Spring Boot run found. Apply the Spring Boot Maven or Gradle plugin.".into())),
         1 => runs.remove(0),
         _ => {
             let items: Vec<_> = runs.iter().map(|r| PickItem::new(&r.id, &r.name)).collect();
@@ -654,7 +626,8 @@ pub(crate) fn run_with_options(ctx: &openidea_plugin::Invocation) -> Result<Opti
     )? {
         return Ok(None);
     }
-    host::open_terminal("Spring Boot", &run.program, &launch)?;
+    host::open_terminal("Spring Boot", &run.program, &launch)
+        .map_err(|error| ui_kit::denied::map(error, "Run with Profiles/Arguments", &format!("process:{}", run.program), "Spring Boot Tools"))?;
     Ok(Some(line))
 }
 impl RunConfigurations for BootTools {
@@ -783,6 +756,16 @@ mod tests {
         assert!(configurations("/project").is_empty());
         assert!(host.process_runs().is_empty() && host.requests().is_empty());
     }
+    #[test]
+    fn denied_build_tool_names_the_permission() {
+        let host = MockHost::install().with_capabilities(&["project.read"]);
+        host.add_file("pom.xml", POM);
+        for answer in [s(&[""]), s(&[""]), s(&[])] {
+            host.answer_next_prompt(answer);
+        }
+        let error = BootTools::default().run_command("run-with-options", &host.invocation(), None).unwrap_err().to_string();
+        assert!(error.contains("Run with Profiles/Arguments needs the process:mvn permission"), "{error}");
+    }
     fn s<'a>(v: &'a [&'a str]) -> Option<&'a [&'a str]> {
         Some(v)
     }
@@ -837,5 +820,29 @@ mod tests {
         let out = launch_args(&run, &["dev".into(), "qa".into()], &["--debug=true".into()]);
         assert_eq!(out[2], "--args=--spring.profiles.active=dev,qa --debug=true");
         assert_eq!(launch_args(&run, &[], &[]), ["--console=plain", "bootRun"]);
+    }
+    #[test]
+    fn nested_project_profiles_excluded() {
+        let host = MockHost::install();
+        host.add_file("src/main/resources/application-outer.properties", "a=1\n");
+        host.add_file("nested/src/main/resources/application-inner.properties", "a=1\n");
+        let project = host.invocation().project().unwrap();
+        assert_eq!(discovered_profiles(&project), ["inner", "outer"]);
+        host.add_project("/project/nested");
+        assert_eq!(discovered_profiles(&project), ["outer"]);
+    }
+
+    #[test]
+    fn nested_import_profiles_do_not_leak() {
+        let host = MockHost::install();
+        host.add_file(
+            "src/main/resources/application.properties",
+            "spring.config.import=classpath:extra.yml\n",
+        );
+        host.add_file("nested/src/main/resources/extra.yml", "spring.profiles.include: leaked\n");
+        let project = host.invocation().project().unwrap();
+        assert_eq!(discovered_profiles(&project), ["leaked"]);
+        host.add_project("/project/nested");
+        assert!(discovered_profiles(&project).is_empty());
     }
 }

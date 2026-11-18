@@ -23,7 +23,7 @@ pub(super) fn snapshot(doc: &Document) -> Result<(String, Vec<(String, String)>)
         if !ownership.contains(&path) { return Err(Error::Stale); }
         let stat = project.stat(&path)?;
         if stat.kind != openidea_plugin::FileKind::File || stat.size > MAX_FILE as u64 || stat.size > (MAX_TOTAL-total) as u64 {
-            return Err("Bundle source exceeds its pre-read admission limit.".into());
+            return Err("A locale file of this bundle is too large to edit here.".into());
         }
         let text = project.read_file(&path)?;
         if text.len() > MAX_FILE || text.len() > MAX_TOTAL-total { return Err("Bundle source exceeds its byte limit.".into()); }
@@ -140,7 +140,7 @@ impl FileActions for Properties {
             let key = prop.exact_key(&doc.text).unwrap();
             if !key.is_empty() && key.len() <= 512 && !key.chars().any(char::is_control) {
                 if scoped_rename::offered(doc) {
-                    actions.push(FileAction {title: "Change key with compiler-proved Java contracts…".into(), kind: Some("refactor.rename".into()), data: Some(serde_json::json!([root, doc.path, doc.version, format!("rename-compiler\n{key}")]).to_string()), ..FileAction::default() });
+                    actions.push(FileAction {title: "Change key and its Java usages (compiler)…".into(), kind: Some("refactor.rename".into()), data: Some(serde_json::json!([root, doc.path, doc.version, format!("rename-compiler\n{key}")]).to_string()), ..FileAction::default() });
                     actions.push(FileAction {
                         title: "Change bundle key and local JDK literals…".into(),
                         kind: Some("refactor.rename".into()),
@@ -464,7 +464,7 @@ mod tests {
     fn atomic_snapshot_admits_source_metadata_and_bounded_current_owners() {
         let (host,_,doc)=setup();
         host.add_file("/project/messages_fr.properties",&"x".repeat(MAX_FILE+1));
-        assert!(snapshot(&doc).err().unwrap().to_string().contains("pre-read admission"));
+        assert!(snapshot(&doc).err().unwrap().to_string().contains("too large to edit here"));
         host.add_file("/project/messages_fr.properties","hello=x\n");
         for n in 0..64 { host.add_project(&format!("/unrelated{n}")); }
         assert!(snapshot(&doc).is_err());

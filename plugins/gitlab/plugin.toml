@@ -1,33 +1,17 @@
 id = "aritti.gitlab"
 name = "GitLab"
 version = "0.3.0" # x-release-please-version
-description = """gitlab.com merge requests in the IDE. List them with the IntelliJ quick filters and follow their timeline. Review the changes with comments on diff lines and pending reviews, then reply, resolve, approve, merge, rebase, close, reopen or mark as draft or ready. The status bar shows the current branch's merge request and the editor shows its unresolved threads. Also checks out merge request branches, clones and shares projects, opens or copies the GitLab link to the current lines, and creates snippets."""
+description = """GitLab merge requests in the IDE, on gitlab.com or a self-hosted server. List them with the IntelliJ quick filters and follow their timeline. Review the changes with comments on diff lines and pending reviews, then reply, resolve, approve, merge, rebase, close, reopen or mark as draft or ready. The status bar shows the current branch's merge request and the editor shows its unresolved threads. Also checks out merge request branches, clones and shares projects, opens or copies the GitLab link to the current lines, and creates snippets."""
 authors = ["Arnaud Ritti <arnaud.ritti@gmail.com>"]
 homepage = "https://github.com/arnaud-ritti/openidea-plugins/tree/main/plugins/gitlab"
 license = "MIT"
 change-notes = """\
-Editor gutter markers for unresolved review threads use a packaged icon. \
-Draft and diff comments omit the unused old/new line instead of sending null, matching the GitLab draft notes API. \
-Bounded CommonMark descriptions/diff comments escape raw HTML, block unsafe links and remote image fetching, with shared native tokens and snapshot-bound link activation. \
-Re-request assigned review with fresh owner/head checks; two declared credential slots isolate identity and snapshot caches. \
-Optional approved glab 1.x adapter follows a freshly validated selected job in a native managed log tab. \
-Pipeline effect controls bind exact source target and cancel-confirm phase before retry, browser or trace actions. \
-Files row and bulk viewed controls carry source context to reject stale MR callbacks. \
-Diff rendering uses checked line counters and withholds guessed malformed-hunk positions. \
-Changes comments/replies/resolution validate displayed row membership; empty discussions no longer panic rendering. \
-Changes callbacks echo the rendered repository/MR/head/commit context and refuse stale or unbound pages. \
-Changes Open/Viewed callbacks validate listed source rows and local project ownership before navigation/state changes. \
-Unreleased: Self-hosted GitLab over HTTPS through the new server setting, approved on first use (net:ask). Merge request Changes and commit diffs open each file in the IDE's side-by-side diff viewer. Cloning a project or adding a merge request worktree offers Open Clone / Open Worktree, and clones ask for a directory when none is set. Local Drafts tab keeps up to 50 unsent review comments per merge request in plugin storage, bound to project, MR and head commit (stale ones are flagged, never submitted; edit, delete, rebind, clear, Submit All to your pending review); Markdown shows `$math$`, `$$math$$` and ```math blocks as escaped, labelled source (not rendered); Markdown shows @mentions as plain highlighted text (never links) and a small set of :emoji: shortcodes, outside code. GitLab: Create Merge Request asks for source and target branch, title, description and draft instead of opening a form window, and offers Open on GitLab when the request fails. The Merge Request window has Overview, Changes, Commits, Files and Pipelines buttons; Merge Request Changes, Commits, Files and Pipelines are sections of it now; the separate Files, Commits and Pipelines tool windows are gone. Merge Request Files view (Tree or List, double-click toggles Viewed, Mark All Viewed, Clear Viewed; no page scripts needed). Create Snippet asks for title, visibility and more project files, and Share Project asks for name and visibility, instead of opening form windows; the `forms` setting is gone. CI value completion (when, stage, extends, needs, dependencies, booleans, !reference job and key) and a warning for !reference naming a missing job. Open on GitLab in the Project view menu (a file or folder). Completion of CI keywords and CI_* variables in .gitlab-ci.yml, and `include: local:` files count for job and stage checks. Edit labels, assignees, reviewers, milestone and title of a merge request from the Details button or GitLab: Edit Merge Request, choosing from the project's labels, members and milestones. The list Filter button picks a quick filter or an author, reviewer, label or text filter. The three tool windows have distinct icons. \
-0.3.0: Create Snippet from the files selected in the Project view, with a title prompt; the status item and Create Merge Request bring their views to the front. Needs OpenIDEA API 1.2. \
-0.2.0: Merge Request Changes tool window (diff, comments on lines, pending review, viewed files), Submit Review, \
-timeline events, the current branch's merge request in the status bar and the editor, Check Out Branch, and cloning \
-and sharing projects with git. \
-0.1.0: first release. \
-gitlab.com with a personal access token: merge request list, threads and review actions, Open on GitLab and Copy Link \
-for files, Create Snippet."""
+Next release: Merge request Details drops five duplicate attribute buttons and moves secondary actions into More…, says when you cannot merge, and a repository without a GitLab remote offers Share Project. Unresolved review threads get their own gutter icon, and Copy Link menu entries following the Project view selection; asks before sending your GitLab token to a self-hosted server, again if the server changes, before a fork checkout overwrites a local branch and before Rebase Merge Request (was Update Merge Request Branch), and Merge names squash and branch deletion; draft and diff comments no longer fail on unused line numbers, added and deleted files open in the diff viewer without an empty side, and fixed crashes in .gitlab-ci.yml completion and on empty threads; links to branches named with # or ? work, and glab checkout accepts any glab 1.x; row commands say what to select and stay disabled until then, with clearer permission messages and names, and a Merge Requests tab. \
+0.3.0: commits, pipelines and job details with retry and cancel, snippet and merge request forms, self-hosted HTTPS servers. \
+0.2.0: Merge Request window sections, distinct window icons and plugin icon."""
 categories = ["vcs"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-view:merge-requests", "on-event:vcs-changed", "on-event:file-opened", "on-event:file-saved", "on-file:**/.gitlab-ci.yml", "on-file:**/*.gitlab-ci.yml"]
 
@@ -57,7 +41,7 @@ languages = ["yaml"]
 [[contributes.secrets]]
 name = "token"
 label = "GitLab personal access token"
-description = "A gitlab.com token with the api and read_user scopes. Run GitLab: Create Access Token to make one."
+description = "A GitLab token with the api and read_user scopes. Run GitLab: Create Access Token to make one."
 
 [[contributes.views]]
 id = "merge-requests"
@@ -80,6 +64,7 @@ category = "GitLab"
 id = "edit-merge-request"
 title = "GitLab: Edit Merge Request"
 category = "GitLab"
+when = "plugin.aritti.gitlab.mrSelected || plugin.aritti.gitlab.branchMergeRequest"
 
 [[contributes.commands]]
 id = "create-snippet"
@@ -110,15 +95,17 @@ category = "GitLab"
 id = "open-existing-merge-request-worktree"
 title = "GitLab: Open Existing Merge Request Worktree"
 category = "GitLab"
+when = "plugin.aritti.gitlab.mrSelected"
 
 [[contributes.commands]]
 id = "open-pending-folder"
 title = "GitLab: Open Cloned or Worktree Folder"
 category = "GitLab"
+when = "plugin.aritti.gitlab.pendingFolder"
 
 [[contributes.commands]]
 id = "update-merge-request-branch"
-title = "GitLab: Update Merge Request Branch"
+title = "GitLab: Rebase Merge Request"
 category = "GitLab"
 
 [[contributes.commands]]
@@ -154,6 +141,14 @@ command = "create-snippet"
 menu = "tools"
 command = "create-merge-request"
 
+[[contributes.menus]]
+menu = "projectView.context"
+command = "copy-link"
+
+[[contributes.menus]]
+menu = "editor.context"
+command = "copy-link"
+
 [[contributes.fileIcons]]
 id = "gitlab-ci"
 patterns = [".gitlab-ci.yml", ".gitlab-ci.yaml", "*.gitlab-ci.yml", "*.gitlab-ci.yaml", "*.gitlab-ci.*.yml", "*.gitlab-ci.*.yaml"]
@@ -163,13 +158,15 @@ icon = "icons/gitlab.svg"
 id = "rerequest-review"
 title = "GitLab: Re-request Review…"
 category = "GitLab"
+when = "plugin.aritti.gitlab.mrSelected"
 
 [[contributes.secrets]]
 name = "secondary-token"
-label = "Secondary GitLab.com personal access token"
-description = "Optional second account; select secondary in the account slot setting. api and read_user scopes are required."
+label = "Secondary GitLab personal access token"
+description = "Optional second account on the same GitLab server; select secondary in the account slot setting. api and read_user scopes are required."
 
 [[contributes.commands]]
 id = "checkout-source-cli"
 title = "GitLab: Check Out Merge Request Source (glab)…"
 category = "GitLab"
+when = "plugin.aritti.gitlab.mrSelected"

@@ -47,6 +47,7 @@ pub fn offer_open(title: &str, body: &str, label: &str, path: &str) {
         host::notify(NotificationLevel::Info, title, body);
         return;
     }
+    let _ = host::set_context("pendingFolder", true);
 
     let actions = [NotificationAction::new(label, "open-pending-folder")];
     if host::notify_with_actions(NotificationLevel::Info, title, body, &actions).is_err() {
@@ -54,9 +55,13 @@ pub fn offer_open(title: &str, body: &str, label: &str, path: &str) {
     }
 }
 
+pub fn has_pending_folder() -> bool {
+    storage::get(PENDING_OPEN_KEY).ok().flatten().is_some_and(|p| !p.is_empty())
+}
+
 /// The command behind the notification buttons: opens the offered folder in a new window.
 pub fn open_pending_folder() -> Result<Option<String>, Error> {
-    let path = storage::get(PENDING_OPEN_KEY)?.filter(|p| !p.is_empty()).ok_or("There is no cloned or worktree folder to open.")?;
+    let path = storage::get(PENDING_OPEN_KEY)?.filter(|p| !p.is_empty()).ok_or_else(|| Error::Invalid("Clone a project or create a worktree first; this opens the folder afterwards.".into()))?;
     host::open_project(&path, true)?;
 
     Ok(Some(format!("Requested opening {path} in a new window.")))
@@ -298,6 +303,13 @@ mod tests {
     fn project_names_from_folders() {
         assert_eq!(project_name("my app (v2)"), "my-app--v2-");
         assert_eq!(project_name("lib_x.rs"), "lib_x.rs");
+    }
+
+    #[test]
+    fn open_pending_folder_without_selection_explains() {
+        let _host = openidea_plugin::mock::MockHost::install();
+        let error = open_pending_folder().unwrap_err();
+        assert!(matches!(error, Error::Invalid(ref message) if message == "Clone a project or create a worktree first; this opens the folder afterwards."), "{error:?}");
     }
 
     #[test]

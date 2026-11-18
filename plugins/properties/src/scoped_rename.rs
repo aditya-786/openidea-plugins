@@ -131,7 +131,7 @@ fn collect(project: &Project, root: &str, doc: &Document, key: &str) -> Result<S
             || stat.size > MAX_SOURCE as u64
             || stat.size > (MAX_TOTAL - total) as u64
         {
-            return Err("A local source is outside the regular-file/128 KiB/8 MiB admission limits; no partial rename is prepared.".into());
+            return Err("A source file is too large to update (over 128 KiB, or over 8 MiB in total), so nothing was renamed.".into());
         }
         let text = project.read_file(&path)?;
         if text.len() > MAX_SOURCE || text.len() > MAX_TOTAL - total {
@@ -372,7 +372,6 @@ pub(super) fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
     use openidea_plugin::{
         file_actions::{FileAction, FileActions},
         mock::MockHost,

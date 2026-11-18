@@ -28,9 +28,9 @@ use openidea_plugin::providers::{CompletionItem, CompletionKind, Document, LineM
 use openidea_plugin::{
     Context, Diagnostic, Error, Event, EventKind, Invocation, Location, Plugin, Position, Range, Severity, host, register_plugin,
 };
-use spring_text::index::{COMMAND_BUDGET, Index, Indexes, PROVIDER_BUDGET, project_of};
+use spring_text::index::{COMMAND_BUDGET, DIAGNOSTICS_WARM, Index, Indexes, PROVIDER_BUDGET, project_of};
 use spring_text::java::{self, Arg, JavaFile, Str};
-use spring_text::{SOURCE_GLOBS, contains, parse_source, range, source_calls, xml};
+use spring_text::{contains, parse_source, range, source_calls, xml};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
@@ -293,6 +293,9 @@ pub fn schemas(text: &str) -> Vec<Schema> {
 }
 
 fn scan_java(path: &str, text: &str) -> Option<Vec<Endpoint>> {
+    if !(path.ends_with(".java") || path.ends_with(".kt")) {
+        return None;
+    }
     let found = endpoints_with_syntax(&parse_source(path, text), text, path.ends_with(".kt"));
     (!found.is_empty()).then_some(found)
 }
@@ -300,9 +303,8 @@ fn scan_java(path: &str, text: &str) -> Option<Vec<Endpoint>> {
 /// Every schema file is kept, even without a schema: it tells resources exist.
 const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 const MAX_SCHEMA_BYTES: usize = 128 * 1024;
-const XPATH_GUARD_GLOBS: &[&str] = &["**/*.java", "**/*.kt", "**/*.xml"];
+const SOURCE_FACT_GLOBS: &[&str] = &["**/*.java", "**/*.kt", "**/*.xml"];
 const SCHEMA_GLOBS: &[&str] = &["**/*.xsd", "**/*.wsdl"];
-const SOURCE_WATCH_GLOBS: &[&str] = &["**/*.java", "**/*.kt", "**/*.xsd", "**/*.wsdl"];
 const WATCH_GLOBS: &[&str] = &["**/*.java", "**/*.kt", "**/*.xsd", "**/*.wsdl", "**/*.xslt", "**/*.xml"];
 
 #[derive(Clone)]
@@ -412,6 +414,9 @@ fn sws_resources(text: &str) -> Vec<(String, Range)> {
 const RESOURCE_DIRS: [&str; 2] = ["src/main/resources", "src/test/resources"];
 
 /// Only an established exact namespace/local pair supplies QName authority.
+/// Most markers one line gets: the IDE folds same-line, same-icon markers into one button with a chooser.
+const MAX_LINE_TARGETS: usize = 200;
+
 fn elements_for<'a>(schemas: &'a Index<SchemaFile>, namespace: Option<&str>) -> Vec<(&'a str, &'a str, Range)> {
     let Some(namespace) = namespace else { return Vec::new(); };
     schemas.iter().flat_map(|(p, file)| file.schemas.iter()
@@ -424,41 +429,52 @@ fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+#[derive(Clone)]
+struct SourceFacts {
+    endpoints: Vec<Endpoint>,
+    types: Vec<typed_xml::SourceType>,
+    legacy_resolver: bool,
+}
+
+fn scan_source_facts(path: &str, text: &str) -> Option<SourceFacts> {
+    let endpoints = scan_java(path, text).unwrap_or_default();
+    let types = typed_xml::scan_source(path, text).unwrap_or_default();
+    let legacy_resolver = xpath::scan_resolver_customization(path, text).is_some();
+    (!endpoints.is_empty() || !types.is_empty() || legacy_resolver).then_some(SourceFacts { endpoints, types, legacy_resolver })
+}
+
 pub struct WsTools {
-    java: Indexes<Vec<Endpoint>>,
+    source: Indexes<SourceFacts>,
     generation: generate::Generation,
     schemas: Indexes<SchemaFile>,
     xpath_packages: Indexes<xpath::PackageNamespaces>,
-    xpath_guards: Indexes<()>,
-    xml_types: Indexes<Vec<typed_xml::SourceType>>,
     resource_paths: resource_paths::Paths,
     watching: bool,
-    unreadable_schemas: BTreeSet<String>,
+    applies: std::collections::BTreeMap<String, (Instant, bool)>,
 }
 
 impl Default for WsTools {
     fn default() -> Self {
         Self {
-            java: Indexes::new(SOURCE_GLOBS, scan_java),
+            source: Indexes::new(SOURCE_FACT_GLOBS, scan_source_facts).with_limits(MAX_DOCUMENT_BYTES, usize::MAX),
             generation:generate::Generation::default(),
             schemas: Indexes::new(SCHEMA_GLOBS, scan_schemas),
             xpath_packages: Indexes::new(&["**/package-info.java"],xpath::scan_package),
-            xpath_guards: Indexes::new(XPATH_GUARD_GLOBS,xpath::scan_resolver_customization),
-            xml_types: Indexes::new(SOURCE_GLOBS,typed_xml::scan_source),
             resource_paths: resource_paths::Paths::default(),
             watching: false,
-            unreadable_schemas: BTreeSet::new(),
+            applies: std::collections::BTreeMap::new(),
         }
     }
 }
 
 impl WsTools {
-    fn cached_resource_definition(&self, doc: &Document, path: &str) -> Vec<Location> {
+    fn cached_resource_definition(&mut self, doc: &Document, path: &str) -> Vec<Location> {
         // Shared scalar source/XML navigation never discovers/reads project files.
         // A complete fresh watched inventory is needed to rule out collisions.
         if !self.watching || doc.path.contains('\\') || doc.path.split('/').any(|p| matches!(p, "." | "..")) { return vec![]; }
         let Some(root) = project_of(&doc.path).and_then(|p| p.root().ok()) else { return vec![]; };
         if root.is_empty() || root.chars().any(char::is_control) || !doc.path.starts_with(&format!("{}/",root.trim_end_matches('/'))) { return vec![]; }
+        if let Some(project) = project_of(&doc.path) { self.resource_paths.warm(&project, PROVIDER_BUDGET); }
         let Some(paths) = self.resource_paths.paths(&root, path) else { return vec![]; };
         let suffixes = RESOURCE_DIRS.map(|directory|format!("/{directory}/{path}"));
         let candidates: Vec<_> = paths.iter().filter(|file| suffixes.iter().any(|suffix|file.ends_with(suffix))).collect();
@@ -475,16 +491,14 @@ impl WsTools {
         };
         let mut markers = Vec::new();
         for e in endpoints_with_syntax(&f, text, doc.path.ends_with(".kt")) {
-            let found = elements_for(schemas, e.namespace.as_deref());
-            match found.iter().find(|(_, n, _)| *n == e.local) {
-                Some((path, _, r)) => markers.push(LineMarker {
-                    line: e.target.start.line,
-                    icon: Some(SCHEMA_MARKER.into()),
-                    tooltip: format!("Payload element <{}> in {}", e.local, file_name(path)),
-                    target: Some(Location { path: (*path).into(), range: *r }),
-                }),
-                None => {}
-            }
+            let found: Vec<_> = elements_for(schemas, e.namespace.as_deref()).into_iter().filter(|(_, n, _)| *n == e.local).collect();
+            let shown = if found.len() > MAX_LINE_TARGETS { format!(" (first {MAX_LINE_TARGETS} of {})", found.len()) } else { String::new() };
+            markers.extend(found.iter().take(MAX_LINE_TARGETS).map(|(path, _, r)| LineMarker {
+                line: e.target.start.line,
+                icon: Some(SCHEMA_MARKER.into()),
+                tooltip: format!("Payload element <{}> in {}{shown}", e.local, file_name(path)),
+                target: Some(Location { path: (*path).into(), range: *r }),
+            }));
         }
         for b in java::bean_names(&f).into_iter().filter(|b| b.ty == "DefaultWsdl11Definition") {
             let line = openidea_plugin::text::position(text, b.at).line;
@@ -498,7 +512,7 @@ impl WsTools {
         if found.iter().all(|s| s.elements.is_empty()) {
             return Vec::new();
         }
-        let Some(java) = self.java.for_document(&doc.path, &doc.text, PROVIDER_BUDGET) else {
+        let Some(java) = self.source.for_document(&doc.path, &doc.text, PROVIDER_BUDGET) else {
             return Vec::new();
         };
         let mut markers = Vec::new();
@@ -506,18 +520,18 @@ impl WsTools {
             for (name, r) in &s.elements {
                 let handlers: Vec<(&str, &Endpoint)> = java
                     .iter()
-                    .flat_map(|(p, es)| es.iter().map(move |e| (p, e)))
+                    .flat_map(|(p, facts)| facts.endpoints.iter().map(move |e| (p, e)))
                     .filter(|(_, e)| &e.local == name && e.namespace.as_ref().is_none_or(|ns| ns == &s.namespace))
                     .collect();
-                if let Some((path, e)) = handlers.first() {
-                    let labels: Vec<&str> = handlers.iter().map(|(_, e)| e.label.as_str()).collect();
-                    markers.push(LineMarker {
-                        line: r.start.line,
-                        icon: Some(ENDPOINT_MARKER.into()),
-                        tooltip: format!("Handled by {}", labels.join(", ")),
-                        target: Some(Location { path: (*path).into(), range: e.target }),
-                    });
-                }
+                let labels: Vec<&str> = handlers.iter().map(|(_, e)| e.label.as_str()).collect();
+                let shown = if handlers.len() > MAX_LINE_TARGETS { format!(" (first {MAX_LINE_TARGETS} of {})", handlers.len()) } else { String::new() };
+                let tooltip = format!("Handled by {}{shown}", labels.join(", "));
+                markers.extend(handlers.iter().take(MAX_LINE_TARGETS).map(|(path, e)| LineMarker {
+                    line: r.start.line,
+                    icon: Some(ENDPOINT_MARKER.into()),
+                    tooltip: tooltip.clone(),
+                    target: Some(Location { path: (*path).into(), range: e.target }),
+                }));
             }
         }
         markers
@@ -526,10 +540,16 @@ impl WsTools {
 
 impl Providers for WsTools {
     fn line_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
+        if !self.spring_ws_document(&doc.path) {
+            return Vec::new();
+        }
         if matches!(doc.language.as_str(), "java" | "kotlin") { self.java_markers(doc) } else { self.xml_markers(doc) }
     }
 
     fn definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
+        if !self.spring_ws_document(&doc.path) {
+            return Vec::new();
+        }
         if let Some(locations)=namespace_values::definition(self,doc,at){return locations;}
         if let Some(locations)=xpath::definition(self,doc,at){return locations;}
         if doc.language == "xml" {
@@ -575,6 +595,9 @@ impl Providers for WsTools {
     }
 
     fn completion(&mut self, doc: &Document, at: Position, _trigger: Option<&str>) -> Vec<CompletionItem> {
+        if !self.spring_ws_document(&doc.path) {
+            return Vec::new();
+        }
         if let Some(items)=namespace_values::completion(self,doc,at){return items;}
         if let Some(items)=xpath::completion(self,doc,at){return items;}
         if doc.language == "xml" {
@@ -609,6 +632,28 @@ impl Providers for WsTools {
 
 impl DiagnosticsProvider for WsTools {
     fn diagnostics(&mut self, doc: &Document) -> Vec<Diagnostic> {
+        let mut found = self.all_diagnostics(doc);
+        found.retain(|d| setting_of(d.code.as_deref().unwrap_or_default()).is_none_or(|key| host::setting_bool(key).unwrap_or(true)));
+        found
+    }
+}
+
+fn setting_of(code: &str) -> Option<&'static str> {
+    match code {
+        "unknown-payload-element" => Some("checkUnknownElements"),
+        "missing-resource" => Some("checkMissingResources"),
+        "wsdl-unpaired-request" => Some("checkRequestResponsePairs"),
+        "unresolved-wsdl-reference" => Some("checkWsdlDefinitions"),
+        code if code.starts_with("wsdl-missing-") => Some("checkWsdlDefinitions"),
+        _ => None,
+    }
+}
+
+impl WsTools {
+    fn all_diagnostics(&mut self, doc: &Document) -> Vec<Diagnostic> {
+        if !self.spring_ws_document(&doc.path) {
+            return Vec::new();
+        }
         if doc.language == "xml" {
             let mut problems=xml_contracts::diagnostics(doc);
             problems.extend(wsdl_qnames::diagnostics(doc));
@@ -617,20 +662,18 @@ impl DiagnosticsProvider for WsTools {
             let Some(index) = self.schemas.for_cached_document(&doc.path, &doc.text) else {
                 return problems;
             };
-            if !self.watching || !complete_schemas(index) || !self.unreadable_schemas.is_empty() {
+            if !self.watching || !complete_schemas(index) {
                 return problems;
             }
-            if self.watching && complete_schemas(index) && self.unreadable_schemas.is_empty() {
-                problems.extend(wsdl_pairs::unpaired_requests(doc, index));
-                problems.extend(wsdl_definitions::pairs(doc, index));
-            }
+            problems.extend(wsdl_pairs::unpaired_requests(doc, index));
+            problems.extend(wsdl_definitions::pairs(doc, index));
             problems.extend(sws_resources(&doc.text)
                 .into_iter()
                 .filter(|(path, _)| {
                     !index.files().keys().any(|file| RESOURCE_DIRS.iter().any(|dir| file.ends_with(&format!("{dir}/{path}"))))
                 })
                 .map(|(path, location)| {
-                    Diagnostic::new(location, Severity::Warning, format!("`{path}` is not in src/main/resources or src/test/resources."))
+                    Diagnostic::new(location, Severity::Info, format!("`{path}` is not in src/main/resources or src/test/resources; it may come from a dependency."))
                         .code("missing-resource")
                 })
                 .collect::<Vec<_>>());
@@ -647,7 +690,7 @@ impl DiagnosticsProvider for WsTools {
         }
         problems.extend(xpath::undeclared_prefixes(self, doc));
         let Some(index) = self.schemas.for_cached_document(&doc.path, &doc.text) else { return problems };
-        if !complete_schemas(index) || !self.unreadable_schemas.is_empty() {
+        if !complete_schemas(index) {
             return problems;
         }
         if index.iter().all(|(_, file)| file.qnames_complete) {
@@ -678,8 +721,8 @@ impl DiagnosticsProvider for WsTools {
                 problems.push(
                     Diagnostic::new(
                         range(&doc.text, source.at, source.end),
-                        Severity::Warning,
-                        format!("`{path}` is not in src/main/resources or src/test/resources."),
+                        Severity::Info,
+                        format!("`{path}` is not in src/main/resources or src/test/resources; it may come from a dependency."),
                     )
                     .code("missing-resource"),
                 );
@@ -689,115 +732,111 @@ impl DiagnosticsProvider for WsTools {
     }
 }
 
+const APPLIES_TTL: Duration = Duration::from_secs(60);
+
+impl WsTools {
+    fn spring_ws(&mut self, project: &openidea_plugin::Project) -> bool {
+        let Ok(root) = project.root() else {
+            return true;
+        };
+        if let Some((at, answer)) = self.applies.get(&root)
+            && at.elapsed() < APPLIES_TTL
+        {
+            return *answer;
+        }
+        let answer = spring_text::build::applies(project, &["spring-ws"]);
+        self.applies.insert(root, (Instant::now(), answer));
+        answer
+    }
+
+    fn spring_ws_document(&mut self, path: &str) -> bool {
+        match project_of(path) {
+            Some(project) => self.spring_ws(&project),
+            None => true,
+        }
+    }
+
+    fn observe_resource_paths(&mut self, events: &[Event], deadline: Instant) {
+        let mut changed = spring_text::index::changed_paths(events);
+        changed.extend(events.iter().filter_map(|event| match event {
+            Event::FileOpened(path) => Some((path.as_str(), false)),
+            _ => None,
+        }));
+        if changed.iter().filter(|(path, _)| resource_paths::relevant(path)).count() > 256 {
+            self.resource_paths.reset();
+            return;
+        }
+        for (path, removed) in changed {
+            if !resource_paths::relevant(path) {
+                continue;
+            }
+            let Some(project) = project_of(path) else { continue };
+            if !self.spring_ws(&project) {
+                continue;
+            }
+            let budget = deadline.saturating_duration_since(Instant::now());
+            if budget.is_zero() {
+                self.resource_paths.reset();
+                return;
+            }
+            self.resource_paths.observe(&project, path, removed);
+            self.resource_paths.warm(&project, budget.min(Duration::from_millis(250)));
+        }
+    }
+}
+
 impl Plugin for WsTools {
     fn activate(&mut self, _ctx: &Context) -> Result<(), Error> {
         self.watching = host::subscribe_paths("files-changed", WATCH_GLOBS).is_ok();
         let _ = host::subscribe(EventKind::FileOpened);
         let _ = host::subscribe(EventKind::FileSaved);
-        // Cross-file facts are warmed outside editor diagnostic requests.
         let deadline = Instant::now() + COMMAND_BUDGET;
         for project in host::projects().unwrap_or_default() {
             let budget = deadline.saturating_duration_since(Instant::now());
             if budget.is_zero() {
                 break;
             }
+            if !self.spring_ws(&project) {
+                continue;
+            }
+            let step = |deadline: Instant| deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250));
             self.schemas.get(&project, budget.min(Duration::from_millis(250)));
-            self.xpath_packages.get(&project, deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250)));
-            self.xml_types.get(&project,deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250)));
-            self.xpath_guards.get(&project,deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250)));
-            self.resource_paths.warm(&project, deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250)));
+            self.xpath_packages.get(&project, step(deadline));
+            self.source.get(&project, step(deadline));
+            self.resource_paths.warm(&project, step(deadline));
         }
         Ok(())
     }
 
     fn handle_events(&mut self, events: &[Event], _ctx: &Invocation) {
         let deadline = Instant::now() + COMMAND_BUDGET;
-        for event in events {
-            let mut changed = Vec::new();
-            match event {
-                Event::FileOpened(path) | Event::FileSaved(path) => changed.push((path.as_str(), false)),
-                Event::FilesChanged(files) => {
-                    changed.extend(files.removed.iter().map(|path| (path.as_str(), true)));
-                    changed.extend(files.created.iter().chain(&files.modified).map(|path| (path.as_str(), false)));
-                }
-                _ => {}
-            }
-            let resource_overflow = changed.iter().filter(|(path, _)| resource_paths::relevant(path)).count() > 256;
-            if resource_overflow { self.resource_paths.reset(); }
-            for (path, removed) in changed {
-                if !WATCH_GLOBS.iter().any(|glob| spring_text::index::glob_matches(glob, path)) {
-                    continue;
-                }
-                let Some(project) = project_of(path) else { continue };
-                let resource_budget = deadline.saturating_duration_since(Instant::now());
-                if resource_budget.is_zero() { self.resource_paths.reset(); return; }
-                if !resource_overflow {
-                    if resource_paths::relevant(path) { self.resource_paths.observe(&project, path, removed); }
-                    self.resource_paths.warm(&project, resource_budget.min(Duration::from_millis(250)));
-                }
-                if XPATH_GUARD_GLOBS.iter().any(|glob| spring_text::index::glob_matches(glob, path)) {
-                    match (removed, project.read_file(path)) {
-                        (true, _) => {
-                            self.xpath_guards.update_existing(&project, path, None);
-                        }
-                        (false, Ok(text)) => {
-                            self.xpath_guards.update_existing(&project, path, Some(&text));
-                        }
-                        (false, Err(_)) => self.xpath_guards.reset(),
-                    }
-                    self.xpath_guards.get(&project, deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250)));
-                }
-                if !SOURCE_WATCH_GLOBS.iter().any(|glob| spring_text::index::glob_matches(glob, path)) { continue; }
-                if removed {
-                    self.unreadable_schemas.remove(path);
-                    self.schemas.update_existing(&project, path, None);
-                    self.java.update_existing(&project, path, None);
-                    self.xpath_packages.update_existing(&project,path,None);
-                    self.xml_types.update_existing(&project,path,None);
-                } else {
-                    match project.read_file(path) {
-                        Ok(text) => {
-                            self.unreadable_schemas.remove(path);
-                            self.schemas.update_existing(&project, path, Some(&text));
-                            self.java.update_existing(&project, path, Some(&text));
-                            self.xpath_packages.update_existing(&project,path,Some(&text));
-                            self.xml_types.update_existing(&project,path,Some(&text));
-                        }
-                        Err(_) => {
-                            if SCHEMA_GLOBS.iter().any(|glob| spring_text::index::glob_matches(glob, path)) {
-                                self.unreadable_schemas.insert(path.to_owned());
-                            }
-                            self.schemas.reset();
-                            self.java.reset();
-                            self.xpath_packages.reset();
-                            self.xml_types.reset();
-                            continue;
-                        }
-                    }
-                }
-                let budget = deadline.saturating_duration_since(Instant::now());
-                if budget.is_zero() {
-                    self.resource_paths.reset();
-                    return;
-                }
-                self.schemas.get(&project, budget.min(Duration::from_millis(250)));
-                self.xpath_packages.get(&project,deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250)));
-                self.xml_types.get(&project,deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250)));
-            }
-        }
+        self.observe_resource_paths(events, deadline);
+        self.schemas.on_events(events, deadline);
+        self.source.on_events(events, deadline);
+        self.xpath_packages.on_events(events, deadline);
     }
 
     fn run_command(&mut self, id: &str, ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
         if id == "refresh-models" {
-            let project=ctx.project().ok_or("Open a project to refresh Spring WS source models.")?;
-            if !self.watching {host::subscribe_paths("files-changed",WATCH_GLOBS)?;self.watching=true;}
+            let project=ctx.project().ok_or("Open a project first.")?;
+            if !self.watching {
+                match host::subscribe_paths("files-changed",WATCH_GLOBS) {
+                    Ok(()) => self.watching=true,
+                    Err(Error::Denied(_)) => return Err(Error::Failed(ui_kit::denied::message("Refresh Schemas and Endpoints","events","Spring Web Services Tools"))),
+                    Err(error) => return Err(error),
+                }
+            }
             let deadline=Instant::now()+COMMAND_BUDGET;
-            let mut ready=self.xml_types.get(&project,deadline.saturating_duration_since(Instant::now())).fresh();
-            let remaining=deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero(){ready=false;}else{ready&=self.xpath_packages.get(&project,remaining).fresh();}
-            let remaining=deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero(){ready=false;}else{ready&=self.schemas.get(&project,remaining).fresh();}
-            return Ok(Some(if ready{"XML and XPath source models refreshed."}else{"Source model refresh is incomplete. Run Refresh Source Models again to continue; unavailable or capped inventories remain partial."}.into()));
+            let left=||deadline.saturating_duration_since(Instant::now());
+            let mut ready=true;
+            if left().is_zero(){ready=false;}else{ready&=self.source.get(&project,left()).fresh();}
+            if left().is_zero(){ready=false;}else{ready&=self.xpath_packages.get(&project,left()).fresh();}
+            if left().is_zero(){ready=false;}else{ready&=self.schemas.get(&project,left()).fresh();}
+            if left().is_zero(){ready=false;}else{
+                self.resource_paths.warm(&project,left());
+                ready&=project.root().is_ok_and(|root|self.resource_paths.ready(&root));
+            }
+            return Ok(Some(if ready{"Schemas and endpoints refreshed."}else{"Refresh incomplete. Run Spring WS: Refresh Schemas and Endpoints again to continue."}.into()));
         }
         if id == "qname-occurrences" { return indexing::occurrences(self,ctx); }
         Err(Error::NotFound(format!("command {id}")))
@@ -957,6 +996,31 @@ class KtCountryEndpoint {
     }
 
     #[test]
+    fn every_matching_element_or_handler_gets_a_marker_on_its_line() {
+        let host = setup();
+        host.add_file("src/main/resources/legacy/countries.xsd", XSD);
+        host.add_file(
+            "src/main/java/com/acme/ws/LegacyEndpoint.java",
+            &ENDPOINT.replace("class CountryEndpoint", "class LegacyEndpoint").replace("class WsConfig", "class LegacyConfig"),
+        );
+        let mut ws = WsTools::default();
+        ws.activate(&host.context("aritti.spring-ws")).unwrap();
+        let markers = ws.line_markers(&java());
+        let schemas: Vec<_> = markers.iter().filter(|m| m.line == 8).map(|m| m.target.as_ref().unwrap().path.as_str()).collect();
+        assert_eq!(schemas.len(), 2, "{schemas:?}");
+        assert!(schemas.contains(&XSD_PATH) && schemas.contains(&"/project/src/main/resources/legacy/countries.xsd"));
+        assert!(markers.iter().filter(|m| m.line == 8).all(|m| m.icon.as_deref() == Some(SCHEMA_MARKER)));
+        assert_eq!(markers.iter().filter(|m| m.line == 14).count(), 1, "one schema, one marker");
+        assert_eq!(ws.definition(&java(), pos(ENDPOINT, "getCountryRequest\"")).len(), 2, "definition lists the same candidates");
+
+        let xsd = ws.line_markers(&Document { path: XSD_PATH.into(), language: "xml".into(), version: 1, text: XSD.into() });
+        let handlers: Vec<_> = xsd.iter().map(|m| m.target.as_ref().unwrap().path.rsplit('/').next().unwrap()).collect();
+        assert_eq!(handlers.len(), 2, "{handlers:?}");
+        assert!(handlers.contains(&"CountryEndpoint.java") && handlers.contains(&"LegacyEndpoint.java"));
+        assert!(xsd.iter().all(|m| m.line == xsd[0].line && m.icon.as_deref() == Some(ENDPOINT_MARKER)));
+    }
+
+    #[test]
     fn links_endpoints_to_schema_elements_and_checks_them() {
         let host = setup();
         let mut ws = WsTools::default();
@@ -1092,22 +1156,6 @@ class KtCountryEndpoint {
         assert!(!ws.definition(&java(), pos(ENDPOINT, "etCountryRequest")).is_empty());
     }
 
-    #[test]
-    fn unreadable_schema_events_stay_quiet_until_facts_recover() {
-        let host = setup();
-        let mut ws = WsTools::default();
-        ws.activate(&host.context("aritti.spring-ws")).unwrap();
-        let path = "/project/src/main/resources/new.xsd";
-        let event = Event::FileSaved(path.into());
-        ws.handle_events(&[event.clone()], &host.invocation());
-        // Even a later navigation scan must not restore absence assertions.
-        ws.line_markers(&java());
-        assert!(ws.diagnostics(&java()).is_empty());
-        host.add_file("src/main/resources/new.xsd", XSD);
-        ws.handle_events(&[event], &host.invocation());
-        assert_eq!(ws.diagnostics(&java()).len(), 2);
-    }
-
     const ROOTS_JAVA: &str = r#"@org.springframework.ws.server.endpoint.annotation.Endpoint class E {
         static final String NS = "http://acme.com/countries";
         @org.springframework.ws.server.endpoint.annotation.PayloadRoots(value = {
@@ -1136,11 +1184,11 @@ class KtCountryEndpoint {
         let problems = ws.diagnostics(&doc);
         assert_eq!(problems.len(), 1);
         assert_eq!(problems[0].range.start, pos(ROOTS_JAVA, "ghostRequest"));
-        let fixed = Document { text: ROOTS_JAVA.replace("ghostRequest", "getCountryResponse"), version: 2, ..doc };
-        assert!(ws.diagnostics(&fixed).is_empty());
         let reverse = ws.line_markers(&Document { path: XSD_PATH.into(), language: "xml".into(), text: XSD.into(), version: 1 });
         assert_eq!(reverse.len(), 1);
         assert_eq!(reverse[0].tooltip, "Handled by E.handle");
+        let fixed = Document { text: ROOTS_JAVA.replace("ghostRequest", "getCountryResponse"), version: 2, ..doc };
+        assert!(ws.diagnostics(&fixed).is_empty());
     }
 
     #[test]
@@ -1277,6 +1325,113 @@ class KtCountryEndpoint {
             ws.schemas.for_cached_document(&doc.path, &doc.text).unwrap().files().is_empty(),
             "cold XML diagnostics do not discover schemas"
         );
+    }
+
+    #[test]
+    fn xsd_with_2000_elements_is_valid() {
+        let elements: String = (0..2000).map(|n| format!("<xs:element name=\"e{n}\"></xs:element>\n")).collect();
+        let text = format!("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:big\">\n{elements}</xs:schema>");
+        assert!(text.len() < MAX_SCHEMA_BYTES);
+        assert!(generate::xml_valid(&text));
+    }
+
+    #[test]
+    fn created_then_deleted_schema_not_unreadable() {
+        let host = setup();
+        let mut ws = WsTools::default();
+        ws.activate(&host.context("aritti.spring-ws")).unwrap();
+        let path = "/project/src/main/resources/new.xsd";
+        let batch = Event::FilesChanged(openidea_plugin::FilesChanged {
+            created: vec![path.into()],
+            modified: vec![],
+            removed: vec![path.into()],
+        });
+        ws.handle_events(&[batch], &host.invocation());
+        ws.line_markers(&java());
+        assert_eq!(ws.diagnostics(&java()).len(), 2);
+    }
+
+    #[test]
+    fn unreadable_schema_events_stay_quiet_until_facts_recover() {
+        let host = setup();
+        let mut ws = WsTools::default();
+        ws.activate(&host.context("aritti.spring-ws")).unwrap();
+        let path = "/project/src/main/resources/new.xsd";
+        host.add_file_bytes("src/main/resources/new.xsd", &[0xff, 0xfe]);
+        let event = Event::FileSaved(path.into());
+        ws.handle_events(&[event.clone()], &host.invocation());
+        ws.line_markers(&java());
+        assert!(ws.diagnostics(&java()).is_empty());
+        host.add_file("src/main/resources/new.xsd", XSD);
+        ws.handle_events(&[event], &host.invocation());
+        assert_eq!(ws.diagnostics(&java()).len(), 2);
+    }
+
+    #[test]
+    fn no_warm_without_spring_ws_dependency() {
+        let walked = |pom: &str| {
+            let host = setup();
+            host.add_file("pom.xml", pom);
+            let mut ws = WsTools::default();
+            ws.activate(&host.context("aritti.spring-ws")).unwrap();
+            ws.handle_events(&[Event::FileSaved("/project/pom.xml".into())], &host.invocation());
+            ws.line_markers(&java());
+            ws.diagnostics(&java());
+            let schemas = ws.schemas.for_cached_document(JAVA_PATH, "").unwrap().walked();
+            (schemas, ws.resource_paths.ready("/project"))
+        };
+        let plain = "<project><dependencies><dependency><artifactId>spring-web</artifactId></dependency></dependencies></project>";
+        assert_eq!(walked(plain), (false, false));
+        let with_ws = "<project><dependencies><dependency><artifactId>spring-ws-core</artifactId></dependency></dependencies></project>";
+        assert_eq!(walked(with_ws), (true, true));
+    }
+
+    #[test]
+    fn missing_resource_is_info() {
+        let host = setup();
+        let mut ws = WsTools::default();
+        ws.activate(&host.context("aritti.spring-ws")).unwrap();
+        let from_java = ws.diagnostics(&java());
+        let missing: Vec<_> = from_java.iter().filter(|p| p.code.as_deref() == Some("missing-resource")).collect();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].severity, Severity::Info);
+        let text = r#"<beans xmlns:s="http://www.springframework.org/schema/web-services"><s:dynamic-wsdl id="x" portTypeName="P"><s:xsd location="classpath:missing.xsd"/></s:dynamic-wsdl></beans>"#;
+        let from_xml = ws.diagnostics(&xml_doc(text));
+        assert_eq!(from_xml.len(), 1);
+        assert_eq!(from_xml[0].severity, Severity::Info);
+        host.set_setting("checkMissingResources", "false");
+        assert!(ws.diagnostics(&java()).iter().all(|p| p.code.as_deref() != Some("missing-resource")));
+        assert!(ws.diagnostics(&xml_doc(text)).is_empty());
+    }
+
+    #[test]
+    fn every_setting_maps_to_a_declared_check() {
+        let schema = include_str!("../settings.schema.json");
+        for code in ["unknown-payload-element", "missing-resource", "wsdl-unpaired-request", "unresolved-wsdl-reference", "wsdl-missing-schema"] {
+            assert!(schema.contains(&format!("\"{}\": {{", setting_of(code).unwrap())), "{code}");
+        }
+        assert_eq!(setting_of("invalid-xpath"), None);
+    }
+
+    #[test]
+    fn refresh_models_denied_events_message() {
+        let host = MockHost::install().with_capabilities(&["project.read"]);
+        let mut ws = WsTools::default();
+        let error = ws.run_command("refresh-models", &host.invocation(), None).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("needs the events permission") && message.contains("Settings › Plugins › Spring Web Services Tools"), "{message}");
+        assert!(!message.contains("permission denied"), "{message}");
+    }
+
+    #[test]
+    fn refresh_models_refreshes_resource_paths() {
+        let host = setup();
+        host.add_file("src/main/resources/a/resource.xslt", "opaque");
+        let mut ws = WsTools::default();
+        ws.activate(&host.context("aritti.spring-ws")).unwrap();
+        ws.resource_paths.expire();
+        ws.run_command("refresh-models", &host.invocation(), None).unwrap();
+        assert!(ws.resource_paths.ready("/project"));
     }
 }
 

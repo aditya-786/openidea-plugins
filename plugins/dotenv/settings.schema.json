@@ -12,7 +12,42 @@
       "title": "Show each key's value in completion and hover",
       "default": true,
       "group": "Value visibility",
-      "description": "Show cached/current source values in completion and hover. Turning this off hides those outputs; it does not erase cached values or hide file contents."
+      "description": "Show values in completion and hover. Keys containing PASS, SECRET, TOKEN, KEY or CREDENTIAL are masked; run .env: Show Value at Caret to reveal one."
+    },
+    "checkKeyNames": {
+      "type": "boolean",
+      "title": "Check key names",
+      "default": true,
+      "group": "Checks",
+      "description": "Warn about keys with '-', lowercase letters or a wrong first character."
+    },
+    "checkDuplicateKeys": {
+      "type": "boolean",
+      "title": "Warn about duplicate keys",
+      "default": true,
+      "group": "Checks",
+      "description": "Warn when a key is declared more than once in a file."
+    },
+    "checkFormatting": {
+      "type": "boolean",
+      "title": "Check spacing and blank lines",
+      "default": true,
+      "group": "Checks",
+      "description": "Warn about spaces around '=', trailing whitespace and extra blank lines."
+    },
+    "checkValueQuotes": {
+      "type": "boolean",
+      "title": "Check value quotes",
+      "default": true,
+      "group": "Checks",
+      "description": "Warn about unquoted values with spaces and ${…} values outside double quotes."
+    },
+    "checkVariableReferences": {
+      "type": "boolean",
+      "title": "Check ${…} references",
+      "default": true,
+      "group": "Checks",
+      "description": "Warn about empty ${} and variables declared in no .env, Dockerfile or compose file."
     }
   }
 }

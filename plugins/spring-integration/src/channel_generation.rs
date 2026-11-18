@@ -28,31 +28,11 @@ fn path(s: &str) -> bool {
         && !s.chars().any(char::is_control)
         && !s.split('/').any(|p| matches!(p, "." | ".."))
 }
-fn balanced(text: &str) -> bool {
-    let mut stack = Vec::new();
-    for token in java::tokens(text) {
-        if token.s.starts_with('"') && (token.s.len() < 2 || !token.s.ends_with('"')) {
-            return false;
-        }
-        match token.s {
-            "(" => stack.push(")"),
-            "[" => stack.push("]"),
-            "{" => stack.push("}"),
-            ")" | "]" | "}" => {
-                if stack.pop() != Some(token.s) {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    stack.is_empty()
-}
 pub(crate) fn context(doc: &Document) -> Option<(String, String)> {
     if doc.text.len() > MAX_TEXT
         || !path(&doc.path)
         || beans::ignored(&doc.path)
-        || !balanced(&doc.text)
+        || !spring_text::text::balanced(&doc.text, doc.path.ends_with(".kt"))
         || !matches!(
             (doc.language.as_str(), doc.path.rsplit('.').next()),
             ("java", Some("java")) | ("kotlin", Some("kt"))
@@ -240,7 +220,7 @@ impl Integration {
             return Err(Error::Cancelled);
         };
         if !identifier(&class) || matches!(class.as_str(), "org" | "java" | "kotlin") {
-            return Err("Choose a new ASCII class identifier up to128 bytes without keywords or namespace roots.".into());
+            return Err("Choose a new ASCII class identifier up to 128 bytes without keywords or namespace roots.".into());
         }
         current(&pending, doc)?;
         let Some(channel) = host::input(
@@ -257,7 +237,7 @@ impl Integration {
             )
         {
             return Err(
-                "Choose a nonreserved ASCII channel/method identifier up to128 bytes.".into(),
+                "Choose a nonreserved ASCII channel/method identifier up to 128 bytes.".into(),
             );
         }
         current(&pending, doc)?;
@@ -345,6 +325,19 @@ mod tests {
     use super::*;
     use openidea_plugin::{file_actions::FileActions, mock::MockHost};
     const PATH: &str = "/project/src/app/SourceConfig.java";
+    #[test]
+    fn bracket_check_ignores_literals_and_comments_and_rejects_unpaired_source() {
+        for (text, kotlin, ok) in [
+            ("class A { void f(int[] a) { g(\"}\"); } }", false, true),
+            ("class A { /* { */ char c = '{'; // (\n}", false, true),
+            ("class A { void f( { } }", false, false),
+            ("class A { String s = \"open; }", false, false),
+            ("class A { /* /* */ */ }", true, true),
+            ("class A { }}", false, false),
+        ] {
+            assert_eq!(spring_text::text::balanced(text, kotlin), ok, "{text}");
+        }
+    }
     fn doc() -> Document {
         Document{path:PATH.into(),language:"java".into(),version:4,text:"package app;\nimport org.springframework.context.annotation.Configuration;\nimport org.springframework.integration.dsl.IntegrationFlow;\n@Configuration public class SourceConfig {}\n".into()}
     }

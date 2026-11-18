@@ -7,7 +7,7 @@ use openidea_plugin::providers::{CompletionItem, CompletionKind, Document, LineM
 use openidea_plugin::text::offset;
 use openidea_plugin::views::{Body, Button, TreeItem, View, ViewEvent, Viewport, Views};
 use openidea_plugin::{Diagnostic, Error, Invocation, Location, Plugin, Position, Project, Range, Severity, host};
-use spring_text::index::{COMMAND_BUDGET, Indexes, PROVIDER_BUDGET, project_of};
+use spring_text::index::{COMMAND_BUDGET, Indexes, project_of};
 use spring_text::tree::Expansion;
 use spring_text::{parse_source, range, source_calls};
 use std::collections::{BTreeMap, BTreeSet};
@@ -292,7 +292,6 @@ impl Config {
 struct Snapshot {
     config: Config,
     uses: Vec<(String, Use)>,
-    complete: bool,
 }
 
 impl Snapshot {
@@ -308,6 +307,21 @@ impl Snapshot {
             .filter(|(p, o)| !(p == path && o.at == u.at) && u.kind.faces(o.kind) && self.config.keys(o).iter().any(|k| keys.contains(k)))
             .collect()
     }
+}
+
+/// The host's navigate arrow for every link this module draws: explicit so same-line markers
+/// group predictably, and apart from the web route icon so they never merge with its URL markers.
+const MARKER_ICON: &str = "navigate";
+
+/// Most markers one line gets; the rest are named in the tooltip.
+const MAX_LINE_TARGETS: usize = 200;
+
+/// One marker per target on `line`: the IDE folds same-line, same-icon markers into one gutter
+/// button that jumps to a single target or opens its chooser for several.
+fn per_target(line: u32, tooltip: &str, targets: Vec<Location>) -> Vec<LineMarker> {
+    let total = targets.len();
+    let tooltip = if total > MAX_LINE_TARGETS { format!("{tooltip} (first {MAX_LINE_TARGETS} of {total})") } else { tooltip.to_owned() };
+    targets.into_iter().take(MAX_LINE_TARGETS).map(|t| LineMarker { line, icon: Some(MARKER_ICON.into()), tooltip: tooltip.clone(), target: Some(t) }).collect()
 }
 
 fn location((path, u): &(String, Use)) -> Location {
@@ -371,7 +385,7 @@ impl WebSocketTools {
 
         if is_script(&doc.path) && !project.as_ref().is_some_and(|p| self.serves_stomp(p)) {
             let config = Config { user: DEFAULT_USER_PREFIX.to_owned(), ..Config::default() };
-            return Snapshot { config, uses: Vec::new(), complete: true };
+            return Snapshot { config, uses: Vec::new() };
         }
 
         if !is_script(&doc.path)
@@ -380,9 +394,9 @@ impl WebSocketTools {
             self.stomp_roots.insert(root);
         }
 
-        match self.index.for_document(&doc.path, &doc.text, PROVIDER_BUDGET) {
-            Some(index) => collect(index.iter(), |_| true, index.complete()),
-            None => collect(std::iter::empty(), |_| true, true),
+        match self.index.for_cached_document(&doc.path, &doc.text) {
+            Some(index) => collect(index.iter(), |_| true),
+            None => collect(std::iter::empty(), |_| true),
         }
     }
 
@@ -390,11 +404,11 @@ impl WebSocketTools {
         let serves_stomp = self.serves_stomp(project);
         let index = self.index.get(project, budget);
 
-        collect(index.iter(), |path| serves_stomp || !is_script(path), index.complete())
+        collect(index.iter(), |path| serves_stomp || !is_script(path))
     }
 }
 
-fn collect<'a>(files: impl Iterator<Item = (&'a str, &'a WsFile)>, include: impl Fn(&str) -> bool, complete: bool) -> Snapshot {
+fn collect<'a>(files: impl Iterator<Item = (&'a str, &'a WsFile)>, include: impl Fn(&str) -> bool) -> Snapshot {
     let mut config = Config::default();
     let mut uses = Vec::new();
     let mut user = None;
@@ -407,14 +421,17 @@ fn collect<'a>(files: impl Iterator<Item = (&'a str, &'a WsFile)>, include: impl
     }
     config.user = user.map_or(DEFAULT_USER_PREFIX.to_owned(), |u| format!("{}/", u.trim_end_matches('/')));
 
-    Snapshot { config, uses, complete }
+    Snapshot { config, uses }
 }
 
 impl WebSocketTools {
     fn destinations_view(&mut self, view: &str, project: &Project, budget: Duration) -> View {
         let snapshot = self.project_snapshot(project, budget);
 
-        if self.index.get(project, Duration::ZERO).scanning() {
+        let index = self.index.get(project, Duration::ZERO);
+        let note = spring_text::index::coverage_note(index);
+        let scanning = index.scanning();
+        if scanning {
             refresh(view);
         }
 
@@ -427,8 +444,8 @@ impl WebSocketTools {
         }
 
         if destinations.is_empty() {
-            let text = if snapshot.complete { "No STOMP destinations found." } else { "Scanning…" };
-            return View::message(text).button(refresh);
+            let text = spring_text::index::empty_message("No STOMP destinations found. Add @MessageMapping or @SubscribeMapping methods, or send with SimpMessagingTemplate", scanning, note.as_deref());
+            return View::message(&text).button(refresh);
         }
 
         let mut items = Vec::new();
@@ -451,7 +468,10 @@ impl WebSocketTools {
         self.expansion.apply(&mut items);
 
         let count = destinations.len();
-        let status = if snapshot.complete { format!("{count} destinations") } else { format!("{count} destinations · scanning…") };
+        let status = match note {
+            None => format!("{count} destinations"),
+            Some(note) => format!("{count} destinations · {note}"),
+        };
         View::new(Body::Tree(items)).button(refresh).status(&status)
     }
 }
@@ -480,7 +500,7 @@ impl Views for WebSocketTools {
         match event {
             ViewEvent::Button(b) if b == "refresh" => {
                 if let Some(project) = ctx.project()
-                    && self.index.get(&project, Duration::ZERO).complete()
+                    && !self.index.get(&project, Duration::ZERO).scanning()
                 {
                     self.index.reset();
                 }
@@ -507,7 +527,7 @@ impl WebSocketTools {
     fn check_xml(&mut self, doc: &Document) {
         let names: Option<BTreeSet<String>> = self
             .beans
-            .for_document(&doc.path, &doc.text, PROVIDER_BUDGET)
+            .for_cached_document(&doc.path, &doc.text)
             .filter(|index| index.complete())
             .map(|index| index.iter().flat_map(|(_, n)| n.clone()).collect());
         let is_bean = |name: &str| names.as_ref().is_some_and(|n| n.contains(name));
@@ -540,8 +560,11 @@ impl Providers for WebSocketTools {
                         let list: Vec<String> = related.iter().map(|r| describe(r)).collect();
                         tooltip = format!("{tooltip}; also used at {}", list.join(", "));
                     }
-                    let target = related.first().map(|r| location(r));
-                    markers.push(LineMarker { line: u.range.start.line, icon: None, tooltip, target });
+                    if related.is_empty() {
+                        markers.push(LineMarker { line: u.range.start.line, icon: Some(MARKER_ICON.into()), tooltip, target: None });
+                    } else {
+                        markers.extend(per_target(u.range.start.line, &tooltip, related.iter().map(|r| location(r)).collect()));
+                    }
                 }
                 Kind::Send | Kind::SendToUser | Kind::ClientSubscribe | Kind::ClientSend => {
                     if check_routing && u.kind == Kind::Send && !snap.config.brokers.is_empty() && !snap.config.routed(&u.dest) {
@@ -552,10 +575,12 @@ impl Providers for WebSocketTools {
                         );
                         problems.push(Diagnostic::new(u.range, Severity::Warning, message).code("unrouted-destination"));
                     }
-                    let Some(first) = related.first() else { continue };
+                    if related.is_empty() {
+                        continue;
+                    }
                     let list: Vec<String> = related.iter().map(|r| describe(r)).collect();
                     let tooltip = format!("{} is also used at {}.", snap.config.keys(u)[0], list.join(", "));
-                    markers.push(LineMarker { line: u.range.start.line, icon: None, tooltip, target: Some(location(first)) });
+                    markers.extend(per_target(u.range.start.line, &tooltip, related.iter().map(|r| location(r)).collect()));
                 }
             }
         }
@@ -638,25 +663,11 @@ pub fn take_problems() -> Vec<openidea_plugin::Diagnostic> {
     PROBLEMS.take()
 }
 
-const DEPENDENCY_MARKERS: [&str; 9] = [
-    "spring-boot-starter-websocket",
-    "spring-messaging",
-    "spring-websocket",
-    "<module>",
-    "include(",
-    "include '",
-    "include \"",
-    "(libs.",
-    " libs.",
-];
+const DEPENDENCY_MARKERS: [&str; 3] = ["spring-boot-starter-websocket", "spring-messaging", "spring-websocket"];
 
-/// True when unsure: a multi-module build or a version catalog hides the dependency from the root build file.
+/// True when unsure (see `spring_text::build::applies`).
 pub fn applies(project: &openidea_plugin::Project) -> bool {
-    let Ok(root) = project.root() else { return true };
-    BUILD_FILES
-        .iter()
-        .filter_map(|file| project.read_file(&format!("{root}/{file}")).ok())
-        .any(|build| DEPENDENCY_MARKERS.iter().any(|marker| build.contains(marker)))
+    spring_text::build::applies(project, &DEPENDENCY_MARKERS)
 }
 
 #[cfg(not(feature = "embedded"))]
@@ -665,6 +676,13 @@ openidea_plugin::register_plugin!(WebSocketTools, providers, views);
 #[cfg(test)]
 #[cfg_attr(feature = "embedded", allow(dead_code, unused_imports))]
 mod tests {
+    fn warmed() -> WebSocketTools {
+        let mut tools = WebSocketTools::default();
+        if let Some(project) = host::projects().unwrap_or_default().first() {
+            tools.live_warm(project, COMMAND_BUDGET, true);
+        }
+        tools
+    }
     use super::*;
     use openidea_plugin::mock::MockHost;
 
@@ -764,7 +782,7 @@ class KtChatController(private val messagingTemplate: SimpMessagingTemplate) {
 
         let host = setup();
         host.add_file("src/main/kotlin/com/acme/chat/KtChatController.kt", KOTLIN_CHAT);
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let path = "/project/src/main/kotlin/com/acme/chat/KtChatController.kt";
         let kt = Document { path: path.into(), language: "kotlin".into(), version: 1, text: KOTLIN_CHAT.into() };
         let tips: Vec<_> = tools.line_markers(&kt).into_iter().map(|m| (m.line, m.tooltip)).collect();
@@ -806,9 +824,27 @@ class KtChatController(private val messagingTemplate: SimpMessagingTemplate) {
 
     #[cfg(not(feature = "embedded"))]
     #[test]
+    fn every_other_use_of_a_destination_gets_a_marker_on_its_line() {
+        let host = setup();
+        host.add_file(
+            "src/main/java/com/acme/chat/Alerts.java",
+            "class Alerts {\n    void alert(Message m) { messagingTemplate.convertAndSend(\"/topic/messages\", m); }\n}\n",
+        );
+        let mut tools = warmed();
+        let markers = tools.line_markers(&doc("ChatController.java", CHAT));
+        let send_to: Vec<_> = markers.iter().filter(|m| m.line == 8).collect();
+        let files: Vec<_> = send_to.iter().map(|m| m.target.as_ref().unwrap().path.rsplit('/').next().unwrap()).collect();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files.contains(&"Alerts.java") && files.contains(&"ChatController.java"));
+        assert!(send_to.iter().all(|m| m.icon.as_deref() == Some(MARKER_ICON)));
+        assert_eq!(markers.iter().filter(|m| m.line == 15).count(), 1, "one other use, one marker");
+    }
+
+    #[cfg(not(feature = "embedded"))]
+    #[test]
     fn marks_handlers_and_links_destinations() {
         let host = setup();
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let d = doc("ChatController.java", CHAT);
         let markers = tools.line_markers(&d);
         let found: Vec<_> = markers.iter().map(|m| (m.line, m.tooltip.as_str())).collect();
@@ -837,7 +873,7 @@ class KtChatController(private val messagingTemplate: SimpMessagingTemplate) {
     }
 
     fn unrouted(host: &MockHost, name: &str, text: &str) -> usize {
-        WebSocketTools::default().line_markers(&doc(name, text));
+        warmed().line_markers(&doc(name, text));
         host.diagnostics()
             .get(&format!("/project/src/main/java/com/acme/chat/{name}"))
             .map_or(0, |d| d.iter().filter(|d| d.code.as_deref() == Some("unrouted-destination")).count())
@@ -875,14 +911,14 @@ class KtChatController(private val messagingTemplate: SimpMessagingTemplate) {
     fn no_warning_without_broker_configuration() {
         let host = MockHost::install();
         host.add_file("src/main/java/com/acme/chat/ChatController.java", CHAT);
-        WebSocketTools::default().line_markers(&doc("ChatController.java", CHAT));
+        warmed().line_markers(&doc("ChatController.java", CHAT));
         assert!(host.diagnostics().is_empty());
     }
 
     #[test]
     fn completes_prefixes_and_known_destinations() {
         let _host = setup();
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let typing = CHAT.replace("\"/news/today\"", "\"/t\"");
         let items = tools.completion(&doc("ChatController.java", &typing), Position::new(20, 43), None);
         let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
@@ -927,7 +963,7 @@ client.onConnect = () => {
         let host = MockHost::install();
         host.add_file("src/main/java/com/acme/chat/ChatController.java", CHAT);
         host.add_file("web/src/chat.ts", CLIENT);
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let d = script_doc();
 
         assert!(tools.line_markers(&d).is_empty());
@@ -939,7 +975,7 @@ client.onConnect = () => {
     fn js_documents_are_indexed_in_a_spring_project() {
         let host = setup();
         host.add_file("web/src/chat.ts", CLIENT);
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
 
         assert!(!tools.line_markers(&script_doc()).is_empty());
     }
@@ -948,7 +984,7 @@ client.onConnect = () => {
     fn js_subscribe_links_to_send_to_destination() {
         let host = setup();
         host.add_file("web/src/chat.ts", CLIENT);
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let d = script_doc();
         let targets = tools.definition(&d, Position::new(4, 24));
         let paths: Vec<_> = targets.iter().map(|t| (t.path.rsplit('/').next().unwrap(), t.range.start.line)).collect();
@@ -966,7 +1002,7 @@ client.onConnect = () => {
     fn js_send_links_to_message_mapping() {
         let host = setup();
         host.add_file("web/src/chat.ts", CLIENT);
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let d = script_doc();
         let targets = tools.definition(&d, Position::new(5, 40));
         assert_eq!(targets.len(), 1);
@@ -982,7 +1018,7 @@ client.onConnect = () => {
     fn js_quiet_for_emitters_and_runtime_destinations() {
         let host = setup();
         host.add_file("web/src/chat.ts", CLIENT);
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let d = script_doc();
         assert!(tools.definition(&d, Position::new(7, 24)).is_empty());
         assert!(tools.definition(&d, Position::new(8, 24)).is_empty());
@@ -997,7 +1033,7 @@ client.onConnect = () => {
         assert!(parse("api.ts", text).is_none());
         let declared = format!("const client = new StompJs.Client({{}});\n{text}client.send('/chat/send', {{}});\n");
         assert_eq!(parse("api.ts", &declared).unwrap().uses.len(), 1);
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let d = Document { path: "/project/web/src/api.ts".into(), language: "typescript".into(), version: 1, text: text.into() };
         assert!(tools.line_markers(&d).is_empty());
         assert!(tools.definition(&d, Position::new(2, 20)).is_empty());
@@ -1035,7 +1071,7 @@ client.onConnect = () => {
     fn view_lists_handlers_and_clients_under_one_destination() {
         let host = setup();
         host.add_file("web/src/chat.ts", CLIENT);
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let view = tools.render(DESTINATIONS_VIEW, None, &host.invocation()).unwrap();
         assert_eq!(view.status.as_deref(), Some("7 destinations"));
         let items = tree(view);
@@ -1074,15 +1110,15 @@ client.onConnect = () => {
     fn view_without_destinations_is_a_message() {
         let host = MockHost::install();
         host.add_file("src/main/java/com/acme/Plain.java", "class Plain {}");
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let view = tools.render(DESTINATIONS_VIEW, None, &host.invocation()).unwrap();
-        assert_eq!(message(&view), "No STOMP destinations found.");
+        assert_eq!(message(&view), "No STOMP destinations found. Add @MessageMapping or @SubscribeMapping methods, or send with SimpMessagingTemplate.");
     }
 
     #[test]
     fn destination_with_only_senders_gets_a_warning_icon() {
         let host = setup();
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let items = tree(tools.render(DESTINATIONS_VIEW, None, &host.invocation()).unwrap());
         let news = items.iter().find(|i| i.key == "d:/news/today").unwrap();
         assert_eq!(news.icon.as_deref(), Some("warning"));
@@ -1094,7 +1130,7 @@ client.onConnect = () => {
     #[test]
     fn activating_a_use_opens_its_location() {
         let host = setup();
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let items = tree(tools.render(DESTINATIONS_VIEW, None, &host.invocation()).unwrap());
         let send_to = children(&items, "d:/topic/messages")[0];
         tools.handle(DESTINATIONS_VIEW, ViewEvent::Activate(send_to.key.clone()), &host.invocation()).unwrap();
@@ -1107,7 +1143,7 @@ client.onConnect = () => {
     #[test]
     fn use_keys_are_unique_when_a_use_appears_under_several_destinations() {
         let host = setup();
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let items = tree(tools.render(DESTINATIONS_VIEW, None, &host.invocation()).unwrap());
         let mut keys: Vec<_> = items.iter().map(|i| i.key.as_str()).collect();
         let total = keys.len();
@@ -1122,7 +1158,7 @@ client.onConnect = () => {
     #[test]
     fn malformed_key_is_ignored() {
         let host = MockHost::install();
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         for key in ["u:0:x:y:/a.java", "u:0:1", "d:/topic/x", "", "u:0:1:2"] {
             tools.handle(DESTINATIONS_VIEW, ViewEvent::Activate(key.into()), &host.invocation()).unwrap();
         }
@@ -1134,10 +1170,48 @@ client.onConnect = () => {
         let host = MockHost::install();
         host.add_file("src/main/java/com/acme/chat/ChatController.java", CHAT);
         host.add_file("web/src/chat.ts", CLIENT);
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let items = tree(tools.render(DESTINATIONS_VIEW, None, &host.invocation()).unwrap());
         assert!(items.iter().all(|i| !i.key.contains("chat.ts")));
         assert!(items.iter().any(|i| i.key == "d:/topic/messages"));
+    }
+
+    #[test]
+    fn java_provider_cold_cache_returns_fast() {
+        let host = MockHost::install();
+        host.add_file("src/main/java/com/acme/chat/ChatController.java", CHAT);
+        for n in 0..30 {
+            host.add_file(&format!("src/main/java/com/acme/S{n}.java"), &format!("package com.acme;\nclass S{n} {{}}\n"));
+        }
+        let mut tools = WebSocketTools::default();
+        let project = host.invocation().project().unwrap();
+        let d = doc("ChatController.java", CHAT);
+        let started = std::time::Instant::now();
+        tools.line_markers(&d);
+        tools.completion(&d, Position::new(5, 10), None);
+        tools.definition(&d, Position::new(5, 10));
+        assert!(started.elapsed() < Duration::from_millis(30));
+        let cached = tools.index.get(&project, Duration::ZERO).files().len();
+        assert!(cached <= 1, "a provider on a cold cache read {cached} files");
+    }
+
+    #[test]
+    fn refresh_resets_incomplete_index() {
+        let host = MockHost::install();
+        host.add_file("src/main/java/com/acme/Chat.java", CHAT);
+        let mut tools = warmed();
+        let project = host.invocation().project().unwrap();
+        host.add_file_bytes("src/main/java/com/acme/Legacy.java", b"class caf\xe9 {}");
+        tools.index.on_events(
+            &[openidea_plugin::Event::FileSaved("/project/src/main/java/com/acme/Legacy.java".into())],
+            std::time::Instant::now() + COMMAND_BUDGET,
+        );
+        let index = tools.index.get(&project, Duration::ZERO);
+        assert!(!index.complete() && !index.scanning());
+        let view = tools.render("destinations", None, &host.invocation()).unwrap();
+        assert!(view.status.unwrap().contains("partial index (1 unreadable)"));
+        tools.handle("destinations", ViewEvent::Button("refresh".into()), &host.invocation()).unwrap();
+        assert!(tools.index.get(&project, Duration::ZERO).files().is_empty(), "an incomplete index starts over");
     }
 
     #[cfg(not(feature = "embedded"))]
@@ -1164,7 +1238,7 @@ client.onConnect = () => {
             "src/main/java/com/acme/Wide.java",
             "class Wide {\n    void f() { messagingTemplate.convertAndSend(\"/topic/\u{1F600}\", \"é😀\"); messagingTemplate.convertAndSend(\"/topic/b\", 1); }\n}\n",
         );
-        let mut tools = WebSocketTools::default();
+        let mut tools = warmed();
         let items = tree(tools.render(DESTINATIONS_VIEW, None, &host.invocation()).unwrap());
         let second = children(&items, "d:/topic/b")[0];
         assert_eq!(second.key.split(':').nth(2), Some("1"), "{}", second.key);
@@ -1180,7 +1254,7 @@ client.onConnect = () => {
         host.add_file("src/main/resources/ws.xml", r#"<bean id="echoHandler" class="com.acme.Echo"/>"#);
         let text = r#"<beans xmlns:websocket="http://www.springframework.org/schema/websocket"><websocket:handlers><websocket:mapping path="/e" handler="echoHandler"/><websocket:mapping path="/g" handler="ghost"/></websocket:handlers><websocket:stomp-error-handler/></beans>"#;
         let d = Document { path: "/project/src/main/resources/ws2.xml".into(), language: "xml".into(), version: 1, text: text.into() };
-        assert!(WebSocketTools::default().line_markers(&d).is_empty());
+        assert!(warmed().line_markers(&d).is_empty());
         let found: Vec<_> = host.diagnostics()[&d.path].iter().map(|x| (x.code.clone().unwrap(), x.severity)).collect();
         assert_eq!(found, [("unresolved-reference".to_owned(), Severity::Info), ("missing-attribute".to_owned(), Severity::Warning)]);
     }
@@ -1197,7 +1271,7 @@ client.onConnect = () => {
     fn applies_follows_the_root_build_file() {
         let host = MockHost::install();
         let project = &host::projects().unwrap()[0];
-        assert!(!applies(project), "no build file");
+        assert!(applies(project), "unsure without a readable build file");
         host.add_file("pom.xml", "<project><artifactId>commons-lang3</artifactId></project>");
         assert!(!applies(project));
         host.add_file("pom.xml", "<project><artifactId>spring-boot-starter-websocket</artifactId></project>");
@@ -1208,20 +1282,16 @@ client.onConnect = () => {
 }
 
 impl WebSocketTools {
-    pub fn live_warm(&mut self, project: &openidea_plugin::Project, budget: std::time::Duration) {
+    pub fn live_warm(&mut self, project: &openidea_plugin::Project, budget: std::time::Duration, discover: bool) {
         if budget.is_zero() {
             return;
         }
-        self.index.get(project, budget / 2);
-        self.beans.get(project, budget / 2);
+        self.index.warm(project, budget / 2, discover);
+        self.beans.warm(project, budget / 2, discover);
     }
-    pub fn live_update(&mut self, project: &openidea_plugin::Project, path: &str, text: Option<&str>) {
-        self.index.update_existing(project, path, text);
-        self.beans.update_existing(project, path, text);
-    }
-    pub fn live_reset(&mut self) {
-        self.index.reset();
-        self.beans.reset();
+    pub fn live_events(&mut self, events: &[openidea_plugin::Event], deadline: std::time::Instant) {
+        self.index.on_events(events, deadline);
+        self.beans.on_events(events, deadline);
     }
 }
 

@@ -9,10 +9,10 @@ default-run = "ddev-wasm-smoke"
 [workspace]
 
 [dependencies]
-ide-plugin = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
-ide-core = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
-ide-extension = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
+ide-plugin = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
+ide-core = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
+ide-extension = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
 serde_json = "1"
 
-ide-remote = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
-ide-run = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
+ide-remote = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
+ide-run = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }

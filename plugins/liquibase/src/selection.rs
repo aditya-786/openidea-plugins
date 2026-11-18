@@ -419,7 +419,7 @@ mod tests {
         assert!(labels(&foreign).contains(&"c.xml"));
         host.set_project_root(None);assert!(matches!(plugin.render("changesets",None,&host.invocation()).unwrap().body,Body::Message(_)));
         host.set_project_root(Some("/other"));let host=host.with_capabilities(&["storage"]);
-        assert!(matches!(plugin.render("changesets",None,&host.invocation()).unwrap().body,Body::Message(text) if text.contains("Project identity is unavailable")));
+        assert!(matches!(plugin.render("changesets",None,&host.invocation()).unwrap().body,Body::Message(text) if text.contains("The project folder could not be read")));
     }
     #[test]
     fn native_render_needs_no_web_bridge_or_refresh_feedback() {

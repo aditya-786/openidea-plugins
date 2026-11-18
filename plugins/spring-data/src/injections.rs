@@ -15,7 +15,7 @@ impl Injections for crate::DataTools {
         {
             return vec![];
         }
-        let file = crate::live::repository_file(doc);
+        let file = self.repository_file(doc);
         let mut out = Vec::new();
         for ty in &file.types {
             for method in ty.methods() {

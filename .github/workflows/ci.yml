@@ -26,10 +26,40 @@ jobs:
       plugins: ${{ steps.list.outputs.plugins }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
 
+      # Pull requests build only the plugins they touch, directly or through a
+      # shared crate; pushes to main and CI changes build every plugin.
       - id: list
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
-          plugins=$(for f in plugins/*/Cargo.toml; do basename "$(dirname "$f")"; done | jq -R . | jq -sc .)
+          all=$(for f in plugins/*/Cargo.toml; do basename "$(dirname "$f")"; done)
+          selected=$all
+
+          if [ "$EVENT" = pull_request ]; then
+            changed=$(git diff --name-only HEAD^1 HEAD)
+
+            if ! grep -qx '.github/workflows/ci.yml' <<< "$changed"; then
+              crates=$(sed -n 's#^crates/\([^/]*\)/.*#\1#p' <<< "$changed" | sort -u)
+              selected=$(for p in $all; do
+                if grep -q "^plugins/$p/" <<< "$changed"; then
+                  echo "$p"
+                  continue
+                fi
+                for c in $crates; do
+                  if grep -rqs --include=Cargo.toml "crates/$c\"" "plugins/$p"; then
+                    echo "$p"
+                    break
+                  fi
+                done
+              done)
+            fi
+          fi
+
+          plugins=$(printf '%s\n' $selected | jq -R . | jq -sc 'map(select(length > 0))')
+          echo "Plugins to build: $plugins"
           echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
 
   crates:
@@ -72,6 +102,7 @@ jobs:
 
   plugin:
     needs: list
+    if: needs.list.outputs.plugins != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -100,7 +131,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download v0.1.46 --repo l0ng-ai/openidea \
+          gh release download v0.1.47 --repo l0ng-ai/openidea \
             --pattern openidea-plugin-linux-x86_64.gz --dir "$RUNNER_TEMP"
           gzip -dc "$RUNNER_TEMP/openidea-plugin-linux-x86_64.gz" > "$RUNNER_TEMP/openidea-plugin"
           chmod +x "$RUNNER_TEMP/openidea-plugin"

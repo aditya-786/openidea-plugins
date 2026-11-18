@@ -7,6 +7,10 @@ const PROBE_SOURCE:&str=include_str!("../runtime/BatchRuntimeProbe.java");
 const QUERY_SOURCE:&str=include_str!("../runtime/BatchRuntimeQuery.java");
 const RUNNER:&str="org.springframework.batch.core.launch.support.CommandLineJobRunner";
 const OPERATOR:&str="org.springframework.batch.core.launch.support.CommandLineJobOperator";
+/// Read as `plugin.aritti.spring-integration.batchCliActive` by the Poll and Cancel commands.
+const ACTIVE_CONTEXT:&str="batchCliActive";
+const EXECUTION_ID:&str="Enter a job execution ID (a positive number).";
+const NOT_RUNNING:&str="No Spring Batch CLI process is running. Start one with Spring Batch: Run Job Operation…";
 fn invalid(s:&str)->Error{Error::Invalid(s.into())}
 fn digest(s:&str)->String{format!("{:x}",Sha256::digest(s.as_bytes()))}
 fn relative(s:&str)->bool{!s.is_empty()&&s.len()<=512&&!s.contains(['\\',':',';','*','?','[',']','{','}'])&&!s.starts_with('/')&&!s.chars().any(char::is_control)&&s.split('/').all(|p|!matches!(p,""|"."|".."))}
@@ -15,19 +19,19 @@ fn literal(s:&str)->bool{!s.is_empty()&&s.len()<=128&&!s.starts_with('-')&&!s.co
 struct Profile{root:String,profile:String,context:String,source_path:String,source:String,kind:String,classpath:Vec<String>,probe:String}
 impl Profile {
  fn load(project:&Project)->Result<Self,Error>{
-  let root=project.root()?;if root.is_empty()||root=="/"||root.contains(['\n','\r','\\']){return Err(invalid("Use one explicit local project root."));}
-  let profile=host::setting_string("springBatch.runtimeProfile").unwrap_or_default();if !matches!(profile.as_str(),"runner-5.2.6"|"operator-6.0.6"){return Err(invalid("Configure an optional Spring Batch runtime profile, explicit classpath, context and source before operating jobs."));}
-  let context=host::setting_string("springBatch.runtimeContext").unwrap_or_default();let resource=host::setting_string("springBatch.runtimeContextSource").unwrap_or_default();if !relative(&resource){return Err(invalid("Runtime context source must be a literal project-relative file."));}
+  let root=project.root()?;if root.is_empty()||root=="/"||root.contains(['\n','\r','\\']){return Err(invalid("Open a local project folder first."));}
+  let profile=host::setting_string("springBatch.runtimeProfile").unwrap_or_default();if !matches!(profile.as_str(),"runner-5.2.6"|"operator-6.0.6"){return Err(invalid("Spring Batch job runs are not set up. Set Batch command-line runner, Batch run classpath, Batch application context class and Batch application context source file in Settings › Plugins › Spring Structure Tools."));}
+  let context=host::setting_string("springBatch.runtimeContext").unwrap_or_default();let resource=host::setting_string("springBatch.runtimeContextSource").unwrap_or_default();if !relative(&resource){return Err(invalid("Batch application context source file must be a project-relative path, such as src/main/java/com/acme/BatchConfig.java."));}
   let source_path=format!("{root}/{resource}");if host::project_of(&source_path).and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str()){return Err(Error::Stale);}
-  let source=project.read_file(&source_path)?;if source.len()>32*1024 {return Err(invalid("Runtime context source exceeds 32 KiB."));}
+  let source=project.read_file(&source_path)?;if source.len()>32*1024 {return Err(invalid("The context source file is too large (over 32 KiB)."));}
   let kind=if resource.ends_with(".java")||resource.ends_with(".kt") {
-   if context.is_empty()||context.len()>512||context.contains(['/', '\\', ':'])||context.chars().any(char::is_control)||context.split('.').any(str::is_empty){return Err(invalid("Use a fully qualified top-level JVM context class."));}
-   let file=spring_text::parse_source(&source_path,&source);if file.types.iter().filter(|t|t.outer.is_none()&&format!("{}.{}",file.package,t.name)==context).count()!=1{return Err(invalid("Context source does not declare the exact selected JVM class."));}"java"
-  }else if resource.ends_with(".xml")&&profile=="runner-5.2.6"&&relative(&context)&&context.ends_with(".xml")&&crate::xml_namespaces::document_valid(&source){"xml"}else{return Err(invalid("Runner supports Java/Kotlin classes or XML resources; Operator requires a declared JVM context class."));}.into();
-  let configured=host::setting_string("springBatch.runtimeClasspath").unwrap_or_default();let entries:Vec<_>=configured.lines().filter(|line|!line.trim().is_empty()).collect();if entries.is_empty()||entries.len()>32{return Err(invalid("List 1–32 explicit project-relative classpath entries, one per line; no wildcards."));}
+   if context.is_empty()||context.len()>512||context.contains(['/', '\\', ':'])||context.chars().any(char::is_control)||context.split('.').any(str::is_empty){return Err(invalid("Batch application context class must be a fully qualified class name, such as com.acme.BatchConfig."));}
+   let file=spring_text::parse_source(&source_path,&source);if file.types.iter().filter(|t|t.outer.is_none()&&format!("{}.{}",file.package,t.name)==context).count()!=1{return Err(invalid("The context source file does not declare the class set in Batch application context class."));}"java"
+  }else if resource.ends_with(".xml")&&profile=="runner-5.2.6"&&relative(&context)&&context.ends_with(".xml")&&spring_text::xml::analysis_valid(&source){"xml"}else{return Err(invalid("Use a Java or Kotlin context class. XML context files work only with the Spring Batch 5.2.6 runner."));}.into();
+  let configured=host::setting_string("springBatch.runtimeClasspath").unwrap_or_default();let entries:Vec<_>=configured.lines().filter(|line|!line.trim().is_empty()).collect();if entries.is_empty()||entries.len()>32{return Err(invalid("Batch run classpath needs 1 to 32 project-relative entries, one per line, without wildcards."));}
   let mut classpath=Vec::new();for entry in entries {
-   if !relative(entry)||entry.trim()!=entry{return Err(invalid("Classpath entries must be literal project-relative paths without wildcards, parent traversal or leading/trailing whitespace."));}
-   let path=format!("{root}/{entry}");if classpath.contains(&path)||host::project_of(&path).and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str()){return Err(invalid("Duplicate or foreign-project classpath entry."));}
+   if !relative(entry)||entry.trim()!=entry{return Err(invalid("Classpath entries must be project-relative paths without wildcards, .. or surrounding spaces."));}
+   let path=format!("{root}/{entry}");if classpath.contains(&path)||host::project_of(&path).and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str()){return Err(invalid("A classpath entry is listed twice or is outside this project."));}
    let stat=project.stat(&path)?;if stat.kind!=FileKind::Directory&&!(stat.kind==FileKind::File&&path.ends_with(".jar")){return Err(invalid("Classpath entries must be existing directories or JAR files."));}classpath.push(path);
   }
   let probe=format!("{}/BatchRuntimeProbe-{}.java",host::fs::plugin_dir()?.trim_end_matches('/'),digest(PROBE_SOURCE));
@@ -43,9 +47,9 @@ fn parse_probe(profile:&Profile,output:&str)->Result<Proof,Error>{
  if output.len()>4096{return Err(invalid("Classpath probe output exceeded its protocol limit."));}
  let mut lines=output.lines();if lines.next()!=Some("OPENIDEA_BATCH_PROFILE_V1"){return Err(invalid("Classpath probe did not return its supported protocol."));}
  let mut fields=BTreeMap::new();for line in lines{let(k,v)=line.split_once('=').ok_or_else(||invalid("Malformed classpath proof."))?;if fields.insert(k,v).is_some(){return Err(invalid("Duplicate classpath proof field."));}}
- if fields.len()!=5||fields.get("profile").copied()!=Some(profile.profile.as_str())||fields.get("source-sha256").copied()!=Some(digest(&profile.source).as_str()){return Err(invalid("Runtime context on disk differs from the reviewed source, or the profile changed; save/rebuild and validate again."));}
+ if fields.len()!=5||fields.get("profile").copied()!=Some(profile.profile.as_str())||fields.get("source-sha256").copied()!=Some(digest(&profile.source).as_str()){return Err(invalid("The compiled context does not match its source file, or the settings changed. Save and rebuild, then run Spring Batch: Validate Configured CLI Profile."));}
  let hash=|name:&str|->Result<String,Error>{let h=fields.get(name).ok_or_else(||invalid("Missing classpath proof hash."))?;if h.len()!=64||!h.bytes().all(|b|b.is_ascii_hexdigit()&&!b.is_ascii_uppercase()){return Err(invalid("Invalid classpath proof hash."));}Ok((*h).into())};
- let java=fields.get("java").and_then(|n|n.parse::<u32>().ok()).filter(|n|*n>=17&&*n<100).ok_or_else(||invalid("This profile requires Java17 or newer."))?;
+ let java=fields.get("java").and_then(|n|n.parse::<u32>().ok()).filter(|n|*n>=17&&*n<100).ok_or_else(||invalid("This profile requires Java 17 or newer."))?;
  Ok(Proof{classpath:hash("classpath-sha256")?,context:hash("context-sha256")?,java})
 }
 fn ensure_probe(profile:&Profile)->Result<(),Error>{
@@ -53,12 +57,12 @@ fn ensure_probe(profile:&Profile)->Result<(),Error>{
  if host::fs::read_file(&profile.probe)?!=PROBE_SOURCE {return Err(Error::Stale);}Ok(())
 }
 fn run_helper(project:&Project,args:&[String])->Result<String,Error>{
- let task=host::begin_task("Read explicit Spring Batch helper result",true);let child=host::start(&Command::new("java").args(args),Some(project))?;child.close_stdin()?;let started=Instant::now();let(mut stdout,mut stderr)=(String::new(),String::new());
+ let task=host::begin_task("Running the Spring Batch helper",true);let child=host::start(&Command::new("java").args(args),Some(project))?;child.close_stdin()?;let started=Instant::now();let(mut stdout,mut stderr)=(String::new(),String::new());
  loop {
   if task.is_cancelled(){let _=child.kill();return Err(Error::Cancelled);}
-  if started.elapsed()>Duration::from_secs(20){let _=child.kill();return Err(invalid("Reviewed Java helper timed out; its process was ended and no helper result is claimed."));}
-  let chunk=child.wait(100)?;stdout.push_str(&chunk.stdout);stderr.push_str(&chunk.stderr);if stdout.len()+stderr.len()>16*1024{let _=child.kill();return Err(invalid("Reviewed Java helper exceeded its output limit; its process was ended and no helper result is claimed."));}
-  if let Some(status)=chunk.status{if status!=0{return Err(Error::Failed(format!("Reviewed Java helper failed (exit {status}): {}",stderr.chars().take(1500).collect::<String>())));}return Ok(stdout);}
+  if started.elapsed()>Duration::from_secs(20){let _=child.kill();return Err(invalid("The Spring Batch helper timed out after 20 seconds and was stopped."));}
+  let chunk=child.wait(100)?;stdout.push_str(&chunk.stdout);stderr.push_str(&chunk.stderr);if stdout.len()+stderr.len()>16*1024{let _=child.kill();return Err(invalid("The Spring Batch helper printed too much output and was stopped."));}
+  if let Some(status)=chunk.status{if status!=0{return Err(Error::Failed(format!("The Spring Batch helper failed (exit {status}): {}",stderr.chars().take(1500).collect::<String>())));}return Ok(stdout);}
  }
 }
 fn probe(project:&Project,profile:&Profile)->Result<Proof,Error>{ensure_probe(profile)?;parse_probe(profile,&run_helper(project,&profile.probe_args())?)}
@@ -97,11 +101,11 @@ impl Operation {
   let mut choices:Vec<_>=[("start","Start a job"),("next","Start next instance"),("stop","Request execution stop"),("restart","Restart an execution"),("abandon","Abandon a stopped execution")].into_iter().map(|(id,label)|openidea_plugin::PickItem::new(id,label)).collect();
   if profile.profile.starts_with("operator-"){choices.push(openidea_plugin::PickItem::new("recover","Recover an execution"));}
   let Some(kind)=host::pick("Spring Batch operation",&choices)? else{return Ok(None);};if !choices.iter().any(|item|item.key==kind){return Err(invalid("Unknown Batch operation."));}
-  let execution=!matches!(kind.as_str(),"start"|"next");let Some(identity)=host::input(if execution{"Exact positive job execution ID"}else{"Exact registered job name"},None)? else{return Ok(None);};
-  if execution {if identity.parse::<u64>().ok().filter(|n|*n>0).is_none()||identity.bytes().any(|b|!b.is_ascii_digit()){return Err(invalid("Use an exact positive decimal execution ID."));}}else if identity.trim().is_empty()||identity.len()>256||identity.chars().any(char::is_control)||profile.profile=="runner-5.2.6"&&identity.starts_with('-'){return Err(invalid("Use one exact registered job name without control characters or Runner option prefixes."));}
+  let execution=!matches!(kind.as_str(),"start"|"next");let Some(identity)=host::input(if execution{"Job execution ID"}else{"Job name"},None)? else{return Ok(None);};
+  if execution {if identity.parse::<u64>().ok().filter(|n|*n>0).is_none()||identity.bytes().any(|b|!b.is_ascii_digit()){return Err(invalid(EXECUTION_ID));}}else if identity.trim().is_empty()||identity.len()>256||identity.chars().any(char::is_control)||profile.profile=="runner-5.2.6"&&identity.starts_with('-'){return Err(invalid("Enter one job name, without line breaks or a leading -."));}
   let mut parameters=Vec::new();if kind=="start"||profile.profile=="runner-5.2.6"&&matches!(kind.as_str(),"next"|"restart") {
    let Some(text)=host::input_multiline("Job parameters, one key=value per line (empty for none)",Some(""))? else{return Ok(None);};if text.len()>4096{return Err(invalid("Job parameters exceed 4 KiB."));}
-   for line in text.lines().filter(|line|!line.is_empty()) {let Some((key,value))=line.split_once('=') else{return Err(invalid("Each parameter must be a literal key=value argument."));};if !literal(key)||value.chars().any(char::is_control)||parameters.len()>=16{return Err(invalid("Use at most16 literal key=value arguments without control characters."));}parameters.push(line.into());}
+   for line in text.lines().filter(|line|!line.is_empty()) {let Some((key,value))=line.split_once('=') else{return Err(invalid("Write each parameter as key=value."));};if !literal(key)||value.chars().any(char::is_control)||parameters.len()>=16{return Err(invalid("Use at most 16 key=value parameters, without line breaks or tabs."));}parameters.push(line.into());}
   }
   if profile.profile=="operator-6.0.6"&&kind=="restart"&&!parameters.is_empty(){return Err(invalid("Operator restart accepts only an execution ID; use an empty parameter list."));}
   Ok(Some(Self{kind,identity,parameters}))
@@ -120,54 +124,57 @@ struct Session{root:String,profile:String,context:String,operation:Operation,chi
 pub(crate) struct Runtime{sessions:BTreeMap<u64,Session>,next:u64}
 impl Runtime {
  pub(crate) fn run_command(&mut self,id:&str,ctx:&Invocation)->Result<Option<String>,Error>{self.run_with(id,ctx,&mut Native)}
- fn run_with(&mut self,id:&str,ctx:&Invocation,launcher:&mut impl Launcher)->Result<Option<String>,Error>{
-  let project=ctx.project().ok_or_else(||invalid("Open the project owning the configured Batch runtime profile."))?;let root=project.root()?;
+ fn run_with(&mut self,id:&str,ctx:&Invocation,launcher:&mut impl Launcher)->Result<Option<String>,Error>{let result=self.run_inner(id,ctx,launcher).map_err(|e|ui_kit::denied::map_capability(e,"Spring Batch runtime","process:java","Spring Structure Tools"));let _=host::set_context(ACTIVE_CONTEXT,!self.sessions.is_empty());result}
+ fn run_inner(&mut self,id:&str,ctx:&Invocation,launcher:&mut impl Launcher)->Result<Option<String>,Error>{
+  let project=ctx.project().ok_or_else(||invalid("Open the project to run Spring Batch jobs in."))?;let root=project.root()?;
   let foreign:Vec<_>=self.sessions.iter().filter(|(_,s)|s.root!=root).map(|(id,_)|*id).collect();
-  if !foreign.is_empty(){for id in &foreign{self.sessions.get(id).ok_or(Error::Stale)?.child.kill()?;self.sessions.remove(id);}return Ok(Some(format!("Project changed: ended {} previous-project owned CLI process(es) without forwarding their output here. This did not issue a Batch stop request. Retry the command for the current project.",foreign.len())));}
+  if !foreign.is_empty(){for id in &foreign{self.sessions.get(id).ok_or(Error::Stale)?.child.kill()?;self.sessions.remove(id);}return Ok(Some(format!("Project changed: ended {} CLI process(es) of the previous project without sending a Batch stop request. Run the command again.",foreign.len())));}
   match id {
-   "batch.runtime-validate"=>{let profile=Profile::load(&project)?;let proof=launcher.validate(&project,&profile)?;Ok(Some(format!("Validated {} with Java{}; compiled context SHA256 {}, classpath SHA256 {}. This identifies reviewed artifacts, not source build provenance or effective database identity.",profile.profile,proof.java,proof.context,proof.classpath)))},
+   "batch.runtime-validate"=>{let profile=Profile::load(&project)?;let proof=launcher.validate(&project,&profile)?;Ok(Some(format!("Validated {} with Java {}. Compiled context SHA-256 {}, classpath SHA-256 {}.",profile.profile,proof.java,proof.context,proof.classpath)))},
    "batch.runtime-inspect"=>{
-    let profile=Profile::load(&project)?;let Some(raw)=host::input("Exact positive execution ID to inspect",None)? else{return Ok(None);};let id=raw.parse::<u64>().ok().filter(|id|*id>0&&raw.bytes().all(|b|b.is_ascii_digit())).ok_or_else(||invalid("Use one positive decimal execution ID."))?;
+    let profile=Profile::load(&project)?;let Some(raw)=host::input("Job execution ID to inspect",None)? else{return Ok(None);};let id=raw.parse::<u64>().ok().filter(|id|*id>0&&raw.bytes().all(|b|b.is_ascii_digit())).ok_or_else(||invalid(EXECUTION_ID))?;
     let proof=launcher.validate(&project,&profile)?;let query_args=inspection_args(&profile,id)?;
-    let review=format!("Project/cwd: {}\nProfile: {}\nCompiled context: {}\nExecution ID: {id}\nCompiled context SHA256: {}\nClasspath SHA256: {}\nProgram: java\nArguments (one per line):\n{}\n\nReviewed source:\n{}\n\nThis explicitly starts the configured compiled application context and reads this execution's metadata through JobExplorer (Runner5) or JobRepository (Operator6). Application startup can perform its configured actions and connect to its configured database. The helper requests no job operation or repository write. Artifact hashes do not prove source build provenance or effective datasource identity. This is a point-in-time query, separate from CLI exit/stop acknowledgement.",root,profile.profile,profile.context,proof.context,proof.classpath,query_args.join("\n"),ui_kit::prompts::readable_source(&profile.source));
-    if !ui_kit::prompts::confirm_exact("Inspect execution through this configured context?",&review)?{return Err(Error::Cancelled);}
+    let review=format!("Project: {}\nRunner: {}\nContext class: {}\nExecution ID: {id}\nCommand: java, with arguments:\n{}\n\nThis starts your application context to read the execution from the job repository. Its startup code runs and connects to its configured database. Nothing is written.",root,profile.profile,profile.context,query_args.join("\n"));
+    if !ui_kit::prompts::confirm_exact(&format!("Inspect job execution {id}?"),&review)?{return Err(Error::Cancelled);}
     if ctx.project().and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str())||Profile::load(&project)?!=profile||launcher.validate(&project,&profile)?!=proof{return Err(Error::Stale);}
-    let state=launcher.inspect(&project,&profile,id)?;let result=if !state.found {format!("Execution {id} was not found by the selected context's repository reader. This is not a global absence claim.")}else{format!("Observed repository state: execution {id}, job {}, instance {}, status {}, start {}, end {}, observed {}. Context: {} ({}).",ui_kit::prompts::readable_source(state.job.as_deref().unwrap_or_default()),state.instance.unwrap_or_default(),state.status.unwrap_or_default(),state.start.unwrap_or_default(),state.end.unwrap_or_default(),state.observed.unwrap_or_default(),profile.context,profile.profile)};
+    let state=launcher.inspect(&project,&profile,id)?;let result=if !state.found {format!("Execution {id} was not found in the job repository of {}.",profile.context)}else{format!("Execution {id}: job {}, instance {}, status {}, started {}, ended {}, checked at {}. Context: {} ({}).",ui_kit::prompts::readable_source(state.job.as_deref().unwrap_or_default()),state.instance.unwrap_or_default(),state.status.unwrap_or_default(),state.start.unwrap_or_default(),state.end.unwrap_or_default(),state.observed.unwrap_or_default(),profile.context,profile.profile)};
     host::output_append(OUTPUT,&format!("\nProject: {root}\n{result}\n"))?;let _=host::output_reveal(OUTPUT);Ok(Some(result))
    },
    "batch.runtime-operate"=>{
-    if self.sessions.len()>=4{return Err(invalid("Four owned Batch CLI processes are active; poll completed controls or cancel one selected process before adding another."));}
+    if self.sessions.len()>=4{return Err(invalid("Four CLI processes are already running. Run Spring Batch: Poll CLI Output to collect finished ones, or Spring Batch: Cancel CLI Process."));}
     let profile=Profile::load(&project)?;let Some(operation)=Operation::input(&profile)? else{return Ok(None);};
-    let launch=matches!(operation.kind.as_str(),"start"|"next"|"restart");if launch&&self.sessions.values().filter(|s|matches!(s.operation.kind.as_str(),"start"|"next"|"restart")).count()>=3{return Err(invalid("Three launch processes are active; the fourth slot is reserved for a stop/abandon/recover control."));}
+    let launch=matches!(operation.kind.as_str(),"start"|"next"|"restart");if launch&&self.sessions.values().filter(|s|matches!(s.operation.kind.as_str(),"start"|"next"|"restart")).count()>=3{return Err(invalid("Three jobs are already running. The fourth slot is kept for a stop, abandon or recover operation."));}
     let next=self.next.checked_add(1).ok_or(Error::Stale)?;let proof=launcher.validate(&project,&profile)?;let args=operation.arguments(&profile);
-    let review=format!("Project/cwd: {}\nProfile: {}\nCompiled context: {}\nContext source: {}\nJava: {}\nCompiled context SHA256: {}\nClasspath SHA256: {}\n\nProgram: java\nArguments (one per line):\n{}\n\nReviewed source snapshot:\n{}\n\nThis invokes the configured compiled application context, including its startup code and configured database connections. Source/bytecode hashes identify artifacts; they do not prove that this bytecode was built from the current source or establish effective datasource identity. A successful stop command acknowledges a stop request; it does not prove the job stopped. Process cancellation is separate from a Batch stop request.",root,profile.profile,profile.context,profile.source_path,proof.java,proof.context,proof.classpath,args.join("\n"),ui_kit::prompts::readable_source(&profile.source));
-    if !ui_kit::prompts::confirm_exact("Run this explicit Spring Batch operation?",&review)?{return Err(Error::Cancelled);}
+    let review=format!("Project: {}\nRunner: {}\nContext class: {}\nJava: {}\nCommand: java, with arguments:\n{}\n\nThis starts your application context: its startup code runs and connects to its configured database. A stop operation only asks the job to stop. Cancel CLI Process ends the local process without stopping the job.",root,profile.profile,profile.context,proof.java,args.join("\n"));
+    if !ui_kit::prompts::confirm_exact("Run this Spring Batch operation?",&review)?{return Err(Error::Cancelled);}
     if ctx.project().and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str())||Profile::load(&project)?!=profile||launcher.validate(&project,&profile)?!=proof{return Err(Error::Stale);}
     let child=launcher.start(&project,&args)?;
-    let _=host::output_append(OUTPUT,&format!("\nCLI #{next} · Project: {root}\n{}: {} {} (compiled context {})\n",profile.profile,operation.kind,operation.identity,profile.context));let _=host::output_append(OUTPUT,&format!("Compiled context SHA256: {}\nClasspath SHA256: {}\n",proof.context,proof.classpath));let _=host::output_reveal(OUTPUT);
-    self.next=next;self.sessions.insert(next,Session{root,profile:profile.profile,context:profile.context,operation,child,bytes:0,omitted:false});Ok(Some(format!("Owned Batch CLI #{next} started. Poll CLI Output reads all owned sessions; Cancel CLI Process ends one selected local process. Stop remains a separate Batch operation.")))
+    let _=host::output_append(OUTPUT,&format!("\nCLI #{next} · Project: {root}\n{}: {} {} (context {})\n",profile.profile,operation.kind,operation.identity,profile.context));let _=host::output_append(OUTPUT,&format!("Compiled context SHA256: {}\nClasspath SHA256: {}\n",proof.context,proof.classpath));let _=host::output_reveal(OUTPUT);
+    self.next=next;self.sessions.insert(next,Session{root,profile:profile.profile,context:profile.context,operation,child,bytes:0,omitted:false});Ok(Some(format!("CLI #{next} started. Run Spring Batch: Poll CLI Output to see its output, or Spring Batch: Cancel CLI Process to end it.")))
    },
    "batch.runtime-poll"=>{
-    if self.sessions.is_empty(){return Err(invalid("No owned Batch CLI is active."));}
+    if self.sessions.is_empty(){return Err(invalid(NOT_RUNNING));}
     let ids:Vec<_>=self.sessions.keys().copied().collect();let mut summaries=Vec::new();
     for id in ids {
      let session=self.sessions.get_mut(&id).ok_or(Error::Stale)?;
      let chunk=session.child.poll(16*1024)?;let data=format!("{}{}",chunk.stdout,chunk.stderr);
      let mut shown=data.len().min((256*1024usize).saturating_sub(session.bytes));while !data.is_char_boundary(shown){shown-=1;}
      if shown>0{host::output_append(OUTPUT,&format!("\nCLI #{id} {} {} {} (context {}):\n{}",session.profile,session.operation.kind,session.operation.identity,session.context,&data[..shown]))?;session.bytes+=shown;}
-     if shown<data.len()&&!session.omitted {session.omitted=true;host::output_append(OUTPUT,&format!("\nCLI #{id}: further output omitted at the256 KiB display limit. The owned process continues; poll still reads its exit status and stop/cancel remain available.\n"))?;}
+     if shown<data.len()&&!session.omitted {session.omitted=true;host::output_append(OUTPUT,&format!("\nCLI #{id}: further output omitted (over 256 KiB). The process keeps running.\n"))?;}
      if let Some(status)=chunk.status {
-      let label=if session.operation.kind=="stop"&&status==0{"Stop request acknowledged; actual execution status is not established."}else if status==0{"CLI completed successfully; inspect its job/application output for execution details."}else{"CLI failed; inspect output. No successful job operation is claimed."};
+      let label=if session.operation.kind=="stop"&&status==0{"Stop request acknowledged. Run Spring Batch: Inspect Execution Repository State to check whether the job stopped."}else if status==0{"CLI finished. See the output for job details."}else{"CLI failed. See the output for the error."};
       let result=format!("CLI #{id} {} {} {}: CLI exit {status}. {label}",session.profile,session.operation.kind,session.operation.identity);host::output_append(OUTPUT,&format!("\n{result}\n"))?;summaries.push(result);self.sessions.remove(&id);
      }else{summaries.push(format!("CLI #{id} {} {} {} is still running.",session.profile,session.operation.kind,session.operation.identity));}
     }
     let _=host::output_reveal(OUTPUT);Ok(Some(summaries.join("\n")))
    },
    "batch.runtime-cancel"=>{
-    let ids:Vec<_>=self.sessions.keys().copied().collect();let id=match ids.as_slice(){[]=>return Err(invalid("No owned Batch CLI is active.")),[id]=>*id,_=>{
-     let items:Vec<_>=self.sessions.iter().map(|(id,s)|openidea_plugin::PickItem::new(&id.to_string(),&format!("CLI #{id}: {} {} {} (context {})",s.profile,s.operation.kind,s.operation.identity,s.context))).collect();let Some(choice)=host::pick("End one owned CLI process (not a Batch stop)",&items)? else{return Ok(None);};choice.parse::<u64>().ok().filter(|id|self.sessions.contains_key(id)).ok_or(Error::Stale)?
+    let ids:Vec<_>=self.sessions.keys().copied().collect();let id=match ids.as_slice(){[]=>return Err(invalid(NOT_RUNNING)),[id]=>*id,_=>{
+     let items:Vec<_>=self.sessions.iter().map(|(id,s)|openidea_plugin::PickItem::new(&id.to_string(),&format!("CLI #{id}: {} {} {} (context {})",s.profile,s.operation.kind,s.operation.identity,s.context))).collect();let Some(choice)=host::pick("Choose the CLI process to end",&items)? else{return Ok(None);};choice.parse::<u64>().ok().filter(|id|self.sessions.contains_key(id)).ok_or(Error::Stale)?
     }};
-    self.sessions.get(&id).ok_or(Error::Stale)?.child.kill()?;self.sessions.remove(&id);Ok(Some(format!("Ended owned local CLI #{id}. This did not issue a Batch stop request or prove remote job execution stopped.")))
+    let session=self.sessions.get(&id).ok_or(Error::Stale)?;let target=if matches!(session.operation.kind.as_str(),"start"|"next"){"job"}else{"execution"};
+    if !host::confirm(&format!("End CLI #{id} ({target} {})?",session.operation.identity),"This ends the local process. It does not send a Batch stop request: use Spring Batch: Run Job Operation… and choose stop for that.")?{return Ok(None);}
+    self.sessions.get(&id).ok_or(Error::Stale)?.child.kill()?;self.sessions.remove(&id);Ok(Some(format!("Ended CLI #{id}. No Batch stop request was sent, so the job may still be marked as running.")))
    },
    _=>Err(invalid("Unknown Batch runtime command.")),
   }
@@ -214,9 +221,13 @@ mod tests {
   let h=configured();h.on_process("java",|_,_|Err(Error::Denied("process:java".into())));answer(&h,"start","fixture","");assert!(Runtime::default().run_with("batch.runtime-operate",&h.invocation(),&mut Fake).is_err());assert_eq!(h.process_runs().len(),1);
  }
  #[test]
+ fn spring_batch_runtime_denied_names_permission() {
+  let h=configured();h.on_process("java",|_,_|Err(Error::Denied("process:java".into())));answer(&h,"start","fixture","");let error=Runtime::default().run_with("batch.runtime-operate",&h.invocation(),&mut Fake).unwrap_err().to_string();assert!(error.contains("needs the process:java permission"),"{error}");assert!(error.contains("Settings › Plugins › Spring Structure Tools"),"{error}");
+ }
+ #[test]
  fn stop_acknowledgement_cancel_and_project_change_have_distinct_semantics() {
-  let h=configured();process(&h);answer(&h,"stop","42","");let mut runtime=Runtime::default();runtime.run_with("batch.runtime-operate",&h.invocation(),&mut Fake).unwrap();assert!(h.process_runs().last().unwrap().args.contains(&"-stop".into()));let result=runtime.run_with("batch.runtime-poll",&h.invocation(),&mut Fake).unwrap().unwrap();assert!(result.contains("Stop request acknowledged"));assert!(result.contains("not established"));
-  answer(&h,"start","fixture","");runtime.run_with("batch.runtime-operate",&h.invocation(),&mut Fake).unwrap();let result=runtime.run_with("batch.runtime-cancel",&h.invocation(),&mut Fake).unwrap().unwrap();assert!(result.contains("did not issue a Batch stop request"));assert!(runtime.sessions.is_empty());
+  let h=configured();process(&h);answer(&h,"stop","42","");let mut runtime=Runtime::default();runtime.run_with("batch.runtime-operate",&h.invocation(),&mut Fake).unwrap();assert!(h.process_runs().last().unwrap().args.contains(&"-stop".into()));let result=runtime.run_with("batch.runtime-poll",&h.invocation(),&mut Fake).unwrap().unwrap();assert!(result.contains("Stop request acknowledged"));assert!(result.contains("check whether the job stopped"));
+  answer(&h,"start","fixture","");runtime.run_with("batch.runtime-operate",&h.invocation(),&mut Fake).unwrap();h.answer_next_prompt(Some(&["yes"]));let result=runtime.run_with("batch.runtime-cancel",&h.invocation(),&mut Fake).unwrap().unwrap();assert!(result.contains("No Batch stop request was sent"));assert!(runtime.sessions.is_empty());
   answer(&h,"start","fixture","");runtime.run_with("batch.runtime-operate",&h.invocation(),&mut Fake).unwrap();h.set_project_root(Some("/other"));let before=h.process_runs().len();let result=runtime.run_with("batch.runtime-poll",&h.invocation(),&mut Fake).unwrap().unwrap();assert!(result.contains("Project changed"));assert!(runtime.sessions.is_empty());assert_eq!(h.process_runs().len(),before);
  }
  #[test]
@@ -228,7 +239,23 @@ mod tests {
   let h=configured();process(&h);let killed=std::rc::Rc::new(std::cell::Cell::new(false));let mut backend=HoldStarts(killed.clone());let mut runtime=Runtime::default();answer(&h,"start","fixture","");runtime.run_with("batch.runtime-operate",&h.invocation(),&mut backend).unwrap();assert_eq!(runtime.sessions.len(),1);
   answer(&h,"stop","42","");runtime.run_with("batch.runtime-operate",&h.invocation(),&mut backend).unwrap();assert_eq!(runtime.sessions.len(),2);assert!(!killed.get());
   let result=runtime.run_with("batch.runtime-poll",&h.invocation(),&mut backend).unwrap().unwrap();assert!(result.contains("still running"));assert!(result.contains("Stop request acknowledged"));assert_eq!(runtime.sessions.len(),1);assert!(runtime.sessions.contains_key(&1));assert!(!killed.get());
-  runtime.run_with("batch.runtime-cancel",&h.invocation(),&mut backend).unwrap();assert!(killed.get());assert!(runtime.sessions.is_empty());
+  h.answer_next_prompt(Some(&["yes"]));runtime.run_with("batch.runtime-cancel",&h.invocation(),&mut backend).unwrap();assert!(killed.get());assert!(runtime.sessions.is_empty());
+ }
+ #[test]
+ fn poll_and_cancel_are_enabled_only_while_a_cli_runs_and_cancel_asks_first() {
+  let manifest=include_str!("../plugin.toml");
+  for id in ["batch.runtime-poll","batch.runtime-cancel"]{let command=manifest.split("[[contributes.commands]]").find(|c|c.contains(&format!("id = \"{id}\""))).unwrap();assert!(command.contains(&format!("when = \"plugin.aritti.spring-integration.{ACTIVE_CONTEXT}\"")),"{id}");}
+  let h=configured();process(&h);let mut runtime=Runtime::default();assert!(runtime.run_with("batch.runtime-poll",&h.invocation(),&mut Fake).unwrap_err().to_string().contains("Run Job Operation"));
+  struct Held(std::rc::Rc<std::cell::Cell<bool>>);
+  impl Running for Held {fn poll(&self,_:u32)->Result<host::Chunk,Error>{Ok(host::Chunk::default())}fn kill(&self)->Result<(),Error>{self.0.set(true);Ok(())}}
+  let killed=std::rc::Rc::new(std::cell::Cell::new(false));runtime.sessions.insert(7,Session{root:"/project".into(),profile:"runner-5.2.6".into(),context:"fixture.Context".into(),operation:Operation{kind:"start".into(),identity:"fixture".into(),parameters:vec![]},child:Box::new(Held(killed.clone())),bytes:0,omitted:false});
+  runtime.run_with("batch.runtime-poll",&h.invocation(),&mut Fake).unwrap();assert_eq!(h.context_keys()[ACTIVE_CONTEXT],openidea_plugin::ContextValue::Flag(true));
+  h.answer_next_prompt(None);assert_eq!(runtime.run_with("batch.runtime-cancel",&h.invocation(),&mut Fake).unwrap(),None);assert!(!killed.get());assert_eq!(runtime.sessions.len(),1);
+  h.answer_next_prompt(Some(&["yes"]));runtime.run_with("batch.runtime-cancel",&h.invocation(),&mut Fake).unwrap();assert!(killed.get());assert_eq!(h.context_keys()[ACTIVE_CONTEXT],openidea_plugin::ContextValue::Flag(false));
+ }
+ #[test]
+ fn unconfigured_runtime_names_the_settings_page() {
+  let h=MockHost::install();let error=Profile::load(&h.invocation().project().unwrap()).unwrap_err().to_string();assert!(error.contains("Settings › Plugins › Spring Structure Tools"),"{error}");assert!(error.contains("Batch command-line runner"),"{error}");
  }
  #[test]
  fn probe_is_embedded_and_materialized_only_in_private_hash_named_source() {
@@ -244,7 +271,7 @@ mod tests {
  fn inspection_record(id:u64,status:&str)->String{format!("startup log\nOPENIDEA_BATCH_EXECUTION_V1\nprofile=runner-5.2.6\nexecution-id={id}\nfound=true\ninstance-id=5\njob-name-hex=66697874757265\nstatus={status}\nstart-time=2026-11-11T00:00:00\nend-time=-\nobserved-at=2026-11-11T00:00:01Z\n")}
  #[test]
  fn repository_inspection_is_separately_reviewed_and_reports_typed_observed_state() {
-  let h=configured();h.on_process("java",|args,_|Ok(ProcessOutput{status:Some(0),stdout:if args.first().map(String::as_str)==Some("--source"){proof("runner-5.2.6",SOURCE,&"a".repeat(64))}else{inspection_record(42,"STOPPED")},stderr:String::new()}));h.answer_next_prompt(Some(&["42"]));h.answer_next_prompt(Some(&["yes"]));let mut runtime=Runtime::default();let message=runtime.run_with("batch.runtime-inspect",&h.invocation(),&mut Fake).unwrap().unwrap();assert!(message.contains("Observed repository state"));assert!(message.contains("status STOPPED"));assert!(message.contains("job fixture"));assert_eq!(h.process_runs().len(),3);let args=&h.process_runs()[2].args;assert_eq!(args[0],"--class-path");assert_eq!(args.last().unwrap(),"42");assert!(runtime.sessions.is_empty());
+  let h=configured();h.on_process("java",|args,_|Ok(ProcessOutput{status:Some(0),stdout:if args.first().map(String::as_str)==Some("--source"){proof("runner-5.2.6",SOURCE,&"a".repeat(64))}else{inspection_record(42,"STOPPED")},stderr:String::new()}));h.answer_next_prompt(Some(&["42"]));h.answer_next_prompt(Some(&["yes"]));let mut runtime=Runtime::default();let message=runtime.run_with("batch.runtime-inspect",&h.invocation(),&mut Fake).unwrap().unwrap();assert!(message.contains("Execution 42:"));assert!(message.contains("status STOPPED"));assert!(message.contains("job fixture"));assert_eq!(h.process_runs().len(),3);let args=&h.process_runs()[2].args;assert_eq!(args[0],"--class-path");assert_eq!(args.last().unwrap(),"42");assert!(runtime.sessions.is_empty());
   let profile=Profile::load(&h.invocation().project().unwrap()).unwrap();assert!(parse_inspection(&profile,41,&inspection_record(42,"STOPPED")).is_err());assert!(parse_inspection(&profile,42,&inspection_record(42,"FUTURE_UNKNOWN_STATUS")).is_err());assert!(parse_inspection(&profile,42,&inspection_record(42,"STOPPED").replace("66697874757265","zz")).is_err());
   let missing=parse_inspection(&profile,42,"OPENIDEA_BATCH_EXECUTION_V1\nprofile=runner-5.2.6\nexecution-id=42\nfound=false\n").unwrap();assert!(!missing.found);assert!(missing.status.is_none());
  }

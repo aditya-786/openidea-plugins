@@ -6,7 +6,7 @@ use openidea_plugin::providers::{CompletionItem, CompletionKind, Document, LineM
 use openidea_plugin::text::offset;
 use openidea_plugin::views::{Body, Button, TreeItem, View, ViewEvent, Viewport, Views};
 use openidea_plugin::{Diagnostic, Error, Invocation, Location, Plugin, Position, Project, Range, Severity, host};
-use spring_text::index::{COMMAND_BUDGET, Index, Indexes, PROVIDER_BUDGET, project_of};
+use spring_text::index::{COMMAND_BUDGET, Index, Indexes, project_of};
 use spring_text::java::{self, Annotation, Member, Str, TypeDecl};
 use spring_text::kotlin;
 use spring_text::tree::Expansion;
@@ -495,6 +495,21 @@ fn schema_fields(schemas: &Index<Schema>, ty: &str, field: &str) -> Vec<(String,
     found
 }
 
+/// The host's navigate arrow for every link this module draws: explicit so same-line markers
+/// group predictably, and apart from the web route icon so they never merge with its URL markers.
+const MARKER_ICON: &str = "navigate";
+
+/// Most markers one line gets; the rest are named in the tooltip.
+const MAX_LINE_TARGETS: usize = 200;
+
+/// One marker per target on `line`: the IDE folds same-line, same-icon markers into one gutter
+/// button that jumps to a single target or opens its chooser for several.
+fn per_target(line: u32, tooltip: &str, targets: Vec<Location>) -> Vec<LineMarker> {
+    let total = targets.len();
+    let tooltip = if total > MAX_LINE_TARGETS { format!("{tooltip} (first {MAX_LINE_TARGETS} of {total})") } else { tooltip.to_owned() };
+    targets.into_iter().take(MAX_LINE_TARGETS).map(|t| LineMarker { line, icon: Some(MARKER_ICON.into()), tooltip: tooltip.clone(), target: Some(t) }).collect()
+}
+
 fn describe(handlers: &[(Location, String)]) -> String {
     match handlers {
         [(_, one)] => format!("Handled by {one}"),
@@ -564,10 +579,27 @@ fn mentions_wiring(path: &str, text: &str) -> Option<bool> {
     (marked > 0 && marked != controller_handlers(text, path.ends_with(".kt")).len()).then_some(true)
 }
 
+/// What one Java or Kotlin file says to this module, read once.
+#[derive(Clone)]
+pub struct JavaFacts {
+    handlers: Vec<Handler>,
+    /// Hand wiring, or a mapping the literal parser did not accept: the handler set is unprovable.
+    wired: bool,
+}
+
+fn java_facts(path: &str, text: &str) -> Option<JavaFacts> {
+    let wired = mentions_wiring(path, text).unwrap_or(false);
+    let handlers = java_file(path, text).unwrap_or_default();
+    (wired || !handlers.is_empty()).then_some(JavaFacts { handlers, wired })
+}
+
+fn handler_files_exist(java: &Index<JavaFacts>) -> bool {
+    java.iter().any(|(_, f)| !f.handlers.is_empty())
+}
+
 pub struct GraphQlTools {
     schemas: Indexes<Schema>,
-    java: Indexes<Vec<Handler>>,
-    wiring: Indexes<bool>,
+    java: Indexes<JavaFacts>,
     settings: Indexes<Vec<Setting>>,
     expansion: Expansion,
 }
@@ -576,8 +608,7 @@ impl Default for GraphQlTools {
     fn default() -> Self {
         Self {
             schemas: Indexes::new(SCHEMA_GLOBS, schema_file),
-            java: Indexes::new(JAVA_GLOBS, java_file),
-            wiring: Indexes::new(JAVA_GLOBS, mentions_wiring),
+            java: Indexes::new(JAVA_GLOBS, java_facts),
             settings: Indexes::new(CONFIG_GLOBS, endpoint_settings),
             expansion: Expansion::default(),
         }
@@ -612,7 +643,9 @@ fn skip_directives(toks: &[Tok], mut k: usize) -> usize {
     k
 }
 
-fn selection(toks: &[Tok], open: usize, scope: &DocField, out: &mut Vec<DocField>) {
+const MAX_SELECTION_DEPTH: usize = 64;
+
+fn selection(toks: &[Tok], open: usize, scope: &DocField, depth: usize, out: &mut Vec<DocField>) {
     let end = close(toks, open).min(toks.len());
     let mut k = open + 1;
     while k < end {
@@ -645,9 +678,11 @@ fn selection(toks: &[Tok], open: usize, scope: &DocField, out: &mut Vec<DocField
         let field = DocField { path: scope.path.clone(), name: s.to_owned(), at, end: at + s.len(), ..scope.clone() };
         out.push(field.clone());
         if toks.get(k).is_some_and(|t| t.1 == "{") {
-            let mut inner = field;
-            inner.path.push(s.to_owned());
-            selection(toks, k, &inner, out);
+            if depth < MAX_SELECTION_DEPTH {
+                let mut inner = field;
+                inner.path.push(s.to_owned());
+                selection(toks, k, &inner, depth + 1, out);
+            }
             k = close(toks, k) + 1;
         }
     }
@@ -677,7 +712,7 @@ pub fn document_fields(text: &str) -> Vec<DocField> {
                 }
                 k = skip_directives(&toks, k);
                 if toks.get(k).is_some_and(|t| t.1 == "{") {
-                    selection(&toks, k, &scope, &mut out);
+                    selection(&toks, k, &scope, 0, &mut out);
                     k = close(&toks, k);
                 }
                 k += 1;
@@ -713,11 +748,10 @@ fn inline_documents(text: &str, is_kotlin: bool) -> Vec<DocField> {
 impl GraphQlTools {
     /// The schema fields (and the handlers of root fields) of the client document field at `at`.
     fn client_document_definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
-        let Some(project) = project_of(&doc.path) else { return Vec::new() };
         let Some(at) = offset(&doc.text, at) else { return Vec::new() };
         let fields = if is_code(doc) { inline_documents(&doc.text, doc.language == "kotlin") } else { document_fields(&doc.text) };
         let Some(hit) = fields.into_iter().find(|f| f.at <= at && at <= f.end) else { return Vec::new() };
-        let schemas = self.schemas.get(&project, PROVIDER_BUDGET / 2);
+        let Some(schemas) = self.schemas.for_cached_document(&doc.path, &doc.text) else { return Vec::new() };
         let mut ty = match (&hit.on, &hit.op) {
             (Some(on), _) => on.clone(),
             (None, Some(op)) => root_type(schemas, op),
@@ -730,10 +764,10 @@ impl GraphQlTools {
         let mut found: Vec<Location> =
             schema_fields(schemas, &ty, &hit.name).into_iter().map(|(path, f)| Location { path, range: f.range }).collect();
         if hit.path.is_empty() && hit.op.is_some() {
-            let java = self.java.get(&project, PROVIDER_BUDGET / 2);
+            let Some(java) = self.java.for_cached_document(&doc.path, &doc.text) else { return found };
             found.extend(
                 java.iter()
-                    .flat_map(|(path, hs)| hs.iter().map(move |h| (path, h)))
+                    .flat_map(|(path, f)| f.handlers.iter().map(move |h| (path, h)))
                     .filter(|(_, h)| h.field == hit.name && type_of(h, schemas) == ty)
                     .map(|(path, h)| Location { path: path.to_owned(), range: h.method }),
             );
@@ -743,8 +777,7 @@ impl GraphQlTools {
 
     /// The open Java file's handlers with the schema fields they map to; publishes its problems.
     fn java_links(&mut self, doc: &Document) -> Vec<(Handler, String, Vec<(String, Field)>)> {
-        let Some(project) = project_of(&doc.path) else { return Vec::new() };
-        let schemas = self.schemas.get(&project, PROVIDER_BUDGET);
+        let Some(schemas) = self.schemas.for_cached_document(&doc.path, &doc.text) else { return Vec::new() };
         let links: Vec<_> = handlers_in(&doc.text, doc.language == "kotlin")
             .into_iter()
             .map(|h| {
@@ -787,12 +820,11 @@ impl GraphQlTools {
 
     /// The open schema file's fields (with their type) and the handlers serving them; publishes its hints.
     fn schema_links(&mut self, doc: &Document) -> Vec<(String, Field, Vec<(Location, String)>)> {
-        let Some(project) = project_of(&doc.path) else { return Vec::new() };
-        let Some(schemas) = self.schemas.for_document(&doc.path, &doc.text, PROVIDER_BUDGET / 2) else {
+        let Some(schemas) = self.schemas.for_cached_document(&doc.path, &doc.text) else {
             return Vec::new();
         };
         let schemas: &Index<Schema> = schemas;
-        let java = self.java.get(&project, PROVIDER_BUDGET / 2);
+        let Some(java) = self.java.for_cached_document(&doc.path, &doc.text) else { return Vec::new() };
         let roots: Vec<String> = ROOTS.iter().map(|r| root_type(schemas, r.1)).collect();
         let mut problems = Vec::new();
         let mut links = Vec::new();
@@ -800,12 +832,12 @@ impl GraphQlTools {
             for f in t.fields {
                 let found: Vec<(Location, String)> = java
                     .iter()
-                    .flat_map(|(path, hs)| hs.iter().map(move |h| (path, h)))
+                    .flat_map(|(path, f)| f.handlers.iter().map(move |h| (path, h)))
                     .filter(|(_, h)| h.field == f.name && type_of(h, schemas) == t.name)
                     .map(|(path, h)| (Location { path: path.to_owned(), range: h.method }, h.label.clone()))
                     .collect();
                 let unmapped_root = found.is_empty() && t.kind == "type" && roots.contains(&t.name);
-                if !cfg!(feature = "embedded") && unmapped_root && java.complete() && !java.files().is_empty() {
+                if !cfg!(feature = "embedded") && unmapped_root && java.complete() && handler_files_exist(java) {
                     let message = format!("No controller method handles `{}.{}`.", t.name, f.name);
                     problems.push(Diagnostic::new(f.range, Severity::Hint, message).code("unmapped-root-field"));
                 }
@@ -813,11 +845,10 @@ impl GraphQlTools {
             }
         }
         if !cfg!(feature = "embedded") && host::setting_bool("springGraphql.reportUnmappedFields").unwrap_or(true) {
-            let wired = self.wiring.get(&project, PROVIDER_BUDGET / 2);
-            if java.complete() && wired.complete() && wired.files().is_empty() {
+            if java.complete() && java.iter().all(|(_, f)| !f.wired) {
                 let objects: Vec<String> = parse_schema(&doc.text).types.into_iter().filter(|t| t.kind == "type").map(|t| t.name).collect();
                 let interface_handles = |field: &str| {
-                    java.iter().flat_map(|(_, hs)| hs).any(|h| {
+                    java.iter().flat_map(|(_, f)| &f.handlers).any(|h| {
                         h.field == field && schemas.iter().any(|(_, s)| s.types.iter().any(|t| t.name == h.ty && t.kind == "interface"))
                     })
                 };
@@ -841,8 +872,7 @@ impl Providers for GraphQlTools {
     fn completion(&mut self, doc: &Document, at: Position, _trigger: Option<&str>) -> Vec<CompletionItem> {
         let Some(at) = offset(&doc.text, at) else { return Vec::new() };
         let Some((slot, s)) = annotation_slot(&doc.text, at, doc.language == "kotlin") else { return Vec::new() };
-        let Some(project) = project_of(&doc.path) else { return Vec::new() };
-        let schemas = self.schemas.get(&project, PROVIDER_BUDGET);
+        let Some(schemas) = self.schemas.for_cached_document(&doc.path, &doc.text) else { return Vec::new() };
         let types = schemas.iter().flat_map(|(_, s)| &s.types);
         // Name → detail.
         let (names, kind): (BTreeMap<String, String>, _) = match slot {
@@ -866,22 +896,15 @@ impl Providers for GraphQlTools {
             return self
                 .java_links(doc)
                 .into_iter()
-                .filter_map(|(h, ty, found)| {
-                    let (path, f) = found.into_iter().next()?;
-                    Some(LineMarker {
-                        line: h.method.start.line,
-                        icon: None,
-                        tooltip: format!("GraphQL schema field {ty}.{}", h.field),
-                        target: Some(Location { path, range: f.range }),
-                    })
+                .flat_map(|(h, ty, found)| {
+                    let targets = found.into_iter().map(|(path, f)| Location { path, range: f.range }).collect();
+                    per_target(h.method.start.line, &format!("GraphQL schema field {ty}.{}", h.field), targets)
                 })
                 .collect();
         }
         self.schema_links(doc)
             .into_iter()
-            .filter_map(|(_, f, found)| {
-                Some(LineMarker { line: f.range.start.line, icon: None, tooltip: describe(&found), target: Some(found.first()?.0.clone()) })
-            })
+            .flat_map(|(_, f, found)| per_target(f.range.start.line, &describe(&found), found.into_iter().map(|(l, _)| l).collect()))
             .collect()
     }
 
@@ -960,7 +983,7 @@ impl GraphQlTools {
     /// Positive operation ownership for source actions; no nonroot action is advertised.
     pub fn source_operations(&mut self,doc:&Document)->Vec<(Range,String)>{
         if !is_code(doc)||doc.text.len()>128<<10{return Vec::new()}
-        let Some(project)=project_of(&doc.path)else{return Vec::new()};let schemas=self.schemas.get(&project,PROVIDER_BUDGET);
+        let Some(schemas)=self.schemas.for_cached_document(&doc.path,&doc.text)else{return Vec::new()};
         if !schemas.complete(){return Vec::new()}
         handlers_in(&doc.text,doc.language=="kotlin").into_iter().filter_map(|h|{
             let mut operations=Vec::new();
@@ -1027,7 +1050,7 @@ impl GraphQlTools {
 impl GraphQlTools {
     fn endpoints_view(&mut self, view: &str, project: &Project, budget: Duration) -> View {
         let settings_index = self.settings.get(project, budget / 2);
-        let complete = settings_index.complete();
+        let settings_note = spring_text::index::coverage_note(settings_index);
         let mut settings: Vec<Setting> = Vec::new();
         let mut files: BTreeMap<String, String> = BTreeMap::new();
         for (path, found) in settings_index.iter() {
@@ -1039,7 +1062,7 @@ impl GraphQlTools {
             }
         }
         let schemas = self.schemas.get(project, budget / 2);
-        let schema_complete = schemas.complete();
+        let schemas_note = spring_text::index::coverage_note(schemas);
         if settings_index.scanning() || schemas.scanning() {
             refresh(view);
         }
@@ -1062,8 +1085,10 @@ impl GraphQlTools {
             items.push(TreeItem::new(&format!("c:0:0:{path}"), &name).parent("schemas").detail(&format!("{types} types")).icon("file-graphql"));
         }
         self.expansion.apply(&mut items);
-        let status =
-            if complete && schema_complete { "GraphQL endpoints".to_owned() } else { "GraphQL endpoints · scanning…".to_owned() };
+        let status = match settings_note.into_iter().chain(schemas_note).min_by_key(|note| note != spring_text::index::SCANNING_NOTE) {
+            None => "GraphQL endpoints".to_owned(),
+            Some(note) => format!("GraphQL endpoints · {note}"),
+        };
         View::new(Body::Tree(items)).button(refresh).status(&status)
     }
 }
@@ -1086,7 +1111,8 @@ impl Views for GraphQlTools {
         match event {
             ViewEvent::Button(b) if b == "refresh" => {
                 if let Some(project) = ctx.project()
-                    && self.settings.get(&project, Duration::ZERO).complete()
+                    && !self.settings.get(&project, Duration::ZERO).scanning()
+                    && !self.schemas.get(&project, Duration::ZERO).scanning()
                 {
                     self.settings.reset();
                     self.schemas.reset();
@@ -1142,16 +1168,11 @@ pub fn take_problems() -> Vec<openidea_plugin::Diagnostic> {
     PROBLEMS.take()
 }
 
-const BUILD_FILES: [&str; 3] = ["pom.xml", "build.gradle", "build.gradle.kts"];
-const DEPENDENCY_MARKERS: [&str; 7] = ["graphql", "<module>", "include(", "include '", "include \"", "(libs.", " libs."];
+const DEPENDENCY_MARKERS: [&str; 1] = ["graphql"];
 
-/// True when unsure: a multi-module build or a version catalog hides the dependency from the root build file.
+/// True when unsure (see `spring_text::build::applies`).
 pub fn applies(project: &openidea_plugin::Project) -> bool {
-    let Ok(root) = project.root() else { return true };
-    BUILD_FILES
-        .iter()
-        .filter_map(|file| project.read_file(&format!("{root}/{file}")).ok())
-        .any(|build| DEPENDENCY_MARKERS.iter().any(|marker| build.contains(marker)))
+    spring_text::build::applies(project, &DEPENDENCY_MARKERS)
 }
 
 #[cfg(not(feature = "embedded"))]
@@ -1160,9 +1181,23 @@ openidea_plugin::register_plugin!(GraphQlTools, providers, views);
 #[cfg(test)]
 #[cfg_attr(feature = "embedded", allow(dead_code, unused_imports))]
 mod tests {
+    fn warmed() -> GraphQlTools {
+        let mut tools = GraphQlTools::default();
+        if let Some(project) = host::projects().unwrap_or_default().first() {
+            tools.live_warm(project, COMMAND_BUDGET, true);
+        }
+        tools
+    }
     use super::*;
     use openidea_plugin::mock::MockHost;
     use openidea_plugin::text::position;
+
+    #[test]
+    fn deep_graphql_selection_no_overflow() {
+        let text = format!("query {{ {}", "a { ".repeat(20_000));
+        let fields = document_fields(&text);
+        assert!(!fields.is_empty() && fields.len() <= MAX_SELECTION_DEPTH + 1);
+    }
 
     const SCHEMA: &str = r#"# The library schema
 schema { query: Query mutation: Mutation }
@@ -1230,7 +1265,7 @@ class BookController {
         host.add_file("src/main/resources/graphql/schema.graphqls","union Result=Book | Author type Query { find(ids:[ID!]!, optional:Int): Result } type Book {id:ID} type Author {id:ID}");
         host.add_file("src/main/resources/application.properties","server.servlet.context-path=/app\nspring.graphql.path=/api/gql\n");
         let d=doc("/project/C.java","java","@Controller class C { @QueryMapping(\"find\") Result search(@Argument List<String> ids){} }");
-        let h=handlers(&d.text).remove(0);let draft=GraphQlTools::default().request_draft(&d,&h).unwrap();
+        let h=handlers(&d.text).remove(0);let draft=warmed().request_draft(&d,&h).unwrap();
         assert_eq!(draft.path,"/app/api/gql");assert!(draft.query.contains("$ids: [ID!]!"));assert!(draft.query.contains("find(ids: $ids) { __typename }"));assert!(!draft.query.contains("optional"));
     }
     #[test]
@@ -1260,7 +1295,7 @@ class BookController {
         let host=MockHost::install();host.add_file("src/main/resources/graphql/schema.graphqls","schema {query: Root} type Root { find: String } type Query { find: String }");
         let d=doc("/project/C.java","java","@Controller class C { @QueryMapping String find(){} }");let h=handlers(&d.text).remove(0);
         assert_eq!(h.ty,"Query");
-        let mut tools=GraphQlTools::default();
+        let mut tools=warmed();
         let project=project_of(&d.path).unwrap();let schemas=tools.schemas.get(&project,spring_text::index::COMMAND_BUDGET);
         assert_eq!(type_of(&h,schemas),"Query");
         assert!(tools.request_draft(&d,&h).is_err());
@@ -1270,7 +1305,7 @@ class BookController {
     #[test]
     fn subscription_document_uses_exact_sdl_and_never_chooses_http_transport(){
         let host=MockHost::install();host.add_file("src/main/resources/graphql/schema.graphqls","type Subscription { changed(ids:[ID!]!): Item } type Item {id:ID}");
-        let d=doc("/project/C.java","java","@Controller class C { @SubscriptionMapping Item changed(){} }");let h=handlers(&d.text).remove(0);let mut tools=GraphQlTools::default();
+        let d=doc("/project/C.java","java","@Controller class C { @SubscriptionMapping Item changed(){} }");let h=handlers(&d.text).remove(0);let mut tools=warmed();
         let draft=tools.subscription_draft(&d,&h).unwrap();assert!(draft.path.is_empty());assert_eq!(draft.operation,"subscription");assert!(draft.query.contains("$ids: [ID!]!"));assert!(draft.query.contains("changed(ids: $ids) { __typename }"));assert!(tools.request_draft(&d,&h).is_err());
         host.add_file("src/main/resources/graphql/schema.graphqls","schema {subscription: Events} type Events {changed:String}");assert!(tools.subscription_draft(&d,&h).is_err());
         let d=doc("/project/C.java","java","@Controller class C { @SchemaMapping(typeName=\"Events\",field=\"changed\") String observe(){} }");let h=handlers(&d.text).remove(0);assert!(tools.subscription_draft(&d,&h).unwrap().query.starts_with("subscription "));
@@ -1283,13 +1318,13 @@ class BookController {
     #[test]
     fn explicit_schema_does_not_invent_undeclared_subscription_roots(){
         let host=MockHost::install();host.add_file("src/main/resources/graphql/schema.graphqls","schema {query: Query} type Query {now:String} type Subscription {changed:String}");
-        let d=doc("/project/C.java","java","@Controller class C {@SubscriptionMapping String changed(){} }");let h=handlers(&d.text).remove(0);let mut tools=GraphQlTools::default();assert!(tools.subscription_draft(&d,&h).is_err());assert!(tools.source_operations(&d).is_empty());
+        let d=doc("/project/C.java","java","@Controller class C {@SubscriptionMapping String changed(){} }");let h=handlers(&d.text).remove(0);let mut tools=warmed();assert!(tools.subscription_draft(&d,&h).is_err());assert!(tools.source_operations(&d).is_empty());
         host.add_file("src/main/resources/graphql/schema.graphqls","type Query {now:String} extend schema {subscription: Subscription} type Subscription {changed:String}");assert!(tools.subscription_draft(&d,&h).is_ok());
     }
     #[test]
     fn request_draft_keeps_scalar_results_leaf_and_refuses_conflicting_schema_or_paths(){
         let host=MockHost::install();host.add_file("src/main/resources/graphql/schema.graphqls","scalar Date enum Status {OPEN CLOSED} type Query { today: Date state: Status }");
-        let d=doc("/project/C.java","java","@Controller class C { @QueryMapping Date today(){} }");let h=handlers(&d.text).remove(0);let mut tools=GraphQlTools::default();
+        let d=doc("/project/C.java","java","@Controller class C { @QueryMapping Date today(){} }");let h=handlers(&d.text).remove(0);let mut tools=warmed();
         let draft=tools.request_draft(&d,&h).unwrap();assert!(!draft.query.contains("__typename"));assert!(draft.variables.is_empty());
         host.add_file("src/main/resources/graphql/other.graphqls","type Query {today: String}");assert!(tools.request_draft(&d,&h).is_err());
         host.add_file("src/main/resources/graphql/other.graphqls","");
@@ -1375,9 +1410,33 @@ class BookController {
 
     #[cfg(not(feature = "embedded"))]
     #[test]
+    fn every_match_of_a_handler_or_field_gets_a_marker_on_its_line() {
+        let host = setup();
+        host.add_file("src/main/resources/graphql/isbn.graphqls", "extend type Book { isbn: String }\n");
+        host.add_file("src/main/resources/graphql/more.graphqls", "extend type Book { isbn: String }\n");
+        host.add_file(
+            "src/main/java/com/acme/TitleController.java",
+            "@Controller\nclass TitleController {\n    @SchemaMapping(typeName = \"Book\")\n    public String title(Book book) { return null; }\n}\n",
+        );
+        let mut tools = warmed();
+        let isbn = at(CONTROLLER, "isbn(").line;
+        let handler: Vec<_> = tools.line_markers(&java()).into_iter().filter(|m| m.line == isbn).collect();
+        let files: Vec<_> = handler.iter().map(|m| m.target.as_ref().unwrap().path.rsplit('/').next().unwrap().to_owned()).collect();
+        assert_eq!(files, ["isbn.graphqls", "more.graphqls"]);
+        assert!(handler.iter().all(|m| m.icon.as_deref() == Some(MARKER_ICON)));
+
+        let title = at(SCHEMA, "title(").line;
+        let field: Vec<_> = tools.line_markers(&graphql()).into_iter().filter(|m| m.line == title).collect();
+        assert_eq!(field.len(), 2, "{field:?}");
+        assert!(field.iter().all(|m| m.icon.as_deref() == Some(MARKER_ICON)));
+        assert_eq!(tools.line_markers(&graphql()).iter().filter(|m| m.line == at(SCHEMA, "author:").line).count(), 1);
+    }
+
+    #[cfg(not(feature = "embedded"))]
+    #[test]
     fn links_handlers_to_schema_fields() {
         let host = setup();
-        let mut tools = GraphQlTools::default();
+        let mut tools = warmed();
         let markers = tools.line_markers(&java());
         let tips: Vec<_> = markers.iter().map(|m| m.tooltip.as_str()).collect();
         assert_eq!(
@@ -1415,7 +1474,7 @@ class BookController {
     }
 
     fn problems_of(host: &MockHost, text: &str) -> Vec<String> {
-        let mut tools = GraphQlTools::default();
+        let mut tools = warmed();
         tools.line_markers(&doc("src/main/java/com/acme/C.java", "java", text));
         host.diagnostics()
             .get("/project/src/main/java/com/acme/C.java")
@@ -1482,7 +1541,7 @@ class BookController {
     #[test]
     fn links_schema_fields_to_handlers() {
         let host = setup();
-        let mut tools = GraphQlTools::default();
+        let mut tools = warmed();
         let markers = tools.line_markers(&graphql());
         let lines: Vec<_> = markers.iter().map(|m| (m.line, m.tooltip.as_str())).collect();
         assert_eq!(
@@ -1521,7 +1580,7 @@ class BookController {
     #[test]
     fn completes_types_and_fields_in_annotations() {
         let _host = setup();
-        let mut tools = GraphQlTools::default();
+        let mut tools = warmed();
         let types = ["Book", "Mutation", "Query"];
         assert_eq!(complete(&mut tools, &CONTROLLER.replace("typeName = \"Author\"", "typeName = \"|\"")), types);
         assert_eq!(complete(&mut tools, &CONTROLLER.replace("(typeName = \"Book\")", "(typeName = \"B|\")")), types);
@@ -1537,7 +1596,7 @@ class BookController {
     #[test]
     fn client_document_field_links_to_schema() {
         let _host = setup();
-        let mut tools = GraphQlTools::default();
+        let mut tools = warmed();
         let file = doc("src/main/resources/graphql-documents/find.graphql", "graphql", DOCUMENT);
         let found = tools.definition(&file, at(DOCUMENT, "bookById"));
         assert_eq!(found.len(), 2, "the schema field and its controller method");
@@ -1584,7 +1643,7 @@ class BookController {
         let host = MockHost::install();
         host.add_file("src/main/resources/graphql/schema.graphqls", SCHEMA);
         host.add_file("src/main/kotlin/com/acme/BookController.kt", KOTLIN);
-        let mut tools = GraphQlTools::default();
+        let mut tools = warmed();
         let kt = doc("src/main/kotlin/com/acme/BookController.kt", "kotlin", KOTLIN);
         let tips: Vec<_> = tools.line_markers(&kt).into_iter().map(|m| m.tooltip).collect();
         assert_eq!(
@@ -1610,12 +1669,12 @@ class BookController {
     fn doc_links(path: &str, language: &str, text: &str, needle: &str) -> Vec<Location> {
         let host = MockHost::install();
         host.add_file("src/main/resources/graphql/schema.graphqls", DOC_SCHEMA);
-        GraphQlTools::default().definition(&doc(path, language, text), at(text, needle))
+        warmed().definition(&doc(path, language, text), at(text, needle))
     }
 
     fn quiet_links(text: &str, needle: &str) -> Vec<Location> {
         let path = "src/main/resources/graphql-documents/d.graphql";
-        GraphQlTools::default().definition(&doc(path, "graphql", text), at(text, needle))
+        warmed().definition(&doc(path, "graphql", text), at(text, needle))
     }
 
     fn graphql_doc(text: &str, needle: &str) -> Vec<Location> {
@@ -1642,7 +1701,7 @@ class BookController {
         host.add_file("src/main/resources/graphql/schema.graphqls", DOC_SCHEMA);
         let last = position(spread, spread.rfind("title").unwrap() + 1);
         let path = "src/main/resources/graphql-documents/d.graphql";
-        assert!(GraphQlTools::default().definition(&doc(path, "graphql", spread), last).is_empty());
+        assert!(warmed().definition(&doc(path, "graphql", spread), last).is_empty());
         assert!(graphql_doc(text, "B ...").is_empty());
         assert!(graphql_doc(text, "id }").is_empty(), "inline fragments are skipped");
         assert_eq!(graphql_doc(text, "bookById").len(), 1);
@@ -1670,7 +1729,7 @@ class BookController {
         assert_eq!(quiet_links("{ bookById { id } }", "bookById").len(), 1);
         assert!(host.diagnostics().values().all(Vec::is_empty));
         let text = "# bookById é\nquery { bookById(id: \"é\", x: [1 {\n# end\n";
-        let mut tools = GraphQlTools::default();
+        let mut tools = warmed();
         for end in (0..=text.len()).filter(|&e| text.is_char_boundary(e)) {
             let d = doc("src/main/resources/graphql-documents/d.graphql", "graphql", &text[..end]);
             tools.definition(&d, position(&text[..end], end));
@@ -1716,7 +1775,7 @@ class BookController {
             "src/main/resources/application.yml",
             "server:\n  servlet:\n    context-path: /app\nspring:\n  graphql:\n    path: /api/gql\n    graphiql:\n      enabled: true\n    websocket:\n      path: /ws\n",
         );
-        let mut tools = GraphQlTools::default();
+        let mut tools = warmed();
         let project = project_of("/project/x").unwrap();
         let mut view = tools.endpoints_view("endpoints", &project, Duration::from_secs(5));
         if !matches!(view.body, Body::Tree(_)) {
@@ -1727,9 +1786,46 @@ class BookController {
     }
 
     #[test]
+    fn java_provider_cold_cache_returns_fast() {
+        let host = setup();
+        for n in 0..30 {
+            host.add_file(&format!("src/main/java/com/acme/S{n}.java"), &format!("package com.acme;\nclass S{n} {{}}\n"));
+        }
+        let mut tools = GraphQlTools::default();
+        let project = host.invocation().project().unwrap();
+        let d = doc("src/main/java/com/acme/BookController.java", "java", CONTROLLER);
+        let started = std::time::Instant::now();
+        tools.line_markers(&d);
+        tools.completion(&d, Position::new(5, 10), None);
+        tools.definition(&d, Position::new(5, 10));
+        assert!(started.elapsed() < Duration::from_millis(30));
+        let cached = tools.java.get(&project, Duration::ZERO).files().len() + tools.schemas.get(&project, Duration::ZERO).files().len();
+        assert!(cached <= 2, "a provider on a cold cache read {cached} files");
+    }
+
+    #[test]
+    fn refresh_resets_incomplete_index() {
+        let host = MockHost::install();
+        host.add_file("src/main/resources/graphql/schema.graphqls", "type Query { books: [String] }");
+        let mut tools = warmed();
+        let project = host.invocation().project().unwrap();
+        host.add_file_bytes("src/main/resources/graphql/Legacy.graphqls", b"# caf\xe9");
+        tools.schemas.on_events(
+            &[openidea_plugin::Event::FileSaved("/project/src/main/resources/graphql/Legacy.graphqls".into())],
+            std::time::Instant::now() + COMMAND_BUDGET,
+        );
+        let schemas = tools.schemas.get(&project, Duration::ZERO);
+        assert!(!schemas.complete() && !schemas.scanning());
+        let view = tools.render("endpoints", None, &host.invocation()).unwrap();
+        assert!(view.status.unwrap().contains("partial index (1 unreadable)"));
+        tools.handle("endpoints", ViewEvent::Button("refresh".into()), &host.invocation()).unwrap();
+        assert!(tools.schemas.get(&project, Duration::ZERO).files().is_empty(), "an incomplete index starts over");
+    }
+
+    #[test]
     fn endpoint_view_defaults_to_graphql() {
         let _host = setup();
-        let mut tools = GraphQlTools::default();
+        let mut tools = warmed();
         let project = project_of("/project/x").unwrap();
         let labels: Vec<_> =
             tree(tools.endpoints_view("endpoints", &project, Duration::from_secs(5))).into_iter().map(|i| (i.label, i.detail)).collect();
@@ -1748,12 +1844,12 @@ class BookController {
             "@Controller class A { @QueryMapping public Author author(@Argument String id) { return null; } @SchemaMapping(typeName = \"Book\") public String title(Book b) { return null; } }",
         );
         let schema = doc("src/main/resources/graphql/schema.graphqls", "graphql", ARGS_SCHEMA);
-        GraphQlTools::default().line_markers(&schema);
+        warmed().line_markers(&schema);
         let found: Vec<_> = host.diagnostics()[&schema.path].iter().map(|d| (d.code.clone().unwrap(), d.severity)).collect();
         assert_eq!(found, [("unmapped-field".to_owned(), Severity::Info)], "Author.books only; Book is served");
 
         host.add_file("src/main/java/com/acme/Wiring.java", "class W { RuntimeWiringConfigurer c() { return null; } }");
-        GraphQlTools::default().line_markers(&schema);
+        warmed().line_markers(&schema);
         assert!(host.diagnostics().get(&schema.path).is_none_or(Vec::is_empty), "hand wiring anywhere silences it");
     }
 
@@ -1818,7 +1914,7 @@ class BookController {
         let wiring = "@Configuration class W { @Bean RuntimeWiringConfigurer c() { return w -> w.type(\"Author\", b -> b.dataFetcher(\"books\", e -> null)); } }";
         host.add_file("src/main/java/com/acme/Wiring.java", wiring);
         let schema = doc("src/main/resources/graphql/schema.graphqls", "graphql", ARGS_SCHEMA);
-        let mut tools = GraphQlTools::default();
+        let mut tools = warmed();
         let links = tools.schema_links(&schema);
         let books = links.iter().find(|(t, f, _)| t == "Author" && f.name == "books").unwrap();
         assert_eq!(books.2.len(), 1, "SDL field navigates to the registration");
@@ -1827,7 +1923,7 @@ class BookController {
         assert_eq!(found.len(), 1, "Book.title only: {found:?}");
 
         host.add_file("src/main/java/com/acme/Wiring.java", &wiring.replace("\"books\"", "FIELD"));
-        let mut tools = GraphQlTools::default();
+        let mut tools = warmed();
         tools.schema_links(&schema);
         assert!(host.diagnostics().get(&schema.path).is_none_or(|v| v.iter().all(|d| d.severity != Severity::Info)), "an unrecognised registration closes the gate");
     }
@@ -1840,12 +1936,12 @@ class BookController {
         let controller = "@Controller class A { @BatchMapping public Map<Author, String> name(List<Author> a) { return null; } }";
         host.add_file("src/main/java/com/acme/A.java", controller);
         let schema = doc("src/main/resources/graphql/schema.graphqls", "graphql", ARGS_SCHEMA);
-        GraphQlTools::default().line_markers(&schema);
+        warmed().line_markers(&schema);
         let found: Vec<_> = host.diagnostics()[&schema.path].iter().map(|d| (d.code.clone().unwrap(), d.severity)).collect();
         assert_eq!(found.iter().filter(|f| f.1 == Severity::Info).count(), 2, "Author.books and Book.title: {found:?}");
 
         host.add_file("src/main/java/com/acme/A.java", &controller.replace("@BatchMapping", "@BatchMapping(typeName = TYPE)"));
-        GraphQlTools::default().line_markers(&schema);
+        warmed().line_markers(&schema);
         assert!(host.diagnostics().get(&schema.path).is_none_or(|v| v.iter().all(|d| d.severity != Severity::Info)), "a non-literal mapping makes the set unprovable");
     }
 
@@ -1861,7 +1957,7 @@ class BookController {
     fn applies_follows_the_root_build_file() {
         let host = MockHost::install();
         let project = &host::projects().unwrap()[0];
-        assert!(!applies(project), "no build file");
+        assert!(applies(project), "unsure without a readable build file");
         host.add_file("pom.xml", "<project><artifactId>commons-lang3</artifactId></project>");
         assert!(!applies(project));
         host.add_file("pom.xml", "<project><artifactId>spring-boot-starter-graphql</artifactId></project>");
@@ -1872,26 +1968,18 @@ class BookController {
 }
 
 impl GraphQlTools {
-    pub fn live_warm(&mut self, project: &openidea_plugin::Project, budget: std::time::Duration) {
+    pub fn live_warm(&mut self, project: &openidea_plugin::Project, budget: std::time::Duration, discover: bool) {
         if budget.is_zero() {
             return;
         }
-        self.schemas.get(project, budget / 4);
-        self.java.get(project, budget / 4);
-        self.wiring.get(project, budget / 4);
-        self.settings.get(project, budget / 4);
+        self.schemas.warm(project, budget / 3, discover);
+        self.java.warm(project, budget / 3, discover);
+        self.settings.warm(project, budget / 3, discover);
     }
-    pub fn live_update(&mut self, project: &openidea_plugin::Project, path: &str, text: Option<&str>) {
-        self.schemas.update_existing(project, path, text);
-        self.java.update_existing(project, path, text);
-        self.wiring.update_existing(project, path, text);
-        self.settings.update_existing(project, path, text);
-    }
-    pub fn live_reset(&mut self) {
-        self.schemas.reset();
-        self.java.reset();
-        self.wiring.reset();
-        self.settings.reset();
+    pub fn live_events(&mut self, events: &[openidea_plugin::Event], deadline: std::time::Instant) {
+        self.schemas.on_events(events, deadline);
+        self.java.on_events(events, deadline);
+        self.settings.on_events(events, deadline);
     }
 }
 

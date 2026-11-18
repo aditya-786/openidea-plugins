@@ -167,17 +167,28 @@ pub fn update<R>(owner: &str, change: impl FnOnce(&mut TaskList, u64) -> Result<
     LAST_WRITE.with(|receipt| *receipt.borrow_mut() = Some((owner.into(), json)));
     Ok(result)
 }
+fn reset_prompt(owner: &str, before: Option<&str>) -> (String, String) {
+    let name = owner.trim_end_matches('/').rsplit('/').next().unwrap_or(owner);
+    let saved = match before.map(serde_json::from_str::<Stored>) {
+        None => "Nothing is saved yet.".to_owned(),
+        Some(Ok(Stored { data, .. })) => format!(
+            "Saved now: {} tasks, {} contexts, {} repository overrides.",
+            data.tasks.len(),
+            data.contexts.len(),
+            data.repositories.len()
+        ),
+        Some(Err(_)) => "The saved task list can't be read.".to_owned(),
+    };
+    (
+        format!("Reset Tasks for {name}?"),
+        format!("Deletes the saved tasks, time tracking, contexts and repository overrides of this project. It can't be undone.\n{saved}\nOther projects, Git branches, tracker issues and files stay unchanged."),
+    )
+}
 pub fn recover(owner: &str) -> Result<(), Error> {
     root(owner)?;
     let before = host::storage::get(&key(owner))?;
-    let bytes = before.as_ref().map_or(0, String::len);
-    if !ui_kit::prompts::confirm_exact(
-        "Reset this project's task state",
-        &format!(
-            "Replace task/context state for this exact project?\n\nProject: {owner}\nStorage key: {}\nExisting bytes: {bytes}\n\nThis deletes saved tasks, active/time state, named contexts and repository overrides for this project only. It does not change git, tracker issues, files or other projects.",
-            key(owner)
-        ),
-    )? {
+    let (title, body) = reset_prompt(owner, before.as_deref());
+    if !ui_kit::prompts::confirm_exact(&title, &body)? {
         return Ok(());
     }
     if host::storage::get(&key(owner))? != before {
@@ -274,6 +285,21 @@ mod tests {
             Err(Error::Stale)
         ));
         assert_eq!(raw("/project").unwrap(), Some(concurrent));
+    }
+    #[test]
+    fn reset_prompt_names_the_project_and_counts_what_is_deleted() {
+        let _h = MockHost::install().with_capabilities(&["storage"]);
+        update("/work/shop", |t, _| {
+            t.add_local("Work", "");
+            Ok(())
+        })
+        .unwrap();
+        let saved = raw("/work/shop").unwrap();
+        let (title, body) = reset_prompt("/work/shop", saved.as_deref());
+        assert_eq!(title, "Reset Tasks for shop?");
+        assert!(body.contains("\nSaved now: 2 tasks, 0 contexts, 0 repository overrides.\n"), "{body}");
+        assert!(!body.contains("tasks:/work/shop"));
+        assert!(reset_prompt("/work/shop", Some("bad")).1.contains("The saved task list can't be read."));
     }
     #[test]
     fn denial_and_cancelled_recovery_never_create_default_state() {

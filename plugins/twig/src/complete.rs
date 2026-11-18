@@ -84,6 +84,12 @@ fn slot_at(text: &str, start: usize) -> Option<Slot> {
     }
 }
 
+/// Whether the caret sits where a plain variable can be typed (not a tag, filter, test or member).
+pub fn variable_slot(text: &str, offset: usize) -> bool {
+    let start = (0..offset).rev().take_while(|&i| is_identifier(text.as_bytes()[i])).last().unwrap_or(offset);
+    matches!(slot_at(text, start), Some(Slot::Function))
+}
+
 #[derive(Default)]
 pub struct Extra<'a> {
     pub filters: Vec<&'a str>,

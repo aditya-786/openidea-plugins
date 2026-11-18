@@ -1,10 +1,11 @@
 //! Bounded local request flow. Native host API 1.4 is required for redirect enforcement.
-use crate::{OpenApi, json};
+use crate::{OpenApi, json, spec};
 use openidea_plugin::{
     Context, Error, HttpRequest, Invocation, PickItem, host,
     views::{Body, Button, Field, FieldValue, View},
 };
 use serde_json::Value;
+use yaml_rust2::Yaml;
 use std::{
     collections::BTreeSet,
     time::{Duration, Instant},
@@ -12,7 +13,6 @@ use std::{
 const MAX_SPEC: usize = 128 << 10;
 const MAX_BODY: usize = 256 << 10;
 const DISPLAY: usize = 64 << 10;
-const HOST: &str = "127.0.0.1";
 #[derive(Default)]
 pub(crate) struct State {
     safe: bool,
@@ -66,9 +66,9 @@ struct Outcome {
 }
 fn failure_reason(error: &Error) -> &'static str {
     match error {
-        Error::Denied(_) => "Request denied by the host. No response is shown. Prepare a new request to retry.",
-        Error::Invalid(_) => "Request or response is unsupported or exceeds the local limits. No response is shown.",
-        _ => "Request failed or did not complete. No response is shown. Prepare a new request to retry.",
+        Error::Denied(_) => "Request denied by the host: it needs the net:127.0.0.1 permission (net:ask for other hosts). Allow it in Settings › Plugins › OpenAPI.",
+        Error::Invalid(_) => "The response is unsupported: over 256 KiB or not text. Nothing is shown.",
+        _ => "The request failed or didn't complete. Run OpenAPI: Try Local GET/HEAD Request… again to retry.",
     }
 }
 fn invalid(message: &str) -> Error {
@@ -96,7 +96,16 @@ fn remote_authority(authority: &str) -> bool {
     let port_ok = port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n > 0));
     let host_ok = host.len() <= 253
         && host.split('.').all(|l| !l.is_empty() && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'));
-    port_ok && host_ok
+    let labels: Vec<&str> = host.split('.').collect();
+    let tld = labels.last().copied().unwrap_or("");
+    let numeric_label = |l: &str| l.bytes().all(|b| b.is_ascii_digit()) || l.strip_prefix("0x").is_some_and(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+    // ponytail: name-only guard; a public name can still resolve to a private address (DNS rebinding), so the net:ask prompt at send time is the backstop. Resolving and pinning the IP needs a host API.
+    let public_name = labels.len() > 1
+        && (tld.starts_with("xn--") || tld.bytes().all(|b| b.is_ascii_lowercase()))
+        && !matches!(tld, "localhost" | "local" | "internal" | "lan")
+        && !host.ends_with(".home.arpa")
+        && !labels.iter().any(|l| numeric_label(l));
+    port_ok && host_ok && public_name && host != "localhost"
 }
 /// With `ask` (net:ask granted), a literal `https://host[:port]` server is also accepted; the host asks the user
 /// at send time, so the spec never gains network reach the user has not approved.
@@ -104,53 +113,53 @@ fn literal_base(url: &str, ask: bool) -> Result<String, Error> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
-        .ok_or_else(|| invalid("Use a literal HTTP(S) loopback server."))?;
+        .ok_or_else(|| invalid("The server URL must start with http:// or https://."))?;
     if url.len() > 1024 || url.chars().any(char::is_control) || rest.contains(['?', '#', '@', '\\', '%', '{', '}']) {
-        return Err(invalid("Unsupported server URL form."));
+        return Err(invalid("The server URL can't contain a query, fragment, user name, % escapes or {variables}."));
     }
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     let remote = ask && url.starts_with("https://") && !authority.starts_with("127.0.0.1:") && remote_authority(authority);
     if remote {
         if !path.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_-.~".contains(&b)) || path.split('/').any(|p| matches!(p, "." | "..")) {
-            return Err(invalid("Server paths must be literal unencoded segments."));
+            return Err(invalid("The server URL path can only use letters, digits and / _ - . ~"));
         }
         return Ok(url.trim_end_matches('/').into());
     }
-    let port = authority.strip_prefix("127.0.0.1:").ok_or_else(|| invalid("Only literal 127.0.0.1 with an explicit port, or an https host when net:ask is granted, is supported."))?;
+    let port = authority.strip_prefix("127.0.0.1:").ok_or_else(|| invalid("Use a server at 127.0.0.1 with a port, or a public https server with the net:ask permission."))?;
     if port.is_empty()
         || !port.bytes().all(|b| b.is_ascii_digit())
         || port.starts_with('0')
         || port.parse::<u16>().ok().is_none_or(|p| p == 0)
     {
-        return Err(invalid("Invalid explicit loopback port."));
+        return Err(invalid("The 127.0.0.1 server needs a port from 1 to 65535."));
     }
     if !path.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_-.~".contains(&b)) || path.split('/').any(|p| matches!(p, "." | "..")) {
-        return Err(invalid("Server paths must be literal unencoded segments."));
+        return Err(invalid("The server URL path can only use letters, digits and / _ - . ~"));
     }
     Ok(url.trim_end_matches('/').into())
 }
 fn schema(value: &Value, path: bool) -> Result<Parameter, Error> {
     if !value.is_object() || value.get("$ref").is_some() {
-        return Err(invalid("Referenced or unknown parameters are unsupported."));
+        return Err(invalid("Parameters that use $ref aren't supported."));
     }
-    let name = value["name"].as_str().filter(|s| plain(s)).ok_or_else(|| invalid("Use plain scalar parameter names."))?;
+    let name = value["name"].as_str().filter(|s| plain(s)).ok_or_else(|| invalid("Parameter names can only use letters, digits, _ and -."))?;
     if value.get("required").is_some_and(|v| !v.is_boolean()) {
-        return Err(invalid("Required must be a literal boolean."));
+        return Err(invalid("A parameter's required value must be true or false."));
     }
     let required = value.get("required").and_then(Value::as_bool).unwrap_or(false);
     if path && !required {
-        return Err(invalid("Path parameters must be explicitly required."));
+        return Err(invalid("Path parameters need required: true."));
     }
     if value.get("style").is_some_and(|s| s != if path { "simple" } else { "form" })
         || value.get("explode").is_some_and(|e| !e.is_boolean())
     {
-        return Err(invalid("Unsupported parameter serialization."));
+        return Err(invalid("Only the default parameter style is supported."));
     }
     let s = &value["schema"];
     let kind = s["type"]
         .as_str()
         .filter(|s| matches!(*s, "string" | "integer" | "number" | "boolean"))
-        .ok_or_else(|| invalid("Only declared scalar parameter types are supported."))?;
+        .ok_or_else(|| invalid("Parameters need a string, integer, number or boolean schema type."))?;
     if s.get("$ref").is_some()
         || s.get("nullable").is_some()
         || s.get("oneOf").is_some()
@@ -158,55 +167,90 @@ fn schema(value: &Value, path: bool) -> Result<Parameter, Error> {
         || s.get("allOf").is_some()
         || value.get("content").is_some()
     {
-        return Err(invalid("Unsupported parameter schema."));
+        return Err(invalid("Parameter schemas with $ref, nullable, oneOf, anyOf, allOf or content aren't supported."));
     }
     let choices = if let Some(e) = s.get("enum") {
-        let e = e.as_array().filter(|e| !e.is_empty() && e.len() <= 32).ok_or_else(|| invalid("Oversized enum."))?;
+        let e = e.as_array().filter(|e| !e.is_empty() && e.len() <= 32).ok_or_else(|| invalid("A parameter enum needs 1 to 32 values."))?;
         e.iter()
             .map(|v| match v {
                 Value::String(s) if kind == "string" => Ok(s.clone()),
                 Value::Number(n) if kind == "number" || kind == "integer" && n.as_i64().is_some() => Ok(v.to_string()),
                 Value::Bool(_) if kind == "boolean" => Ok(v.to_string()),
-                _ => Err(invalid("Only scalar enum values are supported.")),
+                _ => Err(invalid("Enum values must match the parameter's type.")),
             })
             .collect::<Result<Vec<_>, _>>()?
     } else {
         vec![]
     };
     if choices.iter().any(|s| s.len() > 256 || s.chars().any(char::is_control)) {
-        return Err(invalid("Invalid enum value."));
+        return Err(invalid("An enum value is over 256 bytes or has control characters."));
     }
     Ok(Parameter { name: name.into(), path, required, kind: kind.into(), choices })
 }
+/// The JSON value of a YAML source, so YAML runs every JSON check unchanged. Duplicate keys
+/// are refused by the loader; a quoted and an unquoted key that spell the same JSON name are refused here.
+fn yaml_value(yaml: &Yaml) -> Result<Value, Error> {
+    Ok(match yaml {
+        Yaml::Hash(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                let key = match key {
+                    Yaml::String(s) => s.clone(),
+                    Yaml::Integer(i) => i.to_string(),
+                    _ => return Err(invalid("Use string or integer YAML keys.")),
+                };
+                if out.insert(key, yaml_value(value)?).is_some() {
+                    return Err(invalid("The YAML spec has duplicate keys."));
+                }
+            }
+            Value::Object(out)
+        }
+        Yaml::Array(items) => Value::Array(items.iter().map(yaml_value).collect::<Result<_, _>>()?),
+        Yaml::String(s) => Value::String(s.clone()),
+        Yaml::Integer(i) => Value::from(*i),
+        Yaml::Real(_) => yaml.as_f64().and_then(serde_json::Number::from_f64).map(Value::Number).ok_or_else(|| invalid("Unsupported YAML number."))?,
+        Yaml::Boolean(b) => Value::Bool(*b),
+        Yaml::Null => Value::Null,
+        _ => return Err(invalid("Unsupported YAML value.")),
+    })
+}
 fn operations(text: &str, ask: bool) -> Result<Vec<Operation>, Error> {
     if text.len() > MAX_SPEC {
-        return Err(invalid("Spec exceeds 128 KiB."));
+        return Err(invalid("The spec is too large (over 128 KiB)."));
     }
-    let root: Value = serde_json::from_str(text).map_err(|_| invalid("Use a valid JSON OpenAPI source."))?;
+    let root: Value = if spec::is_json(text) {
+        let root = serde_json::from_str(text).map_err(|_| invalid("The JSON spec has a syntax error. Fix it and try again."))?;
+        let mut keys = BTreeSet::new();
+        for key in json::keys(text) {
+            if !keys.insert(key.key) {
+                return Err(invalid("The JSON spec has duplicate keys."));
+            }
+        }
+        root
+    } else {
+        // One document without anchors, aliases, tags or merge keys, bounded before loading.
+        let yaml = crate::yaml_pointer::model(text)
+            .ok_or_else(|| invalid("The YAML spec must be one valid document without anchors, aliases, tags, merge keys or duplicate keys."))?;
+        yaml_value(&yaml)?
+    };
     let version = root["openapi"].as_str().unwrap_or("");
     if !version
         .rsplit_once('.')
         .is_some_and(|(prefix, patch)| matches!(prefix, "3.0" | "3.1") && !patch.is_empty() && patch.bytes().all(|c| c.is_ascii_digit()))
     {
-        return Err(invalid("Only OpenAPI 3.0/3.1 JSON is supported."));
-    }
-    let mut keys = BTreeSet::new();
-    for key in json::keys(text) {
-        if !keys.insert(key.key) {
-            return Err(invalid("Duplicate or ambiguous JSON members."));
-        }
+        return Err(invalid("Only OpenAPI 3.0/3.1 is supported."));
     }
     if !no_auth(root.get("security")) {
-        return Err(invalid("Authenticated operations are unsupported."));
+        return Err(invalid("Specs with a security requirement aren't supported."));
     }
-    let servers = root["servers"].as_array().filter(|a| a.len() == 1).ok_or_else(|| invalid("Declare exactly one literal root server."))?;
+    let servers = root["servers"].as_array().filter(|a| a.len() == 1).ok_or_else(|| invalid("The spec needs exactly one entry in servers."))?;
     if servers[0].get("variables").is_some() {
-        return Err(invalid("Server variables are unsupported."));
+        return Err(invalid("Server variables aren't supported. Write the full server URL."));
     }
-    let base = literal_base(servers[0]["url"].as_str().ok_or_else(|| invalid("Missing literal server URL."))?, ask)?;
-    let paths = root["paths"].as_object().ok_or_else(|| invalid("Missing paths object."))?;
+    let base = literal_base(servers[0]["url"].as_str().ok_or_else(|| invalid("The server has no url."))?, ask)?;
+    let paths = root["paths"].as_object().ok_or_else(|| invalid("The spec has no paths."))?;
     if paths.len() > 64 {
-        return Err(invalid("Too many paths."));
+        return Err(invalid("The spec has more than 64 paths."));
     }
     let mut out = Vec::new();
     for (path, item) in paths {
@@ -216,10 +260,10 @@ fn operations(text: &str, ask: bool) -> Result<Vec<Operation>, Error> {
             || !path.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_-.~{}".contains(&b))
             || path.split('/').any(|p| matches!(p, "." | ".."))
         {
-            return Err(invalid("Unsupported path spelling."));
+            return Err(invalid("A path has characters Try it out can't send (only letters, digits and / _ - . ~ {})."));
         }
         if !item.is_object() || item.get("$ref").is_some() || item.get("servers").is_some() {
-            return Err(invalid("Referenced/overridden path ownership is unsupported."));
+            return Err(invalid("Paths with $ref or their own servers aren't supported."));
         }
         for method in ["get", "head"] {
             let Some(op) = item.get(method) else {
@@ -236,17 +280,17 @@ fn operations(text: &str, ask: bool) -> Result<Vec<Operation>, Error> {
                     let is_path = match p["in"].as_str() {
                         Some("path") => true,
                         Some("query") => false,
-                        _ => return Err(invalid("Header/cookie/auth parameters are unsupported.")),
+                        _ => return Err(invalid("Header and cookie parameters aren't supported.")),
                     };
                     let p = schema(p, is_path)?;
                     if !names.insert((p.path, p.name.clone())) {
-                        return Err(invalid("Duplicate or inherited override parameters are unsupported."));
+                        return Err(invalid("A parameter is declared twice or overridden by its operation; that isn't supported."));
                     }
                     parameters.push(p);
                 }
             }
             if parameters.len() > 16 {
-                return Err(invalid("Too many parameters."));
+                return Err(invalid("An operation has more than 16 parameters."));
             }
             let mut placeholders = BTreeSet::new();
             for segment in path.split('/') {
@@ -255,20 +299,20 @@ fn operations(text: &str, ask: bool) -> Result<Vec<Operation>, Error> {
                         .strip_prefix('{')
                         .and_then(|s| s.strip_suffix('}'))
                         .filter(|s| plain(s))
-                        .ok_or_else(|| invalid("Templates must occupy a whole path segment."))?;
+                        .ok_or_else(|| invalid("A path placeholder must fill a whole segment, like /pets/{id}."))?;
                     if !placeholders.insert(key.to_owned()) {
-                        return Err(invalid("Repeated path placeholder."));
+                        return Err(invalid("A path placeholder appears twice."));
                     }
                 }
             }
             if placeholders != parameters.iter().filter(|p| p.path).map(|p| p.name.clone()).collect() {
-                return Err(invalid("Path placeholder/parameter membership mismatch."));
+                return Err(invalid("Path placeholders don't match the declared path parameters."));
             }
             out.push(Operation { method: method.to_uppercase(), path: path.clone(), base: base.clone(), parameters });
         }
     }
     if out.is_empty() || out.len() > 64 {
-        return Err(invalid("No bounded no-auth GET/HEAD operation is available."));
+        return Err(invalid("No GET or HEAD operation to try: it needs no security and no request body (at most 64 operations)."));
     }
     Ok(out)
 }
@@ -295,13 +339,13 @@ fn url(op: &Operation, values: &[String]) -> Result<String, Error> {
             || p.required && value.is_empty()
             || p.path && matches!(value.as_str(), "." | "..")
         {
-            return Err(invalid("Invalid parameter value."));
+            return Err(invalid("A parameter value is missing, over 256 bytes or not allowed."));
         }
         if value.is_empty() {
             continue;
         }
         if !p.choices.is_empty() && !p.choices.contains(value) {
-            return Err(invalid("Value is outside its declared enum."));
+            return Err(invalid("A value isn't one of the parameter's enum values."));
         }
         let valid = match p.kind.as_str() {
             "integer" => value.parse::<i64>().is_ok(),
@@ -310,7 +354,7 @@ fn url(op: &Operation, values: &[String]) -> Result<String, Error> {
             _ => true,
         };
         if !valid {
-            return Err(invalid("Value does not match its declared scalar type."));
+            return Err(invalid("A value doesn't match the parameter's type."));
         }
         if p.path {
             path = path.replace(&format!("{{{}}}", p.name), &encode(value));
@@ -320,29 +364,31 @@ fn url(op: &Operation, values: &[String]) -> Result<String, Error> {
     }
     let request = format!("{}{}{}", op.base, path, if query.is_empty() { String::new() } else { format!("?{}", query.join("&")) });
     if request.len() > 4096 {
-        return Err(invalid("URL exceeds 4096 bytes."));
+        return Err(invalid("The request URL is too long (over 4096 bytes)."));
     }
     Ok(request)
 }
 fn binding(ctx: &Invocation) -> Result<Binding, Error> {
-    let project = ctx.project().ok_or_else(|| invalid("Open a concrete project first."))?;
+    let project = ctx.project().ok_or_else(|| invalid("Open a project first."))?;
     let root = project.root()?;
-    let editor = ctx.editor().ok_or_else(|| invalid("Focus a JSON OpenAPI source file."))?;
+    let editor = ctx.editor().ok_or_else(|| invalid("Open an OpenAPI JSON or YAML spec in the editor first."))?;
     let path = editor.path();
-    if !path.ends_with(".json") || editor.language() != "json" {
-        return Err(invalid("Focus a JSON OpenAPI source first."));
+    let json_source = path.ends_with(".json") && editor.language() == "json";
+    let yaml_source = crate::is_yaml(&path) && editor.language() == "yaml";
+    if !json_source && !yaml_source {
+        return Err(invalid("Open an OpenAPI JSON or YAML spec in the editor first."));
     }
     let actual = host::project_of(&path).ok_or(Error::Stale)?.root()?;
     if actual != root
         || !path.starts_with(&format!("{}/", root.trim_end_matches('/')))
         || path.split('/').any(|s| matches!(s, "." | ".."))
-        || !path.ends_with(".json")
+        || !crate::is_spec_file(&path)
     {
         return Err(Error::Stale);
     }
     let doc = editor.document()?;
     if doc.text.len() > MAX_SPEC {
-        return Err(invalid("Spec exceeds 128 KiB."));
+        return Err(invalid("The spec is too large (over 128 KiB)."));
     }
     Ok(Binding { root, path, text: doc.text, version: doc.version })
 }
@@ -356,15 +402,15 @@ fn revalidate(ctx: &Invocation, old: &Binding) -> Result<(), Error> {
 impl State {
     fn guard(&self) -> Result<(), Error> {
         if !self.safe {
-            return Err(invalid("Execution requires host API 1.4 with per-hop redirect grant enforcement."));
+            return Err(invalid("Try it out needs OpenIDEA with plugin API 1.4 or later. Update OpenIDEA."));
         }
         if !self.scope_ok {
             return Err(invalid(
-                "Local requests require only the literal 127.0.0.1 network grant; additional/broad network grants are unsupported.",
+                "Try it out works with net:127.0.0.1 or net:ask only. Remove other network permissions for this plugin.",
             ));
         }
         if !self.granted && !self.ask {
-            return Err(Error::Denied(format!("net:{HOST}")));
+            return Err(ui_kit::denied::map(Error::Denied(String::new()), "Try it out", "net:127.0.0.1", "OpenAPI"));
         }
         Ok(())
     }
@@ -373,7 +419,7 @@ impl State {
         self.preview = None;
         self.response = None;
         self.outcome = None;
-        self.next_nonce = self.next_nonce.checked_add(1).ok_or_else(|| invalid("Request nonce exhausted; reload the plugin."))?;
+        self.next_nonce = self.next_nonce.checked_add(1).ok_or_else(|| invalid("Too many requests in this session. Reload the plugin in Settings › Plugins."))?;
         self.pending = Some(self.next_nonce);
         Ok(self.next_nonce)
     }
@@ -401,30 +447,30 @@ impl State {
     pub fn view(&self, ctx: &Invocation) -> View {
         if self.guard().is_err() {
             return View::message(
-                "Local execution is unavailable: a compatible API 1.4 host and only the literal loopback grant are required.",
+                "Try it out is unavailable. It needs plugin API 1.4 or later and the net:127.0.0.1 or net:ask permission (Settings › Plugins › OpenAPI).",
             );
         }
         if let Some(preview) = &self.preview {
             if preview.at.elapsed() > Duration::from_secs(120) || revalidate(ctx, &preview.source).is_err() {
-                return View::message("Prepared request does not match the current project/editor/source. Prepare it again.");
+                return View::message("The prepared request is over 2 minutes old or for another file or version. Run OpenAPI: Try Local GET/HEAD Request… again.");
             }
             return View::new(Body::Form(vec![Field {
                 key: "request".into(),
-                label: "Read-only request preview".into(),
+                label: "Request preview".into(),
                 value: FieldValue::readonly_text(&preview.review, true),
             }]))
-            .status("Not sent. Send approves only this exact request.")
+            .status("Not sent yet. Send runs this request once.")
             .button(Button::new(&format!("send:{}", preview.nonce), &format!("Send {} once", preview.operation.method)).icon("send"));
         }
         if let Some(outcome) = &self.outcome {
             if revalidate(ctx, &outcome.source).is_err() {
-                return View::message("Request outcome belongs to another project/editor/source version.");
+                return View::message("This result is for another file or an older version of it. Run OpenAPI: Try Local GET/HEAD Request… again.");
             }
             return View::message(outcome.reason);
         }
         if let Some(response) = &self.response {
             if revalidate(ctx, &response.source).is_err() {
-                return View::message("Captured response belongs to another project/editor/source version.");
+                return View::message("This response is for another file or an older version of it. Run OpenAPI: Try Local GET/HEAD Request… again.");
             }
             return View::new(Body::Form(vec![Field {
                 key: "response".into(),
@@ -432,7 +478,7 @@ impl State {
                 value: FieldValue::readonly_text(&response.text, true),
             }]));
         }
-        View::message("No prepared request or response. Prepare a local GET/HEAD request from the current JSON OpenAPI source.")
+        View::message("No request yet. Open an OpenAPI spec and run OpenAPI: Try Local GET/HEAD Request… to prepare one.")
     }
 }
 impl OpenApi {
@@ -448,7 +494,7 @@ impl OpenApi {
                 .enumerate()
                 .map(|(i, op)| PickItem { key: i.to_string(), label: format!("{} {}", op.method, op.path), description: None })
                 .collect();
-            let selected = host::pick("Prepare a declared local GET/HEAD request", &choices)?.ok_or(Error::Cancelled)?;
+            let selected = host::pick("Operation to try", &choices)?.ok_or(Error::Cancelled)?;
             let op = selected.parse::<usize>().ok().and_then(|i| operations.get(i)).ok_or(Error::Stale)?;
             let mut values = Vec::new();
             for p in &op.parameters {
@@ -458,7 +504,7 @@ impl OpenApi {
                             "{} parameter {}{}",
                             if p.path { "Path" } else { "Query" },
                             p.name,
-                            if p.required { " (required)" } else { " (blank omits)" }
+                            if p.required { " (required)" } else { " (leave blank to skip)" }
                         ),
                         None,
                     )?
@@ -471,11 +517,11 @@ impl OpenApi {
                 return Err(Error::Stale);
             }
             let review = format!(
-                "Request ticket: {nonce}\nProject: {}\nSource: {} (version {})\n\n{} {}\n\nNo Authorization/Cookie headers, request body, secret-store values or user headers are added. Only declared scalar path/query inputs are sent.\nTimeout: 5 seconds. Host transfer cap: 8 MiB; accepts at most 256 KiB and displays at most 64 KiB.\nAPI 1.4 may follow up to 10 redirects within granted 127.0.0.1 (including other ports/paths) or hosts you allowed. Other hosts and HTTPS-to-HTTP downgrades are denied before connection. A host not yet allowed asks you at send time. Host proxy/TLS settings still apply.\n\nThis immutable preview has not sent anything. Send approves this concrete request once, in the current project/editor/source.",
-                source.root, source.path, source.version, op.method, concrete
+                "{} {}\n\nNot sent yet. Send runs this request once.\nNo auth headers, cookies or body are added. It times out after 5 seconds; responses over 256 KiB are refused and the first 64 KiB is shown.\nRedirects (up to 10) stay on 127.0.0.1 or hosts you allowed; a new host asks you first.\n\nSpec: {}",
+                op.method, concrete, source.path
             );
             if review.len() > 16 << 10 {
-                return Err(invalid("Exact preview exceeds 16 KiB; reduce the request."));
+                return Err(invalid("The request preview is over 16 KiB. Use shorter parameter values."));
             }
             self.try_http.preview =
                 Some(Prepared { source, operation: op.clone(), values, url: concrete, review, nonce, at: Instant::now() });
@@ -521,10 +567,10 @@ impl OpenApi {
                 return Err(Error::Stale);
             }
             if response.body.len() > MAX_BODY {
-                return Err(invalid("Response exceeds the 256 KiB acceptance limit (host transfer cap remains 8 MiB)."));
+                return Err(invalid("The response is too large (over 256 KiB)."));
             }
             let body =
-                String::from_utf8(response.body).map_err(|_| invalid("Binary response is unsupported by this text-only response view."))?;
+                String::from_utf8(response.body).map_err(|_| invalid("The response isn't text, so it can't be shown."))?;
             let mut shown = String::new();
             for c in body.chars() {
                 if shown.len() + c.len_utf8() > DISPLAY {
@@ -534,14 +580,12 @@ impl OpenApi {
             }
             let truncated = shown.len() < body.len();
             let text = format!(
-                "{} {}\nHTTP {}\nSource: {} (version {})\nTicket: {nonce}\n\n{}{}",
+                "{} {}\nHTTP {}\n\n{}{}",
                 prepared.operation.method,
                 prepared.url,
                 response.status,
-                prepared.source.path,
-                prepared.source.version,
                 shown,
-                if truncated { "\n[Display truncated at 64 KiB]" } else { "" }
+                if truncated { "\n[Showing the first 64 KiB]" } else { "" }
             );
             self.try_http.response = Some(Reply { source: prepared.source.clone(), text });
             Ok(())
@@ -609,7 +653,7 @@ mod tests {
         let Body::Form(fields) = view.body else { panic!() };
         let FieldValue::Other { kind, data } = &fields[0].value else { panic!() };
         assert_eq!(kind, "readonly-text");
-        assert!(data.contains("Not sent") || data.contains("has not sent anything"));
+        assert!(data.contains("Not sent yet"));
         assert!(data.contains("%E2%98%83"));
         send(&h, &mut p, &key).unwrap();
         assert_eq!(h.requests().len(), 1);
@@ -649,6 +693,14 @@ mod tests {
     }
 
     #[test]
+    fn try_it_refuses_private_hosts() {
+        for u in ["https://169.254.169.254", "https://10.0.0.5/v1", "https://localhost", "https://intranet", "https://localhost:8443", "https://2130706433", "https://evil.localhost", "https://a.b.localhost", "https://0x7f.0.0.0x1", "https://127.0.0.0x1", "https://localhost.", "https://[::1]", "https://metadata.google.internal", "https://printer.local", "https://x.home.arpa"] {
+            assert!(literal_base(u, true).is_err(), "{u}");
+        }
+        assert!(literal_base("https://api.example.com", true).is_ok());
+    }
+
+    #[test]
     fn net_ask_allows_https_servers_and_refusal_shows_no_response() {
         let remote = SPEC.replace("http://127.0.0.1:32109/api", "https://api.example.test/v1");
         assert!(literal_base("https://api.example.test:8443/v1", true).is_ok());
@@ -671,6 +723,21 @@ mod tests {
         assert!(text.contains("denied"));
     }
     #[test]
+    fn try_it_out_denied_names_permission() {
+        let remote = SPEC.replace("http://127.0.0.1:32109/api", "https://api.example.test/v1");
+        let h = MockHost::install().with_capabilities(&["project.read", "editor.read", "events", "net:ask"]);
+        h.open_editor("/project/openapi.json", "json", &remote, &[]);
+        let mut p = OpenApi::default();
+        p.activate(&Context { api_version: "1.5".into(), capabilities: vec!["net:ask".into()], ..Context::default() }).unwrap();
+        h.on_fetch(|_| Err(Error::Denied("net:api.example.test".into())));
+        let key = prepare(&h, &mut p);
+        assert!(send(&h, &mut p, &key).is_err());
+        let Body::Message(text) = p.render("try-response", None, &h.invocation()).unwrap().body else { panic!() };
+        assert!(text.contains("needs the net:127.0.0.1 permission"), "{text}");
+        assert!(text.contains("net:ask"), "{text}");
+        assert!(text.contains("Settings › Plugins › OpenAPI"), "{text}");
+    }
+    #[test]
     fn api13_default_denied_or_broader_grants_refuse_before_fetch() {
         let (h, mut p) = setup();
         for api in ["1.3", "1.2", "", "2.0", "bogus", "1.+4", "1.4.", "1.4.preview", "1.4.0.extra"] {
@@ -689,7 +756,8 @@ mod tests {
             assert!(p.try_local(&h.invocation()).is_err());
         }
         p.activate(&Context { api_version: "1.4".into(), ..Context::default() }).unwrap();
-        assert!(matches!(p.try_local(&h.invocation()), Err(Error::Denied(_))));
+        let error = p.try_local(&h.invocation()).unwrap_err().to_string();
+        assert!(error.contains("needs the net:127.0.0.1 permission"), "{error}");
         assert!(h.requests().is_empty());
     }
     #[test]
@@ -820,7 +888,7 @@ mod tests {
         h.on_fetch(|_| Ok(HttpResponse { status: 200, headers: vec![], body: vec![b'x'; DISPLAY + 10] }));
         let key = prepare(&h, &mut p);
         send(&h, &mut p, &key).unwrap();
-        assert!(p.try_http.response.as_ref().unwrap().text.contains("Display truncated"));
+        assert!(p.try_http.response.as_ref().unwrap().text.contains("Showing the first 64 KiB"));
         h.open_editor("/project/other.json", "json", SPEC, &[]);
         assert!(matches!(p.try_http.view(&h.invocation()).body, Body::Message(_)));
         h.set_project_root(Some("/other"));
@@ -861,7 +929,7 @@ mod tests {
                 Body::Message(message) => {
                     assert_ne!(message, reason);
                     assert!(!message.contains("private-proxy-data"));
-                    assert!(message.contains("another project/editor/source version"));
+                    assert!(message.contains("older version of it"));
                 }
                 _ => panic!("foreign/stale scope must not expose a retained outcome"),
             }
@@ -902,5 +970,91 @@ mod tests {
         assert!(p.try_http.outcome.is_none() && p.try_http.response.is_none());
         assert_eq!(h.requests().len(), 3);
     }
-
+    const YAML_SPEC: &str = "openapi: 3.1.0\ninfo:\n  title: Owned test\n  version: '1'\nservers:\n  - url: http://127.0.0.1:32109/api\npaths:\n  /pets/{id}:\n    get:\n      parameters:\n        - in: path\n          name: id\n          required: true\n          schema:\n            type: string\n        - in: query\n          name: q\n          schema: {type: string}\n      responses:\n        200:\n          description: OK\n";
+    fn model(text: &str, ask: bool) -> Result<String, String> {
+        operations(text, ask).map(|ops| format!("{ops:?}")).map_err(|e| e.to_string())
+    }
+    #[test]
+    fn yaml_spec_yields_the_json_request_model_and_sends_the_same_request() {
+        assert_eq!(model(YAML_SPEC, false).unwrap(), model(SPEC, false).unwrap());
+        let sent = |path: &str, language: &str, text: &str| {
+            let (h, mut p) = setup();
+            h.open_editor(path, language, text, &[]);
+            h.on_fetch(|_| Ok(HttpResponse { status: 200, headers: vec![], body: b"ok".to_vec() }));
+            let key = prepare(&h, &mut p);
+            assert!(h.requests().is_empty());
+            send(&h, &mut p, &key).unwrap();
+            let r = h.requests().remove(0);
+            (r.method, r.url, r.headers, r.body, r.timeout_ms)
+        };
+        let json = sent("/project/openapi.json", "json", SPEC);
+        assert_eq!(json, sent("/project/openapi.yaml", "yaml", YAML_SPEC));
+        assert_eq!(json, sent("/project/api.yml", "yaml", YAML_SPEC));
+        for (path, language) in [("/project/openapi.yaml", "json"), ("/project/openapi.json", "yaml"), ("/project/openapi.txt", "yaml")] {
+            let (h, mut p) = setup();
+            h.open_editor(path, language, YAML_SPEC, &[]);
+            assert!(p.try_local(&h.invocation()).is_err(), "{path} {language}");
+            assert!(p.try_http.preview.is_none() && h.requests().is_empty());
+        }
+    }
+    #[test]
+    fn yaml_and_json_refuse_the_same_specs() {
+        // JSON is YAML flow syntax: a leading comment routes the very same document through the YAML loader.
+        let as_yaml = |json: &str| format!("# yaml\n{json}");
+        let remote = |server: &str| SPEC.replace("http://127.0.0.1:32109/api", server);
+        let mut variants = vec![
+            SPEC.into(),
+            SPEC.replace("3.1.0", "3.2.0"),
+            SPEC.replace("3.1.0", "3.1.invalid"),
+            SPEC.replace("\"3.1.0\"", "3.1"),
+            SPEC.replace("\"info\":", "\"openapi\":\"3.0.0\",\"info\":"),
+            SPEC.replace("\"paths\":", "\"security\":[{\"bearer\":[]}],\"paths\":"),
+            SPEC.replace("\"get\":", "\"post\":"),
+            SPEC.replace("\"get\":", "\"head\":"),
+            SPEC.replace("\"in\":\"query\"", "\"in\":\"header\""),
+            SPEC.replace("{id}", "{other}"),
+            SPEC.replace("{id}", "x{id}"),
+            SPEC.replace("\"required\":true", "\"required\":\"true\""),
+            SPEC.replace("\"type\":\"string\"", "\"type\":\"string\",\"enum\":[1]"),
+            SPEC.replace("\"type\":\"string\"", "\"type\":\"string\",\"enum\":[]"),
+            SPEC.replace("\"type\":\"string\"", "\"type\":\"integer\",\"enum\":[1,2.5]"),
+            SPEC.replace("\"type\":\"string\"", "\"type\":\"number\",\"enum\":[1,2.5]"),
+            SPEC.replace("\"url\":", "\"variables\":{},\"url\":"),
+            SPEC.replace("\"servers\":[{", "\"servers\":[{\"url\":\"http://127.0.0.1:1\"},{"),
+        ];
+        for server in [
+            "https://api.example.test/v1", "https://169.254.169.254", "https://10.0.0.5/v1", "https://localhost", "https://intranet",
+            "https://localhost:8443", "https://2130706433", "https://evil.localhost", "https://0x7f.0.0.0x1", "https://[::1]",
+            "https://metadata.google.internal", "https://printer.local", "https://x.home.arpa", "https://user@api.example.test",
+            "http://api.example.test", "http://localhost:32109", "http://127.0.0.1.evil:32109", "http://127.0.0.1:0",
+            "http://127.0.0.1:32109/a/../b", "http://127.0.0.1:32109/a%2f",
+        ] {
+            variants.push(remote(server));
+        }
+        let mut accepted = 0;
+        for json in &variants {
+            for ask in [false, true] {
+                let expected = model(json, ask).ok();
+                assert_eq!(model(&as_yaml(json), ask).ok(), expected, "{json} ask={ask}");
+                accepted += usize::from(expected.is_some());
+            }
+        }
+        assert!(accepted >= 5, "the parity cases must include accepted specs");
+        let dup_json = SPEC.replace("\"info\":", "\"servers\":[{\"url\":\"https://api.example.test\"}],\"info\":");
+        assert!(model(&dup_json, true).is_err());
+        assert!(model(&as_yaml(&dup_json), true).is_err());
+        for yaml in [
+            YAML_SPEC.replace("openapi: 3.1.0", "openapi: 3.1.0\nopenapi: 3.0.0"),
+            YAML_SPEC.replace("        200:", "        200:\n          description: OK\n        '200':"),
+            YAML_SPEC.replace("servers:\n  - url:", "servers:\n  - &s\n    url:"),
+            YAML_SPEC.replace("            type: string", "            type: !!str string"),
+            YAML_SPEC.replace("info:", "x: &a {}\ny: *a\ninfo:"),
+            YAML_SPEC.replace("            type: string", "            <<: {type: string}"),
+            format!("{YAML_SPEC}---\n{YAML_SPEC}"),
+            YAML_SPEC.replace("version: '1'", "version: '1'\n  1.5: real key"),
+            YAML_SPEC.replace("openapi: 3.1.0", "openapi: 3.1.0\nx-pad: '{}'", ).replace("{}", &"x".repeat(MAX_SPEC)),
+        ] {
+            assert!(operations(&yaml, true).is_err(), "{yaml}");
+        }
+    }
 }

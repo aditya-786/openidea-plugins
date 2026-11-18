@@ -3,7 +3,7 @@
   "tabs": [
     {
       "id": "resource-details",
-      "label": "Kubernetes"
+      "label": "Resource"
     },
     {
       "id": "resource-watch",

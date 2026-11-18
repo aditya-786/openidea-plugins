@@ -16,7 +16,7 @@ API 1.3, commit `25424465c04c9221a92c02227c905911641d29e3` (released baseline; m
 upstream source when newer behavior matters; the pinned reference is not a claim
 that unmerged proposals have shipped.
 
-For tool-window UI/UX work, read [ui-ux.md](ui-ux.md). It records the user's
+For tool-window UI/UX work, read [ui-ux.md](ui-ux.md). For commands, confirms, messages, settings and copy, load the `openidea-plugin-ux` skill. It records the user's
 preference for grouped navigation, searchable resource tables and contextual
 command workflows, informed by the Laravel OpenIDEA reference. For API availability,
 also check the repository's `docs/api-1.3-gap-reassessment-2026-11-08.md`; the

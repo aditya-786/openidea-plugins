@@ -33,6 +33,27 @@ fn advisory<'a>(report: &'a Report, key: &str) -> Result<&'a str, Error> {
     Ok(matches[0].1)
 }
 
+fn bound_declaration<'a>(root: &str, row: &'a Row) -> Option<&'a Declaration> {
+    let bound: Vec<&Declaration> = row.sources.iter().filter(|d| d.evidence.contains(binding::DECLARED) && scoped_path(root, &d.path)).collect();
+    match bound.as_slice() { [target] => Some(target), _ => None }
+}
+
+/// Palette fallback for row commands: choose one of the last scan's visible dependency rows.
+pub(crate) fn pick_row(ctx: &Invocation) -> Result<Option<String>, Error> {
+    let project = ctx.project().ok_or("Open a project first.")?;
+    let root = project.root()?;
+    let report = stored_report(&project)?.ok_or("Run Dependency Audit: Scan Project first, then choose a dependency in the Dependency Audit view.")?;
+    let scopes = scoped::load(&root);
+    let prefix = format!("{}/", root.trim_end_matches('/'));
+    let items: Vec<_> = report.rows.iter().filter(|row| scoped::visible(&scopes, row))
+        .map(|row| openidea_plugin::PickItem::new(&format!("dep:{}", base(row)), &format!("{} {}", row.name, row.version)).description(row.path.strip_prefix(&prefix).unwrap_or(&row.path)))
+        .collect();
+    if items.is_empty() {
+        return Err("The last scan found no vulnerable dependencies.".into());
+    }
+    host::pick("Choose a vulnerable dependency", &items)
+}
+
 /// Final modal boundary: retained rows and their current source owners must
 /// still be exactly the report that supplied the reviewed resource action.
 pub(crate) fn current_report(project: &Project, before: &Option<String>) -> Result<Report, Error> {
@@ -74,6 +95,8 @@ struct Upgrade {
     edit: TextEdit,
     before: String,
     name: String,
+    /// The whole document with the edit applied, for the diff view.
+    upgraded: String,
 }
 
 fn safe_version(value: &str) -> bool {
@@ -121,8 +144,9 @@ fn plan(root: &str, row: &Row, doc: Document) -> Result<Upgrade, Error> {
     if !safe_version(after.trim_start_matches(['^', '~', 'v'])) {
         return Err(Error::Invalid("The replacement is not a supported literal version.".into()));
     }
+    let upgraded = format!("{}{after}{}", &doc.text[..from], &doc.text[to..]);
     let edit = TextEdit { range: range(&doc.text, from, to), text: after };
-    Ok(Upgrade { root: root.into(), doc, edit, before, name: row.name.clone() })
+    Ok(Upgrade { root: root.into(), doc, edit, before, name: row.name.clone(), upgraded })
 }
 
 fn preview(upgrade: &Upgrade) -> String {
@@ -157,7 +181,7 @@ impl DependencyAudit {
         }
         let report_before=host::storage::get(&rows_key(&project)?)?;
         let report = stored_report(&project)?.ok_or(Error::Stale)?;
-        let key = key.ok_or("Select a dependency or advisory row first.")?;
+        let key = key.ok_or("Choose a dependency in the Dependency Audit view first.")?;
         if id == "open-advisory" {
             let id = advisory(&report, key)?;
             host::open_url(&format!("https://osv.dev/vulnerability/{id}"))?;
@@ -165,20 +189,33 @@ impl DependencyAudit {
         }
         let row = dependency(&report, key)?;
         if id == "open-declaration" {
-            let bound: Vec<&Declaration> = row.sources.iter().filter(|d| d.evidence.contains(binding::DECLARED) && scoped_path(&root, &d.path)).collect();
-            let [target] = bound.as_slice() else {
-                return Err("No single bound declaration for this dependency (transitive, ambiguous or alias); open the listed source manually.".into());
-            };
+            let target = bound_declaration(&root, row)
+                .ok_or("No single bound declaration for this dependency (transitive, ambiguous or alias); open the listed source manually.")?;
             host::open_location(&target.path, target.line, 0)?;
             return Ok(None);
         }
-        let editor = ctx.editor().ok_or("Open a declaration listed for this dependency, then choose Preview upgrade again.")?;
+        let on_source = ctx.editor().filter(|editor| editor.path() == row.path || row.sources.iter().any(|d| d.path == editor.path()));
+        let Some(editor) = on_source else {
+            // Commands get no handle to an editor they open: open the declaration and ask for one more click.
+            let target = bound_declaration(&root, row).ok_or("Open a declaration listed for this dependency, then choose Preview upgrade again.")?;
+            host::open_location(&target.path, target.line, 0)?;
+            return Ok(Some("Opened the declaration. Choose Preview upgrade again to review the change.".into()));
+        };
         let current = editor.document()?;
         let doc = Document { path: editor.path(), language: editor.language(), version: current.version, text: current.text };
         if project_of(&doc.path).and_then(|p| p.root().ok()).as_deref() != Some(root.as_str()) {
             return Err(Error::Stale);
         }
         let upgrade = plan(&root, row, doc)?;
+        // The diff is a view only; the confirmation below still decides, and a host without it keeps the text preview.
+        let diff = openidea_plugin::ContentDiff {
+            left: upgrade.doc.text.clone(),
+            right: upgrade.upgraded.clone(),
+            left_label: Some("Current".into()),
+            right_label: Some(format!("{} upgraded to {}", upgrade.name, upgrade.edit.text)),
+            title: Some(format!("Preview upgrade: {}", upgrade.name)),
+        };
+        let _ = host::open_diff(&diff, upgrade.doc.path.rsplit('/').next());
         if !ui_kit::prompts::confirm_exact("Preview dependency upgrade", &preview(&upgrade))? {
             return Ok(None);
         }
@@ -248,6 +285,11 @@ mod tests {
         assert_eq!(host.editor_text(), current.replace("4.17.15", "4.17.21"));
         assert_eq!(host.editor_version(), 2);
         assert!(host.requests().is_empty());
+        let diffs = host.opened_diffs();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].0.left.as_deref(), Some(current.as_str()));
+        assert_eq!(diffs[0].0.right, Some(current.replace("4.17.15", "4.17.21")));
+        assert_eq!(diffs[0].1.as_deref(), Some("package.json"));
     }
 
     #[test]

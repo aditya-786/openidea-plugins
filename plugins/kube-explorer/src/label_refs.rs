@@ -11,6 +11,7 @@ use yaml_rust2::{
 };
 const MAX_TEXT: usize = 128 << 10;
 const MAX_FILES: usize = 64;
+const MAX_LINE_TARGETS: usize = 200;
 #[derive(Clone, Debug)]
 pub(crate) struct Scalar {
     pub(crate) value: String,
@@ -62,8 +63,22 @@ enum Frame {
     Map(Vec<(Scalar, Node)>, Option<Scalar>),
     Seq(Vec<Node>),
 }
+/// Byte offsets of every line start, so a position costs one binary search.
+pub(crate) struct LineStarts(Vec<usize>);
+impl LineStarts {
+    pub(crate) fn new(source: &str) -> Self {
+        Self(std::iter::once(0).chain(source.match_indices('\n').map(|(at, _)| at + 1)).collect())
+    }
+    pub(crate) fn position(&self, source: &str, at: usize) -> Position {
+        let at = at.min(source.len());
+        let line = self.0.partition_point(|start| *start <= at) - 1;
+        let character = source.get(self.0[line]..at).map_or(0, |text| text.chars().map(|c| c.len_utf16() as u32).sum());
+        Position { line: line as u32, character }
+    }
+}
 struct Reader<'a> {
     source: &'a str,
+    lines: LineStarts,
     offsets: Vec<usize>,
     frames: Vec<Frame>,
     docs: Vec<Node>,
@@ -141,8 +156,8 @@ impl MarkedEventReceiver for Reader<'_> {
                     exact,
                     escaped: scanned.is_some(),
                     range: Range::new(
-                        text::position(self.source, start.min(self.source.len())),
-                        text::position(self.source, end.min(self.source.len())),
+                        self.lines.position(self.source, start),
+                        self.lines.position(self.source, end),
                     ),
                 };
                 self.push(Node::Scalar(scalar));
@@ -180,9 +195,9 @@ impl MarkedEventReceiver for Reader<'_> {
         }
     }
 }
-/// Inner end offset of a single-line quoted scalar opening at `open`, only
-/// when its unescaped text equals the parser's `value`.
-fn scan_quoted(source: &str, open: usize, value: &str) -> Option<usize> {
+/// The unescaped text of a single-line quoted scalar opening at `open`, and
+/// the offset of its closing quote.
+pub(crate) fn unquote(source: &str, open: usize) -> Option<(String, usize)> {
     let quote = *source.as_bytes().get(open)?;
     let rest = source.get(open + 1..)?;
     let mut raw = String::new();
@@ -195,9 +210,9 @@ fn scan_quoted(source: &str, open: usize, value: &str) -> Option<usize> {
                     chars.next();
                     raw.push('\'');
                 }
-                _ => return (raw == value).then_some(open + 1 + i),
+                _ => return Some((raw, open + 1 + i)),
             },
-            (b'"', '"') => return (raw == value).then_some(open + 1 + i),
+            (b'"', '"') => return Some((raw, open + 1 + i)),
             (b'"', '\\') => raw.push(match chars.next()?.1 {
                 '\\' => '\\',
                 '"' => '"',
@@ -212,6 +227,11 @@ fn scan_quoted(source: &str, open: usize, value: &str) -> Option<usize> {
     }
     None
 }
+/// Inner end offset of a single-line quoted scalar opening at `open`, only
+/// when its unescaped text equals the parser's `value`.
+fn scan_quoted(source: &str, open: usize, value: &str) -> Option<usize> {
+    unquote(source, open).filter(|(raw, _)| raw == value).map(|(_, end)| end)
+}
 fn spells(source: &str, start: usize, end: usize, key: &str) -> bool {
     let Some(raw) = source.get(start..end) else {
         return false;
@@ -225,20 +245,34 @@ pub(crate) fn parse(source: &str) -> Option<Vec<Node>> {
     if source.len() > MAX_TEXT || source.contains("{{") || source.contains("${") {
         return None;
     }
-    crate::convert::source_documents(source)?;
-    let mut reader = Reader {
-        source,
-        offsets: source
-            .char_indices()
-            .map(|(i, _)| i)
-            .chain(std::iter::once(source.len()))
-            .collect(),
-        frames: Vec::new(),
-        docs: Vec::new(),
-        bad: false,
+    let mut checked = Checked {
+        guard: crate::convert::ValueGuard::default(),
+        reader: Reader {
+            source,
+            lines: LineStarts::new(source),
+            offsets: source
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(source.len()))
+                .collect(),
+            frames: Vec::new(),
+            docs: Vec::new(),
+            bad: false,
+        },
     };
-    Parser::new_from_str(source).load(&mut reader, true).ok()?;
-    (!reader.bad).then_some(reader.docs)
+    Parser::new_from_str(source).load(&mut checked, true).ok()?;
+    (!checked.guard.rejected() && !checked.reader.bad).then_some(checked.reader.docs)
+}
+/// Feeds one parse pass to the value guard and to the node reader.
+struct Checked<'a> {
+    guard: crate::convert::ValueGuard,
+    reader: Reader<'a>,
+}
+impl MarkedEventReceiver for Checked<'_> {
+    fn on_event(&mut self, event: Event, mark: Marker) {
+        yaml_rust2::parser::EventReceiver::on_event(&mut self.guard, event.clone());
+        self.reader.on_event(event, mark);
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Resource {
@@ -574,7 +608,10 @@ fn facts(path: &str, source: &str) -> Option<Facts> {
         let group = if api == "v1" {
             ""
         } else {
-            api.split_once('/')?.0
+            let Some((group, _)) = api.split_once('/') else {
+                continue;
+            };
+            group
         };
         let Some(kind) = string(node.get("kind")) else {
             continue;
@@ -1194,7 +1231,7 @@ fn label_component(
         .sum();
     if graph_size > 4096 {
         return Err(
-            "Static label graph exceeds4096 fields/conditions; no partial Rename is admitted."
+            "Too many labels and selectors to rename safely (over 4096). Nothing was renamed."
                 .into(),
         );
     }
@@ -1215,7 +1252,7 @@ fn label_component(
                 .count()
                 != 1
             {
-                return Err("A namespace-dependent selector lacks a unique explicit Namespace source; label Rename is withheld.".into());
+                return Err("A selector depends on a namespace that is not set in exactly one place, so Rename cannot check every match. Nothing was renamed.".into());
             }
         }
     }
@@ -1235,7 +1272,7 @@ fn label_component(
             .count()
             != 1
         {
-            return Err("Duplicate resource identities make this label family ambiguous; Rename is withheld.".into());
+            return Err("Two resources share the same kind, namespace and name, so Rename cannot tell them apart. Nothing was renamed.".into());
         }
     }
     let mut owners = vec![subject.owner.clone()];
@@ -1275,7 +1312,7 @@ fn label_component(
             return Ok((owners, selectors));
         }
     }
-    Err("Static label graph did not close within its bounded component limit.".into())
+    Err("Too many connected labels and selectors to rename safely. Nothing was renamed.".into())
 }
 fn association_matrix(
     all: &[(String, Facts)],
@@ -1288,7 +1325,7 @@ fn association_matrix(
                 for (owner_index, owner) in candidates(facts, selector.target).iter().enumerate() {
                     inspected += 1;
                     if inspected > 65536 {
-                        return Err("Static selector association proof exceeds65536 candidate comparisons; Rename is withheld.".into());
+                        return Err("Too many selectors to compare (over 65536 checks). Nothing was renamed.".into());
                     }
                     if matches(selector, owner, facts, all) {
                         result.push((source, selector_index, file, owner_index));
@@ -1362,7 +1399,7 @@ fn resolve_label_action(
     )?
     .ok_or(Error::Cancelled)?;
     if !label_key(&new_key) || new_key == subject.key {
-        return Err("Use a different valid Kubernetes label key (optional DNS prefix/name; name at most63 characters).".into());
+        return Err("Use a different valid Kubernetes label key (optional DNS prefix/name; name at most 63 characters).".into());
     }
     if all.iter().any(|(_, facts)| {
         facts
@@ -1379,7 +1416,7 @@ fn resolve_label_action(
     let mut edits = Vec::new();
     let mut after = Vec::new();
     let mut review = format!(
-        "Label key {} → {}\n{} connected source owners; {} selector scopes. Every existing modeled selector match must remain identical after this edit.\n\nScope: all {} admitted project YAML/JSON files and open buffers. Closed ignored files, external/cluster resources, custom-controller fields, generated/Helm/Kustomize sources and opaque strings are excluded; ambiguous/unparseable/escaped admitted sources are refused. This edits literal source names only, not a live deployment.\n\n",
+        "Label key {} → {}\n{} resources use it; {} selectors match them. Every selector keeps matching the same resources after this edit.\n\nChanges the {} project YAML/JSON files and open buffers. Ignored files, cluster resources, custom-controller fields, Helm or Kustomize sources and opaque strings are not changed; ambiguous or unreadable files stop the rename. Only files change, not the cluster.\n\n",
         subject.key,
         new_key,
         owners.len(),
@@ -1460,7 +1497,7 @@ fn resolve_label_action(
         after.push((
             file.path.clone(),
             facts(&file.path, &rewritten).ok_or(
-                "Rewritten source cannot preserve the admitted graph; Rename is withheld.",
+                "The new name would change which resources a selector matches. Nothing was renamed.",
             )?,
         ));
         if !changes.is_empty() {
@@ -1475,7 +1512,7 @@ fn resolve_label_action(
     }
     if review.len() > ui_kit::prompts::MAX_CONFIRM_BYTES {
         return Err(
-            "The complete label Rename review exceeds16KiB; no partial edits were prepared.".into(),
+            "The complete label Rename review exceeds 16KiB; no partial edits were prepared.".into(),
         );
     }
     if !ui_kit::prompts::confirm_exact("Rename connected static Kubernetes label keys?", &review)? {
@@ -1583,7 +1620,7 @@ fn rename_snapshot(doc: &Document) -> Result<RenameSnapshot, openidea_plugin::Er
         let found = project.find_files(glob, 129)?;
         if found.len() >= 129 {
             return Err(
-                "Project source inventory reached its file limit; no partial Rename is admitted."
+                "The project has too many YAML/JSON files to rename safely. Nothing was renamed."
                     .into(),
             );
         }
@@ -1603,7 +1640,7 @@ fn rename_snapshot(doc: &Document) -> Result<RenameSnapshot, openidea_plugin::Er
     }
     if !files.contains(&doc.path) || files.len() > 128 {
         return Err(
-            "Rename requires an admitted inventory of at most128 project YAML/JSON sources.".into(),
+            "Rename works in projects with at most 128 YAML/JSON files.".into(),
         );
     }
     let mut total = 0usize;
@@ -1622,7 +1659,7 @@ fn rename_snapshot(doc: &Document) -> Result<RenameSnapshot, openidea_plugin::Er
             "Chart.yaml" | "kustomization.yaml" | "kustomization.yml" | "Kustomization"
         ) {
             return Err(
-                "Helm/Kustomize transformation sources are outside static Rename admission.".into(),
+                "Helm and Kustomize sources cannot be renamed safely. Nothing was renamed.".into(),
             );
         }
         let stat = project.stat(&path)?;
@@ -1639,7 +1676,7 @@ fn rename_snapshot(doc: &Document) -> Result<RenameSnapshot, openidea_plugin::Er
             return Err("Rename inventory exceeds static byte limits.".into());
         }
         total += source.len();
-        let nodes=parse(&source).ok_or("An admitted YAML/JSON source is generated, ambiguous or unparseable; no partial Rename is prepared.")?;
+        let nodes=parse(&source).ok_or("A YAML/JSON file is generated, ambiguous or unreadable. Nothing was renamed.")?;
         if nodes.iter().any(|node| !exact_tree(node)) {
             return Err(
                 "Escaped/multiline source spellings are outside this exact static Rename scope."
@@ -1650,7 +1687,7 @@ fn rename_snapshot(doc: &Document) -> Result<RenameSnapshot, openidea_plugin::Er
             let kind = string(node.get("kind")).unwrap_or_default();
             if kind == "List" {
                 return Err(
-                    "Kubernetes List wrappers are outside this static Rename scope.".into(),
+                    "Resources inside a Kubernetes List cannot be renamed.".into(),
                 );
             }
             let api = string(node.get("apiVersion")).unwrap_or_default();
@@ -1679,12 +1716,12 @@ fn rename_snapshot(doc: &Document) -> Result<RenameSnapshot, openidea_plugin::Er
     })
 }
 struct Cached {
-    digest: [u8; 32],
+    stamp: Option<(u64, Option<u64>)>,
     facts: Facts,
 }
 #[derive(Default)]
 pub(crate) struct Cache {
-    files: BTreeMap<(String, String), Cached>,
+    files: crate::lru::Lru<(String, String), Cached>,
 }
 impl Cache {
     pub(crate) fn file_actions(
@@ -1798,7 +1835,7 @@ impl Cache {
         )?
         .ok_or(openidea_plugin::Error::Cancelled)?;
         if !key_name(&new_key) || new_key == subject.key {
-            return Err("Use a different data key containing only letters, digits, '.', '_' or '-' (at most253 bytes).".into());
+            return Err("Use a different data key containing only letters, digits, '.', '_' or '-' (at most 253 bytes).".into());
         }
         if snapshot
             .files
@@ -1813,7 +1850,7 @@ impl Cache {
         }
         let mut edits = Vec::new();
         let mut review = format!(
-            "{} {}/{}: {} → {}\n\nScope: complete admitted inventory of {} project YAML/JSON files plus open YAML/JSON buffers. Closed ignored files, external/cluster resources, custom-controller fields and opaque strings are excluded. Generated/Helm/Kustomize, ambiguous, escaped or unparseable inventory is refused. This is a local source edit, not a cluster operation.\n\n",
+            "{} {}/{}: {} → {}\n\nChanges the {} project YAML/JSON files plus open YAML/JSON buffers. Ignored files, cluster resources, custom-controller fields and opaque strings are not changed; Helm, Kustomize, ambiguous or unreadable files stop the rename. Only files change, not the cluster.\n\n",
             subject.kind,
             subject.namespace,
             subject.name,
@@ -1873,7 +1910,7 @@ impl Cache {
         }
         if review.len() > ui_kit::prompts::MAX_CONFIRM_BYTES {
             return Err(
-                "The complete Rename review exceeds16KiB; no partial edits were prepared.".into(),
+                "The complete Rename review exceeds 16KiB; no partial edits were prepared.".into(),
             );
         }
         if !ui_kit::prompts::confirm_exact("Rename static Kubernetes data-key sources?", &review)? {
@@ -1889,6 +1926,9 @@ impl Cache {
     }
     pub(crate) fn clear(&mut self) {
         self.files.clear();
+    }
+    pub(crate) fn evict(&mut self, path: &str) {
+        self.files.retain(|(_, p), _| p != path);
     }
     pub(crate) fn warm_file(&mut self, path: &str) {
         if let Some(project) = host::project_of(path)
@@ -1913,15 +1953,13 @@ impl Cache {
         let Some(facts) = facts(path, source) else {
             return;
         };
-        if self.files.len() >= MAX_FILES {
-            self.files.clear();
-        }
         self.files.insert(
             (root, path.into()),
             Cached {
-                digest: Sha256::digest(source.as_bytes()).into(),
+                stamp: project.stat(path).ok().map(|stat| (stat.size, stat.modified)),
                 facts,
             },
+            MAX_FILES,
         );
     }
     fn current(&self, doc: &Document) -> Option<Vec<(String, Facts)>> {
@@ -1942,10 +1980,8 @@ impl Cache {
             {
                 continue;
             }
-            let Ok(source) = project.read_file(path) else {
-                continue;
-            };
-            if <[u8; 32]>::from(Sha256::digest(source.as_bytes())) != cache.digest {
+            let current = project.stat(path).ok().map(|stat| (stat.size, stat.modified));
+            if current.is_none() || current != cache.stamp {
                 continue;
             }
             all.push((path.clone(), cache.facts.clone()));
@@ -2248,18 +2284,30 @@ impl Cache {
             .chain(facts.references.iter().map(|r| r.key.range))
             .chain(facts.label_uses.iter().map(|r| r.key.range))
             .collect();
-        ranges
-            .into_iter()
-            .filter_map(|range| {
-                let targets = Self::definition_in(&all, range.start);
-                if targets.len() != 1 {
-                    return None;
+        // One marker per target with the same icon: the IDE merges a line's markers into one button with a chooser.
+        let mut lines: BTreeMap<u32, Vec<Location>> = BTreeMap::new();
+        for range in ranges {
+            let targets = lines.entry(range.start.line).or_default();
+            for target in Self::definition_in(&all, range.start) {
+                if target.range.start != target.range.end && !targets.contains(&target) {
+                    targets.push(target);
                 }
-                Some(LineMarker {
-                    line: range.start.line,
+            }
+        }
+        lines
+            .into_iter()
+            .flat_map(|(line, targets)| {
+                let total = targets.len();
+                let tooltip = if total > MAX_LINE_TARGETS {
+                    format!("Read-only exact label/key source candidate (first {MAX_LINE_TARGETS} of {total} shown)")
+                } else {
+                    "Read-only exact label/key source candidate".to_owned()
+                };
+                targets.into_iter().take(MAX_LINE_TARGETS).map(move |target| LineMarker {
+                    line,
                     icon: Some(crate::LABEL_MARKER.into()),
-                    tooltip: "Read-only exact label/key source candidate".into(),
-                    target: targets.into_iter().next(),
+                    tooltip: tooltip.clone(),
+                    target: Some(target),
                 })
             })
             .collect()
@@ -3147,6 +3195,25 @@ mod tests {
         assert!(cache.definition(&doc, at).is_empty());
     }
     #[test]
+    fn a_selector_matching_several_sources_gets_one_same_icon_marker_per_target() {
+        let (_host, cache) = setup(&[("pod.yaml", POD), ("service.yaml", SERVICE)]);
+        let doc = document("service.yaml", SERVICE);
+        let single = cache.markers(&doc);
+        assert_eq!(single.len(), 2);
+        let pod2 = POD.replace("name: web\n  namespace", "name: web2\n  namespace");
+        let (_host, cache) = setup(&[("pod.yaml", POD), ("pod2.yaml", &pod2), ("service.yaml", SERVICE)]);
+        let markers = cache.markers(&doc);
+        assert_eq!(markers.len(), 4);
+        assert!(markers.iter().all(|m| m.line == 4 && m.icon.as_deref() == Some(crate::LABEL_MARKER)));
+        let targets: BTreeSet<_> = markers.iter().map(|m| {
+            let target = m.target.as_ref().unwrap();
+            assert!(target.range.start != target.range.end);
+            (target.path.clone(), target.range.start.line, target.range.start.character)
+        }).collect();
+        assert_eq!(targets.len(), 4);
+        assert!(targets.iter().any(|(path, ..)| path == "/p/pod2.yaml"));
+    }
+    #[test]
     fn absent_namespaces_aliases_tags_and_generated_expressions_withhold_models() {
         let (_host, cache) = setup(&[("pod.yaml", POD), ("service.yaml", SERVICE)]);
         for source in [
@@ -3235,15 +3302,47 @@ mod tests {
         );
     }
     #[test]
+    fn slashless_api_version_keeps_other_docs() {
+        let source = format!("apiVersion: weird\nkind: Thing\nmetadata: {{name: a, namespace: app}}\n---\n{POD}");
+        let found = facts("/p/a.yaml", &source).unwrap();
+        assert_eq!(found.labels.len(), 2);
+    }
+    #[test]
     fn secret_plaintext_is_not_retained_in_cached_facts() {
         let (_host, cache) = setup(&[("secret.yaml", SECRET)]);
         let cached = cache.files.values().next().unwrap();
         assert_eq!(cached.facts.keys.len(), 1);
         assert_eq!(cached.facts.keys[0].key.value, "server");
-        assert_eq!(
-            cached.digest,
-            <[u8; 32]>::from(Sha256::digest(SECRET.as_bytes()))
-        );
+        assert_eq!(cached.stamp.map(|(size, _)| size), Some(SECRET.len() as u64));
+    }
+    #[test]
+    fn position_table_matches_naive() {
+        for source in ["", "a: 1\n", "a: é\n😀: x\r\nb: ü😀z\n\n\nlast", "\n\n", "key: \"é\"\n  - café: 😀"] {
+            let lines = LineStarts::new(source);
+            for at in (0..=source.len()).filter(|at| source.is_char_boundary(*at)) {
+                assert_eq!(lines.position(source, at), text::position(source, at), "{source:?} at {at}");
+            }
+            assert_eq!(lines.position(source, source.len() + 9), text::position(source, source.len()));
+        }
+    }
+    #[test]
+    fn label_cache_no_rehash() {
+        let (host, cache) = setup(&[("pod.yaml", POD), ("service.yaml", SERVICE)]);
+        let service = Document {
+            path: "/p/service.yaml".into(),
+            language: "yaml".into(),
+            version: 1,
+            text: SERVICE.into(),
+        };
+        let at = caret(SERVICE, "tier");
+        let before = cache.definition(&service, at);
+        assert!(!before.is_empty());
+
+        host.add_file("pod.yaml", &POD.replace("frontend", "frontenx"));
+        assert_eq!(cache.definition(&service, at), before);
+
+        host.add_file("pod.yaml", &format!("{POD}# longer\n"));
+        assert!(cache.definition(&service, at).is_empty());
     }
     #[test]
     fn deployment_selector_links_only_its_own_template_labels() {

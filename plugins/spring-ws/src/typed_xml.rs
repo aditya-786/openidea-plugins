@@ -150,17 +150,13 @@ fn inventory(
     {
         return None;
     }
-    let root = project_of(&doc.path)?.root().ok()?;
-    let index = nav.xml_types.for_cached_document(&doc.path, &doc.text)?;
+    let index = nav.source.for_cached_document_warm(&doc.path, &doc.text, PROVIDER_BUDGET)?;
     if !index.fresh() {
         return None;
     }
     let mut out: BTreeMap<String, Vec<(String, SourceType)>> = BTreeMap::new();
-    for (path, types) in index.iter() {
-        if project_of(path).and_then(|p| p.root().ok()).as_deref() != Some(&root) {
-            continue;
-        }
-        for ty in types {
+    for (path, facts) in index.iter() {
+        for ty in &facts.types {
             out.entry(ty.name.clone())
                 .or_default()
                 .push((path.into(), ty.clone()));
@@ -374,7 +370,7 @@ mod refresh_command_tests {
             nav.run_command("refresh-models", &h.invocation(), None)
                 .unwrap()
                 .as_deref(),
-            Some("XML and XPath source models refreshed.")
+            Some("Schemas and endpoints refreshed.")
         );
         assert_eq!(nav.definition(&doc, at).len(), 1);
         assert!(h.requests().is_empty() && h.process_runs().is_empty());

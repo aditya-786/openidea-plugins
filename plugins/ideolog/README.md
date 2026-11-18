@@ -1,80 +1,307 @@
 # Ideolog
 
-A log viewer for OpenIDEA: detects the log format, colours each event by level, folds multi-line events, links stack frames to source, and supports custom Ideolog parsing/highlighting patterns. MIT; see `LICENSE`.
+A log viewer. It detects the log format, colours each event by level, folds multi-line events and links stack frames to your source. You can add your own Ideolog parsing and highlighting patterns. MIT; see `LICENSE`.
 
-## Viewing logs
+## Requirements
 
-- Detects the log format from the first 25 lines: IntelliJ IDEA, TeamCity build log, Logcat, Loguru, pipe-separated, Docker/ISO timestamps, Python `logging`, nginx error log, syslog (level from keywords), Laravel/Monolog (`[date] channel.LEVEL:`), Serilog text, or your own (yours win ties); other logs are split on the first space.
-- Colours each event by level (error, warning, info), including its stack trace lines. The time column of a coloured event gets its own colour. Colours come from the theme's syntax colours (keyword, tag, string, number…), which approximate red, orange and green in the default schemes; warnings and marked time gaps use `enum-member` because LSP semantic tokens have no `tag` or `constant` kind.
-- The status bar names the detected format (`Log: IntelliJ IDEA`, or `Log: plain text`); click it to open the Patterns view.
-- Setting _Mark time gaps_: the time of an event that comes at least N seconds after the previous one gets its own colour (ISO-like, Logcat, syslog and `HH:MM:SS` times; zones are ignored). Supported ISO `Z`, `±HH:MM` and `±HHMM` offsets are normalized, so changing timezone spelling alone cannot create or hide a gap; malformed offset suffixes yield no parsed time. Naive timestamps retain an assumed common local scale.
-- Folds multi-line events (stack traces) and lists errors and warnings in the structure view. Numeric custom-level identifiers stay intact: `error2` is unclassified rather than normalized to `ERROR`.
+- OpenIDEA with plugin API 1.10 or later (`engines.openidea = "^1.10"`).
+- The log must be inside the open project for navigation, snapshots and marks.
+- Optional: Java 17 or later on the `PATH` for **Ideolog: Capture JVM Regex and Date Observations** and **Ideolog: Open Live Log Tail**.
+- No accounts or network access.
 
-## Navigation
+## Quick start
 
-- **Ideolog: Jump to Source** (F7): opens the stack frame on the caret line (Java/Kotlin, Python, .NET, PHP, Ruby, Dart (`file://`, `package:`), Swift, Node, Go, Rust…), or else the source line whose string literal best matches the event's message. Cmd/Ctrl+click on a stack frame opens its file and line.
-- **Ideolog: Go to Next Error** (Shift+F7), **Go to Next Warning**, **Go to Next Exception** (an event whose text names an exception or a Python traceback), **Go to Previous / Next Entry**.
+1. Install the plugin ([how](../../README.md#install-a-plugin)).
+2. Open a `.log` file from your project. Events are coloured by level and the status bar shows the detected format (`Log: IntelliJ IDEA`).
+3. Press Shift+F7 to jump to the next error.
+4. Put the caret on a stack frame and press F7 to open the source line.
+5. For full theme colours, switch the file type to **Log (Ideolog)**. See [`.log` files](#log-files).
 
-Navigation needs the log inside the open project (the IDE only opens project files for plugins) and requires the editor owner and invoking project to match. Command and definition positions require an exact UTF16-to-byte-to-UTF16 roundtrip, so surrogate-interior or out-of-document carets cannot silently select byte zero. Jump to Source scans up to 5,000 source files, as there is no index to query; it excludes files owned by another open project, including nested project roots, and equal best message/file ranks return no source jump instead of choosing the first file. Stack-frame definitions require an owned Log document (512 KiB maximum), parse at most 8 KiB per frame line, retain at most 32 frame observations and refuse zero/overflow line numbers. Filename lookup is a suffix heuristic: only a unique highest suffix score in an uncapped, project-owned regular-file candidate set is navigable; ambiguity returns no definition.
+## Features
 
-## `.log` files
+### Read logs with colours and folds
 
-OpenIDEA's built-in `Log` file type owns `.log` by default. **Log (Ideolog)** remains available as a manual file-type choice for the custom-language lexical highlighting, folding and outline. Commands and stack-frame links support both types; the same built-in/custom formats, `customPatterns` setting, saved Patterns entries and `timeGapSeconds` setting apply.
+- The format is detected from the first 25 lines. Supported: IntelliJ IDEA, TeamCity build log, Logcat, Loguru, pipe-separated, Docker/ISO timestamps, Python `logging`, nginx error log, syslog, Laravel/Monolog (`[date] channel.LEVEL:`), Serilog text, or your own patterns. Yours win ties. Other logs are split on the first space.
+- Each event is coloured by level (error, warning, info), stack trace included. The time column gets its own colour.
+- Multi-line events such as stack traces fold.
+- The structure view lists errors and warnings.
+- The status bar names the format (`Log: IntelliJ IDEA` or `Log: plain text`). Click it to open the **Formats and Highlighting** tab.
+- On a large log, the status bar adds how much is coloured: `(first 1200 lines highlighted)` or `(too large to highlight)`. Over 512 KiB, its tooltip says folding, outline and stack-frame links are off.
 
-The API 1.3 semantic provider returns Ideolog's event, field and match highlighting tokens for the built-in Log editor, including captured timestamps, levels, messages and stack-trace continuation lines; uncoloured entries retain the editor's existing styling. On v0.1.39 the built-in editor does not render the keyword/string/number/comment semantic kinds used by many rules — use the manual **Log (Ideolog)** file type for full custom theme-mapped highlighting. Built-in log colours alone are not evidence that custom rules rendered. The overlay processes at most the first 64 KiB / 512 complete lines, stops before any line longer than 4096 bytes, and returns at most 4096 single-line UTF-16 tokens. It checks a 15 ms cooperative deadline during format attempts, physical-line grouping and lazy event parsing; individual regex calls/rule passes cannot be preempted. The newline search itself is bounded to a UTF8-safe 64 KiB prefix before splitting lines; a prefix ending inside a line or Unicode scalar does not feed that partial line to format detection. A 512 KiB cutoff containing no complete line returns no custom syntax events, folds or outline entries; complete final document lines remain supported. Configuration is warmed outside the semantic request during activation, log focus/open and explicit pattern/capture work; cold requests return no tokens, and external settings changes apply after that out-of-provider refresh. Providers perform no project discovery, file reads, pattern-storage reads or network requests; the custom `ideolog` language keeps its own lexical highlighting, folding and outline path (512 KiB limit).
+### Spot pauses
 
-## Custom formats
+Set **Mark time gaps (seconds)**. An event that comes at least that many seconds after the previous one gets a coloured time. This works with ISO-like, Logcat, syslog and `HH:MM:SS` times.
 
-Settings › Plugins › Ideolog › _Custom log formats and highlighting_: paste the `<LogParsingPattern …/>` and `<LogHighlightingPattern …/>` elements of an Ideolog settings export, or a custom log formats file (Laravel, Symfony, Serilog, Xdebug…). Patterns use Java-like regular expressions, lookaround included. Highlighting colours map to the nearest theme colour; `HIDE` patterns are ignored. Legacy pasted XML in `customPatterns` remains supported alongside the form.
+### Jump around a log
 
-**Ideolog: Custom Formats and Highlighting** opens the native Patterns view: a table of your patterns with Log Formats / Highlighting sections, enabled state and explicit Enable / Disable. Select a row before Edit, Move Up / Down or Remove; double-click opens Edit. Add Format and Edit open a structured form with name, Enabled, event regex, event-start regex, a bounded numeric timestamp format (empty: automatic) and 0-based timestamp/level/category columns (`-1`: none). Add Highlighting opens a form with line/field/captured-match action, optional column/format restriction (named format selector with Any log format; unknown imported restrictions stay labelled unavailable) and named colour choices. Native text fields commit on blur or Enter; press Tab before Preview/Save after editing. Format UUIDs remain internal identities; duplicate display names are disambiguated. Controls revalidate the rendered storage/layout before mutation.
+- **Ideolog: Go to Next Error** (Shift+F7), **Ideolog: Go to Next Warning** and **Ideolog: Go to Next Exception**.
+- **Ideolog: Go to Previous Entry** and **Ideolog: Go to Next Entry**.
+- **Ideolog: Extend Log Selection** grows the selection from a field to its line, its event and the whole document.
 
-Timestamp formats support fixed numeric `yyyy`, `MM`, `dd`, `HH` (or `hh` with `a`), `mm`, `ss`, `SSS`, quoted literals and `Z`/`X`/`XX`/`XXX` offsets; a pattern requires hour/minute/second fields, and absent/empty preserves automatic parsing. `hh:mm:ss a` accepts case-insensitive ASCII `AM`/`PM` markers; midnight/noon and time gaps use the same normalized scale as 24-hour formats. Ambiguous `hh` without `a`, `HH` with `a`, invalid twelve-hour values and extra text are rejected. Single-letter `M`, `d`, `H`, `h`, `m`, `s` accept one or two digits; `k`/`kk` accepts 1–24 (24 means midnight), `K`/`KK` accepts 0–11 with `a`; `S` reads one to three millisecond digits, `SS`/`SSS` exactly two and three (millisecond numbers, not decimal fractions); variable-width adjacent numeric fields are rejected unless separated. `z` through `zzzz` accepts UTC, GMT and `GMT+02:00`-form offsets; region names are not guessed. RFC822 `Z` through `ZZZ` keeps numeric `+0200` spelling. Unsupported tokens such as locale month/day names are rejected for new edits; imported unsupported formats remain readable but produce configuration errors and no computed gap. This is a documented numeric subset, not full Java `SimpleDateFormat`. Preview confirms whether the sample timestamp matches the selected format; the same parser drives actual timestamp-gap calculation.
+An exception is an event whose text names an exception, or a Python traceback.
 
-A sample event and **Preview** show the timestamp, level, category and message captures, or the pieces coloured by the draft's highlighting rule, even when its Enabled checkbox is off. Sample text stays in the draft and is never written to pattern storage; the sample has exactly two input paths, the bundled Example initializer and the explicit manual Sample field. **Save** validates regex syntax, capture-column bounds, actions and colour values; invalid input stays open with an explanation. **Cancel** discards the draft. Editing preserves the UUID and other exported attributes, including `timePattern` and `fullmatch`. A changed storage snapshot blocks Save so another window's intervening edit is preserved — the SDK has no storage compare-and-swap, so this cannot make concurrent writes atomic across instances. Draft fields carry a fresh edit-session identity; controls retained by another window after Cancel/reopen are rejected.
+### See log levels beside the editor
 
-Bounds: regex/attribute values 4096 bytes, format names 128 bytes, samples 8192 bytes with 4096-byte lines, saved storage 128 entries / 128 KiB. Samples use a bounded backtracking precheck; regex compilation and the parser are not preemptible. These global pattern settings also work without an open project; saving needs the optional storage permission. Open logs pick up a change when they're edited or reopened.
+The **Log Levels** panel sits beside each log editor (needs `editor.read`). It shows:
 
-**Ideolog: Highlight Selection** (editor menu) adds the selected text, escaped, as a highlighting rule — it does not import that text into the draft sample. **Remove Custom Highlightings** deletes them all. Successful changes notify only the Patterns view through native refresh when persistent pattern text actually changes; cancelled/error/no-op commands emit no false change. Notifications contain no definition/sample payload.
+- The detected format, and a **Formats and Highlighting** link to that tab.
+- How many **Errors**, **Warnings**, **Exceptions**, **Info**, **Debug**, **Trace** and **All entries** the log has. A level the format can't write has no row: syslog finds only errors and warnings in the message, and Python `logging` has no trace level.
+- Up and down buttons on each row to go to the previous or next one. They move the caret of the focused log, so click in the log first.
+- **Show level** and **Filter in snapshot**: capture the focused log into the **Log Snapshot** table showing only that level. The editor can't fold or hide entries for a plugin, so the filter lives in the table.
 
-## Log Snapshot
+Levels are read from the format's level column. `NOTICE` and `CONFIG` count as info, `FINE` as debug, `FINER`, `FINEST` and `VERBOSE` as trace. Single letters (`I`, `D`, `T`, `V`) count only in a format's own level column, as in Logcat, never as the first word of a plain log.
 
-**Ideolog: Capture Active Log Snapshot** explicitly captures the focused built-in Log or manual Log(Ideolog) editor into the native **Log Snapshot** bottom view; **Open Captured Log Snapshot** reopens the retained snapshot. The editor remains the main log interface. Capturing requires `editor.read`/`project.read` and an existing file in the invoking owning project; no outside-project grant, process or network is introduced. Rendering never rereads the source or starts capture. The snapshot reuses current format detection, event grouping, timestamp/category extraction and Error/Warning classification; literal captured levels such as INFO/DEBUG/custom names are retained, otherwise severity is Error/Warning/Unclassified. Columns show event source line, level, timestamp, category and the first message line (messages limited to 512 characters, timestamp/category to 128 each). Multiline events remain one row; activate a row to open its original log event line. Navigation is separate from Jump to Source and does not invent resolved source links.
+On a large log, counts cover the first lines only and show a `+`. The note under the table says how many lines were counted; the buttons still search the whole log.
 
-Native viewport requests page at most 100 rows (default 50) with Previous/Next Events, retaining position across tab switches; row activation is restricted to the issued page and revalidates current project/source text before opening, so changed or deleted sources require a new capture. A capture accepts at most 256 KiB of current text and 8192 physical lines, retains the first 2048 parsed events, and reports retained versus parsed count, source version, age and format. Oversized files/buffers are refused, not presented as complete. Discard releases the snapshot; project switches do not expose another root's snapshot. Capture has a cancellable native Task and a cooperative two-second parse deadline with cancellation checkpoints between individual format-detection regex attempts and before every physical line during grouping; cancellation returns no partial snapshot and prior accepted snapshots remain intact, but a single synchronous regex/read call cannot be interrupted. This is snapshot paging, not byte-offset streaming, filesystem tailing, appended-record following, rotation handling or durable/background viewing. Pattern changes apply on the next capture; retained rows keep their capture-time parsing.
+### Jump to source
 
-## JVM regex and date observations
+- **Ideolog: Jump to Source** (F7) opens the stack frame on the caret line. It supports Java/Kotlin, Python, .NET, PHP, Ruby, Dart (`file://`, `package:`), Swift, Node, Go, Rust and more.
+- On a line that isn't a stack frame, it opens the source line whose string literal best matches the event's message.
+- Cmd/Ctrl+click a stack frame to open its file and line.
 
-**Ideolog: Capture JVM Regex and Date Observations** runs an approved Java 17+ executable for an explicitly selected custom `LogParsingPattern`, including raw imported patterns from `customPatterns` with Java regex constructs and SimpleDateFormat fields unsupported by the local parser. Choose an explicit BCP47 locale and Java timezone ID, or leave either empty for the JVM default; the review names the source, format, regex, date pattern, scope and local tool. No Java tool or application is installed or bootstrapped automatically, and syntax/semantic providers never launch a subprocess.
+### `.log` files
 
-The native **JVM Observations** table shows event source lines, epoch milliseconds, time gaps, timestamp/severity/category/message captures and the actual Java version/locale/timezone, following Java `Pattern.find()` capture order, non-overlapping groups, multiline final-message extension and SimpleDateFormat's default lenient, locale-aware parsing. Capture requires an owned project log no larger than 64 KiB/512 lines (4096 bytes per line). One bounded JVM child handles the whole snapshot: 64 MiB heap, 15-second deadline, cancellation, 256 KiB stdout / 8 KiB stderr limits; display cells are truncated to 512 UTF-16 code units. Helper source and a bounded input file live in plugin-private storage; input contents are cleared on every normal return or error (empty input-file metadata may remain until uninstall). The approved tool inherits the host's process environment. Missing/denied Java, unsupported versions, invalid patterns, timeouts and oversized output retain previous observations. Observation activation rechecks project ownership, the exact current source, version where available and stored pattern configuration before navigating; snapshots are memory-only. Helper source stays in plugin-private storage; no log text is persisted or sent to a service.
+The IDE's built-in **Log** file type owns `.log` by default. The plugin colours it, folds events and links stack frames.
 
-For a successfully captured built-in Log document, cached observations supply semantic timestamp, recognized error/warning severity and category tokens, with actual JVM time gaps driving the gap colour. A field is admitted only when it occurs exactly once in its original first physical line; repeated, multiline, potentially truncated and overlapping fields are withheld. Ranges use UTF16 coordinates. Cache use requires the same document path, full text, version, deepest project owner, warmed custom-format configuration and current `customPatterns` setting; file/settings/focus lifecycle events withdraw eligibility while retaining the observation table. Providers read neither files nor pattern storage and run no Java process. Stored format changes from another instance become visible after a configuration refresh or lifecycle event.
+Some colours don't show in the built-in **Log** editor yet. For full theme colours with your own rules, choose **Log (Ideolog)** as the file type. Commands, stack-frame links, custom patterns and **Mark time gaps (seconds)** work with both types.
 
-## Live Log Tail
+### Add your own log formats
 
-Open a saved project UTF-8 log and choose **Ideolog: Open Live Log Tail**, then press **Start** to review an approved Java 17+ file-following session. The panel shows complete raw lines, a case-insensitive literal text filter, inverse **Hide matches**, **Follow** scrolling and **Stop**; leaving or hiding the panel requests Stop, and **Ideolog: Stop Live Log Tail** stops a remaining session after a panel reload. Filtering is confined to the owned panel; it does not hide native editor lines.
+Run **Ideolog: Formats and Highlighting** to open the **Formats and Highlighting** tab. It has **Log Formats** and **Highlighting** sections.
 
-The Java helper uses secure directory-relative read handles with symlinks refused, begins within the final 64 KiB of the file and follows appends for at most 5 minutes / 1 MiB per explicitly started session. Each read is 4096 bytes; only complete UTF-8 lines up to 4096 bytes are admitted; the view retains at most 512 lines / 128 KiB. File identity changes and observed truncation reset the displayed generation; a missing replacement gets a 2-second rotation grace before stopping. Truncate-and-regrow between polls without changing identity or the retained prefix is not promised to be detected. The backend checks project ownership and unsaved-source state, bounds frames/output, rejects stale controller messages and stops its child on cancellation, source invalidation or plugin shutdown; the child self-expires even if the panel loses its controller. Source file contents are never written. Platforms without SecureDirectoryStream or usable file identity refuse the profile; no Windows live-tail profile is supplied.
+1. Click **Add Format** for a new format, or **Add Highlighting** for a colour rule.
+2. Fill in the form. For formats: name, event regex, event-start regex, timestamp format (empty means automatic) and 0-based timestamp/level/category columns (`-1` means none).
+3. Paste a sample event and click **Preview** to check the captures or colours.
+4. Click **Save**. Invalid input stays open with an explanation. **Cancel** discards the draft.
 
-## Editor features and source marks
+Select a row to **Edit**, **Enable / Disable Selected**, **Move Up**, **Move Down** or **Remove** it. Double-click opens **Edit**.
 
-The built-in **Log** language receives generic folding ranges for multiline events/stack traces; exact-source JVM observations can supply fold groups when the local parser cannot express a custom format. **Ideolog: Extend Log Selection** and the generic selection-range provider expand from a captured field through its physical line, event and document; UTF16 carets are validated and explicit selection changes recheck source version/text using the current editor API rather than file edits.
+Text fields commit on blur or Enter. Press Tab before **Preview** or **Save** after typing.
 
-**Ideolog: Mark Current Log Source** paints a bounded snapshot of the focused built-in Log file using native error/warning/time-gap theme decorations; **Clear Log Source Marks** clears them. The log must belong to an open project and `editor.read`/`project.read`/`events` must be granted. It examines at most the first complete 64 KiB/512 lines (4096-byte line limit) and 4096 spans. Marks are cleared by the next semantic request (including edits), observed events, explicit Clear or plugin shutdown; run Mark again to refresh. These snapshot hints do not fix the semantic renderer, filter or redact log text, or provide arbitrary custom colours.
+You can also paste `<LogParsingPattern …/>` and `<LogHighlightingPattern …/>` elements into **Custom log formats and highlighting** in Settings. They come from an Ideolog settings export or a [custom log formats file](https://github.com/JetBrains/ideolog/wiki/Custom-Log-Formats) (Laravel, Symfony, Serilog, Xdebug…). Patterns use Java-like regular expressions, lookaround included. Colours map to the nearest theme colour. `HIDE` patterns are ignored.
 
-## Not implemented
+Open logs pick up a change when you edit or reopen them.
 
-- Hiding, whitelisting or highlighting values and columns, and hiding lines above/below or containing a substring in the native editor (native line visibility/whitelist hooks are unavailable); the Live Log Tail panel supplies literal text filtering and inverse filtering only.
-- Native scrollbar stripe, error-stripe heat map and arbitrary font/background styling (API 1.4 source decorations expose no scrollbar heatmap contract).
-- Large-file editor, terminal and TextMate integrations.
-- Full Java `SimpleDateFormat` support, regex-aware editor widgets, full colour picking and background/bold/italic/stripe widgets in the pattern UI.
-- Storage compare-and-swap across plugin instances; private per-window pattern storage.
+### Highlight text you're looking for
+
+- Select text on one line, right-click and choose **Ideolog: Highlight Selection**. It becomes an escaped highlighting rule.
+- **Ideolog: Remove Custom Highlightings** deletes all of them after you confirm. The confirmation gives the count; custom log formats are kept.
+
+### Review a log as a table
+
+1. Focus a log and run **Ideolog: Capture Active Log Snapshot**.
+2. The **Log Snapshot** tab opens in the bottom panel. Each event is one row with line, level, timestamp, category and message.
+3. Use **Previous** / **Next Events** to page. Activate a row to open that event in the log.
+4. Pick a level button (**All**, **Errors**, **Warnings**, **Info**, **Debug**, **Trace**, each with its count) to list only those events.
+
+**Ideolog: Open Captured Log Snapshot** reopens the last snapshot. A snapshot doesn't update; capture again after the log changes.
+
+### Follow a growing log (Java)
+
+1. Open a saved UTF-8 log from your project.
+2. Run **Ideolog: Open Live Log Tail** and click **Start**. Confirm **Follow app.log?**; the status line then reads *Following app.log (stops in 5 min)*.
+3. New complete lines appear in the panel. Type in the filter to keep matching lines, or check **Hide matches** to hide them.
+4. **Follow** keeps the newest line in view. **Stop** ends the session.
+
+Leaving or hiding the panel stops the tail. **Ideolog: Stop Live Log Tail** stops a session left over after a panel reload. A session lasts at most 5 minutes or 1 MiB.
+
+### Test a Java-only pattern (Java)
+
+**Ideolog: Capture JVM Regex and Date Observations** runs your custom format with the real Java regex and `SimpleDateFormat`. Use it when a pattern needs Java features the built-in parser lacks.
+
+1. Focus a project log of up to 64 KiB / 512 lines.
+2. Run the command and pick a custom format. Optionally set a BCP47 locale and a Java time zone; empty means the JVM default.
+3. Review and approve. Results appear in the **JVM Observations** tab.
+
+The captured timestamps, levels and categories then also colour the built-in **Log** editor until the log or settings change.
+
+### Paint errors and gaps in the built-in Log editor
+
+**Ideolog: Mark Current Log Source** paints errors, warnings and time gaps in the focused built-in **Log** file with native theme decorations. **Ideolog: Clear Log Source Marks** removes them. Marks also disappear when you edit the file; run Mark again to refresh.
+
+## Commands
+
+Find them in Search Everywhere › Actions (⇧⇧) under **Ideolog**; bind keys in Settings › Keymap. **Jump to Source**, the **Go to** commands and **Highlight Selection** show only while a **Log** or **Log (Ideolog)** editor has focus.
+
+| Command | What it does | Shortcut |
+|---|---|---|
+| **Ideolog: Jump to Source** | Opens the stack frame or matching source line for the event at the caret. | F7 |
+| **Ideolog: Go to Next Error** | Moves to the next error event. | Shift+F7 |
+| **Ideolog: Go to Next Warning** | Moves to the next warning event. | none |
+| **Ideolog: Go to Next Exception** | Moves to the next event that names an exception or a Python traceback. | none |
+| **Ideolog: Go to Next Entry** | Moves to the next event. | none |
+| **Ideolog: Go to Previous Entry** | Moves to the previous event. | none |
+| **Ideolog: Extend Log Selection** | Grows the selection: field, line, event, document. | none |
+| **Ideolog: Formats and Highlighting** | Opens the **Formats and Highlighting** tab. | none |
+| **Ideolog: Highlight Selection** | Adds the selected text as a highlighting rule. Also in the editor context menu of log files. | none |
+| **Ideolog: Remove Custom Highlightings** | Asks for confirmation, then deletes all highlighting rules. Custom log formats are kept. | none |
+| **Ideolog: Capture Active Log Snapshot** | Captures the focused log into the **Log Snapshot** tab. Enabled in log editors. | none |
+| **Ideolog: Open Captured Log Snapshot** | Reopens the last snapshot. | none |
+| **Ideolog: Mark Current Log Source** | Paints errors, warnings and gaps in the built-in **Log** editor. Enabled only there. | none |
+| **Ideolog: Clear Log Source Marks** | Removes those marks. | none |
+| **Ideolog: Capture JVM Regex and Date Observations** | Runs a custom format with Java and shows the result. Enabled in log editors. | none |
+| **Ideolog: Open Live Log Tail** | Opens the live tail panel for the focused log. | none |
+| **Ideolog: Stop Live Log Tail** | Stops a running live tail. | none |
+
+## Settings
+
+Settings › Plugins › Ideolog.
+
+| Setting | Key | Default | What it changes |
+|---|---|---|---|
+| Custom log formats and highlighting | `customPatterns` | empty | Pasted Ideolog `<LogParsingPattern>` and `<LogHighlightingPattern>` XML. |
+| Mark time gaps (seconds) | `timeGapSeconds` | `0` (off) | Colours the time of an event after a pause this long. |
+
+Patterns made in the Formats and Highlighting tab are kept in plugin storage, not in this setting. They work without an open project.
+
+## Permissions
+
+Every permission is optional. Colouring works with none. Allow them in Settings › Plugins › Ideolog.
+
+| Permission | Used for | Without it |
+|---|---|---|
+| `editor.read` | Reading the log and caret for navigation, snapshots, marks, **Highlight Selection** and the **Log Levels** panel. | Those commands fail and the panel doesn't show. |
+| `project.read` | Opening source files, finding the source for **Jump to Source**, snapshots and marks. | Navigation and snapshots fail. |
+| `events` | Following the focused editor for the status bar item and refreshing marks and caches. | The status bar item doesn't update. |
+| `storage` | Saving patterns from the Formats and Highlighting tab. | You can't save patterns there; the Settings text still works. |
+| `process:java` | **Ideolog: Capture JVM Regex and Date Observations** and **Ideolog: Open Live Log Tail**. | Those two fail; everything else works. |
+
+## Troubleshooting
+
+See also the [repository guide](../../README.md#troubleshooting).
+
+| Problem | What to do |
+|---|---|
+| Custom colours don't show in a `.log` file | The built-in **Log** editor doesn't render every colour yet. Switch the file type to **Log (Ideolog)**. |
+| A new pattern doesn't apply to the open log | Edit or reopen the log. |
+| "No source line found for this event. Open the project that produced the log." | Open the project whose code wrote the log. |
+| F7 or Cmd+click does nothing on a stack frame | The log must be inside the open project. If two files match the frame equally well, nothing opens. |
+| "Not a log file." | Focus a file of type **Log** or **Log (Ideolog)**. |
+| "Select some text on one line to highlight." | **Highlight Selection** works on one line only. |
+| "Pattern not added: …" | Fix the reason shown, then try again. |
+| A change in the Formats and Highlighting tab won't save | Allow `storage`. If another window changed the patterns, reopen the view and edit again. |
+| "Focus a Log editor, then Capture Active Log Snapshot." | Click into the log editor first. |
+| "This log is … KiB; snapshots are limited to 256 KiB and 8192 lines. Use the log editor for larger files." | Read the log in the editor, or capture a smaller excerpt. |
+| "Click in this log first: the panel moves the caret of the focused editor." | Click in the log, then use the **Log Levels** buttons again. |
+| "Click in this log first: the snapshot captures the focused editor." | Click in the log, then **Filter in snapshot** again. |
+| Ideolog commands are missing from Search Everywhere | Navigation and **Highlight Selection** show only while a log editor has focus. |
+| The status bar says `(too large to highlight)` or `(first … lines highlighted)` | Colouring stops at the first very long line or after 512 KiB. The **Go to** commands and **Log Levels** buttons still search the whole log. |
+| "Snapshot source changed; capture again before following a row." | Run **Ideolog: Capture Active Log Snapshot** again. |
+| "Add or import a custom Ideolog LogParsingPattern first. …" | JVM capture needs a custom format. Add one in the Formats and Highlighting tab or Settings. |
+| "JVM observations support a nonempty log up to 64KiB/512 lines, each at most 4096 bytes." | Use a smaller log or an excerpt. |
+| "Live tail follows saved log files of this project…" | Save the log and make sure it is inside the open project. |
+| "Live tail stopped: the log has unsaved edits…" | Save or revert the log, then click **Start** again. |
+| "Stop the current live tail before starting another." | Click **Stop**, or run **Ideolog: Stop Live Log Tail**. |
+| "Live tail needs the process:java permission…" | Allow `process:java` in Settings › Plugins › Ideolog. Capture JVM Regex and Date Observations shows the same message. |
+| A timestamp format is rejected | Use the supported numeric fields listed in Technical details. Quote literal letters. |
+
+## Limitations
+
+- The native editor can't hide lines, whitelist lines, or highlight values and columns. The **Live Log Tail** panel has literal and inverse text filtering only.
+- No scrollbar stripe, error-stripe heat map, or custom font and background styles.
+- No large-file editor, terminal or TextMate integration.
+- Timestamp formats are a numeric subset, not full Java `SimpleDateFormat`.
+- The pattern forms have no regex-aware widgets, full colour picker, or background/bold/italic/stripe options.
+- Patterns are shared by all windows. Two windows editing at once can overwrite each other.
+- Live tail isn't available on Windows.
+
+## Technical details
+
+<details>
+<summary>Colours, limits, caching and safety checks</summary>
+
+### Colours and levels
+
+- Colours come from the theme's syntax colours (keyword, tag, string, number…), which approximate red, orange and green in the default schemes. Warnings and marked time gaps use `enum-member` because LSP semantic tokens have no `tag` or `constant` kind.
+- Syslog levels come from keywords.
+- Debug and trace keep the editor colour, and the structure view lists only errors and warnings; the **Log Levels** panel counts every level.
+- Numeric custom-level identifiers stay intact: `error2` is unclassified rather than normalized to `ERROR`.
+
+### Time gaps
+
+Zones are ignored. Supported ISO `Z`, `±HH:MM` and `±HHMM` offsets are normalized, so changing time-zone spelling alone can't create or hide a gap. Malformed offset suffixes yield no parsed time. Naive timestamps keep an assumed common local scale.
+
+### Navigation
+
+- Navigation needs the log inside the open project (the IDE only opens project files for plugins) and requires the editor owner and invoking project to match.
+- Command and definition positions need an exact UTF-16-to-byte-to-UTF-16 roundtrip, so surrogate-interior or out-of-document carets can't silently select byte zero.
+- Jump to Source scans up to 5,000 source files, as there is no index to query. It excludes files owned by another open project, including nested project roots. Equal best message/file ranks return no source jump instead of choosing the first file.
+- Stack-frame definitions need an owned Log document (512 KiB maximum), parse at most 8 KiB per frame line, keep at most 32 frame observations and refuse zero or overflowing line numbers.
+- File-name lookup is a suffix heuristic. Only a unique highest suffix score in an uncapped, project-owned regular-file candidate set is navigable; ambiguity returns no definition.
+
+### Built-in Log editor overlay
+
+- The API 1.3 semantic provider returns Ideolog's event, field and match tokens for the built-in Log editor, including captured timestamps, levels, messages and stack-trace continuation lines. Uncoloured entries keep the editor's existing styling.
+- On v0.1.39 the built-in editor doesn't render the keyword/string/number/comment semantic kinds used by many rules. Built-in log colours alone aren't evidence that custom rules rendered.
+- The overlay processes at most the first 64 KiB / 512 complete lines, stops before any line longer than 4096 bytes, and returns at most 4096 single-line UTF-16 tokens.
+- It checks a 15 ms cooperative deadline during format attempts, physical-line grouping and lazy event parsing. Individual regex calls and rule passes can't be preempted.
+- The newline search is bounded to a UTF-8-safe 64 KiB prefix before splitting lines. A prefix ending inside a line or Unicode scalar doesn't feed that partial line to format detection.
+- A 512 KiB cutoff containing no complete line returns no custom syntax events, folds or outline entries; complete final document lines stay supported.
+- Configuration is warmed outside the semantic request during activation, log focus/open and explicit pattern/capture work. Cold requests return no tokens, and external settings changes apply after that out-of-provider refresh.
+- Providers do no project discovery, file reads, pattern-storage reads or network requests. The custom `ideolog` language keeps its own lexical highlighting, folding and outline path (512 KiB limit).
+
+### Formats and Highlighting tab
+
+- Format UUIDs stay internal identities. Duplicate display names are disambiguated. Controls revalidate the rendered storage/layout before mutation.
+- Highlighting rules have a line/field/captured-match action, an optional column/format restriction (named format selector with Any log format; unknown imported restrictions stay labelled unavailable) and named colour choices.
+- Preview works even when the draft's Enabled checkbox is off. Sample text stays in the draft and is never written to pattern storage. The sample has exactly two input paths: the bundled Example initializer and the explicit manual Sample field.
+- **Save** validates regex syntax, capture-column bounds, actions and colour values. Editing preserves the UUID and other exported attributes, including `timePattern` and `fullmatch`.
+- A changed storage snapshot blocks Save so another window's intervening edit is preserved. The SDK has no storage compare-and-swap, so this can't make concurrent writes atomic across instances. Draft fields carry a fresh edit-session identity; controls kept by another window after Cancel/reopen are rejected.
+- Bounds: regex/attribute values 4096 bytes, format names 128 bytes, samples 8192 bytes with 4096-byte lines, saved storage 128 entries / 128 KiB. Samples use a bounded backtracking precheck; regex compilation and the parser aren't preemptible.
+- Legacy pasted XML in `customPatterns` stays supported alongside the form.
+- **Highlight Selection** doesn't import the text into the draft sample. Successful changes refresh only the Formats and Highlighting tab, and only when persistent pattern text actually changes. Cancelled, failed or no-op commands emit no false change. Notifications contain no definition or sample payload.
+
+### Timestamp formats
+
+- Supported: fixed numeric `yyyy`, `MM`, `dd`, `HH` (or `hh` with `a`), `mm`, `ss`, `SSS`, quoted literals and `Z`/`X`/`XX`/`XXX` offsets. A pattern needs hour, minute and second fields. Absent or empty keeps automatic parsing.
+- `hh:mm:ss a` accepts case-insensitive ASCII `AM`/`PM` markers. Midnight, noon and time gaps use the same normalized scale as 24-hour formats. Ambiguous `hh` without `a`, `HH` with `a`, invalid twelve-hour values and extra text are rejected.
+- Single-letter `M`, `d`, `H`, `h`, `m`, `s` accept one or two digits. `k`/`kk` accepts 1–24 (24 means midnight). `K`/`KK` accepts 0–11 with `a`. `S` reads one to three millisecond digits; `SS`/`SSS` exactly two and three (millisecond numbers, not decimal fractions). Variable-width adjacent numeric fields are rejected unless separated.
+- `z` through `zzzz` accepts UTC, GMT and `GMT+02:00`-form offsets; region names aren't guessed. RFC822 `Z` through `ZZZ` keeps numeric `+0200` spelling.
+- Unsupported tokens such as locale month/day names are rejected for new edits. Imported unsupported formats stay readable but produce configuration errors and no computed gap.
+- Preview confirms whether the sample timestamp matches the format. The same parser drives the real time-gap calculation.
+
+### Log Snapshot
+
+- Capturing needs `editor.read`/`project.read` and an existing file in the invoking owning project. No outside-project grant, process or network is used. Rendering never rereads the source or starts capture.
+- The snapshot reuses current format detection, event grouping, timestamp/category extraction and level classification. Literal captured levels such as INFO/DEBUG/custom names are kept; otherwise the level is Error/Warning/Info/Debug/Trace/Unclassified. The level filter counts and pages the kept events only.
+- Messages are limited to 512 characters, timestamp and category to 128 each. Multiline events stay one row. Row navigation is separate from Jump to Source and doesn't invent resolved source links.
+- Viewport requests page at most 100 rows (default 50), keeping position across tab switches. Row activation is restricted to the issued page and revalidates the current project and source text before opening.
+- A capture accepts at most 256 KiB of current text and 8192 physical lines, keeps the first 2048 parsed events, and reports kept versus parsed count, source version, age and format. Oversized files or buffers are refused, not presented as complete.
+- Discard releases the snapshot. Project switches don't expose another root's snapshot.
+- Capture has a cancellable native task and a cooperative two-second parse deadline, with cancellation checkpoints between format-detection regex attempts and before every physical line during grouping. Cancellation returns no partial snapshot and earlier snapshots stay intact, but a single synchronous regex or read call can't be interrupted.
+- This is snapshot paging, not byte-offset streaming, file tailing, appended-record following, rotation handling or durable background viewing. Pattern changes apply on the next capture; kept rows keep their capture-time parsing.
+
+### JVM observations
+
+- It runs an approved Java 17+ executable (`adapters/IdeologProbe.java`) for an explicitly selected custom `LogParsingPattern`, including raw imported patterns from `customPatterns` with Java regex constructs and `SimpleDateFormat` fields the local parser doesn't support.
+- The review names the source, format, regex, date pattern, scope and local tool. No Java tool or application is installed or bootstrapped automatically. Syntax and semantic providers never launch a subprocess.
+- The table shows event source lines, epoch milliseconds, time gaps, timestamp/severity/category/message captures and the actual Java version, locale and time zone. It follows Java `Pattern.find()` capture order, non-overlapping groups, multiline final-message extension and `SimpleDateFormat`'s default lenient, locale-aware parsing.
+- Lines are limited to 4096 bytes. One bounded JVM child handles the whole snapshot: 64 MiB heap, 15-second deadline, cancellation, 256 KiB stdout / 8 KiB stderr. Display cells are truncated to 512 UTF-16 code units.
+- Helper source and a bounded input file live in plugin-private storage. Input contents are cleared on every normal return or error (empty input-file metadata may remain until uninstall). The approved tool inherits the host's process environment.
+- Missing or denied Java, unsupported versions, invalid patterns, timeouts and oversized output keep the previous observations. Activation rechecks project ownership, the exact current source, version where available and stored pattern configuration before navigating. Snapshots are memory-only. No log text is persisted or sent to a service.
+- For a captured built-in Log document, cached observations supply semantic timestamp, recognized error/warning severity and category tokens, with real JVM time gaps driving the gap colour. A field is admitted only when it occurs exactly once in its original first physical line; repeated, multiline, possibly truncated and overlapping fields are withheld. Ranges use UTF-16 coordinates.
+- Cache use requires the same document path, full text, version, deepest project owner, warmed custom-format configuration and current `customPatterns` setting. File, settings and focus events withdraw eligibility while keeping the table. Providers read neither files nor pattern storage and run no Java process. Stored format changes from another instance show after a configuration refresh or lifecycle event.
+- Exact-source JVM observations can supply fold groups when the local parser can't express a custom format.
+
+### Live Log Tail
+
+- The Java helper (`adapters/IdeologTail.java`) uses secure directory-relative read handles and refuses symlinks. It starts within the last 64 KiB of the file and follows appends for at most 5 minutes / 1 MiB per explicitly started session.
+- Each read is 4096 bytes. Only complete UTF-8 lines up to 4096 bytes are admitted. The view keeps at most 512 lines / 128 KiB. Filtering is case-insensitive and literal, and confined to the panel; it doesn't hide native editor lines.
+- File identity changes and observed truncation reset the displayed generation. A missing replacement gets a 2-second rotation grace before stopping. Truncate-and-regrow between polls without changing identity or the kept prefix isn't guaranteed to be detected.
+- The backend checks project ownership and unsaved-source state, bounds frames and output, rejects stale controller messages and stops its child on cancellation, source invalidation or plugin shutdown. The child self-expires even if the panel loses its controller. Source file contents are never written.
+- Platforms without `SecureDirectoryStream` or usable file identity refuse the profile; no Windows profile is supplied.
+
+### Folding, selection and marks
+
+- The built-in **Log** language gets generic folding ranges for multiline events and stack traces.
+- **Extend Log Selection** and the selection-range provider validate UTF-16 carets. Explicit selection changes recheck source version and text using the current editor API rather than file edits.
+- **Mark Current Log Source** needs the log in an open project and `editor.read`/`project.read`/`events`. It examines at most the first complete 64 KiB / 512 lines (4096-byte line limit) and 4096 spans. Marks are cleared by the next semantic request (including edits), observed events, explicit Clear or plugin shutdown.
+- Marks don't fix the semantic renderer, filter or redact log text, or provide arbitrary custom colours. API 1.4 source decorations expose no scrollbar heat-map contract.
+
+</details>
 
 ## Development
 
-```sh
-cargo test
-openidea-plugin build
-openidea-plugin link
-```
+    cargo test
+    openidea-plugin build
+    openidea-plugin link

@@ -452,6 +452,36 @@ pub fn compose_references(text:&str)->(Vec<(String,Range<usize>)>,Option<(String
     }
     (files,service)
 }
+/// Literal `dockerComposeFile` entries, `build.dockerfile` and legacy `dockerFile`, each with its own string's range.
+pub fn file_references(text:&str)->Vec<(String,Range<usize>)> {
+    let bytes=text.as_bytes();
+    let start=skip_trivia(bytes,if bytes.starts_with(b"\xEF\xBB\xBF"){3}else{0});
+    let literal=|r:Range<usize>|serde_json::from_str::<String>(&text[r.clone()]).ok().filter(|s|!s.is_empty()&&!s.contains('$')).map(|s|(s,r));
+    let mut found=vec![];
+    for member in members(bytes,start) {
+        match member.key.as_str() {
+            "dockerComposeFile" if bytes[member.value_range.start]==b'['=>found.extend(elements(bytes,member.value_range.start).into_iter().filter_map(literal)),
+            "dockerComposeFile"|"dockerFile"=>found.extend(literal(member.value_range)),
+            "build"=>found.extend(members(bytes,member.value_range.start).into_iter().filter(|m|m.key=="dockerfile").filter_map(|m|literal(m.value_range))),
+            _=>{}
+        }
+    }
+    found
+}
+/// The value ranges of the array starting at `at`; stops quietly at anything malformed.
+fn elements(bytes:&[u8],at:usize)->Vec<Range<usize>> {
+    let mut found=vec![];
+    let mut i=at+1;
+    loop {
+        i=skip_trivia(bytes,i);
+        if i>=bytes.len()||matches!(bytes[i],b']'|b','|b'}'){return found;}
+        let end=value_end(bytes,i);
+        found.push(i..end);
+        i=skip_trivia(bytes,end);
+        if bytes.get(i)!=Some(&b','){return found;}
+        i+=1;
+    }
+}
 fn check_port_values(text:&str,start:usize,findings:&mut Vec<Finding>) {
     for member in members(text.as_bytes(),start) {
         let Ok(value)=serde_json::from_str::<serde_json::Value>(&text[member.value_range.clone()])else{continue;};
@@ -632,7 +662,8 @@ fn members(bytes: &[u8], at: usize) -> Vec<Member> {
         if key_end < i + 2 || bytes[key_end - 1] != b'"' {
             return found;
         }
-        let key = String::from_utf8_lossy(&bytes[i + 1..key_end - 1]).into_owned();
+        let raw = String::from_utf8_lossy(&bytes[i..key_end]);
+        let key = serde_json::from_str::<String>(&raw).unwrap_or_else(|_| raw[1..raw.len() - 1].to_owned());
         let key_range = i..key_end;
 
         i = skip_trivia(bytes, key_end);

@@ -414,6 +414,18 @@ pub(crate) fn resolve(ctx: &Invocation, raw: &str) -> Result<String, Error> {
     }
     Ok(candidate.command)
 }
+/// The console command class open in the editor, for the command run from the palette.
+pub(crate) fn editor_target(ctx: &Invocation) -> Option<String> {
+    let path = ctx.editor()?.path();
+    let project = ctx.project()?;
+    let doc = Document {
+        path: path.clone(),
+        language: "php".into(),
+        version: 0,
+        text: project.read_file(&path).ok()?,
+    };
+    Some(target(&doc, &candidate(&doc.text)?))
+}
 
 #[cfg(test)]
 mod tests {

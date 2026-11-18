@@ -16,7 +16,7 @@ pub(crate) fn run(ctx: &Invocation) -> Result<Option<String>, Error> {
         return Err(Error::Invalid("Select an OpenAPI document.".into()));
     }
     let proof = pointer_status::Proof::parse(&document.text)
-        .ok_or("Component ownership is unknown in this document.")?;
+        .ok_or("Couldn't read this document as an OpenAPI spec. Fix syntax errors and try again.")?;
     let at = offset(&document.text, caret).ok_or(Error::Stale)?;
     let occurrences = proof
         .component_occurrences(at)
@@ -59,17 +59,17 @@ pub(crate) fn project_usages(ctx: &Invocation) -> Result<Option<String>, Error> 
     let doc = editor.document()?; let path = editor.path();
     let root = comparison_owner(ctx, &path)?;
     let project = ctx.project().ok_or(Error::Stale)?;
-    let proof = pointer_status::Proof::parse(&doc.text).ok_or("Current source ownership is unknown.")?;
+    let proof = pointer_status::Proof::parse(&doc.text).ok_or("Couldn't read this document as an OpenAPI spec. Fix syntax errors and try again.")?;
     let caret = editor.selections()?.first().map(|range| range.start).ok_or(Error::Stale)?;
     let at = offset(&doc.text, caret).ok_or(Error::Stale)?;
     let reference = proof.navigation_ref_at(at).map(|reference| reference.target)
-        .or_else(|| proof.copy_pointer_at(at)).ok_or("Select a component declaration or physical reference.")?;
+        .or_else(|| proof.copy_pointer_at(at)).ok_or("Put the caret on a component declaration or reference.")?;
     let (file, pointer) = reference.split_once('#').ok_or("Select a supported component pointer.")?;
-    let target = physical_target(&path, file).ok_or("Remote and encoded references are not part of physical project usages.")?;
+    let target = physical_target(&path, file).ok_or("Remote and encoded references have no usages in project.")?;
     if comparison_owner(ctx, &target)? != root { return Err(Error::Stale); }
     let target_text = project.read_file(&target)?;
-    let target_proof = pointer_status::Proof::parse(&target_text).ok_or("Target source ownership is unknown.")?;
-    let base = target_proof.component_base(pointer).ok_or("Target component identity is unknown.")?;
+    let target_proof = pointer_status::Proof::parse(&target_text).ok_or("Couldn't read the file this $ref points to as an OpenAPI spec.")?;
+    let base = target_proof.component_base(pointer).ok_or("This $ref doesn't point to a component.")?;
     let declaration = target_proof.pointer_location(&base).ok_or(Error::Stale)?;
     let mut locations = vec![(target.clone(), declaration, std::sync::Arc::new(target_text.clone()), "Component declaration")];
     let mut files = std::collections::BTreeSet::new(); files.insert(path.clone()); files.insert(target.clone());
@@ -93,11 +93,11 @@ pub(crate) fn project_usages(ctx: &Invocation) -> Result<Option<String>, Error> 
             if physical_target(&file, relative).as_deref() != Some(target.as_str()) { continue; }
             if pointer != base && !pointer.starts_with(&format!("{base}/")) {continue;}
             locations.push((file.clone(), spring_text::range(&text, reference.at, reference.end), text.clone(), "$ref"));
-            if locations.len() > 512 {return Err("More than512 component usages; narrow the project before navigating.".into());}
+            if locations.len() > 512 {return Err("More than 512 component usages; narrow the project before navigating.".into());}
         }
     }
     let items: Vec<_> = locations.iter().enumerate().map(|(i,(path,range,_,kind))| PickItem::new(&i.to_string(), &format!("{kind} · {}:{}", path.strip_prefix(&format!("{root}/")).unwrap_or(path), range.start.line+1))).collect();
-    let title = if partial == 0 { "OpenAPI physical component usages in project".into() } else {format!("OpenAPI component usages — partial ({partial} unreadable, unsupported or limited sources)")};
+    let title = if partial == 0 { "OpenAPI component usages in project".into() } else {format!("OpenAPI component usages — partial ({partial} unreadable, unsupported or limited sources)")};
     let Some(choice) = host::pick(&title, &items)? else {return Ok(None);};
     let (selected, range, before, _) = locations.get(choice.parse::<usize>().map_err(|_|Error::Stale)?).ok_or(Error::Stale)?;
     let current = ctx.editor().ok_or(Error::Stale)?; let fresh = current.document()?;

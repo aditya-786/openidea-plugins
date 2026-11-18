@@ -13,13 +13,14 @@ pub fn toggle(ctx: &Invocation) -> Result<Option<String>, Error> {
             "The current editor is not a Twig template.".into(),
         ));
     }
-    let current = editor.document()?;
+    let denied = |e: Error| ui_kit::denied::map(e, "Toggle Comment", "editor.read", "Twig");
+    let current = editor.document().map_err(denied)?;
     if current.text.len() > 128 << 10 {
         return Err(Error::Invalid(
             "Twig comment toggle is limited to 128 KiB documents.".into(),
         ));
     }
-    let selections = editor.selections()?;
+    let selections = editor.selections().map_err(denied)?;
     if selections.len() != 1 {
         return Err(Error::Invalid(
             "Select one Twig range or place a single caret on a line.".into(),
@@ -87,7 +88,8 @@ pub fn toggle(ctx: &Invocation) -> Result<Option<String>, Error> {
             range: EditorRange::new(position(&current.text, start), position(&current.text, end)),
             text: replacement,
         }],
-    )?;
+    )
+    .map_err(|e| ui_kit::denied::map(e, "Toggle Comment", "editor.write", "Twig"))?;
     editor.set_selections(&[EditorRange::new(
         position(&after, start + inner_start),
         position(&after, start + inner_start + inner_len),
@@ -108,6 +110,16 @@ mod tests {
         assert_eq!(host.editor_text(), "<# 😀 text #>\r\nnext");
         toggle(&host.invocation()).unwrap();
         assert_eq!(host.editor_text(), "😀 text\r\nnext");
+    }
+    #[test]
+    fn denied_editor_access_names_the_permission() {
+        let host = MockHost::install().with_capabilities(&[]);
+        host.open_editor("/p/a.twig", "twig", "text", &[(0, 1, 0, 1)]);
+        let err = toggle(&host.invocation()).unwrap_err();
+        assert!(matches!(err, Error::Invalid(m) if m.contains("editor.read permission") && m.contains("Plugins › Twig")));
+        let host = host.with_capabilities(&["editor.read"]);
+        let err = toggle(&host.invocation()).unwrap_err();
+        assert!(matches!(err, Error::Invalid(m) if m.contains("editor.write permission")));
     }
     #[test]
     fn incomplete_nested_and_raw_comment_contexts_are_refused_without_edits() {

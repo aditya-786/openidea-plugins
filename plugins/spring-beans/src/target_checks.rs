@@ -110,7 +110,7 @@ pub fn lifecycle_methods(file: &JavaFile, ty: &TypeDecl, world: &World, out: &mu
         let (Some(bean), Some(returned)) = (spring(file, &method.annotations, "Bean"), method.ty.as_ref()) else { continue };
         let Some(chain) = world.member_chain(&returned.name, None) else { continue };
         // Spring looks the method up on the created object, so a subtype may define it.
-        let subtyped = world.files.values().flat_map(|m| &m.types).any(|t| t.supers.contains(&returned.name));
+        let subtyped = world.has_subtypes(&returned.name);
         if chain[0].is_abstract || subtyped {
             continue;
         }
@@ -166,7 +166,8 @@ pub fn spring_meta_findings(path: &str, text: &str, world: &World) -> Vec<Findin
             continue;
         }
         if handlers {
-            let ours = world.files.values().flat_map(|m| &m.types).any(|t| root_of(&t.qualified) == root_of(value));
+            let root = root_of(value);
+            let ours = world.declares(&root) || root.contains('.') && world.declares_under(&format!("{root}."));
             if ours && world.project_type(&value.replace('$', ".")).is_none() {
                 out.push(Finding::new(key.value_at, key.value_end, "spring-handler-class-missing", format!("No class {value} in the project's sources.")));
             }

@@ -1,0 +1,16 @@
+{
+  "runtime-snapshot": [
+    {
+      "id": "selected-row",
+      "label": "Selected Row",
+      "icon": "run",
+      "items": [
+        "snapshot-related-beans",
+        "snapshot-open-browser",
+        "snapshot-send-request",
+        "snapshot-create-request",
+        "snapshot-copy-request"
+      ]
+    }
+  ]
+}

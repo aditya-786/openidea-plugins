@@ -267,8 +267,8 @@ fn bind_param(
     let find = |names: &[&str]| param.annotations.iter().find(|a| names.contains(&a.name.as_str()));
     let explicit = |a: &Annotation| -> Result<String, String> {
         match style {
-            Style::JaxRs => single(a, &["value"]).map_err(|_| "has a non-literal name; skipped".to_owned())?.ok_or_else(|| "has no name; skipped".to_owned()),
-            _ => Ok(single(a, &["value", "name"]).map_err(|_| "has a non-literal name; skipped".to_owned())?.unwrap_or_else(|| param.name.clone())),
+            Style::JaxRs => single(a, &["value"]).map_err(|_| "has a computed name; skipped".to_owned())?.ok_or_else(|| "has no name; skipped".to_owned()),
+            _ => Ok(single(a, &["value", "name"]).map_err(|_| "has a computed name; skipped".to_owned())?.unwrap_or_else(|| param.name.clone())),
         }
     };
     if let Some(a) = find(path_names) {
@@ -367,7 +367,7 @@ fn spring(cx: &mut Cx, ops: &mut Vec<Op>, class: &TypeDecl, location: &str) {
         Some(Ok(p)) if p.is_empty() => vec![String::new()],
         Some(Ok(p)) => p,
         Some(Err(())) => {
-            cx.notes.push(format!("{location}: {}: non-literal class path; controller skipped.", class.name));
+            cx.notes.push(format!("{location}: {}: computed class path; controller skipped.", class.name));
             return;
         }
     };
@@ -384,7 +384,7 @@ fn spring(cx: &mut Cx, ops: &mut Vec<Op>, class: &TypeDecl, location: &str) {
                         m.text.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| JAXRS_VERBS.contains(w)).map(|w| w.to_lowercase()).collect()
                     }).unwrap_or_default();
                     if named.len() != 1 {
-                        cx.notes.push(format!("{location}: {}.{}: @RequestMapping without exactly one literal method; skipped.", class.name, method.name));
+                        cx.notes.push(format!("{location}: {}.{}: @RequestMapping without exactly one fixed method; skipped.", class.name, method.name));
                         continue;
                     }
                     named.into_iter().collect()
@@ -395,7 +395,7 @@ fn spring(cx: &mut Cx, ops: &mut Vec<Op>, class: &TypeDecl, location: &str) {
                 Ok(p) if p.is_empty() => vec![String::new()],
                 Ok(p) => p,
                 Err(()) => {
-                    cx.notes.push(format!("{location}: {}.{}: non-literal path; skipped.", class.name, method.name));
+                    cx.notes.push(format!("{location}: {}.{}: computed path; skipped.", class.name, method.name));
                     continue;
                 }
             };
@@ -412,7 +412,7 @@ fn micronaut(cx: &mut Cx, ops: &mut Vec<Op>, class: &TypeDecl, location: &str) {
         Ok(p) if p.is_empty() => vec![String::new()],
         Ok(p) => p,
         Err(()) => {
-            cx.notes.push(format!("{location}: {}: non-literal controller path; skipped.", class.name));
+            cx.notes.push(format!("{location}: {}: computed controller path; skipped.", class.name));
             return;
         }
     };
@@ -426,7 +426,7 @@ fn micronaut(cx: &mut Cx, ops: &mut Vec<Op>, class: &TypeDecl, location: &str) {
                 Ok(p) if p.is_empty() => vec![String::new()],
                 Ok(p) => p,
                 Err(()) => {
-                    cx.notes.push(format!("{location}: {}.{}: non-literal path; skipped.", class.name, method.name));
+                    cx.notes.push(format!("{location}: {}.{}: computed path; skipped.", class.name, method.name));
                     continue;
                 }
             };
@@ -440,7 +440,7 @@ fn jaxrs(cx: &mut Cx, ops: &mut Vec<Op>, class: &TypeDecl, location: &str) {
     let prefixes = match literals(class_path, &["value"]) {
         Ok(p) if p.len() == 1 => p,
         _ => {
-            cx.notes.push(format!("{location}: {}: non-literal @Path; skipped.", class.name));
+            cx.notes.push(format!("{location}: {}: computed @Path; skipped.", class.name));
             return;
         }
     };
@@ -450,7 +450,7 @@ fn jaxrs(cx: &mut Cx, ops: &mut Vec<Op>, class: &TypeDecl, location: &str) {
             None => vec![String::new()],
             Some(Ok(p)) if p.len() == 1 => p,
             _ => {
-                cx.notes.push(format!("{location}: {}.{}: non-literal @Path; skipped.", class.name, method.name));
+                cx.notes.push(format!("{location}: {}.{}: computed @Path; skipped.", class.name, method.name));
                 continue;
             }
         };
@@ -550,7 +550,7 @@ pub fn generate(files: &[(String, String)]) -> Draft {
     paths.retain(|_, item| !item.is_empty());
 
     let mut yaml = String::from(
-        "# Draft generated from source mappings. Review before use: only literal paths and parameter names are read;\n\
+        "# Draft generated from source mappings. Review before use: only paths and parameter names written as plain strings are read;\n\
          # DTO properties are field names (Jackson annotations and naming strategies are not applied); response bodies are not inferred.\n\
          openapi: \"3.0.3\"\ninfo:\n  title: \"Draft API\"\n  version: \"0.1.0\"\n",
     );
@@ -680,7 +680,7 @@ record CreateUser(String name, int age, List<String> tags) {}
         assert!(d.yaml.contains("\"age\":"));
         assert!(d.yaml.contains("TODO: the shape of Mystery"));
         let notes = d.skipped.join("\n");
-        assert!(notes.contains("non-literal path"));
+        assert!(notes.contains("computed path"));
         assert!(notes.contains("ant pattern"));
         assert!(notes.contains("regex path variable"));
         assert!(notes.contains("@RequestMapping without exactly one"));

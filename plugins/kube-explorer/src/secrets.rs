@@ -51,98 +51,52 @@ pub fn display(bytes: &[u8]) -> String {
     }
 }
 
-struct Json<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl Json<'_> {
-    fn peek(&mut self) -> Option<u8> {
-        while self.bytes.get(self.at).is_some_and(u8::is_ascii_whitespace) {
-            self.at += 1;
-        }
-        self.bytes.get(self.at).copied()
-    }
-
-    fn eat(&mut self, c: u8) -> Result<(), String> {
-        if self.peek() != Some(c) {
-            return Err(format!("unexpected JSON at byte {}", self.at));
-        }
-        self.at += 1;
-        Ok(())
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.eat(b'"')?;
-        let mut out = Vec::new();
-        loop {
-            let c = *self.bytes.get(self.at).ok_or("unterminated JSON string")?;
-            self.at += 1;
-            match c {
-                b'"' => return Ok(String::from_utf8_lossy(&out).into_owned()),
-                b'\\' => {
-                    let e = *self.bytes.get(self.at).ok_or("unterminated JSON string")?;
-                    self.at += 1;
-                    match e {
-                        b'n' => out.push(b'\n'),
-                        b't' => out.push(b'\t'),
-                        b'r' => out.push(b'\r'),
-                        b'b' => out.push(8),
-                        b'f' => out.push(12),
-                        b'u' => {
-                            let hex = self.bytes.get(self.at..self.at + 4).and_then(|h| std::str::from_utf8(h).ok());
-                            let code = hex.and_then(|h| u32::from_str_radix(h, 16).ok());
-                            self.at += 4;
-                            let ch = code.and_then(char::from_u32).unwrap_or('\u{fffd}');
-                            out.extend(ch.to_string().bytes());
-                        }
-                        other => out.push(other),
-                    }
-                }
-                other => out.push(other),
-            }
-        }
-    }
-
-    fn skip(&mut self) -> Result<(), String> {
-        match self.peek() {
-            Some(b'"') => self.string().map(drop),
-            Some(open @ (b'{' | b'[')) => {
-                let close = if open == b'{' { b'}' } else { b']' };
-                self.at += 1;
-                while self.peek() != Some(close) {
-                    if open == b'{' {
-                        self.string()?;
-                        self.eat(b':')?;
-                    }
-                    self.skip()?;
-                    if self.peek() == Some(b',') {
-                        self.at += 1;
-                    }
-                }
-                self.at += 1;
-                Ok(())
-            }
-            Some(_) => {
-                let start = self.at;
-                while self.bytes.get(self.at).is_some_and(|c| !b",}] \n\r\t".contains(c)) {
-                    self.at += 1;
-                }
-                if self.at == start {
-                    return Err(format!("unexpected JSON at byte {start}"));
-                }
-                Ok(())
-            }
-            None => Err("truncated JSON".into()),
-        }
-    }
-}
-
-/// Bound and validate before the order-preserving span parser sees input.
+/// Bound and validate the Secret JSON; with `preserve_order` its members keep the order kubectl printed.
 /// serde_json's default recursion bound prevents unbounded unknown-field descent.
+/// JSON naming no key twice in any object; `serde_json::Value` would silently keep only the last.
+struct NoDuplicateKeys;
+
+impl<'de> serde::Deserialize<'de> for NoDuplicateKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(NoDuplicateKeys)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for NoDuplicateKeys {
+    type Value = Self;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON without duplicate keys")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self, E> { Ok(self) }
+    fn visit_i64<E>(self, _: i64) -> Result<Self, E> { Ok(self) }
+    fn visit_u64<E>(self, _: u64) -> Result<Self, E> { Ok(self) }
+    fn visit_f64<E>(self, _: f64) -> Result<Self, E> { Ok(self) }
+    fn visit_str<E>(self, _: &str) -> Result<Self, E> { Ok(self) }
+    fn visit_unit<E>(self) -> Result<Self, E> { Ok(self) }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self, A::Error> {
+        while seq.next_element::<Self>()?.is_some() {}
+        Ok(self)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key) {
+                return Err(serde::de::Error::custom("duplicate key"));
+            }
+            map.next_value::<Self>()?;
+        }
+        Ok(self)
+    }
+}
+
 fn validate_object(json:&str)->Result<serde_json::Value,String> {
     if json.len()>2<<20 {return Err("Secret JSON exceeds the 2 MiB read bound".into());}
     let value:serde_json::Value=serde_json::from_str(json).map_err(|_|"Malformed or excessively nested Secret JSON".to_owned())?;
+    serde_json::from_str::<NoDuplicateKeys>(json).map_err(|_|"Secret JSON names a key twice".to_owned())?;
     let object=value.as_object().ok_or("The Secret is not a JSON object")?;
     if let Some(data)=object.get("data").filter(|v|!v.is_null()) {
         let data=data.as_object().ok_or("Secret data is not a JSON object")?;
@@ -168,37 +122,16 @@ pub(crate) fn validate_response(json:&str,name:&str,namespace:Option<&str>,editi
 
 /// The decoded top-level `data` of a Secret, in the order kubectl printed it.
 pub fn data_entries(json: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
-    validate_object(json)?;
-    let mut seen_data=false;
-    let mut p = Json { bytes: json.as_bytes(), at: 0 };
-    let mut entries = Vec::new();
-    p.eat(b'{')?;
-    while p.peek() != Some(b'}') {
-        let key = p.string()?;
-        p.eat(b':')?;
-        if key=="data" {if seen_data {return Err("Secret JSON repeats its data member".into());}seen_data=true;}
-        if key != "data" || p.peek() != Some(b'{') {
-            p.skip()?;
-        } else {
-            p.eat(b'{')?;
-            while p.peek() != Some(b'}') {
-                let name = p.string()?;
-                p.eat(b':')?;
-                if !valid_key(&name)||entries.len()>=4096||entries.iter().any(|(key,_)|key==&name) {return Err("Secret data has unsupported or repeated keys".into());}
-                let value = p.string()?;
-                let bytes = b64_decode(&value).ok_or_else(|| "Secret data contains invalid base64".to_owned())?;
-                entries.push((name, bytes));
-                if p.peek() == Some(b',') {
-                    p.at += 1;
-                }
-            }
-            p.at += 1;
-        }
-        if p.peek() == Some(b',') {
-            p.at += 1;
-        }
-    }
-    Ok(entries)
+    let value = validate_object(json)?;
+    let Some(data) = value["data"].as_object() else {
+        return Ok(Vec::new());
+    };
+    data.iter()
+        .map(|(name, encoded)| {
+            let bytes = b64_decode(encoded.as_str().unwrap_or_default()).ok_or_else(|| "Secret data contains invalid base64".to_owned())?;
+            Ok((name.clone(), bytes))
+        })
+        .collect()
 }
 
 /// A DNS subdomain: what Kubernetes accepts as a Secret name.
@@ -248,38 +181,21 @@ pub(crate) fn command_error(operation:&str,error:Error)->Error {
     match error {Error::Stale=>Error::Stale,Error::Cancelled=>Error::Cancelled,Error::Denied(_)=>Error::Denied("process:kubectl".into()),_=>command_failure(operation,None)}
 }
 
-/// Byte span of the value of a top-level member of a JSON object.
-fn member_span(json: &str, name: &str) -> Result<Option<(usize, usize)>, String> {
-    let mut p = Json { bytes: json.as_bytes(), at: 0 };
-    p.eat(b'{')?;
-    while p.peek() != Some(b'}') {
-        let key = p.string()?;
-        p.eat(b':')?;
-        p.peek();
-        let start = p.at;
-        p.skip()?;
-        if key == name {
-            return Ok(Some((start, p.at)));
-        }
-        if p.peek() == Some(b',') {
-            p.at += 1;
-        }
-    }
-    Ok(None)
-}
-
 /// `json` (a whole Secret) with its `data` replaced; everything else, the resourceVersion included, stays.
 pub fn replace_data(json: &str, data: &[(String, Vec<u8>)]) -> Result<String, String> {
-    validate_object(json)?;
-    let members: Vec<String> = data.iter().map(|(key, bytes)| format!("\"{key}\":\"{}\"", b64_encode(bytes))).collect();
-    let object = format!("{{{}}}", members.join(","));
-    match member_span(json, "data")? {
-        Some((start, end)) => Ok(format!("{}{object}{}", &json[..start], &json[end..])),
-        None => {
-            let open = json.find('{').ok_or("the Secret is not a JSON object")?;
-            Ok(format!("{}\"data\":{object},{}", &json[..=open], &json[open + 1..]))
-        }
+    let secret = validate_object(json)?;
+    let replacement: serde_json::Map<String, serde_json::Value> =
+        data.iter().map(|(key, bytes)| (key.clone(), serde_json::Value::String(b64_encode(bytes)))).collect();
+    let replacement = serde_json::Value::Object(replacement);
+    let mut members = serde_json::Map::new();
+    if secret.get("data").is_none() {
+        members.insert("data".into(), replacement.clone());
     }
+    for (key, value) in secret.as_object().into_iter().flatten() {
+        let value = if key == "data" { replacement.clone() } else { value.clone() };
+        members.insert(key.clone(), value);
+    }
+    serde_json::to_string(&members).map_err(|_| "Could not write the Secret".to_owned())
 }
 
 const FIELD_PREFIX: &str = "secret-edit:";
@@ -394,6 +310,7 @@ impl KubeExplorer {
         let data = edit.data()?;
         let (namespace, _) = self.split_scope("secrets", &edit.row)?;
         let manifest = replace_data(&edit.json, &data)?;
+        self.confirm_replace("secrets", &edit.row)?;
         let args = self.args_in(namespace.as_deref(), &["replace", "-f", "-"]);
         let out = self.process(KUBECTL, &args, Some(&manifest)).map_err(|error|command_error("save",error))?;
         if out.status != Some(0) {
@@ -453,6 +370,13 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_data_key_is_rejected() {
+        let error = data_entries(r#"{"kind":"Secret","data":{"user":"YQ==","user":"Yg=="}}"#).unwrap_err();
+        assert!(error.contains("twice"));
+        assert_eq!(data_entries(r#"{"kind":"Secret","data":{"user":"YQ==","pw":"Yg=="}}"#).unwrap().len(), 2);
+    }
+
+    #[test]
     fn replace_data_keeps_everything_but_data() {
         let replaced = replace_data(JSON, &[("k".into(), b"v".to_vec())]).unwrap();
         assert_eq!(replaced, JSON.replace(r#"{"user":"YWRtaW4=","blob":"/+8="}"#, r#"{"k":"dg=="}"#));
@@ -478,6 +402,7 @@ mod tests {
         type_into(&mut kube, "secret-edit:user", "root");
         type_into(&mut kube, "secret-new-key", "token");
         type_into(&mut kube, "secret-new-value", "t0p");
+        _host.answer_next_prompt(Some(&[]));
         kube.button("submit-secret-edit").unwrap();
         let (args, stdin) = runs.borrow().last().cloned().unwrap();
         assert_eq!(args, ["--namespace=shop", "replace", "-f", "-"]);
@@ -492,10 +417,23 @@ mod tests {
     }
 
     #[test]
+    fn declining_the_save_confirm_keeps_the_form_and_runs_nothing() {
+        let (host, runs) = host(true, "");
+        let mut kube = editing();
+        runs.borrow_mut().clear();
+        type_into(&mut kube, "secret-edit:user", "root");
+        host.answer_next_prompt(None);
+        assert!(matches!(kube.button("submit-secret-edit"), Err(Error::Cancelled)));
+        assert!(runs.borrow().is_empty());
+        assert!(kube.editing_secret.is_some());
+    }
+
+    #[test]
     fn removed_keys_are_dropped() {
         let (_host, runs) = host(true, "");
         let mut kube = editing();
         type_into(&mut kube, "secret-remove", "user blob");
+        _host.answer_next_prompt(Some(&[]));
         kube.button("submit-secret-edit").unwrap();
         let manifest = runs.borrow().last().unwrap().1.clone().unwrap();
         assert!(manifest.contains(r#""data":{}"#));
@@ -506,6 +444,7 @@ mod tests {
         let (_host, _) = host(true, "Operation cannot be fulfilled on secrets \"db\": the object has been modified; root");
         let mut kube = editing();
         type_into(&mut kube, "secret-edit:user", "root");
+        _host.answer_next_prompt(Some(&[]));
         let error = format!("{:?}", kube.button("submit-secret-edit").unwrap_err());
         assert!(error.contains("changed in the cluster") && !error.contains("root"));
         assert!(kube.editing_secret.is_some());
@@ -528,7 +467,7 @@ mod tests {
         let mut kube = KubeExplorer::default();
         kube.edit_secret("db").unwrap();
         assert!(kube.editing_secret.is_none() && runs.borrow().is_empty());
-        assert!(host.notifications()[0].body.contains("allowRevealSecrets"));
+        assert!(host.notifications()[0].body.contains("Allow Show Secret and YAML on a secret"));
 
         host.set_setting("allowRevealSecrets", "true");
         let mut kube = editing();

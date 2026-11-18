@@ -306,24 +306,13 @@ fn details_offer_the_review_flow() {
         actions,
         [
             "comment",
-            "react",
             "approve",
             "merge",
-            "review",
             "edit",
-            "edit-attribute:labels",
-            "edit-attribute:assignees",
-            "edit-attribute:reviewers",
-            "edit-attribute:milestone",
-            "edit-attribute:title",
-            "draft",
             "close",
             "checkout",
-            "open-overview-snapshot",
-            "open-diff-snapshot",
-            "open-existing-worktree",
             "browser",
-            "copy",
+            "more-actions",
             "refresh"
         ]
     );
@@ -339,6 +328,28 @@ fn details_offer_the_review_flow() {
     assert_eq!(fields[5].label, "Description");
     assert_eq!(fields[5].value, FieldValue::readonly_text("Adds it", true));
     assert!(!fields.iter().any(|f| matches!(f.value, FieldValue::Text(_))), "no read-only facts as inputs: {fields:?}");
+}
+
+#[test]
+fn more_lists_only_available_secondary_actions_and_runs_the_chosen_one() {
+    let host = setup();
+    let mut plugin = selected(&host);
+    plugin.render(DETAILS, None, &host.invocation()).unwrap();
+
+    let offered: Vec<&str> = plugin.more_actions().unwrap().into_iter().map(|(id, _)| id).collect();
+    assert_eq!(offered, ["react", "review", "draft", "open-overview-snapshot", "open-diff-snapshot", "open-existing-worktree", "copy"]);
+
+    host.answer_next_prompt(Some(&["rerequest-review"]));
+    assert!(plugin.handle(DETAILS, ViewEvent::Button("more-actions".into()), &host.invocation()).is_err(), "no reviewers: not offered");
+
+    host.answer_next_prompt(None);
+    plugin.handle(DETAILS, ViewEvent::Button("more-actions".into()), &host.invocation()).unwrap();
+    assert!(writes(&host).is_empty(), "a cancelled picker does nothing");
+
+    host.answer_next_prompt(Some(&["draft"]));
+    plugin.handle(DETAILS, ViewEvent::Button("more-actions".into()), &host.invocation()).unwrap();
+    assert!(writes(&host)[0].2.contains(r#""draft":true"#));
+    assert_eq!(plugin.status.as_deref(), Some("Marked as draft."));
 }
 
 #[test]
@@ -475,7 +486,7 @@ fn merge_sends_the_head_sha_and_options() {
 
     assert!(writes(&host).is_empty(), "the first click only asks to confirm");
     let view = plugin.render(DETAILS, None, &host.invocation()).unwrap();
-    assert_eq!(label(&view, "merge"), "Confirm Merge !7 into main");
+    assert_eq!(label(&view, "merge"), "Confirm Merge !7 into main (squash, delete source branch)");
 
     plugin.handle(DETAILS, ViewEvent::Button("merge".into()), &host.invocation()).unwrap();
 
@@ -517,7 +528,7 @@ fn a_merge_confirm_does_not_follow_a_switch_to_the_branch_merge_request() {
 
     assert!(writes(&host).is_empty(), "{:?}", writes(&host));
     let view = plugin.render(DETAILS, None, &host.invocation()).unwrap();
-    assert_eq!(label(&view, "merge"), "Confirm Merge !8 into main");
+    assert_eq!(label(&view, "merge"), "Confirm Merge !8 into main (delete source branch)");
 }
 
 #[test]
@@ -757,6 +768,52 @@ fn check_out_fetches_and_tracks_the_source_branch() {
     assert_eq!(plugin.status.as_deref(), Some("Checked out feature."));
 }
 
+fn fork_host(branch_exists: bool) -> MockHost {
+    let host = setup();
+    host.on_fetch(|r| match r.url.split('?').next() == Some("https://gitlab.com/api/v4/projects/g%2Fp/merge_requests/7") {
+        true => ok(&MR.replace("\"source_project_id\": 5", "\"source_project_id\": 9")),
+        false => gitlab(r),
+    });
+    host.on_process("git", move |args, _| match args[0] == "rev-parse" {
+        true => Ok(ProcessOutput { status: Some(if branch_exists { 0 } else { 1 }), stdout: String::new(), stderr: String::new() }),
+        false => git_ok(args, None),
+    });
+    host
+}
+
+#[test]
+fn fork_checkout_confirms_existing_branch() {
+    let host = fork_host(true);
+    let mut plugin = selected(&host);
+    plugin.handle(DETAILS, ViewEvent::Button("checkout".into()), &host.invocation()).unwrap();
+    let runs = git_runs(&host);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert!(runs[0].starts_with("rev-parse --verify --quiet refs/heads/fork/"), "{runs:?}");
+
+    let host = fork_host(true);
+    let mut plugin = selected(&host);
+    host.answer_next_prompt(Some(&["ok"]));
+    plugin.handle(DETAILS, ViewEvent::Button("checkout".into()), &host.invocation()).unwrap();
+    assert!(git_runs(&host).iter().any(|r| r.starts_with("fetch -- origin +refs/merge-requests/7/head:refs/heads/fork/")), "{:?} {:?}", git_runs(&host), plugin.status);
+
+    let host = fork_host(false);
+    let mut plugin = selected(&host);
+    plugin.handle(DETAILS, ViewEvent::Button("checkout".into()), &host.invocation()).unwrap();
+    assert!(git_runs(&host).iter().any(|r| r.starts_with("fetch -- origin +refs/merge-requests/7/head:")));
+}
+
+#[test]
+fn fork_checkout_treats_an_unexpected_rev_parse_status_as_an_error() {
+    let host = fork_host(true);
+    host.on_process("git", |_, _| Ok(ProcessOutput { status: None, stdout: String::new(), stderr: "killed".into() }));
+    let mut plugin = selected(&host);
+
+    let result = plugin.handle(DETAILS, ViewEvent::Button("checkout".into()), &host.invocation());
+
+    assert!(git_runs(&host).iter().all(|r| !r.starts_with("fetch") && !r.starts_with("checkout")), "{:?}", git_runs(&host));
+    assert!(result.is_err() || plugin.status.as_deref().is_some_and(|s| s.contains("rev-parse failed")), "{result:?} {:?}", plugin.status);
+}
+
 #[test]
 fn check_out_without_git_says_so() {
     let without_git: Vec<&str> = CAPS.iter().copied().filter(|c| *c != "process:git").collect();
@@ -765,7 +822,7 @@ fn check_out_without_git_says_so() {
 
     plugin.handle(DETAILS, ViewEvent::Button("checkout".into()), &host.invocation()).unwrap();
 
-    assert_eq!(plugin.status.as_deref(), Some("Allow git for GitLab in Settings › Plugins to check out branches."));
+    assert_eq!(plugin.status.as_deref(), Some("Checking out a branch needs the process:git permission. Allow it in Settings › Plugins › GitLab."));
 }
 
 #[test]
@@ -899,7 +956,7 @@ fn the_token_never_appears_in_requests_logs_notifications_or_views() {
     host.set_vcs_remotes(&[("origin", "git@github.com:x/y.git")]);
     GitLab::default().run_command("share-project", &host.invocation(), None).unwrap();
 
-    assert_eq!(api::authorization(), "Bearer {{secret:token}}");
+    assert_eq!(api::authorization("https://gitlab.com").unwrap(), "Bearer {{secret:token}}");
     let requests = host.requests();
     assert!(requests.len() >= 5, "{requests:?}");
     for request in &requests {
@@ -985,7 +1042,10 @@ fn copy_link_without_clipboard_notifies() {
 
     GitLab::default().run_command("copy-link", &host.invocation(), None).unwrap();
 
-    assert_eq!(host.notifications()[0].body, "https://gitlab.com/g/p/-/blob/abc123/a.rs#L1");
+    assert_eq!(
+        host.notifications()[0].body,
+        "Copying the link needs the clipboard permission. Allow it in Settings › Plugins › GitLab.\nhttps://gitlab.com/g/p/-/blob/abc123/a.rs#L1"
+    );
 }
 
 #[test]
@@ -1031,7 +1091,7 @@ fn second_page_is_fetched_when_first_is_full() {
 #[test]
 fn paging_stops_at_the_page_cap() {
     let host = setup();
-    host.on_fetch(|_| ok(&format!("[{}]", vec![r#"{"id": "d"}"#; 100].join(","))));
+    host.on_fetch(|_| ok(&format!("[{}]", vec![r#"{"id": "d", "notes": [{"id": 1}]}"#; 100].join(","))));
 
     let threads = api::Project("g/p").discussions(7).unwrap();
 
@@ -1228,7 +1288,7 @@ fn a_suggestion_reaching_past_the_file_is_not_offered() {
 #[test]
 fn paging_stops_at_the_deadline() {
     let host = setup();
-    host.on_fetch(|_| ok(&format!("[{}]", vec![r#"{"id": "d"}"#; 100].join(","))));
+    host.on_fetch(|_| ok(&format!("[{}]", vec![r#"{"id": "d", "notes": [{"id": 1}]}"#; 100].join(","))));
     let clock = std::cell::Cell::new(0);
     let now = || {
         clock.set(clock.get() + 20);
@@ -1322,7 +1382,7 @@ fn crlf_suggestion_on_a_last_line_without_newline_keeps_no_carriage_return() {
 #[test]
 fn second_list_in_the_same_task_respects_the_shared_deadline() {
     let host = setup();
-    host.on_fetch(|_| ok(&format!("[{}]", vec![r#"{"id": "d"}"#; 100].join(","))));
+    host.on_fetch(|_| ok(&format!("[{}]", vec![r#"{"id": "d", "notes": [{"id": 1}]}"#; 100].join(","))));
     let now = || if host.requests().is_empty() { 0 } else { 36 };
     api::begin_budget_at(0);
 
@@ -1700,13 +1760,14 @@ mod worktree_tests {
 
         GitLab::default().run_command("open-merge-request-in-worktree", &host.invocation(), None).unwrap();
 
-        assert!(host.notifications()[0].body.contains("Allow git"));
+        assert!(host.notifications()[0].body.contains("process:git permission"));
     }
 
     #[test]
     fn update_branch_request_targets_rebase_endpoint() {
         let host = setup();
         let _plugin = selected(&host);
+        host.answer_next_prompt(Some(&[]));
 
         let message = GitLab::default().run_command("update-merge-request-branch", &host.invocation(), None).unwrap();
 
@@ -1724,6 +1785,7 @@ mod worktree_tests {
             _ => gitlab(req),
         });
         let _plugin = selected(&host);
+        host.answer_next_prompt(Some(&[]));
 
         let message = GitLab::default().run_command("update-merge-request-branch", &host.invocation(), None).unwrap();
 
@@ -1738,10 +1800,22 @@ mod worktree_tests {
             _ => gitlab(req),
         });
         let _plugin = selected(&host);
+        host.answer_next_prompt(Some(&[]));
 
         let error = GitLab::default().run_command("update-merge-request-branch", &host.invocation(), None).unwrap_err();
 
         assert_eq!(error.to_string(), "Rebase of !7 failed: Rebase failed. Please rebase locally");
+    }
+
+    #[test]
+    fn rebase_command_asks_first_and_does_nothing_when_cancelled() {
+        let host = setup();
+        let _plugin = selected(&host);
+
+        let message = GitLab::default().run_command("update-merge-request-branch", &host.invocation(), None).unwrap();
+
+        assert_eq!(message, None);
+        assert!(writes(&host).is_empty());
     }
 }
 
@@ -3190,6 +3264,28 @@ fn project_view_opens_a_file_blob_and_a_folder_tree() {
     assert_eq!(host.opened_urls(), ["https://gitlab.com/g/p/-/blob/abc123/src/a%20b.rs", "https://gitlab.com/g/p/-/tree/abc123/src"]);
 }
 
+#[test]
+fn selecting_a_merge_request_enables_its_palette_commands() {
+    let host = setup();
+    assert!(!host.context_keys().contains_key("mrSelected"));
+
+    let _plugin = selected(&host);
+
+    assert_eq!(host.context_keys().get("mrSelected"), Some(&openidea_plugin::ContextValue::Flag(true)));
+}
+
+#[test]
+fn project_view_copies_the_selected_file_link_not_the_editor() {
+    let host = setup();
+    host.add_file("/project/src/b.rs", "x");
+    host.open_editor("/project/src/a.rs", "rust", "x", &[(0, 0, 0, 0)]);
+    host.select_paths(&["/project/src/b.rs"]);
+
+    GitLab::default().run_command("copy-link", &host.invocation(), None).unwrap();
+
+    assert_eq!(host.clipboard().as_deref(), Some("https://gitlab.com/g/p/-/blob/abc123/src/b.rs"));
+}
+
 mod ci_aid_tests {
     use super::*;
     use crate::ci;
@@ -3208,6 +3304,18 @@ mod ci_aid_tests {
         let found = host.diagnostics().get("/project/.gitlab-ci.yml").cloned().unwrap_or_default();
 
         found.into_iter().filter_map(|d| d.code).collect()
+    }
+
+    #[test]
+    fn completion_after_non_ascii_does_not_panic() {
+        labels("test:\n  script: echo café|");
+
+        let seeds = ["test:\n  script: echo café", "build:\n  script: $é${C", "café: 😀 $CI_"];
+        for seed in seeds {
+            for offset in (0..=seed.len()).filter(|o| seed.is_char_boundary(*o)) {
+                ci::completions(seed, Some(offset));
+            }
+        }
     }
 
     #[test]
@@ -3644,8 +3752,9 @@ mod content_snapshot_tests {
     }
     fn open_in_frame(host: &MockHost, plugin: &mut GitLab, button: &str, frame: &str) -> Result<(), Error> {
         ui_kit::web::reveal_view(DETAILS, include_str!("ui_config.json"))?;
+        host.answer_next_prompt(Some(&[button]));
         let message = serde_json::json!({"channel":"ui-kit","sequence":1,"targetView":DETAILS,"frameId":frame,"project":"/project", "op":"event",
-            "event":{"kind":"button","key":button}})
+            "event":{"kind":"button","key":"more-actions"}})
         .to_string();
         plugin.handle(LIST, ViewEvent::Message(message), &host.invocation())?;
         let response: serde_json::Value = serde_json::from_str(&host.view_messages().last().unwrap().1).unwrap();
@@ -4253,9 +4362,23 @@ mod diff_row_path_receipts {
             "https://gitlab.com/api/v4/projects/g%2Fp/repository/files/src%2Fa.rs/raw?ref=abcdef1",
         ]);
         assert!(writes(&host).is_empty());
+        let diffs=host.opened_diffs();
+        assert_eq!((diffs[0].0.left.as_deref(),diffs[0].0.right.as_deref(),diffs[0].1.as_deref()),(Some("file text"),Some("file text"),Some("src/a.rs")));
         let before=host.requests().len();
         assert!(changes_message(&mut plugin,&host,ViewEvent::Message(r#"{"type":"diff","path":"src/other.rs"}"#.into())).is_err());
         assert_eq!(host.requests().len(),before);
+    }
+    #[test]
+    fn added_file_diff_has_no_left_side_and_skips_the_base_read() {
+        let host=setup();
+        host.on_fetch(|r|if r.url.contains("/diffs") {ok(r#"[{"old_path":"src/a.rs","new_path":"src/a.rs","new_file":true,"diff":"@@ -0,0 +1 @@\n+c\n"}]"#)}
+            else if r.url.contains("/repository/files/") {ok("new text")} else {gitlab(r)});
+        let mut plugin=selected(&host);changes_view(&mut plugin,&host).unwrap();
+        changes_message(&mut plugin,&host,ViewEvent::Message(r#"{"type":"diff","path":"src/a.rs"}"#.into())).unwrap();
+        let reads:Vec<String>=host.requests().into_iter().map(|r|r.url).filter(|u|u.contains("/repository/files/")).collect();
+        assert_eq!(reads,["https://gitlab.com/api/v4/projects/g%2Fp/repository/files/src%2Fa.rs/raw?ref=abcdef1"]);
+        let diff=&host.opened_diffs()[0].0;
+        assert_eq!((diff.left.as_deref(),diff.right.as_deref()),(None,Some("new text")));
     }
     #[test]
     fn registered_current_diff_row_opens_without_remote_mutation() {
@@ -4491,8 +4614,8 @@ fn account_slots_use_declared_secret_placeholders_and_expire_previous_identity()
     assert!(plugin.me.is_none()&&plugin.projects.is_none()&&plugin.content_snapshots.is_empty());
     assert_ne!(selection_scope(&gitlab_project(&h.invocation()).unwrap()),previous);
     assert!(plugin.checked_selection(&gitlab_project(&h.invocation()).unwrap(),&h.invocation()).is_err());
-    assert_eq!(api::authorization(),"Bearer {{secret:secondary-token}}");
-    assert!(!api::authorization().contains("second-private-token"));
+    assert_eq!(api::authorization("https://gitlab.com").unwrap(),"Bearer {{secret:secondary-token}}");
+    assert!(!api::authorization("https://gitlab.com").unwrap().contains("second-private-token"));
 }
 #[test]
 fn account_slot_change_cannot_reuse_an_unsent_primary_comment() {
@@ -4531,11 +4654,21 @@ mod source_cli_checkout {
         assert!(writes(&h).is_empty());assert!(!git_runs(&h).iter().any(|args|args.starts_with("fetch ")||args.starts_with("checkout ")));
     }
     #[test]
+    fn fork_checkout_denied_names_permission(){
+        let h=setup();let h=h.with_capabilities(CAPS);
+        h.on_fetch(|r|if r.url.split('?').next()==Some("https://gitlab.com/api/v4/projects/g%2Fp/merge_requests/7") {ok(&MR.replace("\"source_project_id\": 5","\"source_project_id\": 9").replace("\"abc123\"",&format!("\"{SHA}\"")))}else{gitlab(r)});
+        let mut p=selected(&h);h.answer_next_prompt(Some(&["ok"]));
+        let error=p.checkout_source_cli(&h.invocation()).unwrap_err().to_string();
+        assert!(error.contains("needs the process:glab permission"),"{error}");assert!(error.contains("Settings › Plugins › GitLab"),"{error}");
+    }
+    #[test]
     fn canceled_review_never_probes_or_launches_cli(){let(h,mut p)=prepared();h.answer_next_prompt(None);p.checkout_source_cli(&h.invocation()).unwrap();assert!(h.process_runs().is_empty());assert!(h.terminals().is_empty());}
     #[test]
     fn dirty_worktree_refuses_even_version_probe(){let(h,mut p)=prepared();let mut s=status("main");s.changed_files=1;h.set_vcs_status(Some(s));assert!(p.checkout_source_cli(&h.invocation()).is_err());assert!(h.process_runs().is_empty());assert!(h.terminals().is_empty());}
     #[test]
-    fn unsupported_cli_profile_never_launches(){let(h,mut p)=prepared();h.on_process("glab",|_,_|Ok(ProcessOutput{status:Some(0),stdout:"glab 1.129.0\n".into(),stderr:String::new()}));h.answer_next_prompt(Some(&["ok"]));assert!(p.checkout_source_cli(&h.invocation()).is_err());assert!(h.terminals().is_empty());}
+    fn unsupported_cli_profile_never_launches(){let(h,mut p)=prepared();h.on_process("glab",|_,_|Ok(ProcessOutput{status:Some(0),stdout:"glab 2.0.0\n".into(),stderr:String::new()}));h.answer_next_prompt(Some(&["ok"]));let error=p.checkout_source_cli(&h.invocation()).unwrap_err().to_string();assert_eq!(error,"Checking out with glab needs GitLab CLI glab 1.x (found 2.0.0). Install it, sign in with glab auth login, then retry.");assert!(h.terminals().is_empty());}
+    #[test]
+    fn any_glab_1x_launches_checkout(){let(h,mut p)=prepared();h.on_process("glab",|_,_|Ok(ProcessOutput{status:Some(0),stdout:"glab version 1.46.1 (2024-10-01)\n".into(),stderr:String::new()}));h.answer_next_prompt(Some(&["ok"]));p.checkout_source_cli(&h.invocation()).unwrap();assert_eq!(h.terminals().len(),1);}
     #[test]
     fn moving_source_identity_refuses_launch(){
         let(h,mut p)=prepared();let moved=std::rc::Rc::new(std::cell::Cell::new(false));let m=moved.clone();
@@ -4569,4 +4702,28 @@ fn thread_marker_icon_is_declared_in_the_manifest() {
     let manifest = include_str!("../plugin.toml");
     assert!(manifest.contains(&format!("icon = \"{}\"", crate::branch::THREAD_MARKER)));
     assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(crate::branch::THREAD_MARKER).is_file());
+}
+
+#[test]
+fn a_ready_merge_request_without_merge_permission_says_why() {
+    let host = setup();
+    host.on_fetch(|req| match req.url.split('?').next().is_some_and(|url| url.ends_with("/merge_requests/7")) {
+        true => ok(&MR.replace(r#""can_merge": true"#, r#""can_merge": false"#)),
+        false => gitlab(req),
+    });
+
+    let view = selected(&host).render(DETAILS, None, &host.invocation()).unwrap();
+
+    assert!(!buttons(&view).contains(&"merge"));
+    assert!(view.status.as_deref().is_some_and(|status| status.ends_with(" · You cannot merge this merge request")), "{view:?}");
+}
+
+#[test]
+fn a_repository_without_a_gitlab_remote_offers_share_project() {
+    let host = setup();
+    host.set_vcs_remotes(&[("origin", "git@github.com:x/y.git")]);
+
+    let view = GitLab::default().render(LIST, None, &host.invocation()).unwrap();
+
+    assert!(buttons(&view).contains(&"share-project"), "{view:?}");
 }

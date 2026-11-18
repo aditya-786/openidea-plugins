@@ -9,7 +9,9 @@ const MAX_TEXT: usize = 128 << 10;
 impl SecurityTools {
     pub(crate) fn activate_live(&mut self) {
         self.watching = host::subscribe_paths("files-changed", &beans::GLOBS).is_ok();
-        let _ = host::subscribe(EventKind::FileOpened);
+        if matches!(host::subscribe(EventKind::FileOpened), Err(Error::Denied(_))) {
+            ui_kit::denied::notify_once(&self.events_notice, "Missing-bean checks", "events", "Spring Security Tools");
+        }
         let _ = host::subscribe(EventKind::FileSaved);
         let deadline = Instant::now() + Duration::from_secs(3);
         for project in host::projects().unwrap_or_default() {
@@ -23,42 +25,8 @@ impl SecurityTools {
     }
     pub(crate) fn live_events(&mut self, events: &[Event]) {
         let deadline = Instant::now() + Duration::from_secs(3);
-        for event in events {
-            let paths: Vec<_> = match event {
-                Event::FileOpened(p) | Event::FileSaved(p) => vec![(p, false)],
-                Event::FilesChanged(f) => {
-                    f.removed.iter().map(|p| (p, true)).chain(f.created.iter().chain(&f.modified).map(|p| (p, false))).collect()
-                }
-                _ => Vec::new(),
-            };
-            for (path, removed) in paths {
-                if Instant::now() >= deadline {
-                    return;
-                }
-                if !beans::GLOBS.iter().any(|g| spring_text::index::glob_matches(g, path)) {
-                    continue;
-                }
-                let Some(project) = spring_text::index::project_of(path) else {
-                    continue;
-                };
-                let text = if removed {
-                    None
-                } else {
-                    match project.read_file(path) {
-                        Ok(text) => Some(text),
-                        Err(_) => {
-                            self.beans.reset();
-                            self.mappings.reset();
-                            continue;
-                        }
-                    }
-                };
-                self.beans.update_existing(&project, path, text.as_deref());
-                self.mappings.update_existing(&project, path, text.as_deref());
-                self.beans.get(&project, deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250)));
-                self.mappings.get(&project, deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250)));
-            }
-        }
+        self.beans.on_events(events, deadline);
+        self.mappings.on_events(events, deadline);
     }
 }
 fn supported(doc: &Document) -> bool {
@@ -110,7 +78,6 @@ impl DiagnosticsProvider for SecurityTools {
         let mut found: Vec<_> = problems(&doc.path, &doc.text)
             .into_iter()
             .map(|p| p.diagnostic)
-            .filter(|d| d.code.as_deref() != Some("obsolete-path-pattern"))
             .collect();
         found.extend(self.reference_findings(doc));
         found.extend(super::path_matcher::diagnostics(doc));
@@ -141,7 +108,7 @@ fn matchers(doc: &Document) -> Vec<Matcher> {
         return declared;
     }
     if doc.language != "xml" || !host::setting_bool("springSecurity.checkMatchers").unwrap_or(true)
-        || !crate::xml_namespaces::document_valid(&doc.text) {
+        || !spring_text::xml::analysis_valid(&doc.text) {
         return Vec::new();
     }
     let elements = xml::elements(&doc.text);
@@ -189,13 +156,22 @@ impl HoverProvider for SecurityTools {
         if !host::setting_bool("springSecurity.matcherHover").unwrap_or(true) { return None; }
         let off = offset(&doc.text, at)?;
         let m = matchers(doc).into_iter().find(|m| m.start <= off && off < m.end)?;
-        let title=if m.strategy=="Unresolved" {"Declared request pattern; matcher strategy unresolved".into()} else {format!("Explicit {} request matcher",m.strategy)};
-        Some(Hover::new(format!("{title}\n\nLiteral path: `{}`\n\nHTTP method: {}.\n\nSource contract: {}.\n\nThis source declaration does not establish effective runtime security policy, installed framework version, classpath resolution or filter-chain precedence.",m.path,m.method.as_deref().unwrap_or("any method (no specific method declared)"),m.api.unwrap_or("explicit XML Ant declaration"))).range(range(&doc.text,m.start,m.end)))
+        let title = if m.strategy == "Unresolved" {
+            "Declared request pattern; matcher strategy unresolved".to_owned()
+        } else {
+            format!("Explicit {} request matcher", m.strategy)
+        };
+        let method = m.method.as_deref().unwrap_or("any method (no specific method declared)");
+        let source = m.api.unwrap_or("explicit XML Ant declaration");
+        Some(Hover::new(format!("{title}\n\nLiteral path: `{}`\n\nHTTP method: {method}.\n\nSource contract: {source}.\n\nRead from the source only; the runtime policy may differ.", m.path)).range(range(&doc.text, m.start, m.end)))
     }
 }
+
 impl InlayHints for SecurityTools {
     fn inlay_hints(&mut self, doc: &Document, requested: Range) -> Vec<InlayHint> {
-        if !host::setting_bool("springSecurity.matcherInlays").unwrap_or(true) { return Vec::new(); }
+        if !host::setting_bool("springSecurity.matcherInlays").unwrap_or(true) {
+            return Vec::new();
+        }
         matchers(doc)
             .into_iter()
             .filter_map(|m| {
@@ -203,11 +179,11 @@ impl InlayHints for SecurityTools {
                 if end < requested.start || end > requested.end {
                     return None;
                 }
-                Some(
-                    InlayHint::new(end, if m.strategy=="Unresolved" {m.method.as_deref().map(|verb|format!("{verb} · declared pattern · strategy unresolved")).unwrap_or_else(||"declared pattern · strategy unresolved".into())} else {format!("{} · {}", m.strategy, m.method.as_deref().unwrap_or("any method"))})
-                        .padding_left()
-                        .tooltip("Explicit source matcher declaration only; installed framework version, classpath resolution, runtime policy and filter-chain precedence are not inferred."),
-                )
+                let label = match (m.strategy, m.method.as_deref()) {
+                    ("Unresolved", method) => method?.to_owned(),
+                    (strategy, method) => format!("{strategy} · {}", method.unwrap_or("any method")),
+                };
+                Some(InlayHint::new(end, label).padding_left())
             })
             .collect()
     }
@@ -233,6 +209,16 @@ mod tests {
             text:format!("import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;\r\nclass S {{Object f() {{ /* 😀 retained */ return {expression};}}}}")}
     }
     #[test]
+    fn missing_bean_checks_notice_shown_once() {
+        let host = MockHost::install().with_capabilities(&["project.read"]);
+        let mut tools = SecurityTools::default();
+        tools.activate_live();
+        tools.activate_live();
+        let notices: Vec<_> = host.notifications().into_iter().filter(|n| n.body.contains("needs the events permission")).collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].body.contains("Settings › Plugins › Spring Security Tools"));
+    }
+    #[test]
     fn explicit_java_factory_hover_and_inlays_use_current_utf16_source_and_method() {
         let h=MockHost::install(); let mut tools=SecurityTools::default();
         for (expression,method,api) in [
@@ -243,7 +229,7 @@ mod tests {
             let at=openidea_plugin::text::position(&d.text,start);
             let hover=tools.hover(&d,at).unwrap();
             assert_eq!(hover.range.unwrap(),range(&d.text,start,start+6));
-            for claim in ["Explicit PathPattern",api,"does not establish","installed framework version"] {assert!(hover.markdown.contains(claim));}
+            for claim in ["Explicit PathPattern",api,"Read from the source only"] {assert!(hover.markdown.contains(claim));}
             let hints=tools.inlay_hints(&d,all()); assert_eq!(hints.len(),1);
             assert_eq!(hints[0].label,format!("PathPattern · {method}"));
             assert_eq!(hints[0].position,openidea_plugin::text::position(&d.text,start+6));
@@ -425,7 +411,6 @@ class S {
             valid.replace("</s:http>",""),
             format!("{valid}<extra/>"),
             format!("{valid}trailing"),
-            format!("<!DOCTYPE s:http>{valid}"),
             valid.replace("<s:intercept-url", "<s:intercept-url unbound:attr='x'"),
         ] {
             let d=doc(&text); let at=openidea_plugin::text::position(&d.text,d.text.find("/api").unwrap());
@@ -478,5 +463,75 @@ class S {
         d.version += 1;
         d.text = r#"@Service class S { @PreAuthorize("@local.ok()") void f() {} }"#.into();
         assert!(tools.diagnostics(&d).iter().any(|d| d.code.as_deref() == Some("unresolved-bean-reference")));
+    }
+    #[test]
+    fn matcher_inlay_hidden_when_unresolved() {
+        let _h = MockHost::install();
+        let mut tools = SecurityTools::default();
+        let modern = Document {
+            path: "/project/S.java".into(),
+            language: "java".into(),
+            version: 1,
+            text: "import org.springframework.security.config.annotation.web.builders.HttpSecurity; class S {void f(HttpSecurity http){http.authorizeHttpRequests(a -> a.requestMatchers(\"/api\"));}}".into(),
+        };
+        assert!(tools.inlay_hints(&modern, all()).is_empty());
+        let with_method = Document {
+            text: format!("import org.springframework.http.HttpMethod;\n{}", modern.text.replace("requestMatchers(\"/api\")", "requestMatchers(HttpMethod.GET, \"/api\")")),
+            ..modern
+        };
+        let hints = tools.inlay_hints(&with_method, all());
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].label, "GET");
+    }
+    #[test]
+    fn matcher_inlay_shows_http_method() {
+        let _h = MockHost::install();
+        let mut tools = SecurityTools::default();
+        let hints = tools.inlay_hints(&doc(&xml("request-matcher=\"ant\"", "/api")), all());
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].label, "Ant · GET");
+    }
+    #[test]
+    fn unknown_bean_info_survives_ttl() {
+        let host = MockHost::install();
+        host.add_file("src/main/java/com/acme/Authz.java", "@Component class Authz {}");
+        let src = "@Service\nclass S {\n    @PreAuthorize(\"@ghost.ok()\")\n    void m() {}\n}\n";
+        let d = Document { path: "/project/src/main/java/com/acme/S.java".into(), language: "java".into(), version: 1, text: src.into() };
+        let mut tools = SecurityTools::default();
+        tools.activate_live();
+        let unknown = |tools: &mut SecurityTools| tools.diagnostics(&d).iter().any(|x| x.code.as_deref() == Some("unresolved-bean-reference"));
+        assert!(unknown(&mut tools));
+        tools.beans.for_cached_document(&d.path, &d.text).unwrap().mark_stale();
+        assert!(unknown(&mut tools));
+    }
+    #[test]
+    fn line_markers_advance_cold_index() {
+        let host = MockHost::install();
+        host.add_file("src/main/java/com/acme/Authz.java", "@Component class Authz {}");
+        let d = Document { path: "/project/src/main/java/com/acme/S.java".into(), language: "java".into(), version: 1, text: "class S {}".into() };
+        let mut tools = SecurityTools::default();
+        tools.line_markers(&d);
+        let index = tools.beans.cached(&d.path).unwrap();
+        assert!(index.fresh() && index.iter().any(|(p, _)| p.ends_with("Authz.java")));
+    }
+    #[test]
+    fn bean_name_set_is_cached_per_generation() {
+        let host = MockHost::install();
+        host.add_file("src/main/java/com/acme/Authz.java", "@Component class Authz {}");
+        let d = Document { path: "/project/src/main/java/com/acme/S.java".into(), language: "java".into(), version: 1, text: "@Component class S {}".into() };
+        let mut tools = SecurityTools::default();
+        tools.activate_live();
+        let first = tools.project_bean_names(&d, true).unwrap();
+        let second = tools.project_bean_names(&d, true).unwrap();
+        assert!(Rc::ptr_eq(&first, &second));
+    }
+    #[test]
+    fn doctype_xml_still_gets_hover_and_inlays() {
+        let _h = MockHost::install();
+        let mut tools = SecurityTools::default();
+        let d = doc(&format!("<!DOCTYPE beans>{}", xml("request-matcher=\"ant\"", "/api")));
+        let at = openidea_plugin::text::position(&d.text, d.text.find("/api").unwrap());
+        assert!(tools.hover(&d, at).is_some());
+        assert_eq!(tools.inlay_hints(&d, all()).len(), 1);
     }
 }

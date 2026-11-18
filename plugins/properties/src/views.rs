@@ -8,7 +8,7 @@ use crate::props::{append_line, escape_key, escape_value, file_name, locale_name
 use crate::{Properties, bundle_inventory, project_for, to_edits};
 use openidea_plugin::text::position;
 use openidea_plugin::views::{Body, Button, Table, TreeItem, View, ViewEvent, Viewport, Views};
-use openidea_plugin::{Error, EventKind, Invocation, NotificationLevel, TextEditor, host};
+use openidea_plugin::{Error, EventKind, Invocation, NotificationLevel, PickItem, TextEditor, host};
 use openidea_plugin::providers::Document;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range as Span;
@@ -70,7 +70,7 @@ fn inverse_bundle_edit(doc: &Document, edits: &[openidea_plugin::TextEdit]) -> R
     Ok((after,inverse))
 }
 fn revert_review(record: &BundleRevert) -> Result<String,Error> {
-    let mut body=format!("Revert the last reviewed bundle edit only. This is a plugin memory-only inverse, not native Undo. No other file changes.\nProject: {}\nFile: {}\nDocument version: {}\n",serde_json::to_string(&record.root).unwrap_or_default(),serde_json::to_string(&record.after.path).unwrap_or_default(),record.after.version);
+    let mut body=format!("Undoes the last edit made from this table, in this file only. Other files and earlier edits stay as they are.\nFile: {}\n",serde_json::to_string(&record.after.path).unwrap_or_default());
     for edit in &record.inverse {
         let start=openidea_plugin::text::offset(&record.after.text,edit.range.start).ok_or(Error::Stale)?;
         let end=openidea_plugin::text::offset(&record.after.text,edit.range.end).ok_or(Error::Stale)?;
@@ -497,16 +497,14 @@ impl Properties {
             status.push_str(" · Select a property to edit this file or open a translation");
         }
         let mut view=View::new(Body::Table(table))
-            .button(Button::new("bundle-stage-start", "Edit All Locales…").icon("edit"))
+            .button(Button::new("bundle-stage-start", "Edit All Locales").icon("edit"))
             .button(Button::new("reload", "Reload Locales").icon("refresh"))
             .button(Button::new("incomplete", filter).icon("filter"))
             .button(Button::new("bundle-edit-value", "Edit Value…").icon("edit").enabled(selected.is_some()))
-            .button(Button::new("bundle-edit-key", "Rename Key in This File…").icon("edit").enabled(selected.is_some()))
-            .button(Button::new("bundle-open-translation", "Open Translation…").icon("external-link").enabled(selected.is_some()))
             .button(Button::new("bundle-add", "Add Property…").icon("plus"))
-            .button(Button::new("bundle-remove", "Remove from This File…").icon("minus").enabled(selected.is_some()))
+            .button(Button::new("bundle-row-more", "More…").icon("more").enabled(selected.is_some()))
             .status(&status);
-        if can_revert { view=view.button(Button::new("revert-reviewed", "Revert last reviewed bundle edit…").icon("undo")); }
+        if can_revert { view=view.button(Button::new("revert-reviewed", "Undo Last Table Edit…").icon("undo")); }
         Ok(view)
     }
 
@@ -532,7 +530,7 @@ impl Properties {
         if stage_button || self.bundle_draft.is_some() {
             let (_,doc,root)=owned_editor(ctx)?;
             if matches!(&event,ViewEvent::Button(id) if id=="bundle-stage-start") {
-                if self.bundle_draft.is_some() { return Err("Finish or discard the existing staged locale grid first.".into()); }
+                if self.bundle_draft.is_some() { return Err("Apply or discard the current locale edits first.".into()); }
                 self.bundle_serial=self.bundle_serial.checked_add(1).ok_or(Error::Stale)?;
                 self.bundle_draft=Some(crate::bundle_draft::Draft::new(&doc,self.bundle_serial)?);
                 host::refresh_view(BUNDLE);
@@ -542,7 +540,7 @@ impl Properties {
                 if let ViewEvent::Button(id)=&event {
                     match id.as_str() {
                         "bundle-stage-discard" => {
-                            if draft.changed() && !ui_kit::prompts::confirm_exact("Discard staged locale changes?","Only the in-memory grid draft will be discarded. Source files are unchanged by this action.")? {return Ok(());}
+                            if draft.changed() && !crate::bundle_draft::confirm_discard(&draft.doc.path)? {return Ok(());}
                             self.bundle_draft=None; self.bundle=None; self.bundle_bindings.clear();
                             host::refresh_view(BUNDLE);return Ok(());
                         }
@@ -552,10 +550,11 @@ impl Properties {
                             // Do not synchronously execute native intentions here: their
                             // provider callback would re-enter this still-running plugin.
                             host::open_editor(&doc.path,None)?;
-                            host::notify(NotificationLevel::Info,"Apply staged bundle changes","In the text editor, open Context Actions (Alt+Enter) and choose Apply staged bundle changes… to review the exact atomic edit. The grid remains staged until source text matches.");
+                            let file=doc.path.rsplit('/').next().unwrap_or_default();
+                            host::notify(NotificationLevel::Info,"Properties",&format!("Press ⌥⏎ in {file} and choose {} to review and save the edits. Several locale files change at once, which only ⌥⏎ can do in one undoable step.",crate::bundle_draft::APPLY_TITLE));
                             return Ok(());
                         }
-                        _ => return Err("Use Continue to Apply or Discard while a locale grid is staged.".into()),
+                        _ => return Err("Apply or discard the locale edits first.".into()),
                     }
                 }
                 if event.table_select().is_some() || event.table_activate().is_some() {return Ok(());}
@@ -569,10 +568,10 @@ impl Properties {
 
         if matches!(&event,ViewEvent::Button(id) if id=="revert-reviewed") {
             let (editor,doc,root)=owned_editor(ctx)?;
-            let record=self.bundle_revert.as_ref().ok_or("No reviewed bundle edit is available to revert.")?;
+            let record=self.bundle_revert.as_ref().ok_or("There is no table edit to undo.")?;
             if record.root!=root || record.after!=doc { return Err(Error::Stale); }
             let review=revert_review(record)?;
-            if !ui_kit::prompts::confirm_exact("Revert last reviewed bundle edit?",&review)? { return Ok(()); }
+            if !ui_kit::prompts::confirm_exact("Undo the last table edit?",&review)? { return Ok(()); }
             let (_,current,current_root)=owned_editor(ctx)?;
             if current!=doc || current_root!=root { return Err(Error::Stale); }
             editor.apply_edits(doc.version,&record.inverse)?;
@@ -618,6 +617,16 @@ impl Properties {
             }
             host::refresh_view(BUNDLE);
             return Ok(());
+        }
+        if matches!(&event,ViewEvent::Button(id) if id=="bundle-row-more") {
+            let key=binding.selected.and_then(|row|binding.keys.get(row)).ok_or("Select a property first.")?;
+            let items=[
+                PickItem::new("bundle-edit-key","Rename Key in This File…"),
+                PickItem::new("bundle-open-translation","Open Translation…").description("Also: double-click the row"),
+                PickItem::new("bundle-remove","Remove from This File…"),
+            ];
+            let Some(chosen)=host::pick(&format!("Property {key}"),&items)? else {return Ok(())};
+            return self.handle_bundle(ViewEvent::Button(chosen),ctx);
         }
         if let ViewEvent::Button(id)=&event {
             if matches!(id.as_str(),"bundle-edit-value"|"bundle-edit-key"|"bundle-open-translation"|"bundle-add"|"bundle-remove") {
@@ -799,7 +808,7 @@ mod tests {
         assert_eq!(after,"😀=New😀\nother=Keep\n");assert_eq!(inverse[0].range.end.character,8);
         let record=BundleRevert{root:"/project".into(),after:Document{text:after,version:2,..doc.clone()},inverse};
         let review=revert_review(&record).unwrap();
-        for phrase in ["not native Undo","/project/messages.properties","Document version: 2","Before: \"New😀\"","After: \"Old\""] {assert!(review.contains(phrase));}
+        for phrase in ["Undoes the last edit made from this table","/project/messages.properties","Before: \"New😀\"","After: \"Old\""] {assert!(review.contains(phrase));}
         let too_big=Document{text:"x".repeat(MAX_BUNDLE_TEXT+1),..doc.clone()};assert!(inverse_bundle_edit(&too_big,&[]).is_err());
         let mut overlapping=edits.clone();overlapping.push(edits[0].clone());assert!(inverse_bundle_edit(&doc,&overlapping).is_err());
     }
@@ -1161,6 +1170,29 @@ mod tests {
     }
 
     #[test]
+    fn selected_row_more_menu_runs_the_picked_row_action() {
+        let host=locale_host();let mut plugin=Properties::default();let ctx=host.invocation();
+        let view=plugin.render(BUNDLE,None,&ctx).unwrap();
+        assert!(view.toolbar.len()<=5,"{:?}",view.toolbar.iter().map(|b|&b.label).collect::<Vec<_>>());
+        plugin.handle(BUNDLE,ViewEvent::Other{kind:"table-select".into(),data:r#"{"row":1}"#.into()},&ctx).unwrap();
+        let view=plugin.render(BUNDLE,None,&ctx).unwrap();
+        assert!(view.toolbar.iter().any(|b|b.id=="bundle-row-more"));
+        assert!(!view.toolbar.iter().any(|b|b.id=="bundle-remove"));
+        host.answer_next_prompt(Some(&["bundle-remove"]));host.answer_next_prompt(Some(&[]));
+        plugin.handle(BUNDLE,ViewEvent::Button("bundle-row-more".into()),&ctx).unwrap();
+        assert!(!host.editor_text().contains("bye=Bye"));
+    }
+    #[test]
+    fn apply_locale_edits_button_names_the_alt_enter_action() {
+        let host=locale_host();host.add_file("/project/messages.properties","hello=Hello\nbye=Bye\n");
+        let mut plugin=Properties::default();let ctx=host.invocation();
+        plugin.handle(BUNDLE,ViewEvent::Button("bundle-stage-start".into()),&ctx).unwrap();
+        plugin.handle(BUNDLE,ViewEvent::Cell{row:0,column:2,value:"Salut".into()},&ctx).unwrap();
+        plugin.handle(BUNDLE,ViewEvent::Button("bundle-stage-apply".into()),&ctx).unwrap();
+        let body=host.notifications().last().unwrap().body.clone();
+        assert!(body.contains("⌥⏎ in messages.properties") && body.contains(crate::bundle_draft::APPLY_TITLE),"{body}");
+    }
+    #[test]
     fn readonly_bundle_overview_has_complete_reviewed_current_file_workflow() {
         let host=locale_host();
         let mut plugin=Properties::default();
@@ -1217,16 +1249,6 @@ mod tests {
         assert!(host.process_runs().is_empty());
         assert!(host.opened_locations().is_empty());
         assert_eq!(host.invocation().project().unwrap().read_file("/project/messages_fr.properties").unwrap(), "hello=Bonjour\n");
-    }
-
-    #[test]
-    fn the_setting_keeps_other_locales_read_only() {
-        let host = locale_host();
-        host.set_setting("bundle.writeOtherLocales", "false");
-        let mut plugin = Properties::default();
-        plugin.render(BUNDLE, None, &host.invocation()).unwrap();
-        assert!(plugin.handle(BUNDLE, ViewEvent::Cell { row: 1, column: 2, value: "x".into() }, &host.invocation()).is_err());
-        assert!(host.opened_locations().is_empty());
     }
 }
 

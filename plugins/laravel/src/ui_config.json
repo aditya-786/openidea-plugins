@@ -6,7 +6,6 @@
     "laravel-request": "Request",
     "laravel-models": "Models",
     "laravel-database": "Database",
-    "laravel-schema": "Schema",
     "laravel-views": "Views",
     "laravel-components": "Components",
     "laravel-middleware": "Middleware",
@@ -71,7 +70,7 @@
     {
       "view": "laravel-models",
       "id": "model-create-fields",
-      "label": "Create Fields…",
+      "label": "Create Model Fields…",
       "kind": "",
       "icon": "add"
     },
@@ -119,11 +118,6 @@
         "id": "laravel-database",
         "label": "Database",
         "icon": "table"
-      },
-      {
-        "id": "laravel-schema",
-        "label": "Schema",
-        "icon": "hierarchy"
       },
       {
         "id": "laravel-views",
@@ -175,6 +169,47 @@
         "label": "Processes",
         "icon": "run"
       }
+    ],
+    "sections": [
+      {
+        "id": "browse",
+        "label": "Browse",
+        "tabs": [
+          "laravel-about",
+          "laravel",
+          "laravel-views",
+          "laravel-components",
+          "laravel-middleware",
+          "laravel-config",
+          "laravel-env",
+          "laravel-translations"
+        ]
+      },
+      {
+        "id": "data",
+        "label": "Data",
+        "tabs": [
+          "laravel-models",
+          "laravel-database"
+        ]
+      },
+      {
+        "id": "run",
+        "label": "Run",
+        "tabs": [
+          "laravel-request",
+          "laravel-artisan",
+          "laravel-runtime",
+          "laravel-processes"
+        ]
+      },
+      {
+        "id": "build",
+        "label": "Build",
+        "tabs": [
+          "laravel-generators"
+        ]
+      }
     ]
   },
   "opaque_views": [
@@ -182,8 +217,7 @@
     "laravel-generators",
     "laravel-processes",
     "laravel-models",
-    "laravel-database",
-    "laravel-schema"
+    "laravel-database"
   ],
   "toolbar_groups": {
     "laravel-models": [

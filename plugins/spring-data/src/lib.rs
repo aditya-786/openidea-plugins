@@ -9,12 +9,11 @@ use openidea_plugin::{
     Diagnostic, Error, Invocation, Location, NotificationLevel, PickItem, Plugin, Position, Range, Severity, TextEdit, host,
     register_plugin,
 };
-#[cfg(test)]
-use spring_text::index::PROVIDER_BUDGET;
 use spring_text::index::{Index, Indexes};
 use spring_text::java::{self, JavaFile, Member, TypeDecl, TypeRef};
 use spring_text::{SOURCE_GLOBS, is_kotlin, parse_source, range};
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 mod checks;
 mod injections;
@@ -285,22 +284,16 @@ struct Model<'a> {
     entities: BTreeMap<&'a str, &'a Class>,
     /// Every project file has been read.
     complete: bool,
+    facts: Rc<live::Facts>,
 }
 
 impl<'a> Model<'a> {
-    #[cfg(test)]
-    fn new(index: &'a Index<Vec<Class>>) -> Self {
-        let mut by_name: BTreeMap<&str, Vec<(&str, &Class)>> = BTreeMap::new();
-        let mut entities = BTreeMap::new();
-        for (path, classes) in index.iter() {
-            for c in classes {
-                by_name.entry(&c.name).or_default().push((path, c));
-                if let Some(e) = &c.entity {
-                    entities.insert(e.as_str(), c);
-                }
-            }
-        }
-        Self { by_name, entities, complete: index.complete() }
+    fn unknown() -> Self {
+        Self { by_name: BTreeMap::new(), entities: BTreeMap::new(), complete: false, facts: Rc::default() }
+    }
+
+    fn is_ambiguous(&self, name: &str) -> bool {
+        self.facts.ambiguous.contains(name)
     }
 
     fn identity(&self, class: &Class) -> String {
@@ -641,7 +634,7 @@ fn query_problems(model: &Model, query: &str, domain_in_project: bool) -> Vec<Qu
     let declarations = jpql::declarations(&words);
     if domain_in_project {
         for decl in declarations.iter().filter(|d| !d.is_path()) {
-            if model.entities.contains_key(decl.target.s) || model.class(decl.target.s).is_some() {
+            if model.entities.contains_key(decl.target.s) || model.class(decl.target.s).is_some() || model.is_ambiguous(decl.target.s) {
                 continue;
             }
             let Some(known) = model.near_miss(decl.target.s) else {
@@ -682,7 +675,6 @@ fn warning(text: &str, from: usize, to: usize, code: &str, message: String) -> D
 
 /// The problems of the repositories of a file.
 fn problems(model: &Model, text: &str, file: &JavaFile) -> Vec<Diagnostic> {
-    let types_on = host::setting_bool("springData.checkQueryTypes").unwrap_or(true);
     let mongo = text.contains("springframework.data.mongodb");
     let mut out = Vec::new();
     for (ti, domain) in repositories(file) {
@@ -744,14 +736,6 @@ fn problems(model: &Model, text: &str, file: &JavaFile) -> Vec<Diagnostic> {
             for part in &parts {
                 if let Resolved::Missing { from, to, name, ty } = resolve(model, &domain, &m.name, part.from, part.to) {
                     out.push(warning(text, m.at + from, m.at + to, "unknown-property", format!("`{ty}` has no property `{name}`.")));
-                }
-            }
-            if types_on {
-                out.extend(parameter_problems(model, &domain, m, &parts, text));
-                if let Some(message) = types::return_problem(m)
-                    && let Some(ty) = &m.ty
-                {
-                    out.push(warning(text, ty.at, ty.at + ty.name.len(), "query-return-type", message));
                 }
             }
             let expected: Option<usize> = parts.iter().map(|p| p.args).sum();
@@ -846,32 +830,6 @@ fn entity_graph_problems(model: &Model, domain: &str, a: &java::Annotation, text
     out
 }
 
-/// A parameter whose type cannot convert to the type of the property its part of the method name compares.
-fn parameter_problems(model: &Model, domain: &str, m: &Member, parts: &[Part], text: &str) -> Vec<Diagnostic> {
-    let mut params = m.params.iter().filter(|p| !SPECIAL_PARAMS.contains(&p.ty.name.as_str()));
-    let mut out = Vec::new();
-    for part in parts {
-        let Some(count) = part.args else { return out };
-        let taken: Vec<_> = params.by_ref().take(count).collect();
-        let Resolved::Found(steps) = resolve(model, domain, &m.name, part.from, part.to) else {
-            continue;
-        };
-        let Some((_, _, _, property)) = steps.last() else {
-            continue;
-        };
-        for p in taken {
-            let ty = match p.ty.args.last() {
-                Some(arg) if CONTAINERS.contains(&p.ty.name.as_str()) => arg,
-                _ => &p.ty,
-            };
-            if let Some(message) = types::mismatch(&property.ty, ty) {
-                out.push(Diagnostic::new(range(text, ty.at, ty.at + ty.name.len()), Severity::Info, message).code("query-parameter-type"));
-            }
-        }
-    }
-    out
-}
-
 /// Top-level keys of a MongoDB `@Query` that name no property of the domain class, nor a `@Field` name.
 fn mongo_problems(model: &Model, domain: &str, query: &java::Annotation, text: &str) -> Vec<Diagnostic> {
     let Some(props) = model.props(domain) else {
@@ -903,75 +861,10 @@ fn mongo_problems(model: &Model, domain: &str, query: &java::Annotation, text: &
     out
 }
 
-/// Entities referenced from the aggregate roots `roots` that are also referenced from another root.
-#[cfg(test)]
-fn shared_entities(model: &Model, roots: &std::collections::BTreeSet<String>, path: &str) -> Vec<Diagnostic> {
-    let mut out = Vec::new();
-    let referenced = |root: &Class, entity: &str| root.props.iter().any(|p| p.ty == entity && !p.embedded);
-    for (name, found) in &model.by_name {
-        let Some((_, root)) = found.iter().find(|(p, _)| *p == path).filter(|_| roots.contains(*name)) else {
-            continue;
-        };
-        for prop in root.props.iter().filter(|p| !p.embedded) {
-            let Some((_, entity)) = model.class(&prop.ty).filter(|(_, c)| c.has_id && !roots.contains(&c.name)) else {
-                continue;
-            };
-            let others: Vec<&str> = roots
-                .iter()
-                .filter(|r| r.as_str() != *name)
-                .filter(|r| model.class(r).is_some_and(|(_, c)| referenced(c, &entity.name)))
-                .map(String::as_str)
-                .collect();
-            if !others.is_empty() {
-                let message = format!(
-                    "`{}` is referenced from the aggregate roots `{name}` and `{}`; in Spring Data JDBC an entity belongs to one aggregate.",
-                    entity.name,
-                    others.join("`, `")
-                );
-                out.push(Diagnostic::new(prop.range, Severity::Warning, message).code("jdbc-shared-entity"));
-            }
-        }
-    }
-    out
-}
-
+#[derive(Default)]
 pub struct DataTools {
     live: live::Live,
-    #[cfg(test)]
-    classes: Indexes<Vec<Class>>,
-    #[cfg(test)]
-    domains: Indexes<Vec<String>>,
     generation: generation::Generation,
-}
-
-impl Default for DataTools {
-    fn default() -> Self {
-        Self {
-            live: live::Live::default(),
-            #[cfg(test)]
-            classes: Indexes::new(SOURCE_GLOBS, classes),
-            #[cfg(test)]
-            domains: Indexes::new(SOURCE_GLOBS, repository_domains),
-            generation: generation::Generation::default(),
-        }
-    }
-}
-
-impl DataTools {
-    #[cfg(test)]
-    fn index(&mut self, doc: &Document) -> Option<&Index<Vec<Class>>> {
-        self.classes.for_document(&doc.path, &doc.text, PROVIDER_BUDGET).map(|i| &*i)
-    }
-}
-
-/// The domain types of the repositories a source declares.
-#[cfg(test)]
-fn repository_domains(path: &str, text: &str) -> Option<Vec<String>> {
-    if !text.contains("Repository") {
-        return None;
-    }
-    let found: Vec<String> = repositories(&parse_source(path, text)).into_iter().map(|(_, d)| d).collect();
-    (!found.is_empty()).then_some(found)
 }
 
 /// A derived query method name in words, for a tooltip: `findByAgeGreaterThanOrderByName` reads `age greater than, order by name`.
@@ -986,7 +879,8 @@ fn describe(name: &str, parts: &[Part]) -> String {
         }
         out
     };
-    let order_at = name.find("OrderBy").unwrap_or(name.len());
+    let predicate = predicate_start(name).unwrap_or(0);
+    let order_at = name[predicate..].find("OrderBy").map_or(name.len(), |at| predicate + at);
     let (criteria, ordering): (Vec<&Part>, Vec<&Part>) = parts.iter().partition(|p| p.from < order_at);
     let mut text = String::new();
     for (i, part) in criteria.iter().enumerate() {
@@ -1126,7 +1020,7 @@ fn declaration_position(text: &str, repository: &TypeDecl, start: usize, off: us
 impl DataTools {
     /// Entity names after `from`/`join` and properties after `alias.` inside a `@Query` string.
     fn query_completion(&mut self, doc: &Document, off: usize) -> Vec<CompletionItem> {
-        let file = live::repository_file(doc);
+        let file = self.repository_file(doc);
         let Some((t, domain)) = repository_at(&file, off) else {
             return Vec::new();
         };
@@ -1155,11 +1049,9 @@ impl DataTools {
             .find(|(_, c)| !(c.is_alphanumeric() || matches!(c, '_' | '$' | '.')))
             .map_or(0, |(i, c)| i + c.len_utf8());
         let typed = &s.value[typed_start..cursor];
-        let watching = self.live.watching;
-        let Some(index) = self.cached_index(doc) else {
+        let Some(model) = self.model_for(doc, &file, false) else {
             return Vec::new();
         };
-        let model = live::model(index, &file, watching, &doc.path);
         if model.class(&domain).is_none() {
             return Vec::new();
         }
@@ -1215,7 +1107,7 @@ impl Providers for DataTools {
         let Some(off) = offset(&doc.text, at) else {
             return Vec::new();
         };
-        let file = live::repository_file(doc);
+        let file = self.repository_file(doc);
         let Some((t, domain)) = repository_at(&file, off) else {
             return Vec::new();
         };
@@ -1225,11 +1117,9 @@ impl Providers for DataTools {
         let Some(parts) = derived(&m.name) else {
             return Vec::new();
         };
-        let watching = self.live.watching;
-        let Some(index) = self.cached_index(doc) else {
+        let Some(model) = self.model_for(doc, &file, false) else {
             return Vec::new();
         };
-        let model = live::model(index, &file, watching, &doc.path);
         let rel = off - m.at;
         for part in parts.iter().filter(|p| p.from <= rel && rel <= p.to) {
             if let Resolved::Found(steps) = resolve(&model, &domain, &m.name, part.from, part.to)
@@ -1245,7 +1135,7 @@ impl Providers for DataTools {
         if !doc.text.contains("springframework.data.mongodb") {
             return Vec::new();
         }
-        let file = live::repository_file(doc);
+        let file = self.repository_file(doc);
         let mut actions = Vec::new();
         for (ti, _) in repositories(&file) {
             for query in file.types[ti].methods().filter_map(|m| m.annotation("Query")) {
@@ -1294,7 +1184,7 @@ impl Providers for DataTools {
         let Some(pred_at) = predicate_start(word) else {
             return Vec::new();
         };
-        let file = live::repository_file(doc);
+        let file = self.repository_file(doc);
         let Some((repository, domain)) = repository_at(&file, off) else {
             return Vec::new();
         };
@@ -1303,11 +1193,9 @@ impl Providers for DataTools {
         if !declaration_position(&doc.text, original_repository, start, off) {
             return Vec::new();
         }
-        let watching = self.live.watching;
-        let Some(index) = self.cached_index(doc) else {
+        let Some(model) = self.model_for(doc, &file, false) else {
             return Vec::new();
         };
-        let model = live::model(index, &file, watching, &doc.path);
         let pred = &word[pred_at..];
         let (tail, order) = tail_start(pred);
         let head = &word[..pred_at + tail];
@@ -1345,7 +1233,7 @@ impl Plugin for DataTools {
         let (doc, selections) = match (editor.document(), editor.selections()) {
             (Ok(doc), Ok(selections)) => (doc, selections),
             (Err(Error::Denied(_)), _) | (_, Err(Error::Denied(_))) => {
-                return Err("Grant the editor.read capability to show inherited members.".into());
+                return Err("Showing inherited members needs the editor.read permission. Allow it in Settings › Plugins › Spring Data Tools.".into());
             }
             (Err(error), _) | (_, Err(error)) => return Err(error),
         };
@@ -1362,89 +1250,18 @@ impl Plugin for DataTools {
             );
             return Ok(None);
         }
-        let items: Vec<PickItem> =
-            found.iter().map(|(owner, member)| PickItem::new(&format!("{owner}.{member}"), member).description(owner)).collect();
-        match host::pick(&format!("Inherited members of {}", repository.name), &items) {
-            Err(Error::Invalid(_)) => Ok(None),
-            other => other.map(|_| None),
-        }
+        // The members live in library jars: the list is for reading, choosing one opens nothing.
+        let items: Vec<PickItem> = found
+            .iter()
+            .enumerate()
+            .map(|(i, (owner, member))| PickItem::new(&i.to_string(), member).description(&format!("from {owner}")))
+            .collect();
+        host::pick(&format!("{} inherits {} members", repository.name, items.len()), &items)?;
+        Ok(None)
     }
 }
 
 register_plugin!(DataTools, injections, providers, file_actions, diagnostics, hover, inlay_hints);
-
-// Legacy fixtures retain parser/marker coverage independently of the stricter live ownership contract.
-#[cfg(test)]
-impl DataTools {
-    fn legacy_parser_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
-        let file = parse_source(&doc.path, &doc.text);
-        let repos = repositories(&file);
-        let repository_types: Vec<usize> = repos.iter().map(|(ti, _)| *ti).collect();
-        let found: Vec<Diagnostic> =
-            checks::check(&file, &repository_types, checks::Groups::from_settings()).iter().map(|f| f.diagnostic(&doc.text)).collect();
-        let jdbc = checks::Groups::from_settings().jdbc_mapping && (doc.text.contains("data.relational") || doc.text.contains("data.jdbc"));
-        let roots: Option<std::collections::BTreeSet<String>> = if jdbc {
-            let domains = self.domains.for_document(&doc.path, &doc.text, PROVIDER_BUDGET).filter(|d| d.complete());
-            domains.map(|d| d.iter().flat_map(|(_, names)| names.iter().cloned()).collect())
-        } else {
-            None
-        };
-        if repos.is_empty() {
-            let mut diagnostics = found;
-            if let Some(roots) = &roots
-                && let Some(index) = self.index(doc)
-            {
-                diagnostics.extend(shared_entities(&Model::new(index), roots, &doc.path));
-            }
-            let _ = host::publish_diagnostics(&doc.path, &diagnostics);
-            return Vec::new();
-        }
-        let Some(index) = self.index(doc) else {
-            return Vec::new();
-        };
-        let model = Model::new(index);
-        let mut diagnostics = problems(&model, &doc.text, &file);
-        diagnostics.extend(found);
-        if let Some(roots) = roots {
-            diagnostics.extend(shared_entities(&model, &roots, &doc.path));
-        }
-        let _ = host::publish_diagnostics(&doc.path, &diagnostics);
-        let mut markers = Vec::new();
-        let mut derived_markers = Vec::new();
-        for (ti, domain) in repos {
-            let t = &file.types[ti];
-            let line = range(&doc.text, t.at, t.at).start.line;
-            if let Some((path, c)) = model.class(&domain) {
-                let target = Some(Location { path: path.into(), range: c.range });
-                markers.push(LineMarker { line, icon: Some(DOMAIN_MARKER.into()), tooltip: format!("Domain type: {domain}"), target });
-            }
-            let custom = format!("{}Impl", t.name);
-            if let Some((path, c)) = model.class(&custom) {
-                let target = Some(Location { path: path.into(), range: c.range });
-                markers.push(LineMarker {
-                    line,
-                    icon: Some(IMPLEMENTATION_MARKER.into()),
-                    tooltip: format!("Custom implementation: {custom}"),
-                    target,
-                });
-            }
-            for m in t.methods().filter(|m| derived_method(m)) {
-                let Some(parts) = derived(&m.name).filter(|p| !p.is_empty()) else {
-                    continue;
-                };
-                let line = range(&doc.text, m.at, m.at).start.line;
-                let tooltip = format!(
-                    "Derived query: {} {domain} where {}",
-                    m.name[..parts[0].from.min(m.name.len())].trim_end_matches("By"),
-                    describe(&m.name, &parts)
-                );
-                derived_markers.push(LineMarker { line, icon: Some(QUERY_MARKER.into()), tooltip, target: None });
-            }
-        }
-        markers.extend(derived_markers);
-        markers
-    }
-}
 
 pub(crate) const DOMAIN_MARKER: &str = "icons/marker-domain.svg";
 pub(crate) const IMPLEMENTATION_MARKER: &str = "icons/marker-implementation.svg";
@@ -1462,6 +1279,7 @@ mod tests {
     }
 
     use super::*;
+    use openidea_plugin::diagnostics::DiagnosticsProvider;
     use openidea_plugin::mock::MockHost;
 
     const BASE: &str = r#"package com.acme;
@@ -1473,6 +1291,8 @@ public abstract class BaseEntity {
 }
 "#;
     const USER: &str = r#"package com.acme;
+
+import java.util.List;
 
 @Entity
 public class User extends BaseEntity {
@@ -1498,7 +1318,7 @@ class Address {
 record Order(String number, BigDecimal total) {}
 "#;
     const REPO: &str = r#"package com.acme;
-import org.springframework.data.jpa.repository.JpaRepository; import org.springframework.data.jpa.repository.Query; import org.springframework.data.repository.query.Param; import org.springframework.data.jpa.repository.Modifying; import org.springframework.data.repository.RepositoryDefinition;
+import org.springframework.data.jpa.repository.JpaRepository; import org.springframework.data.jpa.repository.Query; import org.springframework.data.repository.query.Param; import org.springframework.data.jpa.repository.Modifying; import org.springframework.data.repository.RepositoryDefinition; import org.springframework.data.domain.Pageable;
 public interface UserRepository extends JpaRepository<User, Long>, UserRepositoryCustom {
     List<User> findByFirstNameAndLastNameAllIgnoreCase(String first, String last);
     List<User> findDistinctTop3ByAddressZipCodeOrderByAgeDesc(String zip);
@@ -1555,6 +1375,35 @@ interface OtherRepository {
         }
     }
 
+    const SPRING_IMPORTS: [&str; 5] = [
+        "org.springframework.data.jpa.repository.JpaRepository",
+        "org.springframework.data.jpa.repository.Query",
+        "org.springframework.data.repository.query.Param",
+        "org.springframework.data.jpa.repository.Modifying",
+        "org.springframework.data.jpa.repository.EntityGraph",
+    ];
+
+    fn spring(text: &str) -> String {
+        if text.contains("mongodb") || text.contains("import org.springframework.data.jpa.repository.JpaRepository") {
+            return text.into();
+        }
+        let semicolon = if text.starts_with("package com.acme;") { ";" } else { "" };
+        let imports: String =
+            SPRING_IMPORTS.iter().filter(|i| !text.contains(&format!("import {i}"))).map(|i| format!("\nimport {i}{semicolon}")).collect();
+        text.replacen(&format!("package com.acme{semicolon}"), &format!("package com.acme{semicolon}{imports}"), 1)
+    }
+
+    fn ready() -> (MockHost, DataTools) {
+        let host = setup();
+        let mut tools = DataTools::default();
+        tools.activate_live();
+        (host, tools)
+    }
+
+    fn diagnose(tools: &mut DataTools, text: &str) -> Vec<Diagnostic> {
+        tools.diagnostics(&doc(&spring(text)))
+    }
+
     fn parts(name: &str) -> Vec<(&str, Option<usize>)> {
         derived(name).unwrap().into_iter().map(|p| (&name[p.from..p.to], p.args)).collect()
     }
@@ -1580,10 +1429,8 @@ interface OtherRepository {
 
     #[test]
     fn checks_derived_queries_and_query_annotations() {
-        let host = setup();
-        let mut tools = DataTools::default();
-        tools.legacy_parser_markers(&doc(REPO));
-        let problems = &host.diagnostics()["/project/src/main/java/com/acme/UserRepository.java"];
+        let (_host, mut tools) = ready();
+        let problems = &diagnose(&mut tools, REPO);
         let found: Vec<_> = problems
             .iter()
             .map(|d| (d.code.as_deref().unwrap(), &REPO[offset(REPO, d.range.start).unwrap()..offset(REPO, d.range.end).unwrap()]))
@@ -1605,10 +1452,8 @@ interface OtherRepository {
 
     #[test]
     fn links_repository_to_entity_and_properties() {
-        let _host = setup();
-        let mut tools = DataTools::default();
-        tools.activate_live();
-        let markers = tools.legacy_parser_markers(&doc(REPO));
+        let (_host, mut tools) = ready();
+        let markers = tools.line_markers(&doc(REPO));
         let targets: Vec<_> = markers
             .iter()
             .filter(|m| m.target.is_some())
@@ -1673,10 +1518,9 @@ public interface UserRepository extends JpaRepository<User, Long> {
 "#;
 
     fn query_diagnostics(text: &str) -> Vec<(String, String)> {
-        let host = setup();
-        let mut tools = DataTools::default();
-        tools.legacy_parser_markers(&doc(text));
-        let problems = host.diagnostics().get("/project/src/main/java/com/acme/UserRepository.java").cloned().unwrap_or_default();
+        let (_host, mut tools) = ready();
+        let text = &spring(text);
+        let problems = tools.diagnostics(&doc(text));
         problems
             .iter()
             .map(|d| (d.code.clone().unwrap(), text[offset(text, d.range.start).unwrap()..offset(text, d.range.end).unwrap()].to_owned()))
@@ -1714,14 +1558,13 @@ public interface UserRepository extends JpaRepository<User, Long> {
 
     #[test]
     fn incomplete_index_stays_quiet() {
-        let mut index: Index<Vec<Class>> = Index::new(SOURCE_GLOBS, classes);
-        index.update("/p/Customer.java", CUSTOMER);
-        let model = Model::new(&index);
-        assert!(!model.complete);
-        assert!(query_problems(&model, "select c from Custmer c where c.nme = 1", true).is_empty());
-        let mut complete = Model::new(&index);
-        complete.complete = true;
-        assert_eq!(query_problems(&complete, "select c from Custmer c where c.nme = 1", true).len(), 1);
+        let (host, mut tools) = ready();
+        let typo = "select c from Custmer c where c.nme = 1";
+        let text = format!("package com.acme;\ninterface CustomerRepository extends JpaRepository<Customer, Long> {{\n    @Query(\"{typo}\")\n    List<Customer> q();\n}}\n");
+        assert_eq!(diagnose(&mut tools, &text).len(), 1);
+        host.add_file("src/main/java/com/acme/Broken.java", "class Broken {");
+        tools.live_events(&[openidea_plugin::Event::FileSaved("/project/src/main/java/com/acme/Broken.java".into())]);
+        assert!(diagnose(&mut tools, &text).is_empty());
     }
 
     #[test]
@@ -1738,7 +1581,7 @@ public interface UserRepository extends JpaRepository<User, Long> {
             "src/main/kotlin/com/acme/Person.kt",
             "package com.acme\n\n@Entity\nclass Person(@Id val id: Long, var name: String)\n",
         );
-        let repo = "package com.acme\n\ninterface PersonRepository : JpaRepository<Person, Long> {\n    @Query(\"\"\"\n        select p from Person p\n        where p.nmae = :name\n    \"\"\")\n    fun byName(name: String): List<Person>\n}\n";
+        let repo = "package com.acme\nimport org.springframework.data.jpa.repository.JpaRepository\nimport org.springframework.data.jpa.repository.Query\n\ninterface PersonRepository : JpaRepository<Person, Long> {\n    @Query(\"\"\"\n        select p from Person p\n        where p.nmae = :name\n    \"\"\")\n    fun byName(name: String): List<Person>\n}\n";
         let kt = Document {
             path: "/project/src/main/kotlin/com/acme/PersonRepository.kt".into(),
             language: "kotlin".into(),
@@ -1746,8 +1589,8 @@ public interface UserRepository extends JpaRepository<User, Long> {
             text: repo.into(),
         };
         let mut tools = DataTools::default();
-        tools.legacy_parser_markers(&kt);
-        let problems = &host.diagnostics()["/project/src/main/kotlin/com/acme/PersonRepository.kt"];
+        tools.activate_live();
+        let problems = tools.diagnostics(&kt);
         assert_eq!(problems.len(), 1);
         assert_eq!(problems[0].message, "`Person` has no property `nmae`.");
     }
@@ -1810,7 +1653,7 @@ public interface UserRepository extends JpaRepository<User, Long> {
             "src/main/kotlin/com/acme/Person.kt",
             "package com.acme\n\n@Entity\nclass Person(@Id val id: Long, var name: String)\n",
         );
-        let repo = "package com.acme\n\ninterface PersonRepository : JpaRepository<Person, Long> {\n    @Query(\"select p from Person p where p.nmae = :name\")\n    fun byName(name: String): List<Person>\n}\n";
+        let repo = "package com.acme\nimport org.springframework.data.jpa.repository.JpaRepository\nimport org.springframework.data.jpa.repository.Query\n\ninterface PersonRepository : JpaRepository<Person, Long> {\n    @Query(\"select p from Person p where p.nmae = :name\")\n    fun byName(name: String): List<Person>\n}\n";
         let kt = Document {
             path: "/project/src/main/kotlin/com/acme/PersonRepository.kt".into(),
             language: "kotlin".into(),
@@ -1818,33 +1661,27 @@ public interface UserRepository extends JpaRepository<User, Long> {
             text: repo.into(),
         };
         let mut tools = DataTools::default();
-        tools.legacy_parser_markers(&kt);
-        let problems = &host.diagnostics()["/project/src/main/kotlin/com/acme/PersonRepository.kt"];
+        tools.activate_live();
+        let problems = tools.diagnostics(&kt);
         assert_eq!(problems.len(), 1);
         assert_eq!(problems[0].message, "`Person` has no property `nmae`.");
     }
 
     #[test]
-    fn fixed_file_publishes_empty_list() {
-        let host = setup();
+    fn fixed_file_has_no_diagnostics() {
+        let (_host, mut tools) = ready();
         let path = "/project/src/main/java/com/acme/Person.java";
         let bad = "import org.springframework.data.relational.core.mapping.Sequence;\nclass Person {\n    @Sequence(sequence = \"\")\n    Long id;\n}\n";
-        let mut tools = DataTools::default();
         let doc = |text: &str| Document { path: path.into(), language: "java".into(), version: 1, text: text.into() };
-        tools.legacy_parser_markers(&doc(bad));
-        assert_eq!(host.diagnostics()[path].len(), 1);
-        tools.legacy_parser_markers(&doc(&bad.replace("\"\"", "\"person_seq\"")));
-        assert!(host.diagnostics().get(path).is_none_or(|d| d.is_empty()));
+        assert_eq!(tools.diagnostics(&doc(bad)).len(), 1);
+        assert!(tools.diagnostics(&doc(&bad.replace("\"\"", "\"person_seq\""))).is_empty());
     }
 
     #[test]
-    fn repository_findings_are_published_with_problems() {
-        let host = setup();
-        let path = "/project/src/main/java/com/acme/UserRepository.java";
+    fn repository_findings_come_with_problems() {
+        let (_host, mut tools) = ready();
         let text = "package com.acme;\n\nimport org.springframework.data.domain.Page;\n\ninterface UserRepository extends JpaRepository<User, Long> {\n    Page<User> findByFirstName(String firstName);\n}\n";
-        let mut tools = DataTools::default();
-        tools.legacy_parser_markers(&Document { path: path.into(), language: "java".into(), version: 1, text: text.into() });
-        let codes: Vec<_> = host.diagnostics()[path].iter().map(|d| d.code.clone()).collect();
+        let codes: Vec<_> = diagnose(&mut tools, text).iter().map(|d| d.code.clone()).collect();
         assert_eq!(codes, [Some("page-without-pageable".to_owned())]);
     }
 
@@ -1887,7 +1724,7 @@ public interface UserRepository extends JpaRepository<User, Long> {
             "src/main/kotlin/com/acme/Person.kt",
             "package com.acme\n\n@Entity\nclass Person(@Id val id: Long, var name: String, var age: Int)\n",
         );
-        let repo = "package com.acme\n\ninterface PersonRepository : JpaRepository<Person, Long> {\n    fun findByName(name: String): List<Person>\n    fun findByNmae(name: String): List<Person>\n}\n";
+        let repo = "package com.acme\nimport org.springframework.data.jpa.repository.JpaRepository\n\ninterface PersonRepository : JpaRepository<Person, Long> {\n    fun findByName(name: String): List<Person>\n    fun findByNmae(name: String): List<Person>\n}\n";
         let kt = Document {
             path: "/project/src/main/kotlin/com/acme/PersonRepository.kt".into(),
             language: "kotlin".into(),
@@ -1895,9 +1732,10 @@ public interface UserRepository extends JpaRepository<User, Long> {
             text: repo.into(),
         };
         let mut tools = DataTools::default();
-        let markers = tools.legacy_parser_markers(&kt);
+        tools.activate_live();
+        let markers = tools.line_markers(&kt);
         assert_eq!(markers[0].tooltip, "Domain type: Person");
-        let problems = &host.diagnostics()["/project/src/main/kotlin/com/acme/PersonRepository.kt"];
+        let problems = tools.diagnostics(&kt);
         assert_eq!(problems.len(), 1);
         assert_eq!(problems[0].message, "`Person` has no property `nmae`.");
     }
@@ -1909,8 +1747,9 @@ public interface UserRepository extends JpaRepository<User, Long> {
         host.add_file("src/main/java/com/acme/OpenView.java", "package com.acme;\ninterface OpenView {\n    @Value(\"#{target.x}\")\n    String getAnything();\n}\n");
         host.add_file("src/main/java/com/acme/UserDto.java", "package com.acme;\nrecord UserDto(String firstName, String age, String bogus) {}\n");
         let mut tools = DataTools::default();
-        tools.legacy_parser_markers(&doc(text));
-        let problems = host.diagnostics().get("/project/src/main/java/com/acme/UserRepository.java").cloned().unwrap_or_default();
+        tools.activate_live();
+        let text = &spring(text);
+        let problems = tools.diagnostics(&doc(text));
         problems
             .iter()
             .map(|d| (d.code.clone().unwrap(), text[offset(text, d.range.start).unwrap()..offset(text, d.range.end).unwrap()].to_owned()))
@@ -1918,7 +1757,7 @@ public interface UserRepository extends JpaRepository<User, Long> {
     }
 
     fn repo_with(body: &str) -> String {
-        format!("package com.acme;\nimport org.springframework.data.jpa.repository.EntityGraph;\ninterface UserRepository extends JpaRepository<User, Long> {{\n{body}\n}}\n")
+        format!("package com.acme;\nimport org.springframework.data.jpa.repository.EntityGraph;\nimport org.springframework.data.domain.Pageable;\ninterface UserRepository extends JpaRepository<User, Long> {{\n{body}\n}}\n")
     }
 
     #[test]
@@ -1953,41 +1792,21 @@ public interface UserRepository extends JpaRepository<User, Long> {
     }
 
     #[test]
+    fn find_order_by_name_subject_tooltip() {
+        let words = |name: &str| describe(name, &derived(name).unwrap());
+        assert_eq!(words("findOrderByName"), "name");
+        assert_eq!(words("findOrderByNameOrderByAgeDesc"), "name, order by age desc");
+        assert_eq!(words("findByAgeOrderByName"), "age, order by name");
+    }
+
+    #[test]
     fn derived_query_methods_get_a_tooltip_in_words() {
-        let _host = setup();
-        let markers = DataTools::default().legacy_parser_markers(&doc(REPO));
+        let (_host, mut tools) = ready();
+        let markers = tools.line_markers(&doc(REPO));
         let tips: Vec<&str> = markers.iter().filter(|m| m.target.is_none()).map(|m| m.tooltip.as_str()).collect();
         assert!(tips.contains(&"Derived query: find User where first name and last name all ignore case"), "{tips:?}");
         assert!(tips.contains(&"Derived query: findDistinctTop3 User where address zip code, order by age desc"), "{tips:?}");
         assert!(tips.contains(&"Derived query: find User where age between"), "{tips:?}");
-    }
-
-    fn found_codes(text: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
-        let host = setup();
-        for (path, content) in extra {
-            host.add_file(path, content);
-        }
-        DataTools::default().legacy_parser_markers(&doc(text));
-        host.diagnostics()
-            .get("/project/src/main/java/com/acme/UserRepository.java")
-            .map(|d| d.iter().map(|d| (d.code.clone().unwrap_or_default(), d.message.clone())).collect())
-            .unwrap_or_default()
-    }
-
-    #[test]
-    fn parameter_types_that_cannot_convert_are_reported() {
-        let repo = "interface UserRepository extends JpaRepository<User, Long> {\n    List<User> findByAge(String age);\n    List<User> findByAgeIn(List<Integer> ages);\n    List<User> findByAgeBetween(Long from, Long to);\n    List<User> findByOwner(String owner);\n    List<User> findByActive(Boolean on);\n}\n";
-        let found = found_codes(repo, &[]);
-        let types: Vec<_> = found.iter().filter(|(c, _)| c == "query-parameter-type").collect();
-        assert_eq!(types.len(), 1, "{found:?}");
-        assert!(types[0].1.contains("`int`"));
-    }
-
-    #[test]
-    fn verbs_that_cannot_produce_the_return_type_are_reported() {
-        let repo = "interface UserRepository extends JpaRepository<User, Long> {\n    List<User> countByAge(int age);\n    long countByActive(boolean a);\n    String existsByAge(int age);\n}\n";
-        let found = found_codes(repo, &[]);
-        assert_eq!(found.iter().filter(|(c, _)| c == "query-return-type").count(), 2, "{found:?}");
     }
 
     const MONGO_PERSON: &str = "package com.acme;\n@Document\nclass Person {\n    @Id String id;\n    String lastname;\n    @Field(\"first_name\") String firstname;\n    Address address;\n}\n";
@@ -2018,49 +1837,44 @@ public interface UserRepository extends JpaRepository<User, Long> {
 
     #[test]
     fn mongo_query_fields_must_exist_on_the_document() {
-        let repo = "import org.springframework.data.mongodb.repository.Query;\ninterface PersonRepository extends MongoRepository<Person, String> {\n    @Query(\"{ 'lastname': ?0, 'address.city': ?1, first_name: ?2, $or: [ { nope: 1 } ], 'lastnme': ?3 }\")\n    List<Person> find(String a, String b, String c, String d);\n}\n";
+        let repo = "package com.acme;\nimport org.springframework.data.mongodb.repository.Query;\nimport org.springframework.data.mongodb.repository.MongoRepository;\ninterface PersonRepository extends MongoRepository<Person, String> {\n    @Query(\"{ 'lastname': ?0, 'address.city': ?1, first_name: ?2, $or: [ { nope: 1 } ], 'lastnme': ?3 }\")\n    List<Person> find(String a, String b, String c, String d);\n}\n";
         let host = setup();
         host.add_file("src/main/java/com/acme/Person.java", MONGO_PERSON);
-        DataTools::default().legacy_parser_markers(&doc(repo));
-        let found = host.diagnostics()["/project/src/main/java/com/acme/UserRepository.java"].clone();
+        let mut tools = DataTools::default();
+        tools.activate_live();
+        let found = tools.diagnostics(&doc(repo));
         let mongo: Vec<_> = found.iter().filter(|d| d.code.as_deref() == Some("mongo-unknown-field")).collect();
         assert_eq!(mongo.len(), 1, "{found:?}");
         assert!(mongo[0].message.contains("lastnme"));
 
         let library = repo.replace("Person, String", "Library, String");
-        DataTools::default().legacy_parser_markers(&doc(&library));
-        assert!(
-            host.diagnostics()
-                .get("/project/src/main/java/com/acme/UserRepository.java")
-                .is_none_or(|d| d.iter().all(|c| c.code.as_deref() != Some("mongo-unknown-field")))
-        );
+        assert!(tools.diagnostics(&doc(&library)).iter().all(|c| c.code.as_deref() != Some("mongo-unknown-field")));
     }
 
     #[test]
-    fn jdbc_entity_shared_by_two_roots_is_reported() {
-        let host = setup();
-        let imports = "import org.springframework.data.relational.core.mapping.Table;\n";
-        let order = format!("{imports}class Order {{ @Id Long id; Set<Line> lines; }}");
-        host.add_file("src/main/java/com/acme/Order.java", &order);
-        host.add_file("src/main/java/com/acme/Invoice.java", "class Invoice { @Id Long id; Set<Line> lines; Set<Tag> tags; }");
-        host.add_file("src/main/java/com/acme/Line.java", "class Line { @Id Long id; }");
-        host.add_file("src/main/java/com/acme/Tag.java", "class Tag { String name; }");
-        host.add_file("src/main/java/com/acme/Repos.java", "interface OrderRepository extends CrudRepository<Order, Long> {}\ninterface InvoiceRepository extends CrudRepository<Invoice, Long> {}\n");
-        let path = "/project/src/main/java/com/acme/Order.java";
-        let d = Document { path: path.into(), language: "java".into(), version: 1, text: order };
-        DataTools::default().legacy_parser_markers(&d);
-        let found = host.diagnostics()[path].clone();
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].code.as_deref(), Some("jdbc-shared-entity"));
-        assert!(found[0].message.contains("`Line`") && found[0].message.contains("`Invoice`"));
+    fn show_repository_members_denied_names_permission() {
+        let host = MockHost::install().with_capabilities(&["project.read"]);
+        host.open_editor("/project/src/main/java/com/acme/UserRepository.java", "java", REPO, &[(2, 20, 2, 20)]);
+        let error = DataTools::default().run_command("show-repository-members", &host.invocation(), None).unwrap_err().to_string();
+        assert!(error.contains("needs the editor.read permission"), "{error}");
+        assert!(error.contains("Settings › Plugins › Spring Data Tools"), "{error}");
     }
 
     #[test]
     fn members_of_known_parent_interfaces_are_listed_by_the_command() {
         let host = setup();
         host.open_editor("/project/src/main/java/com/acme/UserRepository.java", "java", REPO, &[(2, 20, 2, 20)]);
-        host.answer_next_prompt(None);
         assert_eq!(DataTools::default().run_command("show-repository-members", &host.invocation(), None).unwrap(), None);
         assert!(DataTools::default().run_command("nope", &host.invocation(), None).is_err());
+    }
+
+    #[test]
+    fn inherited_members_are_listed_in_a_picker_by_interface() {
+        let host = setup();
+        host.open_editor("/project/src/main/java/com/acme/UserRepository.java", "java", REPO, &[(2, 20, 2, 20)]);
+        host.answer_next_prompt(Some(&["0"]));
+        assert_eq!(DataTools::default().run_command("show-repository-members", &host.invocation(), None).unwrap(), None);
+        assert!(host.notifications().is_empty(), "no notification dump");
+        assert!(host.opened_locations().is_empty(), "library members open nothing");
     }
 }

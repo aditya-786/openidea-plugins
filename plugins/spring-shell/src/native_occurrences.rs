@@ -12,7 +12,8 @@ struct Snapshot {
 }
 #[derive(Default)]
 pub(super) struct State {
-    snapshots: BTreeMap<String, Snapshot>,
+    /// The newest snapshot of each document, with its token.
+    snapshots: BTreeMap<String, (String, Snapshot)>,
 }
 fn edges(doc: &Document) -> openidea_plugin::indexing::Edges {
     if !((doc.language == "java" && doc.path.ends_with(".java"))
@@ -75,7 +76,8 @@ impl LanguageFeatures for ShellTools {
         if definitions.is_empty() {
             return vec![];
         }
-        if self.native_occurrences.snapshots.len() >= 8 {
+        self.native_occurrences.snapshots.remove(&doc.path);
+        if self.native_occurrences.snapshots.len() >= 64 {
             self.native_occurrences.snapshots.clear();
         }
         let random = std::collections::hash_map::RandomState::new();
@@ -84,34 +86,34 @@ impl LanguageFeatures for ShellTools {
             random.hash_one(0u8),
             random.hash_one(1u8)
         );
-        let lenses = definitions
+        let lenses: Vec<_> = definitions
             .iter()
             .enumerate()
-            .map(|(i, (key, range))| {
+            .filter_map(|(i, (key, range))| {
                 let count = edges
                     .definitions
                     .iter()
                     .chain(&edges.references)
                     .filter(|a| a.key == *key)
                     .count();
-                CodeLens {
+                (count > 1).then(|| CodeLens {
                     range: *range,
-                    title: format!(
-                        "{count} local occurrence{}",
-                        if count == 1 { "" } else { "s" }
-                    ),
+                    title: format!("{count} local occurrences"),
                     command: "command-occurrences".into(),
                     argument: Some(format!("{token}:{i}")),
-                }
+                })
             })
             .collect();
+        if lenses.is_empty() {
+            return lenses;
+        }
         self.native_occurrences.snapshots.insert(
-            token,
-            Snapshot {
+            doc.path.clone(),
+            (token, Snapshot {
                 root,
                 doc: doc.clone(),
                 definitions,
-            },
+            }),
         );
         lenses
     }
@@ -127,7 +129,9 @@ impl ShellTools {
         let snapshot = self
             .native_occurrences
             .snapshots
-            .get(token)
+            .values()
+            .find(|(own, _)| own == token)
+            .map(|(_, snapshot)| snapshot)
             .ok_or(Error::Stale)?;
         let (key, span) = snapshot.definitions.get(index).ok_or(Error::Stale)?;
         let editor = ctx.editor().ok_or(Error::Stale)?;
@@ -244,6 +248,28 @@ mod tests {
         assert!(h.requests().is_empty() && h.process_runs().is_empty());
     }
     #[test]
+    fn lens_in_other_file_not_stale() {
+        let h = MockHost::install();
+        let d = doc();
+        let mut nav = ShellTools::default();
+        let lens = nav.code_lenses(&d).remove(0);
+        for i in 0..12 {
+            nav.code_lenses(&Document { path: format!("/project/Other{i}.java"), ..doc() });
+        }
+        h.open_editor(&d.path, "java", SOURCE, &[(0, 0, 0, 0)]);
+        h.answer_next_prompt(Some(&["1"]));
+        let result = nav.run_command(&lens.command, &h.invocation(), lens.argument.as_deref());
+        assert!(!matches!(result, Err(Error::Stale)), "{result:?}");
+    }
+    #[test]
+    fn single_occurrence_gets_no_lens() {
+        let _h = MockHost::install();
+        let text = SOURCE.replace(" @ShellMethodAvailability({\"run task\",\"rt\"}) Availability gate(){return null;}", "")
+            .replace("@ShellMethodAvailability(\"isReady\") ", "");
+        let lenses = ShellTools::default().code_lenses(&Document { text, ..doc() });
+        assert!(lenses.is_empty(), "{lenses:?}");
+    }
+    #[test]
     fn native_surfaces_withhold_escaped_foreign_ambiguous_and_inherited_scopes() {
         let _h = MockHost::install();
         let mut nav = ShellTools::default();
@@ -299,7 +325,7 @@ mod kotlin_identity_tests {
     #[test]
     fn lens_tokens_do_not_cross_paths_or_project_ownership() {
         let h = MockHost::install();
-        let text = "import org.springframework.shell.command.annotation.Command; @Command class C { @Command(command=\"run\") void run(){} }";
+        let text = "import org.springframework.shell.standard.ShellComponent; import org.springframework.shell.standard.ShellMethod; import org.springframework.shell.standard.ShellMethodAvailability; @ShellComponent class C { @ShellMethod(key=\"run\") void run(){} @ShellMethodAvailability(\"run\") Availability g(){return null;} }";
         let doc = Document {
             path: "/project/C.java".into(),
             language: "java".into(),

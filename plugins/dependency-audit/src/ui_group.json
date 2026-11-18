@@ -3,7 +3,7 @@
   "tabs": [
     {
       "id": "vulnerabilities",
-      "label": "Dependency Audit"
+      "label": "Vulnerabilities"
     },
     {
       "id": "npm-dependency-graph",
@@ -15,7 +15,7 @@
     },
     {
       "id": "call-analysis",
-      "label": "Call Evidence"
+      "label": "Vulnerable Calls"
     },
     {
       "id": "sbt-resolution",

@@ -89,8 +89,8 @@ fn lines(text: &str) -> Vec<Line<'_>> {
         .collect()
 }
 
-fn is_separator(line: &Line) -> bool {
-    line.text.strip_prefix("---").is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+pub fn is_separator(text: &str) -> bool {
+    text.strip_prefix("---").is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
 }
 
 /// The documents of `text`; a document that is empty between two separators is left out.
@@ -100,7 +100,7 @@ pub fn documents(text: &str) -> Vec<Doc> {
     let all = lines(text);
     let mut docs = Vec::new();
     let mut from = 0;
-    for to in (0..=all.len()).filter(|&i| i == all.len() || is_separator(&all[i])) {
+    for to in (0..=all.len()).filter(|&i| i == all.len() || is_separator(all[i].text)) {
         if from < to {
             let end = all.get(to).map_or(text.len(), |line| line.start);
             let mut doc = scan(&all[from..to]);

@@ -48,8 +48,10 @@ def assets(name):
             plugin_icons[f"ext:fileIcon/{manifest['id']}/{entry['id']}"] = variants
     data['plugin-icons.js'] = 'window.uiKitPluginIcons = Object.freeze(' + json.dumps(plugin_icons, ensure_ascii=False) + ');\n'
     group_path = package/'src/ui_group.json'
-    tabs = json.loads(group_path.read_text()).get('tabs', []) if group_path.exists() else []
-    data['plugin-icons.js'] += 'window.uiKitViewTabs = Object.freeze(' + json.dumps(tabs, ensure_ascii=False) + ');\n'
+    group = json.loads(group_path.read_text()) if group_path.exists() else {}
+    data['plugin-icons.js'] += 'window.uiKitViewTabs = Object.freeze(' + json.dumps(group.get('tabs', []), ensure_ascii=False) + ');\n'
+    if group.get('sections'):
+        data['plugin-icons.js'] += 'window.uiKitViewSections = Object.freeze(' + json.dumps(group['sections'], ensure_ascii=False) + ');\n'
     data['hub.html'] = data['hub.html'].replace('<script src="./native-icons.js">', '<script src="./plugin-icons.js"></script><script src="./native-icons.js">')
     functions = []
     if name == 'laravel':
@@ -89,6 +91,14 @@ def config(manifest, package):
         ids = [tab['id'] for tab in tabs]
         if len(ids) < 2 or len(ids) != len(set(ids)) or group['primary'] not in views or group['primary'] not in ids:
             raise ValueError(f'Invalid custom tab group: {group_path}')
+        sections = group.get('sections')
+        if sections is not None:
+            # Optional grouped navigation: every tab belongs to exactly one labelled section.
+            covered = [tab for section in sections for tab in section.get('tabs', [])]
+            section_ids = [section.get('id') for section in sections]
+            if (len(sections) < 2 or sorted(covered) != sorted(ids) or len(set(section_ids)) != len(sections)
+                    or any(not re.fullmatch(r'[a-z][a-z0-9-]*', str(section.get('id'))) or not section.get('label') or not section.get('tabs') for section in sections)):
+                raise ValueError(f'Invalid view sections: {group_path}')
         views.update({tab['id']:tab['label'] for tab in tabs})
     actions = []
     for menu in (json.loads((package/'src/ui_actions.json').read_text()) if (package/'src/ui_actions.json').exists() else contributions.get('menus',[])):

@@ -2,7 +2,8 @@
   "properties": {
     "server": {
       "type": "string",
-      "title": "GitLab server (HTTPS URL; leave empty for https://gitlab.com). A self-hosted server is approved on first use.",
+      "title": "GitLab server",
+      "description": "HTTPS URL of a self-hosted server; leave empty for https://gitlab.com. The IDE asks you to approve a self-hosted server on first use.",
       "default": ""
     },
     "editorReview": {
@@ -57,7 +58,7 @@
     },
     "accountSlot": {
       "type": "string",
-      "title": "GitLab.com account slot",
+      "title": "GitLab account slot",
       "enum": [
         "primary",
         "secondary"

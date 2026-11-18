@@ -214,6 +214,7 @@ impl Providers for Endpoints {
             markers.extend(self.graphql.line_markers(doc));
         }
         if self.wants_webflow(doc) {
+            self.webflow.active = self.sections.active() == "webflow";
             markers.extend(self.webflow.line_markers(doc));
         }
         if self.wants_cloud(doc) {
@@ -238,7 +239,17 @@ impl Views for Endpoints {
                 "feign" => self.cloud.render(&module_view(cloud::WINDOW_SECTION, "feign-clients"), viewport, ctx)?,
                 _ => self.web.render(&module_view(WINDOW_SECTION, "endpoints"), viewport, ctx)?,
             };
-            Ok(self.sections.buttons(inner, &[]))
+            let mut view = self.sections.buttons(inner, &[]);
+            let section = self.sections.active().to_owned();
+            if let Some(project) = ctx.project()
+                && let Some(note) = self.absence_note(&project, &section)
+            {
+                view.status = Some(match view.status {
+                    Some(status) => format!("{status} · {note}"),
+                    None => note,
+                });
+            }
+            Ok(view)
         })().map(ui_kit::actions::available)
     }
 
@@ -269,7 +280,6 @@ impl Plugin for Endpoints {
         Ok(())
     }
     fn run_command(&mut self, id: &str, ctx: &Invocation, arg: Option<&str>) -> Result<Option<String>, Error> {
-        if id == cloud::CHOOSE_TARGET { return self.cloud.run_command(id, ctx, arg); }
         if matches!(id,crate::graphql_subscriptions::START|crate::graphql_subscriptions::POLL|crate::graphql_subscriptions::CANCEL){self.subscriptions.run_command(id,ctx)?;return Ok(None)}
         if id==crate::subscription_drafts::COMMAND {crate::subscription_drafts::run(&mut self.graphql,ctx,arg)?;return Ok(None)}
         if id==crate::source_lenses::GRAPHQL_COMMAND {crate::source_lenses::run_graphql(&mut self.graphql,ctx,arg)?;return Ok(None)}
@@ -320,6 +330,53 @@ mod tests {
 
     fn codes(host: &MockHost) -> Vec<String> {
         host.provider_diagnostics().get(JAVA_PATH).into_iter().flatten().filter_map(|d| d.code.clone()).collect()
+    }
+
+    #[test]
+    fn endpoints_published_with_unreadable_file() {
+        use openidea_plugin::endpoints::EndpointsProvider;
+        let host = setup(WEB_POM);
+        let mut endpoints = Endpoints::default();
+        endpoints.render("endpoints", None, &host.invocation()).unwrap();
+        host.add_file_bytes("src/main/java/com/acme/Legacy.java", b"class caf\xe9 {}");
+        endpoints.live_events(&[Event::FileSaved("/project/src/main/java/com/acme/Legacy.java".into())]);
+        let published = endpoints.endpoints(&host.invocation()).unwrap();
+        assert_eq!(published.len(), 1, "{published:?}");
+        let view = endpoints.render("endpoints", None, &host.invocation()).unwrap();
+        assert!(view.status.unwrap().contains("partial index (1 unreadable)"));
+    }
+
+    #[test]
+    fn pom_line_markers_do_not_refresh_view() {
+        let host = setup("<project><artifactId>spring-webflow</artifactId></project>");
+        let mut endpoints = Endpoints::default();
+        let pom = doc("/project/pom.xml", "xml", WEB_POM);
+        endpoints.line_markers(&pom);
+        assert!(host.refreshed_views().is_empty(), "{:?}", host.refreshed_views());
+        let flow = "<flow xmlns=\"http://www.springframework.org/schema/webflow\"><view-state id=\"a\"/></flow>";
+        let flow = doc("/project/flow.xml", "xml", flow);
+        endpoints.line_markers(&flow);
+        assert!(host.refreshed_views().is_empty(), "webflow section is not active");
+        endpoints.handle("endpoints", ViewEvent::Button("section:webflow".into()), &host.invocation()).unwrap();
+        let before = host.refreshed_views().len();
+        endpoints.line_markers(&pom);
+        assert_eq!(host.refreshed_views().len(), before);
+        endpoints.line_markers(&flow);
+        assert_eq!(host.refreshed_views().len(), before + 1);
+    }
+
+    #[test]
+    fn diagnostics_on_a_cold_project_discover_no_files() {
+        use openidea_plugin::diagnostics::DiagnosticsProvider;
+        let _host = setup(GRAPHQL_POM);
+        let mut endpoints = Endpoints::default();
+        let all = Applies { web: true, websocket: true, messaging: true, graphql: true, webflow: true, cloud: true };
+        endpoints.applies.insert("/project".into(), (Instant::now(), all));
+        endpoints.diagnostics(&doc(JAVA_PATH, "java", JAVA));
+        let discovered = |walked: bool, scanning: bool| walked || scanning;
+        assert!(!endpoints.web.endpoints.cached(JAVA_PATH).is_some_and(|i| discovered(i.walked(), i.scanning())));
+        assert!(!endpoints.web.versioning.cached(JAVA_PATH).is_some_and(|i| discovered(i.walked(), i.scanning())));
+        assert!(endpoints.web.models.cached(JAVA_PATH).is_none());
     }
 
     #[test]
@@ -491,11 +548,11 @@ impl openidea_plugin::endpoints::EndpointsProvider for Endpoints {
         let Some(project) = ctx.project() else {
             return Ok(Vec::new());
         };
-        let (routes, complete) = self.web.routes(&project, spring_text::index::COMMAND_BUDGET);
-        if !complete {
-            return Err(Error::Failed("Spring route index is incomplete; refresh after indexing.".into()));
+        let found = self.web.routes(&project, spring_text::index::COMMAND_BUDGET);
+        if found.scanning && !found.walked {
+            return Err(Error::Failed("Spring routes are still being indexed; try again in a moment.".into()));
         }
-        Ok(ui_kit::routes::endpoints(&routes, "Spring"))
+        Ok(ui_kit::routes::endpoints(&found.routes, "Spring"))
     }
 }
 
@@ -531,9 +588,6 @@ mod transition_owner_tests {
 }
 
 impl openidea_plugin::language_features::LanguageFeatures for Endpoints {
-    fn gutter_actions(&mut self, doc: &Document) -> Vec<openidea_plugin::language_features::GutterAction> {
-        if self.wants_cloud(doc) { self.cloud.gutter_actions(doc) } else { Vec::new() }
-    }
     fn code_lenses(&mut self,doc:&Document)->Vec<openidea_plugin::language_features::CodeLens>{
         if !matches!(doc.language.as_str(),"java"|"kotlin"){return Vec::new()}
         let mut lenses=if self.wants_web(doc){crate::source_lenses::lenses(doc)}else{Vec::new()};

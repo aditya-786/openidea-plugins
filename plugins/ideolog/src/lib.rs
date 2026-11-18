@@ -29,6 +29,9 @@ const FORMAT_STATUS: &str = "format";
 // ponytail: only the head of a big log is parsed, so the provider answers within
 // the IDE's 50 ms edit budget; parse incrementally if big logs need colour past it.
 const MAX_DOCUMENT_BYTES: usize = 512 << 10;
+/// Highlighting stops this far into one event, so a log without recognised
+/// headers (one giant event) cannot outrun the provider deadline.
+const MAX_HIGHLIGHTED_EVENT_BYTES: usize = 32 << 10;
 
 #[derive(Default)]
 pub struct Ideolog {
@@ -36,8 +39,11 @@ pub struct Ideolog {
     viewer: viewer::Viewer,
     jvm: jvm::Adapter,
     tail: live_tail::LiveTail,
+    /// Path and project root of the log last marked with Mark Current Log Source.
+    marked: Option<(String, String)>,
     /// The `customPatterns` setting it was built from, and the config.
     config: Option<(String, Rc<Config>)>,
+    editor_denied: bool,
 }
 
 impl Ideolog {
@@ -69,11 +75,27 @@ impl Ideolog {
         };
 
         let config = self.config();
-        let (text, tooltip) = match config.detect(head(&document.text)) {
-            Some(format) => (format!("Log: {}", format.name), "The log format Ideolog detected. Click to manage custom formats."),
-            None => ("Log: plain text".to_owned(), "No known log format matches this file. Click to add a custom format."),
+        let (mut text, mut tooltip) = match config.detect(head(&document.text)) {
+            Some(format) => (format!("Log: {}", format.name), "The log format Ideolog detected. Click to manage custom formats.".to_owned()),
+            None => ("Log: plain text".to_owned(), "No known log format matches this file. Click to add a custom format.".to_owned()),
         };
-        host::set_status_item(FORMAT_STATUS, &StatusItem { text, tooltip: Some(tooltip.into()), command: Some("patterns".into()) });
+        text.push_str(&highlight_limit_note(&editor.language(), &document.text));
+        if document.text.len() > MAX_DOCUMENT_BYTES {
+            tooltip.push_str(" Folding, outline and stack-frame links are off for logs over 512 KiB.");
+        }
+        host::set_status_item(FORMAT_STATUS, &StatusItem { text, tooltip: Some(tooltip), command: Some("patterns".into()) });
+    }
+}
+
+/// Status-bar suffix saying how much of a big log gets colours, empty when all of it does.
+fn highlight_limit_note(language: &str, text: &str) -> String {
+    let highlighted = if language == "log" { semantic::bounded_head(text) } else { head(text) };
+    if highlighted.len() == text.len() {
+        return String::new();
+    }
+    match highlighted.lines().count() {
+        0 => " (too large to highlight)".to_owned(),
+        lines => format!(" (first {lines} lines highlighted)"),
     }
 }
 
@@ -84,24 +106,34 @@ fn refresh_changed_patterns(before: &str) {
     }
 }
 
-impl Plugin for Ideolog {
-    fn activate(&mut self, _ctx: &openidea_plugin::Context) -> Result<(), Error> {
-        // Compile bounded stored regex configuration outside editor requests.
-        self.config();
-        Ok(())
-    }
-    fn deactivate(&mut self) {
-        self.stop_tail();
-        let _ = host::clear_decorations(semantic::DECORATION_SET);
-    }
-    fn handle_events(&mut self, events: &[HostEvent], ctx: &Invocation) {
-        if !events.is_empty() { self.tail_lifecycle(ctx); self.invalidate_jvm_tokens(); let _ = host::clear_decorations(semantic::DECORATION_SET); }
-        if events.iter().any(|e| matches!(e, HostEvent::EditorFocused(_) | HostEvent::FileOpened(_))) {
-            self.show_format(ctx);
-        }
+impl Ideolog {
+    /// Marks, the JVM snapshot and the live tail each belong to one log; events
+    /// about other files or editors leave them alone.
+    fn events_name_a_tracked_log(&self, events: &[HostEvent]) -> bool {
+        let tracked: Vec<(String, String)> = [self.marked.clone(), self.jvm.source(), self.tail.source()]
+            .into_iter()
+            .flatten()
+            .collect();
+        let is_tracked = |path: &str| tracked.iter().any(|(log, _)| log == path);
+        events.iter().any(|event| match event {
+            HostEvent::FileOpened(path) | HostEvent::FileSaved(path) => is_tracked(path),
+            HostEvent::EditorFocused(path) => path.as_deref().is_some_and(is_tracked),
+            HostEvent::DocumentChanged(change) => is_tracked(&change.path),
+            HostEvent::FilesChanged(changes) => changes
+                .created
+                .iter()
+                .chain(&changes.modified)
+                .chain(&changes.removed)
+                .any(|path| is_tracked(path)),
+            HostEvent::VcsChanged(root) => tracked.iter().any(|(_, tracked_root)| tracked_root == root),
+            HostEvent::Other { kind, data } if kind == "file-closed" => {
+                serde_json::from_str::<String>(data).is_ok_and(|path| is_tracked(&path))
+            }
+            _ => false,
+        })
     }
 
-    fn run_command(&mut self, id: &str, ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
+    fn run_log_command(&mut self, id: &str, ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
         if id == "extend-log-selection" { self.extend_log_selection(ctx)?; return Ok(None); }
         if id == "live-tail" { ui_kit::web::reveal_view(live_tail::VIEW, include_str!("ui_config.json"))?; return Ok(None); }
         if id == "stop-tail" { self.stop_tail(); return Ok(None); }
@@ -116,6 +148,15 @@ impl Plugin for Ideolog {
         }
 
         if id == "remove-highlightings" {
+            let count = patterns::highlighting_count();
+            if count == 0 {
+                host::notify(NotificationLevel::Info, "Ideolog", "There are no custom highlighting patterns to remove.");
+                return Ok(None);
+            }
+            let body = format!("Delete all {count} custom highlighting pattern(s)? Custom log formats are kept.");
+            if !host::confirm("Remove Custom Highlightings", &body)? {
+                return Ok(None);
+            }
             let before = patterns::stored();
             let removed = patterns::remove_highlightings()?;
             self.config();
@@ -124,7 +165,9 @@ impl Plugin for Ideolog {
             return Ok(None);
         }
 
-        let editor = ctx.editor().ok_or("No file is open.")?;
+        let Some(editor) = ctx.editor() else {
+            return Err(if self.editor_denied { Error::Denied("editor.read".into()) } else { Error::Invalid("No file is open.".into()) });
+        };
         if !matches!(editor.language().as_str(), "ideolog" | "log") {
             return Err("Not a log file.".into());
         }
@@ -141,15 +184,9 @@ impl Plugin for Ideolog {
         let config = self.config();
         match id {
             "jump-to-source" => jump_to_source(&config, ctx, &editor),
-            "next-error" => go_to(&config, &editor, "No error below the caret.", |events, at| {
-                events.iter().skip(at + 1).find(|(_, severity, _)| *severity == Some(Severity::Error))
-            }),
-            "next-warning" => go_to(&config, &editor, "No warning below the caret.", |events, at| {
-                events.iter().skip(at + 1).find(|(_, severity, _)| *severity == Some(Severity::Warning))
-            }),
-            "next-exception" => go_to(&config, &editor, "No exception below the caret.", |events, at| {
-                events.iter().skip(at + 1).find(|(_, _, exception)| *exception)
-            }),
+            "next-error" => step(&config, &editor, "error", true),
+            "next-warning" => step(&config, &editor, "warning", true),
+            "next-exception" => step(&config, &editor, "exception", true),
             "next-entry" => go_to(&config, &editor, "Already at the last log entry.", |events, at| events.get(at + 1)),
             "previous-entry" => {
                 go_to(&config, &editor, "Already at the first log entry.", |events, at| at.checked_sub(1).map(|i| &events[i]))
@@ -157,6 +194,44 @@ impl Plugin for Ideolog {
             _ => Err(Error::NotFound(format!("command {id}"))),
         }
     }
+}
+
+impl Plugin for Ideolog {
+    fn activate(&mut self, ctx: &openidea_plugin::Context) -> Result<(), Error> {
+        self.editor_denied = !ctx.has("editor.read");
+        // Compile bounded stored regex configuration outside editor requests.
+        self.config();
+        Ok(())
+    }
+    fn deactivate(&mut self) {
+        self.stop_tail();
+        let _ = host::clear_decorations(semantic::DECORATION_SET);
+    }
+    fn handle_events(&mut self, events: &[HostEvent], ctx: &Invocation) {
+        if events.iter().any(|e| matches!(e, HostEvent::Other { kind, .. } if kind == "settings-changed")) {
+            self.config();
+        }
+        if self.events_name_a_tracked_log(events) {
+            self.tail_lifecycle(ctx);
+            self.invalidate_jvm_tokens();
+            let _ = host::clear_decorations(semantic::DECORATION_SET);
+        } else if events.iter().any(|e| matches!(e, HostEvent::Scheduled)) {
+            self.tail_lifecycle(ctx);
+        }
+        if events.iter().any(|e| matches!(e, HostEvent::EditorFocused(_) | HostEvent::FileOpened(_))) {
+            self.show_format(ctx);
+        }
+    }
+
+    fn run_command(&mut self, id: &str, ctx: &Invocation, arg: Option<&str>) -> Result<Option<String>, Error> {
+        let result = self.run_log_command(id, ctx, arg);
+        if !self.editor_denied {
+            return result;
+        }
+
+        result.map_err(|e| ui_kit::denied::map_capability(e, "Log file commands", "editor.read", "Ideolog"))
+    }
+
 }
 
 impl SyntaxProvider for Ideolog {
@@ -221,6 +296,12 @@ impl Views for Ideolog {
         if view==live_tail::VIEW { return self.handle_tail(event,_ctx); }
         if view=="jvm-observations" { return self.handle_jvm(event,_ctx); }
         if view==viewer::VIEW {return self.handle_log(event,_ctx);}
+        if view == LEVELS_PANEL {
+            return match event {
+                ViewEvent::Message(request) => self.levels_panel(&request, _ctx),
+                _ => Ok(()),
+            };
+        }
         let result = match view {
             patterns::VIEW => patterns::handle(&mut self.pattern_editor, event),
             _ => Err(Error::NotFound(view.into())),
@@ -230,6 +311,117 @@ impl Views for Ideolog {
         }
         result
     }
+}
+
+pub const LEVELS_PANEL: &str = "levels";
+
+impl Ideolog {
+    /// The editor panel beside a log. `{op:"summary",id,path}` answers the detected format and
+    /// event counts (broadcast to every panel frame, so `id` names the asking one);
+    /// `{op:"go",path,level,forward}` moves the caret like the navigation commands;
+    /// `{op:"snapshot",path,level}` captures the log into the Log Snapshot table filtered to `level`
+    /// (the editor cannot fold or hide lines for a plugin); `{op:"patterns"}` opens the Formats &
+    /// Highlighting view.
+    fn levels_panel(&mut self, request: &str, ctx: &Invocation) -> Result<(), Error> {
+        let request: serde_json::Value = serde_json::from_str(request).map_err(|_| Error::Invalid("Malformed panel request.".into()))?;
+        if request["op"] == "patterns" {
+            return ui_kit::web::reveal_view(patterns::VIEW, include_str!("ui_config.json"));
+        }
+        let path = request["path"].as_str().ok_or_else(|| Error::Invalid("The panel sent no file.".into()))?;
+        let editor = ctx.editor().filter(|editor| editor.path() == path && matches!(editor.language().as_str(), "ideolog" | "log"));
+        let config = self.config();
+        match request["op"].as_str() {
+            Some("go") => {
+                let Some(editor) = editor else {
+                    host::notify(NotificationLevel::Info, "Ideolog", "Click in this log first: the panel moves the caret of the focused editor.");
+                    return Ok(());
+                };
+                let level = request["level"].as_str().unwrap_or_default();
+                step(&config, &editor, level, request["forward"].as_bool().unwrap_or(true)).map(|_| ())
+            }
+            Some("snapshot") => {
+                if editor.is_none() {
+                    host::notify(NotificationLevel::Info, "Ideolog", "Click in this log first: the snapshot captures the focused editor.");
+                    return Ok(());
+                }
+                match self.capture_log(ctx) {
+                    Ok(()) => {
+                        self.viewer.level = viewer::level_filter(request["level"].as_str().unwrap_or_default());
+                        ui_kit::web::refresh_view(viewer::VIEW, include_str!("ui_config.json"));
+                    }
+                    Err(Error::Cancelled) => {}
+                    Err(error) => host::notify(NotificationLevel::Info, "Ideolog", &error.to_string()),
+                }
+                Ok(())
+            }
+            Some("summary") => {
+                let text = match editor {
+                    Some(editor) => editor.document().map(|document| document.text),
+                    None => project_of(path).ok_or(Error::Stale).and_then(|project| project.read_file(path)),
+                };
+                // Every request is answered, so the page never waits in vain.
+                let mut reply = match text {
+                    Ok(text) => summary(&config, &text),
+                    Err(error) => serde_json::json!({ "message": format!("Cannot read this log ({error}). Click in it to count its events.") }),
+                };
+                reply["id"] = request["id"].as_str().filter(|id| id.len() <= 64).into();
+                reply["path"] = path.into();
+                host::post_view_message(LEVELS_PANEL, &reply.to_string())
+            }
+            _ => Err(Error::Invalid("Unknown panel request.".into())),
+        }
+    }
+}
+
+/// The format and event counts of the part of `text` that gets colours ([`head`]).
+fn summary(config: &Config, text: &str) -> serde_json::Value {
+    let counted = head(text);
+    let (format, events) = parsed_events(config, counted);
+    let mut levels = [0; 5];
+    let mut exceptions = 0;
+    for (event, parsed) in &events {
+        let level = parsed.level(format);
+        if let Some(level) = level {
+            levels[level as usize] += 1;
+        }
+        if log::has_exception(event.text, level == Some(Severity::Error)) {
+            exceptions += 1;
+        }
+    }
+    // A level the format cannot express is null, and the panel hides its row.
+    let count = |level: Severity| format.is_none_or(|f| f.expresses(level)).then_some(levels[level as usize]);
+    serde_json::json!({
+        "format": format.map(|format| format.name.as_str()),
+        "error": count(Severity::Error),
+        "warning": count(Severity::Warning),
+        "exception": exceptions,
+        "info": count(Severity::Info),
+        "debug": count(Severity::Debug),
+        "trace": count(Severity::Trace),
+        "entry": events.len(),
+        "firstLines": (counted.len() < text.len()).then(|| counted.lines().count()),
+    })
+}
+
+/// Moves the caret to the previous or next event of `level` (`error`, `warning`, `info`, `debug`,
+/// `trace`, `exception` or `entry`).
+fn step(config: &Config, editor: &TextEditor, level: &str, forward: bool) -> Result<Option<String>, Error> {
+    type Wanted = fn(&(Range<u32>, Option<Severity>, bool)) -> bool;
+    let (noun, wanted): (&str, Wanted) = match level {
+        "error" => ("errors", |(_, severity, _)| *severity == Some(Severity::Error)),
+        "warning" => ("warnings", |(_, severity, _)| *severity == Some(Severity::Warning)),
+        "info" => ("info entries", |(_, severity, _)| *severity == Some(Severity::Info)),
+        "debug" => ("debug entries", |(_, severity, _)| *severity == Some(Severity::Debug)),
+        "trace" => ("trace entries", |(_, severity, _)| *severity == Some(Severity::Trace)),
+        "exception" => ("exceptions", |(_, _, exception)| *exception),
+        "entry" => ("entries", |_| true),
+        _ => return Err(Error::Invalid(format!("Unknown log level {level}."))),
+    };
+    let none = format!("No more {noun} {} the caret.", if forward { "below" } else { "above" });
+    go_to(config, editor, &none, |events, at| match forward {
+        true => events.iter().skip(at + 1).find(|entry| wanted(entry)),
+        false => events[..at].iter().rev().find(|entry| wanted(entry)),
+    })
 }
 
 /// The open project holding `path` (providers get no window context).
@@ -288,7 +480,8 @@ fn highlights_checked(config: &Config, text: &str, gap_seconds: f64, cap: usize,
     let mut previous: Option<f64> = None;
     for event in &events {
         if out.len() >= cap || checkpoint().is_err() { break; }
-        let parsed=Parsed::new(format,event.text);
+        let event_text=capped_event(event.text);
+        let parsed=Parsed::new(format,event_text);
         if checkpoint().is_err() { break; }
         let now = parsed.time(format).and_then(|time| log::time_seconds(time, format.and_then(|f| f.time_pattern.as_deref())));
         let gap_range = match (gap_seconds > 0.0, previous, now) {
@@ -302,15 +495,24 @@ fn highlights_checked(config: &Config, text: &str, gap_seconds: f64, cap: usize,
         for (range, kind) in highlighted {
             match &gap_range {
                 Some(gap) if range.start < gap.end && gap.start < range.end => {}
-                _ => push_by_line(&mut out, event.text, event.offset, range, kind),
+                _ => push_by_line(&mut out, event_text, event.offset, range, kind),
             }
         }
         if let Some(gap) = gap_range {
-            push_by_line(&mut out, event.text, event.offset, gap, Highlight::Constant);
+            push_by_line(&mut out, event_text, event.offset, gap, Highlight::Constant);
         }
     }
     out.truncate(cap);
     out
+}
+
+fn capped_event(event: &str) -> &str {
+    if event.len() <= MAX_HIGHLIGHTED_EVENT_BYTES {
+        return event;
+    }
+
+    let head = &event[..log::floor_char_boundary(event, MAX_HIGHLIGHTED_EVENT_BYTES)];
+    head.rfind('\n').map_or(head, |end| &head[..=end])
 }
 
 /// One token per line: a multi-line event (a stack trace) is coloured on
@@ -387,7 +589,10 @@ fn go_to(
     let (format, events) = parsed_events(config, &text);
     let entries: Vec<_> = events
         .iter()
-        .map(|(e, p)| (e.lines.clone(), p.severity(format), log::has_exception(e.text, p.severity(format) == Some(Severity::Error))))
+        .map(|(e, p)| {
+            let level = p.level(format);
+            (e.lines.clone(), level, log::has_exception(e.text, level == Some(Severity::Error)))
+        })
         .collect();
     let at = entries.iter().position(|(lines, ..)| lines.contains(&line)).unwrap_or(entries.len().saturating_sub(1));
 
@@ -509,6 +714,20 @@ java.lang.IllegalStateException: boom
         host.open_editor("/p/a.rs", "rust", "fn main() {}", &[]);
         plugin.handle_events(&[HostEvent::EditorFocused(None)], &host.invocation());
         assert!(host.status_items().is_empty());
+    }
+
+    #[test]
+    fn status_item_says_when_a_big_log_is_only_partly_highlighted() {
+        let host = MockHost::install();
+        let mut plugin = Ideolog::default();
+        host.open_editor("/p/big.log", "log", &"INFO line\n".repeat(60_000), &[]);
+        plugin.handle_events(&[HostEvent::EditorFocused(None)], &host.invocation());
+        let text = &host.status_items()["format"].text;
+        assert!(text.starts_with("Log: plain text (first ") && text.ends_with(" lines highlighted)"), "{text}");
+
+        host.open_editor("/p/small.log", "log", "INFO line\n", &[]);
+        plugin.handle_events(&[HostEvent::EditorFocused(None)], &host.invocation());
+        assert_eq!(host.status_items()["format"].text, "Log: plain text");
     }
 
     #[test]
@@ -724,6 +943,26 @@ java.lang.IllegalStateException: boom
     }
 
     #[test]
+    fn log_commands_denied_names_permission() {
+        let host = MockHost::install().with_capabilities(&["project.read"]);
+        open_log(&host, 0, 0);
+        let mut plugin = Ideolog::default();
+        plugin.activate(&host.context("aritti.ideolog")).unwrap();
+        let error = plugin.run_command("next-error", &host.invocation(), None).unwrap_err().to_string();
+        assert!(error.contains("needs the editor.read permission"), "{error}");
+        assert!(error.contains("Settings › Plugins › Ideolog"), "{error}");
+    }
+
+    #[test]
+    fn log_commands_without_an_editor_still_say_no_file_is_open() {
+        let host = MockHost::install().with_capabilities(&["editor.read", "project.read"]);
+        let mut plugin = Ideolog::default();
+        plugin.activate(&host.context("aritti.ideolog")).unwrap();
+        let error = plugin.run_command("next-error", &host.invocation(), None).unwrap_err().to_string();
+        assert!(error.contains("No file is open."), "{error}");
+    }
+
+    #[test]
     fn next_error_skips_to_the_next_error_event() {
         let host = MockHost::install().with_capabilities(&["editor.read", "project.read"]);
         open_log(&host, 0, 0);
@@ -767,6 +1006,102 @@ java.lang.IllegalStateException: boom
         plugin.run_command("next-entry", &host.invocation(), None).unwrap();
         plugin.run_command("previous-entry", &host.invocation(), None).unwrap();
         assert_eq!(host.opened_locations(), [("/p/logs/idea.log".to_owned(), 5, 0), ("/p/logs/idea.log".to_owned(), 1, 0)]);
+    }
+
+    fn panel(plugin: &mut Ideolog, host: &MockHost, request: serde_json::Value) {
+        plugin.handle(LEVELS_PANEL, ViewEvent::Message(request.to_string()), &host.invocation()).unwrap();
+    }
+
+    #[test]
+    fn levels_panel_counts_events_and_names_the_format() {
+        let host = MockHost::install().with_capabilities(&["editor.read", "project.read"]);
+        open_log(&host, 0, 0);
+        let mut plugin = Ideolog::default();
+        panel(&mut plugin, &host, serde_json::json!({"op":"summary","id":"f1","path":"/p/logs/idea.log"}));
+        let (view, reply) = host.view_messages().pop().unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(view, LEVELS_PANEL);
+        assert_eq!(
+            reply,
+            serde_json::json!({"id":"f1","path":"/p/logs/idea.log","format":"IntelliJ IDEA","error":1,"warning":1,"exception":1,"info":1,"debug":1,"trace":0,"entry":4,"firstLines":null})
+        );
+    }
+
+    #[test]
+    fn levels_panel_says_how_much_of_a_big_log_it_counted() {
+        let big = IDEA.repeat(MAX_DOCUMENT_BYTES / IDEA.len() + 2);
+        let reply = summary(&Config::default(), &big);
+        assert_eq!(reply["firstLines"].as_u64(), Some(head(&big).lines().count() as u64));
+        assert!(reply["firstLines"].as_u64().unwrap() < big.lines().count() as u64);
+    }
+
+    #[test]
+    fn levels_panel_moves_to_the_previous_and_next_event_of_a_level() {
+        let host = MockHost::install().with_capabilities(&["editor.read", "project.read"]);
+        open_log(&host, 5, 0);
+        let mut plugin = Ideolog::default();
+        panel(&mut plugin, &host, serde_json::json!({"op":"go","path":"/p/logs/idea.log","level":"warning","forward":false}));
+        panel(&mut plugin, &host, serde_json::json!({"op":"go","path":"/p/logs/idea.log","level":"error","forward":true}));
+        assert_eq!(host.opened_locations(), [("/p/logs/idea.log".to_owned(), 1, 0)]);
+        assert_eq!(host.notifications()[0].body, "No more errors below the caret.");
+        assert!(plugin.handle(LEVELS_PANEL, ViewEvent::Message(r#"{"op":"go","path":"/p/logs/idea.log","level":"x"}"#.into()), &host.invocation()).is_err());
+    }
+
+    #[test]
+    fn levels_panel_steps_through_info_debug_and_trace() {
+        let host = MockHost::install().with_capabilities(&["editor.read", "project.read"]);
+        open_log(&host, 5, 0);
+        let mut plugin = Ideolog::default();
+        let go = |plugin: &mut Ideolog, level: &str, forward: bool| {
+            panel(plugin, &host, serde_json::json!({"op":"go","path":"/p/logs/idea.log","level":level,"forward":forward}));
+        };
+        go(&mut plugin, "info", false);
+        go(&mut plugin, "debug", false);
+        go(&mut plugin, "trace", true);
+        assert_eq!(host.opened_locations(), [("/p/logs/idea.log".to_owned(), 0, 0)]);
+        assert_eq!(host.notifications().iter().map(|n| n.body.as_str()).collect::<Vec<_>>(), ["No more debug entries above the caret.", "No more trace entries below the caret."]);
+    }
+
+    #[test]
+    fn levels_panel_hides_levels_the_format_cannot_express() {
+        let python = summary(&Config::default(), "DEBUG:app:one\nINFO:app:two\nWARNING:app:three\n");
+        assert_eq!((python["info"].as_u64(), python["debug"].as_u64(), python["trace"].as_u64()), (Some(1), Some(1), None));
+        let syslog = summary(&Config::default(), "May  1 10:00:00 host app[1]: started\nMay  1 10:00:01 host app[1]: failed\n");
+        assert_eq!(syslog["format"], "Syslog");
+        assert_eq!((syslog["error"].as_u64(), syslog["info"].as_u64(), syslog["trace"].as_u64()), (Some(1), None, None));
+        let serilog = summary(&Config::default(), "2024-05-01 10:00:00.000 +02:00 [VRB] a\n2024-05-01 10:00:00.000 +02:00 [INF] b\n");
+        assert_eq!((serilog["info"].as_u64(), serilog["debug"].as_u64(), serilog["trace"].as_u64()), (Some(1), Some(0), Some(1)));
+    }
+
+    #[test]
+    fn levels_panel_opens_the_snapshot_filtered_to_a_level() {
+        let host = MockHost::install().with_capabilities(&["editor.read", "project.read"]);
+        host.set_project_root(Some("/p"));
+        host.add_file("logs/idea.log", IDEA);
+        open_log(&host, 0, 0);
+        let mut plugin = Ideolog::default();
+        panel(&mut plugin, &host, serde_json::json!({"op":"snapshot","path":"/p/logs/idea.log","level":"debug"}));
+        let view = plugin.render_log(None, &host.invocation()).unwrap();
+        let openidea_plugin::views::Body::Table(table) = &view.body else { panic!("table") };
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0][1], "DEBUG");
+        let sections: Vec<_> = view.toolbar.iter().filter(|b| b.id.starts_with("section:")).map(|b| b.label.as_str()).collect();
+        assert_eq!(sections, ["All (4)", "Errors (1)", "Warnings (1)", "Info (1)", "\u{25cf} Debug (1)"]);
+        plugin.handle(viewer::VIEW, ViewEvent::Button("section:all".into()), &host.invocation()).unwrap();
+        let openidea_plugin::views::Body::Table(table) = plugin.render_log(None, &host.invocation()).unwrap().body else { panic!("table") };
+        assert_eq!(table.total_rows, 4);
+    }
+
+    #[test]
+    fn levels_panel_moves_only_the_focused_log_and_opens_the_patterns_view() {
+        let host = MockHost::install().with_capabilities(&["editor.read", "project.read"]);
+        open_log(&host, 0, 0);
+        let mut plugin = Ideolog::default();
+        panel(&mut plugin, &host, serde_json::json!({"op":"go","path":"/p/logs/other.log","level":"error","forward":true}));
+        assert!(host.opened_locations().is_empty());
+        assert_eq!(host.notifications().len(), 1);
+        panel(&mut plugin, &host, serde_json::json!({"op":"patterns"}));
+        assert_eq!(host.revealed_views().len(), 1);
     }
 
     #[test]
@@ -818,8 +1153,30 @@ java.lang.IllegalStateException: boom
         let stored = patterns::stored();
         assert!(stored.contains("pattern=\"a\\.b\\(1\\)\""), "{stored}");
         assert!(stored.contains("HIGHLIGHT_MATCH"));
+        host.answer_next_prompt(None);
+        Ideolog::default().run_command("remove-highlightings", &host.invocation(), None).unwrap();
+        assert_eq!(patterns::stored(), stored, "dismissing the confirmation keeps the patterns");
+        host.answer_next_prompt(Some(&[]));
         Ideolog::default().run_command("remove-highlightings", &host.invocation(), None).unwrap();
         assert!(patterns::stored().trim().is_empty());
+    }
+
+    #[test]
+    fn remove_highlightings_asks_first() {
+        let host = MockHost::install();
+        patterns::save(&[patterns::highlight_element("seed", "HIGHLIGHT_LINE", -39836)]).unwrap();
+        host.answer_next_prompt(Some(&[]));
+        Ideolog::default().run_command("remove-highlightings", &host.invocation(), None).unwrap();
+        assert_eq!(patterns::highlighting_count(), 0);
+    }
+
+    #[test]
+    fn cancel_keeps_rules() {
+        let host = MockHost::install();
+        patterns::save(&[patterns::highlight_element("seed", "HIGHLIGHT_LINE", -39836)]).unwrap();
+        host.answer_next_prompt(None);
+        Ideolog::default().run_command("remove-highlightings", &host.invocation(), None).unwrap();
+        assert_eq!(patterns::highlighting_count(), 1);
     }
 
     #[test]
@@ -950,6 +1307,7 @@ mod external_patterns_refresh_tests {
         host.open_editor("/project/a.log","ideolog","selected_literal",&[(0,0,0,0)]);
         assert!(plugin.run_command("highlight-selection",&host.invocation(),None).is_err());assert!(host.view_messages().is_empty());
         patterns::save(&[patterns::highlight_element("seed","HIGHLIGHT_LINE",-39836)]).unwrap();
+        host.answer_next_prompt(Some(&[]));
         plugin.run_command("remove-highlightings",&host.invocation(),None).unwrap();
         assert_eq!(host.refreshed_views(),[patterns::VIEW.to_owned()]);assert!(host.view_messages().iter().all(|(_,text)| serde_json::from_str::<serde_json::Value>(text).ok().is_some_and(|value| value["channel"] == "ui-kit-refresh" && value.as_object().unwrap().len() <= 2)));assert!(host.refreshed_views().iter().all(|view|view==patterns::VIEW));
     }
@@ -960,6 +1318,7 @@ mod external_patterns_refresh_tests {
         plugin.handle(patterns::VIEW,ViewEvent::Button("add-highlight".into()),&host.invocation()).unwrap();
         let sample=plugin.pattern_editor.control_key("pattern-sample");
         plugin.handle(patterns::VIEW,ViewEvent::Field(sample,"manual-global-settings-sample".into()),&host.invocation()).unwrap();
+        host.answer_next_prompt(Some(&[]));
         plugin.run_command("remove-highlightings",&host.invocation(),None).unwrap();
         host.set_project_root(Some("/other"));
         assert!(format!("{:?}",plugin.render(patterns::VIEW,None,&host.invocation()).unwrap().body).contains("manual-global-settings-sample"));

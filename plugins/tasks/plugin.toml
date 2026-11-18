@@ -5,17 +5,13 @@ description = """Work on one task at a time. Create local tasks or pick issues f
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 homepage = "https://github.com/arnaud-ritti/openidea-plugins/tree/main/plugins/tasks"
 license = "MIT"
-change-notes = """Unreleased: a self-hosted YouTrack host (any DNS name) works through the optional net:ask grant, approved in the host dialog at first use; unattended refreshes just report it as denied. Unreleased: Jira Search Issues accepts owned JQL via a `jql:` prefix (<=256 bytes, no control chars, balanced quotes/parentheses, no dangling operator, single trailing ORDER BY field [ASC|DESC] list) with clear local refusals; the server still validates semantics. Unreleased: user-declared Generic REST/Java-regex tracker family (search and reviewed close) through the same private credential-profile bridge. Unreleased: explicit multi-profile self-hosted Redmine/MantisBT search with actual metadata/pagination and reviewed close (Redmine allowed-status fresh reads; Mantis strong ETag); credentials stay in externally provisioned private Python bridge profiles. Unreleased: explicit FogBugz Cloud search and reviewed optimistic close through an approved Python3 credential-profile bridge; no token enters native settings/logs and automatic refresh never launches the helper. Unreleased: documented Lighthouse Cloud search, descriptions and reviewed close with tenant/project identity and optional secret-header transport. Unreleased: tracker descriptions are retained as bounded plaintext (Jira ADF flattened) for cached issue hover and task description tabs. Optional closed GitHub/GitLab/Codeberg search with cache-policy isolation; automatic issue refresh remains open-only. \
-Unreleased: native Tasks tree and scoped native review forms replace the packaged panel, with selection-aware Open/Switch/Reopen, explicit Close Active Task review, Search Issues and grouped Contexts entry points. Native window-scoped task status and owned open-editor named contexts with bounded active selection restoration (API 1.4). task/context storage now carries concrete owner/schema/revision, validates legacy records and bounds without silent reset, rejects stale rendered callbacks and supports explicit project-only recovery. Tasks: Search Issues asks for a query, searches every set-up tracker and opens the picked issue. Save, Load and Remove Context keep named lists of the open files. Add and Remove Repository read issues from several GitHub, GitLab or Codeberg repositories. \
-0.2.0: Tasks: Switch Task picks a task from a list; Close Active Task brings the Tasks view to the front. Needs OpenIDEA API 1.2. \
-0.1.0: first release. \
-Local tasks, task switching and time tracking. Issues from GitHub, gitlab.com, codeberg.org, *.youtrack.cloud, \
-*.atlassian.net and Trello, updated every 20 minutes. With git: a branch per task, shelving, and merging on close. \
-Closing a task can update the issue state; work time can be posted to YouTrack and Jira. Each task reopens its files. \
-The active task's commit message goes to the clipboard or to commit.template."""
+change-notes = """\
+Next release: Closing a task says when it worked, the merge option says it also deletes the branch, a denied tracker update is reported, and the empty Issues row says why it is empty; self-hosted YouTrack, Redmine, MantisBT, FogBugz, Lighthouse and custom REST trackers, and Jira search accepts JQL with a jql: prefix; issue descriptions show on hover and in task tabs, and tracker credentials are sent only to the configured tracker server; an update where one tracker fails keeps that tracker's issues, GitHub issues from several repositories get distinct ids, and the commit template works in a repository with no commits; Open Task reveals the Tasks window when it needs its form, New Task gets Alt+Shift+K, the toolbar moves Search Issues, Update Issues and contexts into More…, caret commands need a focused editor, and plainer confirmations, settings and permission messages. \
+0.3.0: more trackers and closed-issue search. \
+0.2.0: plugin icon and task tree."""
 categories = ["tools", "vcs"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-view:tasks", "on-startup-finished", "on-schedule:1200", "on-event:file-opened"]
 
@@ -88,7 +84,7 @@ location = "left"
 [[contributes.statusBar]]
 id = "active-task"
 text = "Default task"
-tooltip = "Active task"
+tooltip = "Active task. Click to copy its commit message."
 command = "copy-commit-message"
 
 [[contributes.commands]]
@@ -146,6 +142,24 @@ id = "remove-repository"
 title = "Tasks: Remove Added Repository"
 category = "Tasks"
 
+[[contributes.commands]]
+id = "new-task"
+title = "Tasks: New Task…"
+category = "Tasks"
+
+[[contributes.commands]]
+id = "open-task"
+title = "Tasks: Open Task…"
+category = "Tasks"
+
+[[contributes.keymaps]]
+command = "open-task"
+key = "Alt+Shift+N"
+
+[[contributes.keymaps]]
+command = "new-task"
+key = "Alt+Shift+K"
+
 [[contributes.keymaps]]
 command = "close"
 key = "Alt+Shift+W"
@@ -182,31 +196,36 @@ languages = ["*"]
 
 [[contributes.commands]]
 id = "open-issue-at-caret"
-title = "Tasks: Open Cached Issue at Caret in Browser"
+title = "Tasks: Open Issue at Caret in Browser"
 category = "Tasks"
+when = "editorFocus"
 
 [[contributes.commands]]
 id = "activate-issue-at-caret"
-title = "Tasks: Activate Cached Issue at Caret Locally (No VCS Changes)"
+title = "Tasks: Start Task for Issue at Caret (No Branch)"
 category = "Tasks"
+when = "editorFocus"
 
 [[contributes.menus]]
 menu = "editor.context"
 command = "open-issue-at-caret"
+when = "editorFocus"
 
 [[contributes.menus]]
 menu = "editor.context"
 command = "activate-issue-at-caret"
+when = "editorFocus"
 
 [[contributes.commands]]
 id = "reset-project-state"
-title = "Tasks: Reset This Project’s Task State (Asks First)…"
+title = "Tasks: Reset Tasks for This Project…"
 category = "Tasks"
 
 [[contributes.commands]]
 id = "review-issue-branch-at-caret"
-title = "Tasks: Review Cached Issue Activation and Branch Options at Caret"
+title = "Tasks: Start Task with Branch for Issue at Caret…"
 category = "Tasks"
+when = "editorFocus"
 
 [[contributes.secrets]]
 name = "lighthouse-token"

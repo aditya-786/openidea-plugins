@@ -1,6 +1,7 @@
 //! Explicitly enabled, pinned official formatter; edits never touch external files.
 use crate::*;
 use openidea_plugin::language_features::{FormatOptions, LanguageFeatures};
+const FORMATTER_PHAR_TITLE: &str = "Absolute path to official Twig-CS-Fixer 4.1.1 PHAR (exact release hash required)";
 const SHA256: &str = "4d099a3be74ea41b0c8f1b2a7033c53a77e7d0dfba36725c2bbaaa19453ed2e5";
 const ADAPTER: &str = include_str!("formatter.php");
 /// Compare all literal data and string contents; only whitespace between Twig
@@ -108,7 +109,7 @@ impl LanguageFeatures for Twig {
         }
         let raw = host::setting("formatterPhar").ok_or_else(|| {
             Error::Invalid(
-                "Configure the reviewed official Twig-CS-Fixer 4.1.1 PHAR path before formatting."
+                "Set the path to the official Twig-CS-Fixer 4.1.1 PHAR in Settings › Plugins › Twig before formatting."
                     .into(),
             )
         })?;
@@ -123,7 +124,7 @@ impl LanguageFeatures for Twig {
             || !path.ends_with(".phar")
         {
             return Err(Error::Invalid(
-                "Choose an absolute reviewed .phar path.".into(),
+                "The Twig-CS-Fixer path must be an absolute path to a .phar file.".into(),
             ));
         }
         let before = structure(&doc.text).ok_or_else(|| {
@@ -144,7 +145,12 @@ impl LanguageFeatures for Twig {
             SHA256,
         ]);
         let request = serde_json::json!({"source":doc.text}).to_string();
-        let output = host::run_command(&command, None, Some(&request))?;
+        let output = host::run_command(&command, None, Some(&request)).map_err(|e| match e {
+            Error::Denied(_) => Error::Invalid(format!(
+                "Formatting needs the process:php permission. Allow it in Settings › Plugins › Twig, and set \"{FORMATTER_PHAR_TITLE}\" there."
+            )),
+            other => other,
+        })?;
         if output.status != Some(0) || output.stdout.len() > 1 << 20 {
             return Err(Error::Invalid("Formatting failed: approve PHP and the exact official Twig-CS-Fixer 4.1.1 PHAR; unsupported or malformed templates remain unchanged.".into()));
         }
@@ -234,6 +240,19 @@ mod tests {
         assert_eq!(host.editor_text(), source);
     }
     #[test]
+    fn formatting_denied_names_permission() {
+        let host = MockHost::install().with_capabilities(&["project.read", "editor.read"]);
+        let source = "{{foo}}";
+        host.add_file("a.twig", source);
+        host.open_editor("/project/a.twig", "twig", source, &[(0, 0, 0, 0)]);
+        host.set_setting("formatterEnabled", "true");
+        host.set_setting("formatterPhar", r#""/tools/twig-cs-fixer.phar""#);
+        let error = Twig::default().format(&doc(source), None, options()).unwrap_err().to_string();
+        assert!(error.contains("needs the process:php permission"), "{error}");
+        assert!(error.contains("Settings › Plugins › Twig"), "{error}");
+        assert!(error.contains("Absolute path to official Twig-CS-Fixer 4.1.1 PHAR (exact release hash required)"), "{error}");
+    }
+    #[test]
     fn provider_refuses_denied_execution_and_semantically_changed_output_without_edits() {
         let host = MockHost::install().with_capabilities(&["project.read", "editor.read"]);
         let source = "{{foo}}";
@@ -243,7 +262,7 @@ mod tests {
         host.set_setting("formatterPhar", r#""/tools/twig-cs-fixer.phar""#);
         assert!(matches!(
             Twig::default().format(&doc(source), None, options()),
-            Err(Error::Denied(_))
+            Err(Error::Invalid(_))
         ));
         assert_eq!(host.editor_text(), source);
         let host = host.with_capabilities(&["project.read", "editor.read", "process:php"]);

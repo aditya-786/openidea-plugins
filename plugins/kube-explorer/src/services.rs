@@ -128,7 +128,8 @@ impl KubeExplorer {
             let action = button.id.rsplit(':').next().unwrap_or(&button.id);
             match action {
                 "yaml" => button.label = "Edit YAML…".into(),
-                "logs" => button.label = "Follow Logs".into(),
+                "logs" => button.label = "Follow Logs (Terminal)".into(),
+                "log-view" => button.label = "Log Snapshot…".into(),
                 "shell" => button.label = "Open Shell".into(),
                 "port-forward" => button.label = "Port Forward…".into(),
                 "create-secret" => button.icon = Some("plus".into()),
@@ -169,8 +170,8 @@ impl KubeExplorer {
         };
         let mut items = Vec::new();
         if kind == "pods" || WORKLOADS.contains(&kind.as_str()) {
-            items.push(PickItem::new("log-view", "View Log Snapshot…"));
-            items.push(PickItem::new("log-sources", "Select Log Sources…"));
+            items.push(PickItem::new("log-view", "Log Snapshot…"));
+            items.push(PickItem::new("log-sources", "Follow Logs from Selected Sources…"));
         }
         if kind == "pods" {
             items.push(PickItem::new("attach", "Attach"));
@@ -226,7 +227,7 @@ impl KubeExplorer {
         let normalized = self.checked_tree_key(key)?;
         let key = normalized.as_str();
         if key == "kube:status" {
-            return Ok(vec![Tab::new("status","Kubernetes",Pane::Message("Allow kubectl in Settings › Plugins › Kube Explorer to browse clusters. Private kubeconfig import/review needs no connection; imported profiles are not activated automatically.".into()))]);
+            return Ok(vec![Tab::new("status","Kubernetes",Pane::Message(format!("{} Private kubeconfig import/review needs no connection; imported profiles are not activated automatically.", ui_kit::denied::message("Browsing clusters", "process:kubectl", "Kube Explorer"))))]);
         }
         let Some((kind, row)) = self.checked_resource(key)? else {
             let context = self
@@ -528,12 +529,8 @@ mod tests {
             .unwrap();
         kube.handle(TREE, ViewEvent::Button(shell.clone()), &host.invocation())
             .unwrap();
-        assert_eq!(host.terminals().len(), 1);
-        assert!(
-            host.terminals()[0]
-                .args
-                .contains(&"--namespace=team-a".into())
-        );
+        let session = kube.shell_terminal_key(Some("team-a"), "web");
+        assert!(host.finish_terminal(&session).is_some());
         let secret = row(&mut kube, &host, "secrets");
         kube.handle(TREE, ViewEvent::Select(secret), &host.invocation())
             .unwrap();
@@ -545,7 +542,7 @@ mod tests {
             kube.handle(PANEL, ViewEvent::Button(shell), &host.invocation())
                 .is_err()
         );
-        assert_eq!(host.terminals().len(), 1);
+        assert!(host.finish_terminal(&session).is_none());
         kube.handle(TREE, ViewEvent::Select(key.clone()), &host.invocation())
             .unwrap();
         let view = kube.render(TREE, None, &host.invocation()).unwrap();
@@ -587,12 +584,7 @@ mod tests {
             .unwrap();
         kube.handle(TREE, ViewEvent::Button(clipped), &host.invocation())
             .unwrap();
-        assert!(
-            host.terminals()[0]
-                .args
-                .iter()
-                .any(|arg| arg == &name || arg == &format!("pods/{name}"))
-        );
+        assert!(host.finish_terminal(&kube.shell_terminal_key(Some("team-a"), &name)).is_some());
         // Altering an action must invalidate its proof, even on the same row.
         let forged = shell.strip_suffix("shell").unwrap().to_owned() + "delete";
         assert!(
@@ -618,7 +610,7 @@ mod tests {
                 "Refresh",
                 "Describe",
                 "Edit YAML…",
-                "Follow Logs",
+                "Follow Logs (Terminal)",
                 "Open Shell",
                 "Port Forward…",
                 "Delete",

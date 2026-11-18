@@ -524,7 +524,7 @@ fn type_value(declared: &str) -> Option<Value> {
 pub fn var_comment_values(text: &str, offset: usize) -> BTreeMap<String, Value> {
     let mut values = BTreeMap::new();
     for (at, _) in text[..offset.min(text.len())].match_indices("{#") {
-        let Some(end) = text[at..].find("#}") else { continue };
+        let Some(end) = text[at + 2..].find("#}").map(|c| c + 2) else { continue };
         let body = text[at + 2..at + end].trim();
         let Some(rest) = body.strip_prefix("@var") else { continue };
         let words: Vec<&str> = rest.split_whitespace().collect();

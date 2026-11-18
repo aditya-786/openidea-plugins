@@ -7,11 +7,11 @@ publish = false
 [workspace]
 
 [dependencies]
-ide-core = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
-ide-host = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
-ide-language = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
-ide-mcp = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
-ide-plugin = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.46" }
+ide-core = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
+ide-host = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
+ide-language = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
+ide-mcp = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
+ide-plugin = { git = "https://github.com/l0ng-ai/openidea", tag = "v0.1.47" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
 tempfile = "3"

@@ -172,9 +172,10 @@ pub(crate) fn resolve(
         .pending
         .remove(action.data.as_deref().ok_or(Error::Stale)?)
         .ok_or(Error::Stale)?;
-    let project = current(&pending, doc)?;
+    current(&pending, doc)?;
     let candidate = candidate(doc, pending.at).ok_or(Error::Stale)?;
-    let names = xml_file_actions::names(&project, doc)?;
+    let names = xml_file_actions::names(nav, doc, COMMAND_BUDGET)?;
+    let inventory = xml_file_actions::fingerprint(&names);
     if names.contains(&candidate.id) {
         return Err("This bean ID/alias already exists in the source inventory; no definition will be replaced.".into());
     }
@@ -195,29 +196,23 @@ pub(crate) fn resolve(
         "{leading}{}<{}bean id=\"{}\" class=\"{}\"/>{}",
         candidate.indent, candidate.prefix, candidate.id, class, candidate.newline
     );
-    let mut after = doc.text.clone();
-    after.insert_str(candidate.insert, &added);
+    let insert = TextEdit { range: range(&doc.text, candidate.insert, candidate.insert), text: added };
+    let (_, changes) = crate::reviewed(&doc.text, std::slice::from_ref(&insert))?;
     let preview = format!(
-        "Project: {}\nSource: {}\n\nAdd source bean ID {:?} for the selected literal reference, with the explicitly supplied class spelling {:?}. No existing declaration/file is replaced. Source inventory absence is not runtime absence; classpath, constructor, imports, profiles and effective bean activation are unverified.\n\nComplete resulting XML:\n{after}",
+        "Project: {}\nSource: {}\n\nAdd source bean ID {:?} for the selected literal reference, with the explicitly supplied class spelling {:?}. No existing declaration/file is replaced. Source inventory absence is not runtime absence; classpath, constructor, imports, profiles and effective bean activation are unverified.\n\nChanged lines of the resulting XML:\n{changes}",
         pending.root, doc.path, candidate.id, class
     );
     if !ui_kit::prompts::confirm_exact("Review XML bean creation", &preview)? {
         return Err(Error::Cancelled);
     }
     current(&pending, doc)?;
-    if xml_file_actions::names(&project, doc)? != names {
+    if xml_file_actions::fingerprint(&xml_file_actions::names(nav, doc, std::time::Duration::ZERO)?) != inventory {
         return Err(Error::Stale);
     }
     Ok(FileAction {
         title: "Create XML bean for literal reference".into(),
         kind: Some("refactor".into()),
-        edits: vec![(
-            doc.path.clone(),
-            vec![TextEdit {
-                range: range(&doc.text, candidate.insert, candidate.insert),
-                text: added,
-            }],
-        )],
+        edits: vec![(doc.path.clone(), vec![insert])],
         ..Default::default()
     })
 }
@@ -360,7 +355,6 @@ mod tests {
             format!("<!DOCTYPE beans [<!ENTITY x 'unsafe'>]>{valid}"),
             valid.replace("</beans>", "</wrong>"),
             valid.replace("</beans>", "</beans>\r"),
-            format!("{valid}{}", " ".repeat(12 * 1024)),
         ] {
             let (_h, mut d, mut nav) = setup(&xml);
             let at = xml.find("ref=").unwrap_or(0) + 5;

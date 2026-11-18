@@ -58,7 +58,7 @@ fn decode(root: &str, raw: Option<&str>) -> Result<Vec<Mapping>, Error> {
 }
 pub fn load(root: &str) -> Result<Vec<Mapping>, Error> {
     if root.is_empty() {
-        return Err("Missing project identity.".into());
+        return Err("Open a project first.".into());
     }
     let raw = host::storage::get(&key(root))?;
     decode(root, raw.as_deref())
@@ -154,7 +154,7 @@ fn root(ctx: &Invocation) -> Result<(Project, String), Error> {
     let project = ctx.project().ok_or("Open a project before configuring Twig paths.")?;
     let root = project.root()?;
     if root.is_empty() {
-        return Err("Missing project identity.".into());
+        return Err("Open a project first.".into());
     }
     Ok((project, root))
 }
@@ -194,8 +194,8 @@ impl Editor {
                     "Enabled for plugin navigation",
                     FieldValue::Checkbox(draft.mapping.enabled),
                 ),
-                Field::new("twig-path-preview", "Project-owned hint target", FieldValue::readonly_text(&destination, false)),
-                Field::new("twig-path-error", "Validation / scope", FieldValue::readonly_text(&draft.error, true)),
+                Field::new("twig-path-preview", "Resolves to", FieldValue::readonly_text(&destination, false)),
+                Field::new("twig-path-error", "Notes", FieldValue::readonly_text(&draft.error, true)),
             ]))
             .button(Button::new(&self.control_key("twig-path-save"), "Save").icon("check"))
             .button(Button::new(&self.control_key("twig-path-cancel"), "Cancel").icon("close"))
@@ -264,7 +264,7 @@ impl Editor {
                     }
                     _ => return Err("Unknown Twig settings field.".into()),
                 }
-                draft.error = "Draft only; Save validates current project directory and storage snapshot.".into();
+                draft.error = "Not saved yet. Click Save to apply.".into();
                 Ok(false)
             }
             ViewEvent::Button(id) if id == "twig-path-cancel" => {
@@ -358,7 +358,7 @@ impl Editor {
                     rows,
                     at,
                     mapping,
-                    error: "Project-owned plugin hint; no Symfony/Twig runtime configuration is changed.".into(),
+                    error: "Used by this plugin's navigation only; your Symfony and Twig configuration is not changed.".into(),
                     rejected: BTreeSet::new(),
                 });
                 Ok(false)
@@ -485,7 +485,7 @@ mod tests {
         let project = host.invocation().project().unwrap();
         let index = Index::build(&project);
         assert_eq!(index.templates["@Mail/same.twig"].path, "/project/custom/same.twig");
-        assert!(index.templates["@Mail/same.twig"].detail.as_ref().unwrap().contains("unverified"));
+        assert!(index.templates["@Mail/same.twig"].detail.as_ref().unwrap().contains("may differ at runtime"));
         assert!(index.template_paths_unknown);
         store("/project", &[mapping("Mail", "custom"), mapping("Mail", "other")]);
         let index = Index::build(&project);

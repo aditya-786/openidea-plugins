@@ -298,7 +298,7 @@ fn graphql_source(
             == Some(arg)
     }) {
         return Err(Error::Failed(
-            "GraphQL handler source is no longer admitted.".into(),
+            "This GraphQL handler changed. Run the action again from the updated code.".into(),
         ));
     }
     let handler = graphql::handlers_in(&doc.text, spring_text::is_kotlin(&doc.path))
@@ -379,7 +379,7 @@ pub fn run_graphql(
     }
     match project.write_file(&path, &content) {
         Ok(()) => openidea_plugin::host::open_location(&path, 0, 0),
-        Err(Error::Denied(_)) => openidea_plugin::host::copy_to_clipboard(&content),
+        Err(Error::Denied(_)) => crate::copy_after_write_denied(&content),
         Err(error) => Err(error),
     }
 }
@@ -414,6 +414,7 @@ mod graphql_tests {
             text: source.into(),
         };
         let mut owner = crate::window::Endpoints::default();
+        owner.activate_live();
         let lens = owner
             .code_lenses(&doc)
             .into_iter()
@@ -457,7 +458,7 @@ mod graphql_tests {
         let source="@Controller class Books { @SchemaMapping(typeName=\"Root\",field=\"book\") String book(){} }";
         h.open_editor("/project/Books.java","java",source,&[]);
         let doc=Document{path:"/project/Books.java".into(),language:"java".into(),version:h.editor_version(),text:source.into()};
-        let mut owner=crate::window::Endpoints::default();let lens=owner.code_lenses(&doc).into_iter().find(|l|l.command==GRAPHQL_COMMAND).unwrap();
+        let mut owner=crate::window::Endpoints::default();owner.activate_live();let lens=owner.code_lenses(&doc).into_iter().find(|l|l.command==GRAPHQL_COMMAND).unwrap();
         h.answer_next_prompt(Some(&["http://localhost:8080"]));owner.run_command(GRAPHQL_COMMAND,&h.invocation(),lens.argument.as_deref()).unwrap();
         let content=h.invocation().project().unwrap().read_file("http/graphql-query-book.http").unwrap();assert!(content.contains("POST http://localhost:8080/graphql"));
         let payload:serde_json::Value=serde_json::from_str(content.split_once("\n\n").unwrap().1).unwrap();assert_eq!(payload["query"],"query OpenIdeaRequest {\n  book\n}");

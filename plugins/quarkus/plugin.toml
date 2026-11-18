@@ -4,10 +4,13 @@ version = "0.3.0" # x-release-please-version
 description = "Quarkus support for application.properties, application.yaml and microprofile-config.properties: completion of keys and values from the Quarkus 3.40 configuration metadata, MicroProfile Config and the project's @ConfigProperty and @ConfigMapping declarations, %dev/%test/%prod profiles, warnings for deprecated and unknown keys, Quarkus Dev Mode run configurations (mvn, gradle, quarkus CLI) and a shortcut to code.quarkus.io."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Unreleased: JAX-RS resource checks from literal source (inventory-complete modules only for cross-file ones): @PathParam/@RestPath names must match a {x} or {x:regex} variable of the class and method @Path (warning), a variable no parameter binds is only info, more than one HTTP method annotation on a method warns, @GET with an unannotated entity parameter is info, resource methods with the same normalised template, verb and overlapping @Consumes/@Produces warn, and duplicate literal @Scheduled identity values warn; dynamic values stay quiet. Unreleased: Qute Java-embedded templates: literal @Location, injected Template fields and @CheckedTemplate methods/records warn when the fresh source inventory proves no template file exists; lookup honours default suffixes (qute.html, qute.txt, html, txt) and a literal quarkus.qute.suffixes (Quarkus has no template-root property; template-path-exclude, profiled, dynamic or YAML values stay quiet); {name} completion in a template offers literal checked-method parameters, record components, .data(\"name\", ..) chains and literal @TemplateData/@TemplateExtension namespaces. Unreleased: the optional JDT configuration overlay also adds saved application.yaml/yml, .env and config/application.properties|yaml files as sources (bounded, inside the project root, no symlink escapes); unsaved buffers override them; YAML ordinals stay unconfirmed. Unreleased: the optional JDT configuration overlay now also covers unsaved application.yaml/yml (literal single-document block mappings flattened with dotted keys, [n] list indexes, quoted keys and \"%profile\" top-level keys; anchors, flow, block scalars, tabs and multi-document refused), config/application.properties, .env and new unsaved config files, with documented ordinals. Unreleased: JAX-RS lenses show the effective path composed from literal quarkus.http.root-path, a single literal @ApplicationPath (which replaces quarkus.rest.path) or quarkus.rest.path, and class/method @Path; quiet when ambiguous or non-literal. Unreleased: @Scheduled every values are checked against the documented Duration.parse prefix rules (a bare number or `30ms` is invalid), and ${key}/{key} references in cron/every/timeZone/delayed without default are noted when no config file sets the key (opt-in quarkus.checkUnassigned). Unreleased: optional hash-pinned Qute/JDT stdio broker with actual inferred-model freshness tests and exact qute.html language scope; source JAX-RS/scheduler lenses/symbols and Java declared-default/converter inlays. Unreleased: conventional Gradle version-catalog plugin alias detection with exact literal identity and catalogue/settings lifecycle invalidation. Unreleased: REST registration fixes preserve qualified source identity and recheck the unique fresh target before returning a safe FQN annotation edit. Mapping groups use unambiguous same-file lexical owners instead of the first matching simple type name. Mapping modifiers and naming strategies require literal framework namespace ownership instead of simple-name/suffix guesses. Annotation scalar metadata uses exact literals and marks unresolved expressions incomplete instead of inventing first-fragment facts. Java config metadata/hover/completion checks literal framework annotation ownership before claiming source facts. Cached project-source metadata and navigation recheck deepest project ownership and withhold foreign facts. Module gating requires literal Maven/Gradle declarations and keeps comment/string-only Quarkus mentions quiet. Configuration hover labels actual project-source, selected-JAR and bundled origins, including packaged dataset version provenance; no runtime dependency/value inference. Unreleased: explicit reviewed local config-model reads from one literal root-POM Maven dependency, with bounded archive validation, scoped session cache and source provenance. Java checks for health checks (@Liveness/@Readiness/@Wellness without HealthCheck and HealthCheck without a qualifier, with quick fixes) and @Gauge (scope, return type), setting quarkus.checkHealthMetrics; quick fix Add @RegisterRestClient (and its import) to the REST client interface. keys of named instances (quarkus.datasource.\"users\".jdbc.url) complete and are checked like the unnamed ones; opt-in setting quarkus.checkRequired notes required keys that no config file sets; Java: completion in @ConfigProperty(name) and @ConfigMapping(prefix), checks for @RestClient without @RegisterRestClient and @Scheduled expressions, opt-in quarkus.checkUnassigned, quick fixes to add a defaultValue or the key to application.properties; Go to Declaration and gutter markers between config keys and @ConfigProperty/@ConfigMapping declarations. 0.1.0: first release, with key and value completion, profiles, project keys from @ConfigProperty and @ConfigMapping, deprecated and unknown key warnings, Quarkus Dev Mode run detectors and the Open code.quarkus.io command. Bundled configuration metadata from Quarkus 3.40.1."
+change-notes = """\
+Next release: Checks for JAX-RS resources and @Scheduled values, and JAX-RS lenses show the full path; Qute template support in Java, and gutter icons link config keys with the @ConfigProperty and @ConfigMapping code using them, listing every match; the plugin wakes only for projects that declare Quarkus; edits to a gitignored .env made outside the IDE are picked up when you open or save it, and tracked .env files are watched; row commands say what to select, permission and JAR metadata messages are clearer (including how to allow ~/.m2/repository), setting titles are shorter and the starter command is Create Maven/Qute Starter, defaults to Quarkus 3.40.1, confirms once and creates the files itself with the optional project.write permission (⌥⏎ otherwise), never overwriting, and Open Starter is offered afterwards, Show Endpoint or Schedule Details lists the current file's lenses from Search Everywhere, and Load Config Keys from a Dependency JAR replaces the old title. \
+0.3.0: wider configuration support and a consolidated window. \
+0.2.0: plugin icon and audit improvements."""
 categories = ["frameworks"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = [
     "on-file:**/application*.properties",
@@ -19,12 +22,11 @@ activation = [
     "on-language:quarkus-properties",
     "on-file:**/pom.xml",
     "on-file:**/src/main/resources/templates/**",
-    "on-event:files-changed",
 ]
 
 [capabilities]
 required = ["project.read"]
-optional = ["events", "fs.read:~/.m2/repository", "editor.read"]
+optional = ["events", "fs.read:~/.m2/repository", "editor.read", "project.write"]
 
 [[contributes.providers]]
 kinds = ["completion", "line-markers"]
@@ -33,6 +35,11 @@ languages = ["properties", "quarkus-properties", "yaml"]
 [[contributes.providers]]
 kinds = ["completion", "code-actions", "line-markers"]
 languages = ["java"]
+
+[[contributes.markerIcons]]
+id = "config"
+icon = "icons/quarkus.svg"
+iconDark = "icons/quarkus_dark.svg"
 
 [[contributes.providers]]
 kinds = ["diagnostics", "hover", "definition"]
@@ -86,18 +93,20 @@ title = "Quarkus Tools"
 
 [[contributes.commands]]
 id = "read-dependency-jar-metadata"
-title = "Quarkus: Read Config Model from Selected Maven Dependency JAR…"
+title = "Quarkus: Load Config Keys from a Dependency JAR…"
 category = "Quarkus"
 
 [[contributes.commands]]
 id = "prepare-local-starter"
-title = "Quarkus: Prepare Offline Maven/Qute Starter…"
+title = "Quarkus: Create Maven/Qute Starter…"
 category = "Quarkus"
+when = "editorLangId == java || editorLangId == xml"
 
 [[contributes.commands]]
 id = "open-reviewed-starter"
-title = "Quarkus: Open Reviewed Starter…"
+title = "Quarkus: Open Starter…"
 category = "Quarkus"
+when = "plugin.aritti.quarkus.starterCreated"
 
 [[contributes.providers]]
 kinds = ["code-lenses", "document-symbols", "inlay-hints"]
@@ -105,8 +114,9 @@ languages = ["java"]
 
 [[contributes.commands]]
 id = "inspect-source-declaration"
-title = "Quarkus: Inspect Source Declaration"
+title = "Quarkus: Show Endpoint or Schedule Details…"
 category = "Quarkus"
+when = "editorLangId == java"
 
 [[contributes.languages]]
 path = "languages/qute-html.toml"

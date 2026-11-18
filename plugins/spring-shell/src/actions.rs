@@ -16,25 +16,9 @@ pub(crate) struct State {
     pending: BTreeMap<String, Pending>,
 }
 pub(super) fn root(doc: &Document) -> Option<String> {
-    let root = host::project_of(&doc.path)?.root().ok()?;
-    if !root.starts_with('/')
-        || root == "/"
-        || root.ends_with('/')
-        || root.len() > 4096
-        || root.contains(['\\', '\0'])
-        || root.chars().any(char::is_control)
-        || doc.path.len() > 4096
-        || doc.path.contains("//")
-        || doc.path.contains('\\')
-        || doc.path.chars().any(char::is_control)
-        || doc.path.split('/').any(|p| matches!(p, "." | ".."))
-        || !doc.path.starts_with(&format!("{root}/"))
-    {
-        return None;
-    }
-    Some(root)
+    spring_text::index::owning_root(&doc.path)
 }
-fn candidates(doc: &Document, selection: Range) -> Vec<(usize, usize)> {
+fn candidates(doc: &Document, selection: Range, extended: &dyn Fn(&str) -> bool) -> Vec<(usize, usize)> {
     let Some(f) = document_model(doc) else {
         return Vec::new();
     };
@@ -50,7 +34,16 @@ fn candidates(doc: &Document, selection: Range) -> Vec<(usize, usize)> {
     }
     f.types
         .iter()
-        .filter(|t| t.kind == "class" && t.outer.is_none() && t.annotations.is_empty() && t.supers().next().is_none())
+        .enumerate()
+        .filter(|(ti, t)| {
+            t.kind == "class"
+                && t.outer.is_none()
+                && t.annotations.is_empty()
+                && t.supers().next().is_none()
+                && !t.modifiers.iter().any(|m| m == "abstract")
+                && !extended(&f.qualified(*ti))
+        })
+        .map(|(_, t)| t)
         .filter(|t| {
             t.methods().any(|m| {
                 m.annotation("ShellMethod").is_some_and(|a| rules::supported(&f, &doc.text, a))
@@ -69,7 +62,8 @@ impl FileActions for ShellTools {
         let Some(root) = root(doc) else {
             return Vec::new();
         };
-        let candidates = candidates(doc, selection);
+        let cached = self.indexes.cached(&doc.path);
+        let candidates = candidates(doc, selection, &|qualified| cached.is_none_or(|index| may_be_extended(index, qualified)));
         if self.actions.pending.len() + candidates.len() > 8 {
             self.actions.pending.clear();
         }
@@ -81,7 +75,7 @@ impl FileActions for ShellTools {
                 let token = format!("shell-component:{:016x}{:016x}", random.hash_one(0u8), random.hash_one(1u8));
                 self.actions.pending.insert(token.clone(), Pending { root: root.clone(), doc: doc.clone(), class_at, start });
                 FileAction {
-                    title: "Preview add explicit ShellComponent annotation…".into(),
+                    title: "Add @ShellComponent…".into(),
                     kind: Some("quickfix".into()),
                     data: Some(token),
                     ..FileAction::default()
@@ -104,12 +98,14 @@ impl FileActions for ShellTools {
             return Err(Error::Stale);
         }
         let pos = position(&doc.text, p.class_at);
-        if !candidates(doc, Range::new(pos, pos)).contains(&(p.class_at, p.start)) {
+        let cached = self.indexes.cached(&doc.path);
+        let still_offered = candidates(doc, Range::new(pos, pos), &|qualified| cached.is_none_or(|index| may_be_extended(index, qualified)));
+        if !still_offered.contains(&(p.class_at, p.start)) {
             return Err(Error::Stale);
         }
         let project = host::project_of(&doc.path).ok_or(Error::Stale)?;
         if project.read_file(&doc.path)? != doc.text {
-            return Err(Error::Stale);
+            return Err(Error::Invalid("Save the file first".into()));
         }
         let line = doc.text[..p.start].rfind('\n').map_or(0, |i| i + 1);
         let indent = &doc.text[line..p.start];
@@ -153,6 +149,7 @@ mod tests {
     }
     fn action(tools: &mut ShellTools, d: &Document) -> FileAction {
         let p = position(&d.text, d.text.find("run(){}").unwrap());
+        tools.line_markers(d);
         tools.file_actions(d, Range::new(p, p)).remove(0)
     }
     #[test]
@@ -200,6 +197,7 @@ mod tests {
         ] {
             let (_host, mut tools, mut d) = setup();
             d.text = source;
+            tools.line_markers(&d);
             let p = position(&d.text, d.text.find("run(){}").unwrap());
             assert!(tools.file_actions(&d, Range::new(p, p)).is_empty(), "{}", d.text);
         }
@@ -211,6 +209,7 @@ mod tests {
         d.language = "kotlin".into();
         d.text = "import org.springframework.shell.standard.ShellMethod\n// 😀\nclass C { @ShellMethod(\"Run\") fun run(){} }".into();
         host.add_file("C.kt", &d.text);
+        tools.line_markers(&d);
         let p = position(&d.text, d.text.find("run(){}").unwrap());
         let pending = tools.file_actions(&d, Range::new(p, p)).remove(0);
         host.answer_next_prompt(Some(&["yes"]));
@@ -221,5 +220,30 @@ mod tests {
         d.text = d.text.replace("class C", "class C<org>");
         let p = position(&d.text, d.text.find("run(){}").unwrap());
         assert!(tools.file_actions(&d, Range::new(p, p)).is_empty());
+    }
+    #[test]
+    fn fix_on_unsaved_buffer_says_save_first() {
+        let (_host, mut tools, mut d) = setup();
+        d.text.push_str("\r\n// unsaved");
+        let pending = action(&mut tools, &d);
+        let result = tools.resolve_file_action(&d, pending);
+        assert!(matches!(&result, Err(Error::Invalid(m)) if m == "Save the file first"), "{result:?}");
+    }
+    #[test]
+    fn cold_index_offers_no_component_fix() {
+        let (_host, mut tools, d) = setup();
+        let p = position(&d.text, d.text.find("run(){}").unwrap());
+        assert!(tools.file_actions(&d, Range::new(p, p)).is_empty());
+    }
+    #[test]
+    fn windows_root_fixes_available() {
+        let host = MockHost::install();
+        host.set_project_root(Some("C:/work/app"));
+        host.add_file("C.java", SOURCE);
+        let d = Document { path: "C:/work/app/C.java".into(), language: "java".into(), version: 5, text: SOURCE.into() };
+        let mut tools = ShellTools::default();
+        tools.line_markers(&d);
+        let p = position(&d.text, d.text.find("run(){}").unwrap());
+        assert!(!tools.file_actions(&d, Range::new(p, p)).is_empty());
     }
 }

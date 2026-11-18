@@ -1,13 +1,16 @@
 id = "aritti.dotenv"
 name = ".env files"
 version = "0.3.0" # x-release-please-version
-description = ".env file support: highlighting, inspections with quick fixes and ${VARIABLE} completion. Environment variables in code (getenv, os.environ, process.env, ENV[…], env::var, PHPUnit <env>, …) get completion and go to declaration in .env files, Dockerfiles and docker-compose files. Go to declaration on a key in a .env file lists its usages, and a confirmed source-only action can update current-file interpolation tokens after a key edit."
+description = ".env file support: highlighting, inspections with quick fixes and ${VARIABLE} completion. Environment variables in code (getenv, os.environ, process.env, ENV[…], env::var, PHPUnit <env>, …) get completion and go to declaration in .env files, Dockerfiles and docker-compose files. Go to declaration on a key in a .env file lists its usages, and after you rename a key you can update its ${VARIABLE} references in the same file."
 authors = ["Arnaud RITTI"]
 license = "MIT"
-change-notes = "Unreleased: extension point aritti.dotenv.sources lets other plugins register exact file names as env declaration files (role declares) or env readers (role reads); changes apply without a restart. Unreleased: Dockerfile ARG links also cover a global ARG re-declared as bare ARG K inside a stage, and ${K}/$K uses after the declaration in that stage or in stages based on it, only in instructions Docker expands (ADD, COPY, ENV, EXPOSE, LABEL, STOPSIGNAL, USER, VOLUME, WORKDIR, ONBUILD of those) and in shell-form RUN/CMD/ENTRYPOINT outside single quotes; a global ARG is not inherited by stages, a stage ARG is by stages based on it (per Docker docs). Unreleased: saving, creating or deleting a Dockerfile that a Compose service builds re-derives its ARG links. Unreleased: hover shows which Compose services load an env file via env_file (scalar, list, path/required object forms; line shown), that the project .env feeds interpolation only, and links a Dockerfile ARG (declared after a FROM, per its stage) supplied by compose build.args from ${VAR} to that .env key (also a usage); quiet on aliases, merges and non-literal paths. Unreleased: Docker Compose $VAR and ${VAR}, ${VAR:-d}, ${VAR-d}, ${VAR:?e}, ${VAR?e}, ${VAR:+r} interpolations link to keys in the project-directory .env (usages), with Info-only hints for plain ${VAR} missing from that .env and for .env keys nothing references; cache-only, quiet when the cache is incomplete or the file is an env_file target. Unreleased: bounded YAML env_file alias/nested merge graph discovery and optional-file semantics, with explicit byte/node/depth/anchor/replay budgets. Unreleased: bounded cached-source hover for env declarations and existing code/reference forms; values obey showValues, ambiguity and incomplete caches are labelled. Hover performs no discovery or file reads. 0.1.0: first release. Includes highlighting, the 11 inspections and their quick fixes, ${VARIABLE} completion and navigation, environment variable completion, go to declaration and usages in code, keys from Dockerfiles and docker-compose files, and source-only current-file interpolation updates after an edited key."
+change-notes = """\
+Next release: Other plugins can register their own env files; Docker Compose variables and Dockerfile ARG values link to .env keys with hover details, and a gutter icon on each .env key lists its usages and the other env files declaring it; values of keys like PASSWORD, SECRET, TOKEN and KEY show as •••• in completion and hover, and .env: Show Value at Caret reveals one in a picker, never in the notification history; saving no longer re-scans the whole project, and changes made outside the editor are picked up; settings to turn checks off, single-quoted values with ${…} are no longer flagged, one name per action and clearer messages. \
+0.3.0: Docker ARG scope, Compose and env_file checks and more code references. \
+0.2.0: plugin icon and window consolidation."""
 categories = ["languages", "linters"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-language:dotenv"]
 
@@ -20,6 +23,13 @@ fields = { fileName = "string", role = "string" }
 [capabilities]
 # project.read: read the project's .env files, publish problems. events: check .env files when opened or saved.
 required = ["project.read", "events"]
+# editor.read: .env: Show Value at Caret reads the caret position.
+optional = ["editor.read"]
+
+[[contributes.commands]]
+id = "show-value"
+title = ".env: Show Value at Caret"
+category = ".env"
 
 # The IDE's own `dotenv` definition wins (detection, comments); this copy only
 # makes the plugin the language's owner, so its highlighting is used.
@@ -27,8 +37,12 @@ required = ["project.read", "events"]
 path = "languages/dotenv.toml"
 
 [[contributes.providers]]
-kinds = ["completion", "definition", "code-actions", "hover"]
+kinds = ["completion", "definition", "code-actions", "hover", "line-markers"]
 languages = ["dotenv"]
+
+[[contributes.markerIcons]]
+id = "related"
+icon = "icons/dotenv.svg"
 
 [[contributes.providers]]
 kinds = ["completion", "definition", "hover"]

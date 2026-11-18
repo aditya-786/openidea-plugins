@@ -24,7 +24,6 @@ impl<'a> Graph<'a> {
         let mut complete = index.fresh();
         let mut limited = false;
         'files: for (path, info) in index.iter() {
-            complete &= info.complete;
             for class in &info.classes {
                 if count >= MAX_CLASSES {
                     complete = false;
@@ -165,26 +164,6 @@ pub(super) fn qualified(file: &java::JavaFile, owner: usize, ty: &java::TypeRef)
     Ok(tail.map_or(base.clone(), |tail| format!("{base}.{tail}")))
 }
 
-pub(super) fn balanced(text: &str) -> bool {
-    let mut stack = Vec::new();
-    for token in java::tokens(text) {
-        if token.s.starts_with('"') && (token.s.len() < 2 || !token.s.ends_with('"')) {
-            return false;
-        }
-        match token.s {
-            "(" => stack.push(")"),
-            "[" => stack.push("]"),
-            "{" => stack.push("}"),
-            ")" | "]" | "}" => {
-                if stack.pop() != Some(token.s) {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    stack.is_empty()
-}
 fn literal(value: &str) -> String {
     value.chars().take(256).map(|c| if c == '`' || c.is_control() { ' ' } else { c }).collect()
 }
@@ -193,14 +172,14 @@ impl openidea_plugin::hover::HoverProvider for SpringOsgi {
         if doc.text.len() > 512 * 1024 || doc.language != "xml" || !doc.path.ends_with(".xml") {
             return None;
         }
-        validate_generation_xml(&doc.text).ok()?;
+        xml::analysis_valid(&doc.text).then_some(())?;
         let osgi = OsgiXml::new(&doc.text)?;
         if osgi.els.len() > 2048 {
             return None;
         }
         let offset = offset(&doc.text, at)?;
-        let scope=self.source_scope(&doc.path);
-        let mut local = Index::new(&["**/*.java", "**/*.xml"], parse);
+        let scope=self.source_scope(&doc.path, &doc.text);
+        let mut local = Index::new(GLOBS, parse);
         let index = match self.indexes.for_cached_document(&doc.path,&doc.text) {
             Some(index)=>index,
             None=>{local.update(&doc.path,&doc.text);&mut local}
@@ -307,7 +286,7 @@ mod tests {
             host.add_file(path, text);
         }
         let project = host::projects().unwrap().remove(0);
-        let mut index = Index::new(&["**/*.java", "**/*.xml"], parse);
+        let mut index = Index::new(GLOBS, parse);
         index.scan(&project, Duration::from_secs(1));
         (host, index)
     }
@@ -447,7 +426,6 @@ mod tests {
         plugin.indexes.get(&projects[0], Duration::from_secs(1));
         let mut other = document(r#"<bean id="impl" class="app.Impl"/><o:service ref="impl" interface="app.Api"/>"#);
         other.path = "/other/context.xml".into();
-        assert!(plugin.diagnostics(&other).is_empty(), "the other root has no warmed type graph");
         plugin.indexes.get(&projects[1], Duration::from_secs(1));
         assert!(
             plugin.diagnostics(&other).iter().any(|d| d.code.as_deref() == Some("osgi-service-common")),

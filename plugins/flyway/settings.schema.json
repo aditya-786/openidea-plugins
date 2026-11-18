@@ -1,9 +1,10 @@
 {
   "properties": {
     "locations": {
+      "title": "Migration locations (comma-separated)",
       "type": "string",
-      "title": "Migration locations, comma-separated (classpath:db/migration, filesystem:sql). Empty: read flyway.toml, flyway.conf and spring.flyway.locations",
-      "default": ""
+      "default": "",
+      "description": "Migration locations, comma-separated (classpath:db/migration, filesystem:sql). Empty: read flyway.toml, flyway.conf and spring.flyway.locations"
     },
     "runner": {
       "type": "string",
@@ -16,17 +17,18 @@
     },
     "arguments": {
       "type": "string",
-      "title": "Extra arguments for Flyway commands (-environment=dev, -Dflyway.user=\u2026)",
+      "title": "Extra arguments for Flyway commands (-environment=dev, -Dflyway.user=…)",
       "default": ""
     },
     "executionMode": {
+      "title": "Show command output in",
       "type": "string",
-      "title": "CLI command output ownership (managed is instance-lifetime, Refresh Status/Cancel; terminal uses native controls/raw output)",
       "enum": [
         "terminal",
         "managed"
       ],
-      "default": "terminal"
+      "default": "terminal",
+      "description": "terminal: run Flyway in the project's terminal. managed: run it in the background and follow it in the Command Output tab with Refresh Output and Cancel; output is kept until the plugin restarts."
     }
   }
 }

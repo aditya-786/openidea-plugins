@@ -92,6 +92,16 @@ assert.equal(node('poll').textContent,'Polling stopped');assert.equal(timers.siz
 events.refreshclick();reply({...model,status:'Current observation',poll:'Polling stopped'});
 assert.equal(node('status').textContent,'Current observation');assert.equal(node('status').className,'');
 assert.equal(node('refresh').getAttribute('aria-busy'),'false');assert.equal(timers.size,0);
+// Spring Runtime: Start Auto-Refresh posts a frame-less start request; it starts once,
+// and only through the normal validated Start round trip.
+receive(JSON.stringify({channel:'runtime-controls',op:'start-request'}));
+assert.equal(last().op,'start');const requestedStart=last().nonce;
+reply({...model,active:true});assert.equal(timers.size,1);
+events.stopclick();assert.equal(last().op,'stop');reply(model);assert.equal(timers.size,0);
+receive(JSON.stringify({channel:'runtime-controls',op:'start-request',frame:'f'.repeat(32)}));assert.equal(last().op,'stop','framed messages are replies, not requests');
+events.refreshclick();reply({...model,autostart:true});assert.equal(last().op,'start','a hello/refresh reply can carry the request');assert.notEqual(last().nonce,requestedStart);
+reply({...model,active:true});events.stopclick();reply(model);
+events.refreshclick();reply({...model,autostart:true,enabled:false});assert.equal(last().op,'refresh','disabled setting drops the request');
 console.log('current packaged controls: frame/sequence routing, 60s tick, hidden/busy/pagehide stop, brief hide during tick/start, explicit restart, aria-busy and literal error/status class transitions passed');
 
 // Grouped-view disposal revokes an outstanding Start before releasing listeners.

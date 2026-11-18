@@ -156,7 +156,8 @@ pub fn model(text: &str) -> FileModel {
                     ctor_names: Vec::new(),
                 });
                 let kind = if t.s == "interface" { "interface" } else { "class" };
-                let repository = model::is_repository(kind, supers.iter().map(String::as_str));
+                let repository =
+                    !anns.iter().any(|a| a.name == "NoRepositoryBean") && model::is_repository(kind, supers.iter().map(String::as_str));
                 let bean = if prev == "annotation" { None } else { model::class_bean(text, name.s, name.s, name.at, &anns, repository) };
                 let profiles = bean.as_ref().map(|b| b.profiles.clone()).unwrap_or_default();
                 let owner = bean.map(|b| {

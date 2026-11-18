@@ -495,7 +495,7 @@ impl GitLab {
 
     pub(crate) fn render_files(&mut self, ctx: &openidea_plugin::Invocation) -> Result<View, Error> {
         let Some(iid) = Self::selected() else {
-            return Ok(View::message("Select a merge request in the Merge Requests tool window."));
+            return Ok(View::message("Select a merge request in the GitLab window."));
         };
 
         let project = gitlab_project(ctx)?.path;
@@ -592,7 +592,7 @@ impl GitLab {
 
     pub(crate) fn render_changes(&mut self, ctx: &openidea_plugin::Invocation) -> Result<View, Error> {
         let Some(iid) = Self::selected() else {
-            return Ok(View::message("Select a merge request in the Merge Requests tool window."));
+            return Ok(View::message("Select a merge request in the GitLab window."));
         };
 
         let project = gitlab_project(ctx)?.path;
@@ -687,15 +687,15 @@ impl GitLab {
         let _task = host::begin_task("Loading diff", false);
         let remote = api::Project(project);
         let left = match file.new_file || base.is_empty() {
-            true => String::new(),
-            false => remote.raw_file(&file.old_path, &base)?,
+            true => None,
+            false => Some(remote.raw_file(&file.old_path, &base)?),
         };
         let right = match file.deleted_file {
-            true => String::new(),
-            false => remote.raw_file(&file.new_path, &head)?,
+            true => None,
+            false => Some(remote.raw_file(&file.new_path, &head)?),
         };
         let short = |sha: &str| sha.chars().take(8).collect::<String>();
-        let diff = openidea_plugin::ContentDiff {
+        let diff = openidea_plugin::FileDiff {
             left,
             right,
             left_label: Some(format!("{} @ {}", file.old_path, short(&base))),
@@ -703,7 +703,7 @@ impl GitLab {
             title: Some(format!("{} (!{})", file.new_path, details.mr.iid)),
         };
 
-        host::open_diff(&diff, Some(&file.new_path))
+        host::open_file_diff(&diff, Some(&file.new_path))
     }
 
     pub(crate) fn handle_changes_message(&mut self, message: &str, ctx: &openidea_plugin::Invocation) -> Result<(), Error> {

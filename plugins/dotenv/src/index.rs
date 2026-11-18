@@ -5,11 +5,11 @@
 
 use crate::{code, docker, ownership, parse};
 use openidea_plugin::{Error, Location, Project, Range, text};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::Instant;
 
-/// Env files read in each folder that looks like a project: the walk
-/// discovers hidden paths in API 1.3, but normal ignore rules still apply.
+/// Env files read in each folder that looks like a project. They are read
+/// directly, because the walk may skip gitignored files and `.env` usually is.
 pub const ENV_FILES: &[&str] = &[
     ".env",
     ".env.local",
@@ -34,7 +34,6 @@ pub const ENV_FILES: &[&str] = &[
 ];
 
 /// Files whose folder gets [`ENV_FILES`] looked up, besides the root.
-// Ignored, nonstandard env files elsewhere may remain unknown until opened or explicitly referenced.
 const MARKERS: &[&str] = &[
     "package.json",
     "composer.json",
@@ -55,7 +54,7 @@ const MARKERS: &[&str] = &[
     "compose.yaml",
 ];
 
-const CODE: &[&str] = &[
+pub(crate) const CODE: &[&str] = &[
     "php", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "vue", "svelte", "go", "rb", "rake", "rs", "java", "kt", "kts",
     "scala", "groovy", "cs",
 ];
@@ -83,8 +82,17 @@ pub struct Usage {
 
 #[derive(Default)]
 pub struct Index {
-    /// Built from the whole project, not just the root's env files.
+    /// The project was walked once; events only update single files after that.
+    pub walked: bool,
+    /// The listing a cut walk continues from; `None` once walked or not yet listed.
+    walk: Option<Walk>,
+    held_complete: bool,
+    /// The walk saw everything: no cut-off, unreadable file or unresolved reference.
     pub complete: bool,
+    /// Files whose failed read, size or unresolved reference keeps `complete` false; re-reading them can restore it.
+    blockers: BTreeSet<String>,
+    /// Incompleteness no single file's re-read can clear (fact budget, deadline).
+    hard_incomplete: bool,
     pub declarations: Vec<Declaration>,
     pub usages: Vec<Usage>,
     /// Folders of indexed Compose files: the project directory whose `.env` Compose interpolates from.
@@ -130,6 +138,19 @@ enum Source {
 
 pub fn folder_of(path: &str) -> &str {
     path.rsplit_once(['/', '\\']).map_or("", |(folder, _)| folder)
+}
+
+/// The value as completion and hover show it: keys that look like secrets are masked.
+pub fn shown_value<'a>(key: &str, value: &'a str) -> &'a str {
+    let key = key.to_ascii_uppercase();
+    match !value.is_empty() && ["PASS", "SECRET", "TOKEN", "KEY", "CREDENTIAL"].iter().any(|word| key.contains(word)) {
+        true => "••••",
+        false => value,
+    }
+}
+
+pub fn is_secret_like(key: &str, value: &str) -> bool {
+    !value.is_empty() && shown_value(key, value) != value
 }
 
 pub fn is_compose_file(path: &str) -> bool {
@@ -264,7 +285,7 @@ fn confined_path(root: &str, folder: &str, file: &str) -> Option<String> {
 impl Index {
     fn add(&mut self, path: &str, text: &str) {
         if text.len() > MAX_SOURCE_BYTES {
-            self.complete = false;
+            self.block(path);
             return;
         }
         match source(path) {
@@ -290,6 +311,7 @@ impl Index {
     fn bound_facts(&mut self) {
         if self.declarations.len() > MAX_FACTS || self.usages.len() > MAX_FACTS {
             self.complete = false;
+            self.hard_incomplete = true;
             self.declarations.truncate(MAX_FACTS);
             self.usages.truncate(MAX_FACTS);
         }
@@ -300,6 +322,40 @@ impl Index {
     /// explicitly referenced files leave discovery incomplete.
     pub fn add_compose_env_files(&mut self, project: &Project, root: &str, compose_path: &str, text: &str) {
         self.compose_env_files_before(project, root, compose_path, text, Instant::now() + std::time::Duration::from_secs(1));
+        if !self.complete {
+            self.held_complete = false;
+        }
+    }
+
+    /// Something could not be read: a walk in progress must not finish complete.
+    pub fn mark_incomplete(&mut self, path: &str) {
+        self.held_complete = false;
+        self.block(path);
+    }
+
+    fn block(&mut self, path: &str) {
+        self.complete = false;
+        self.blockers.insert(path.to_owned());
+    }
+
+    /// Drops every fact under the folder `prefix`, which was removed.
+    pub fn forget_under(&mut self, prefix: &str) {
+        let under = format!("{}/", prefix.trim_end_matches(['/', '\\']));
+        self.declarations.retain(|d| !d.location.path.starts_with(&under));
+        self.usages.retain(|u| !u.location.path.starts_with(&under));
+        self.loaders.retain(|l| !l.compose_path.starts_with(&under));
+        self.arg_links.retain(|l| !l.compose_path.starts_with(&under));
+        self.build_targets.retain(|(compose, _)| !compose.starts_with(&under));
+        self.compose_folders.retain(|f| !format!("{f}/").starts_with(&under));
+        self.env_file_paths.retain(|f| !f.starts_with(&under));
+        self.blockers.retain(|f| !f.starts_with(&under));
+        self.restore_completeness();
+    }
+
+    fn restore_completeness(&mut self) {
+        if self.walked && self.blockers.is_empty() && !self.hard_incomplete {
+            self.complete = true;
+        }
     }
 
     fn compose_env_files_before(&mut self, project: &Project, root: &str, compose_path: &str, text: &str, deadline: Instant) {
@@ -312,21 +368,21 @@ impl Index {
         let folder = compose_path.rsplit_once(['/', '\\']).map_or("", |(folder, _)| folder);
         self.add_ownership(project, root, compose_path, text);
         let (files, graph_complete, optional) = docker::compose_env_file_graph(text);
-        if !graph_complete { self.complete=false; }
+        if !graph_complete { self.block(compose_path); }
         if files.len() > 128 {
-            self.complete = false;
+            self.block(compose_path);
         }
         for file in files.into_iter().take(128) {
             if Instant::now() >= deadline {
-                self.complete = false;
+                self.block(compose_path);
                 break;
             }
             if file.contains('$') || file.len() > 4096 {
-                self.complete = false;
+                self.block(compose_path);
                 continue;
             }
             let Some(path) = confined_path(root, folder, &file) else {
-                self.complete = false;
+                self.block(compose_path);
                 continue;
             };
             self.env_file_paths.insert(path.clone());
@@ -338,7 +394,7 @@ impl Index {
                     self.declarations.extend(env_declarations(&path, &env).into_iter().map(|d| Declaration { primary: true, ..d }))
                 }
                 Err(openidea_plugin::Error::NotFound(_)) if optional.contains(&file) => {},
-                _ => self.complete = false,
+                _ => self.block(&path),
             }
             self.bound_facts();
         }
@@ -346,6 +402,7 @@ impl Index {
 
     fn add_ownership(&mut self, project: &Project, root: &str, compose_path: &str, text: &str) {
         let folder = folder_of(compose_path);
+        let mut seen_usages: Option<HashSet<(String, String, Range)>> = None;
         for service in ownership::compose_services(text) {
             for (file, line) in &service.env_files {
                 let Some(env_path) = confined_path(root, folder, file).filter(|_| !file.contains('$')) else { continue };
@@ -392,9 +449,9 @@ impl Index {
                                 self.arg_links.push(link);
                             }
                         }
-                        let usage = Usage { key: env_key.clone(), location };
-                        if !self.usages.contains(&usage) {
-                            self.usages.push(usage);
+                        let seen = seen_usages.get_or_insert_with(|| self.usages.iter().map(|u| (u.location.path.clone(), u.key.clone(), u.location.range)).collect());
+                        if seen.insert((location.path.clone(), env_key.clone(), location.range)) {
+                            self.usages.push(Usage { key: env_key.clone(), location });
                         }
                     }
                 }
@@ -410,9 +467,11 @@ impl Index {
         self.loaders.retain(|l| l.compose_path != path);
         self.arg_links.retain(|l| l.compose_path != path);
         self.build_targets.retain(|(compose, _)| compose != path);
+        self.blockers.remove(path);
         if let Some(text) = text {
             self.add(path, text);
         }
+        self.restore_completeness();
     }
 
     /// Compose files whose build `dockerfile` is `path`.
@@ -438,9 +497,16 @@ impl Index {
         index
     }
 
-    /// Every file that declares or reads keys, declarations first, until `deadline`.
-    // ponytail: a huge project is cut at the deadline (usages first); persist the index if that bites.
+    /// Every file that declares or reads keys, until `deadline`. A walk cut by
+    /// the deadline keeps its place; [`Index::resume`] continues it.
     pub fn full(project: &Project, root: &str, deadline: Instant) -> Self {
+        let mut index = Self::begin(project, root, deadline);
+        index.resume(project, root, deadline);
+        index
+    }
+
+    /// Lists the project once. Reading the listed files is [`Index::resume`]'s job.
+    pub fn begin(project: &Project, root: &str, deadline: Instant) -> Self {
         if Instant::now() >= deadline {
             return Self::default();
         }
@@ -451,27 +517,6 @@ impl Index {
         let discovery_complete = files.len() <= MAX_FILES as usize;
         files.truncate(MAX_FILES as usize);
         let discovered: BTreeSet<_> = files.iter().cloned().collect();
-        // Inventory obeys ignore rules. A configured ignore file means an
-        // unlisted nonstandard env source may exist, so absence is unknown.
-        // These probes run only during the warm project scan, never diagnostics.
-        let mut ignore_unknown = files.iter().any(|file| matches!(file_name(file), ".gitignore" | ".ignore"));
-        for name in [".gitignore", ".ignore", ".git/info/exclude"] {
-            if Instant::now() >= deadline {
-                return Self::default();
-            }
-            let path = format!("{}/{name}", root.trim_end_matches(['/', '\\']));
-            match project.read_file(&path) {
-                Ok(text) => {
-                    if text.len() > MAX_SOURCE_BYTES
-                        || text.lines().any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
-                    {
-                        ignore_unknown = true;
-                    }
-                }
-                Err(Error::NotFound(_)) => {}
-                Err(_) => ignore_unknown = true,
-            }
-        }
         let mut folders = BTreeSet::from([root.trim_end_matches(['/', '\\']).to_owned()]);
         for file in &files {
             if MARKERS.contains(&file_name(file)) {
@@ -489,36 +534,74 @@ impl Index {
             .collect();
         paths.sort();
         paths.dedup();
-        let mut index = Self { complete: discovery_complete && !ignore_unknown, ..Self::default() };
-        for (_, path) in paths {
-            if Instant::now() >= deadline {
-                index.complete = false;
-                break;
+        Self {
+            complete: discovery_complete,
+            hard_incomplete: !discovery_complete,
+            walk: Some(Walk { paths: paths.into_iter().map(|(_, path)| path).collect(), next: 0, discovered, touched: HashSet::new() }),
+            ..Self::default()
+        }
+    }
+
+    /// Reads the listed files from the cursor until `deadline`. Finishing the list sets `walked`.
+    pub fn resume(&mut self, project: &Project, root: &str, deadline: Instant) {
+        self.resume_limited(project, root, deadline, usize::MAX);
+    }
+
+    fn resume_limited(&mut self, project: &Project, root: &str, deadline: Instant, max_reads: usize) {
+        let Some(mut walk) = self.walk.take() else { return };
+        self.complete = self.complete || self.held_complete;
+        let mut reads = 0;
+        while walk.next < walk.paths.len() {
+            let path = walk.paths[walk.next].clone();
+            if walk.touched.contains(&path) {
+                walk.next += 1;
+                continue;
             }
+            if reads >= max_reads || Instant::now() >= deadline {
+                self.held_complete = self.complete;
+                self.complete = false;
+                self.walk = Some(walk);
+                return;
+            }
+            reads += 1;
+            walk.next += 1;
             match project.read_file(&path) {
                 Ok(text) => {
-                    if Instant::now() >= deadline {
-                        index.complete = false;
-                        break;
-                    }
-                    index.add(&path, &text);
+                    self.add(&path, &text);
                     if text.len() <= MAX_SOURCE_BYTES {
-                        index.compose_env_files_before(project, root, &path, &text, deadline);
+                        self.compose_env_files_before(project, root, &path, &text, deadline);
                     }
                 }
-                Err(Error::NotFound(_)) if !discovered.contains(&path) => {}
-                Err(_) => index.complete = false,
+                Err(Error::NotFound(_)) if !walk.discovered.contains(&path) => {}
+                Err(_) => self.block(&path),
             }
-            if index.declarations.len() >= MAX_FACTS || index.usages.len() >= MAX_FACTS {
-                index.complete = false;
+            if self.declarations.len() >= MAX_FACTS || self.usages.len() >= MAX_FACTS {
+                self.complete = false;
+                self.hard_incomplete = true;
                 break;
             }
         }
-        if Instant::now() >= deadline {
-            index.complete = false;
-        }
-        index
+        self.walked = true;
     }
+
+    /// Marks `path` as already brought up to date, so a walk in progress doesn't add it twice.
+    pub fn touched(&mut self, path: &str) {
+        if let Some(walk) = &mut self.walk {
+            walk.touched.insert(path.to_owned());
+        }
+    }
+
+    pub fn walk_in_progress(&self) -> bool {
+        self.walk.is_some()
+    }
+}
+
+/// The listing of a walk and how far reading it got.
+struct Walk {
+    paths: Vec<String>,
+    next: usize,
+    discovered: BTreeSet<String>,
+    touched: HashSet<String>,
 }
 
 #[cfg(test)]
@@ -574,15 +657,80 @@ mod tests {
     }
 
     #[test]
-    fn ignored_inventory_does_not_prove_absence_but_keeps_known_declarations() {
+    fn ignore_files_do_not_imply_incompleteness() {
         let host = MockHost::install();
         host.set_project_root(Some("/p"));
         host.add_file(".env", "A=1\n");
         host.add_file(".gitignore", "*.env\n");
         let project = host.invocation().project().unwrap();
         let index = Index::full(&project, "/p", Instant::now() + Duration::from_secs(5));
-        assert!(!index.complete);
+        assert!(index.complete && index.walked);
         assert!(index.declarations.iter().any(|d| d.key == "A"));
+    }
+
+    #[test]
+    fn expired_deadline_leaves_the_walk_unfinished() {
+        let host = MockHost::install();
+        host.set_project_root(Some("/p"));
+        host.add_file(".env", "A=1\n");
+        let project = host.invocation().project().unwrap();
+        assert!(!Index::full(&project, "/p", Instant::now() - Duration::from_secs(1)).walked);
+        assert!(Index::full(&project, "/p", Instant::now() + Duration::from_secs(5)).walked);
+    }
+
+    #[test]
+    fn a_cut_walk_resumes_from_its_cursor_without_rereading() {
+        let host = MockHost::install();
+        host.set_project_root(Some("/p"));
+        for n in 0..10 {
+            host.add_file(&format!("f{n}.py"), &format!("os.getenv('K{n}')\n"));
+        }
+        let project = host.invocation().project().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut index = Index::begin(&project, "/p", deadline);
+        let total = index.walk.as_ref().unwrap().paths.len();
+        let part = 4;
+        let mut batches = 0;
+        let mut cursor = 0;
+        while !index.walked {
+            index.resume_limited(&project, "/p", deadline, part);
+            batches += 1;
+            let reached = index.walk.as_ref().map_or(total, |w| w.next);
+            assert_eq!(reached, (cursor + part).min(total), "each batch reads exactly its share");
+            cursor = reached;
+            assert!(!index.complete || index.walked, "a partial index never claims completeness");
+        }
+        assert_eq!(batches, total.div_ceil(part));
+        assert_eq!(index.usages.len(), 10, "no file read twice");
+        assert!(index.complete && !index.walk_in_progress());
+    }
+
+    #[test]
+    fn completeness_returns_once_the_blocking_file_is_fixed() {
+        let host = MockHost::install();
+        host.set_project_root(Some("/p"));
+        host.add_file(".env", &format!("A={}\n", "x".repeat(MAX_SOURCE_BYTES)));
+        let project = host.invocation().project().unwrap();
+        let mut index = Index::full(&project, "/p", Instant::now() + Duration::from_secs(5));
+        assert!(index.walked && !index.complete);
+        index.update("/p/.env", Some("A=1\n"));
+        assert!(index.complete);
+    }
+
+    #[test]
+    fn an_incomplete_mark_during_a_cut_walk_survives_the_resume() {
+        let host = MockHost::install();
+        host.set_project_root(Some("/p"));
+        for n in 0..6 {
+            host.add_file(&format!("f{n}.py"), "os.getenv('K')\n");
+        }
+        let project = host.invocation().project().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut index = Index::begin(&project, "/p", deadline);
+        index.resume_limited(&project, "/p", deadline, 2);
+        index.mark_incomplete("/p/f0.py");
+        index.resume(&project, "/p", deadline);
+        assert!(index.walked && !index.complete);
     }
 
     #[test]
@@ -593,7 +741,11 @@ mod tests {
             host.add_file(&format!("unrelated/{n}.txt"), "");
         }
         let project = host.invocation().project().unwrap();
-        let index = Index::full(&project, "/p", Instant::now() + Duration::from_secs(10));
+        let mut index = Index::full(&project, "/p", Instant::now() + Duration::from_secs(10));
+        assert!(!index.complete);
+        index.update("/p/.env", Some("A=1\n"));
+        assert!(!index.complete);
+        index.forget_under("/p/unrelated");
         assert!(!index.complete);
     }
 

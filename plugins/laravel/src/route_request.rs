@@ -325,7 +325,7 @@ pub(crate) fn execute(project: &Project, runner: Runner, args: &[String]) -> Res
     runner.verify(project)?;
     let args = runner.argv(project, args, false)?;
     let task = host::begin_task(crate::ui_text::text("request.task", "Send Laravel request"), true);
-    let child = crate::artisan_runner::start_background(runner.name(), &args, project)?;
+    let child = crate::artisan_runner::start_background(runner, &args, project)?;
     if let Err(error) = child.close_stdin() {
         let _ = child.kill();
         return Err(error);

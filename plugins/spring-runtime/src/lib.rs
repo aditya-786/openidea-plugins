@@ -50,13 +50,44 @@ struct JavaType {
     params: Vec<Vec<String>>,
     /// The one literal `@ConfigurationProperties` prefix of the type, if it has exactly that.
     config_prefix: Option<String>,
+    /// Set when the file was too big to index: its package and file stem, to tell what it might hold.
+    incomplete: Option<(String, String)>,
 }
 
-fn index_java(_: &str, text: &str) -> Option<Vec<JavaType>> {
-    let incomplete = || Some(vec![JavaType {fqn:"\0incomplete".into(),line:0,column:0,methods:Vec::new(),params:Vec::new(),config_prefix:None}]);
-    if text.len()>512<<10 {return incomplete();}
+impl JavaType {
+    /// Whether an unindexed file could declare `class` (qualified, or `Outer.Inner`).
+    fn could_hold(&self, class: &str) -> bool {
+        let Some((package, stem)) = &self.incomplete else { return false };
+        let in_package = !package.is_empty() && class.strip_prefix(package.as_str()).is_some_and(|rest| rest.starts_with('.'));
+        in_package || class.split('.').any(|part| part == stem) || (package.is_empty() && !class.contains('.'))
+    }
+}
+
+fn file_stem(path: &str) -> String {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.strip_suffix(".java").unwrap_or(name).to_owned()
+}
+
+fn incomplete_file(path: &str, package: &str) -> Option<Vec<JavaType>> {
+    Some(vec![JavaType {
+        fqn: "\0incomplete".into(),
+        line: 0,
+        column: 0,
+        methods: Vec::new(),
+        params: Vec::new(),
+        config_prefix: None,
+        incomplete: Some((package.to_owned(), file_stem(path))),
+    }])
+}
+
+fn index_java(path: &str, text: &str) -> Option<Vec<JavaType>> {
+    if text.len()>512<<10 {
+        let mut head=text.len().min(8<<10);
+        while !text.is_char_boundary(head) {head-=1;}
+        return incomplete_file(path,&java::parse(&text[..head]).package);
+    }
     let file = java::parse(text);
-    if file.types.len()>512 || file.types.iter().map(|t|t.members.len()).sum::<usize>()>4096 {return incomplete();}
+    if file.types.len()>512 || file.types.iter().map(|t|t.members.len()).sum::<usize>()>4096 {return incomplete_file(path,&file.package);}
     let at = |offset| {
         let p = position(text, offset);
         (p.line, p.character)
@@ -77,7 +108,7 @@ fn index_java(_: &str, text: &str) -> Option<Vec<JavaType>> {
                 let [only] = arg.strings.as_slice() else { return None };
                 (arg.text.trim().len() == only.value.len() + 2).then(|| only.value.clone())
             });
-            JavaType { fqn: file.qualified(i), line, column, methods, params, config_prefix }
+            JavaType { fqn: file.qualified(i), line, column, methods, params, config_prefix, incomplete: None }
         })
         .collect();
     (!types.is_empty()).then_some(types)
@@ -149,6 +180,14 @@ fn age(at: u64) -> String {
         s @ 60..3600 => format!("{} min ago", s / 60),
         s => format!("{} h ago", s / 3600),
     }
+}
+
+/// Turns a denied optional capability into something the user can act on.
+fn allow<T>(result: Result<T, Error>, capability: &str) -> Result<T, Error> {
+    result.map_err(|error| match error {
+        Error::Denied(_) => Error::Failed(format!("Allow {capability} for Spring Runtime Insight in Settings › Plugins.")),
+        other => other,
+    })
 }
 
 fn simple(ty: &str) -> &str {
@@ -242,17 +281,18 @@ fn fetch_snapshot_guarded(url:&str,auth:&str,mut guard:impl FnMut()->Result<(),E
             Ok(r) => r,
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(Error::Denied(cap)) if cap == "secrets" => {
-                return Err(
-                    "The actuator-token secret needs the secrets permission. Allow it in Settings › Plugins, or set actuatorAuth to none."
-                        .into(),
-                );
+                return Err(format!(
+                    "{} Or set actuatorAuth to none.",
+                    ui_kit::denied::message("The actuator-token secret", "secrets", "Spring Runtime Insight")
+                )
+                .into());
             }
             Err(Error::Denied(cap)) => {
-                let cap=if matches!(cap.as_str(),"net:localhost"|"net:127.0.0.1"){cap.as_str()}else{"required network capability (possibly redirected request)"};
-                return Err(format!("{cap} is not granted. Review Settings › Plugins and the requested local URL; redirect peer identity is not established here.").into());
+                let cap=if matches!(cap.as_str(),"net:localhost"|"net:127.0.0.1"){cap.as_str()}else{"net:localhost"};
+                return Err(ui_kit::denied::message("Refreshing the runtime snapshot",cap,"Spring Runtime Insight").into());
             }
             Err(Error::NotFound(_)) if i == 0 && matches!(auth, "bearer" | "basic") && !host::secret_is_set("actuator-token") => {
-                return Err("Set the actuator-token secret in Settings › Plugins, or set actuatorAuth to none.".into());
+                return Err("Set the actuator-token secret in Settings › Plugins › Spring Runtime Insight, or set actuatorAuth to none.".into());
             }
             // The application isn't up: don't wait for every endpoint to time out.
             Err(_) if i == 0 => {
@@ -301,7 +341,7 @@ impl Tree<'_> {
     fn push(&mut self,mut item:TreeItem)->bool {
         if item.key.len()>4096 || item.parent.as_ref().is_some_and(|p|p.len()>4096) || self.items.len()>=5000 {self.limited=true;return false;}
         item.label=presentation(&item.label,1024);item.detail=item.detail.map(|s|presentation(&s,4096));
-        let bytes=serde_json::json!({"key":item.key,"parent":item.parent,"label":item.label,"detail":item.detail,"expanded":item.expanded,"expandable":item.expandable,"icon":item.icon}).to_string().len();
+        let bytes=item.key.len()+item.parent.as_ref().map_or(0,String::len)+item.label.len()+item.detail.as_ref().map_or(0,String::len)+item.icon.as_ref().map_or(0,String::len)+96;
         if self.bytes.saturating_add(bytes)>3<<20 {self.limited=true;return false;}
         self.bytes+=bytes;self.items.push(item);true
     }
@@ -561,6 +601,10 @@ pub struct Runtime {
     polling: controls::Polling,
     jmx: Option<(String, String)>,
     snapshot: Option<Snapshot>,
+    /// Built from `snapshot` on first use by the editor providers; dropped whenever it changes.
+    lookup: Option<Lookup>,
+    /// Snapshots of the other projects the editor providers asked about; the view state never follows them.
+    others: BTreeMap<Scope, Option<(Snapshot, Lookup)>>,
     scope: Option<Scope>,
     /// Storage was read (the snapshot may survive instance reclaim).
     loaded: bool,
@@ -582,6 +626,8 @@ impl Default for Runtime {
             polling: controls::Polling::default(),
             jmx: None,
             snapshot: None,
+            lookup: None,
+            others: BTreeMap::new(),
             scope: None,
             loaded: false,
             error: None,
@@ -615,17 +661,27 @@ fn invalidate_snapshot_views() {
 impl Runtime {
     fn load_scope(&mut self, scope: Scope) {
         if self.scope.as_ref()!=Some(&scope) {
-            self.panes.clear();self.graph.clear();self.snapshot=None;self.loaded=false;self.error=None;self.targets.clear();self.expanded.clear();self.polling.clear();self.poll_status=None;self.scope=Some(scope.clone());
+            self.panes.clear();self.graph.clear();self.snapshot=None;self.lookup=None;self.loaded=false;self.error=None;self.targets.clear();self.expanded.clear();self.polling.clear();self.poll_status=None;self.scope=Some(scope.clone());
         }
         if !self.loaded {
             self.loaded=true;
-            match persistence::read(&scope) {Ok(snapshot)=>{self.snapshot=snapshot;self.error=persistence::failure(&scope);},Err(error)=>self.error=Some(error.to_string())}
+            match persistence::read(&scope) {Ok(snapshot)=>{self.snapshot=snapshot;self.lookup=None;self.error=persistence::failure(&scope);},Err(error)=>self.error=Some(error.to_string())}
         }
     }
-    fn document_snapshot(&mut self,path:&str)->Option<&Snapshot> {
-        let scope=spring_text::index::project_of(path).and_then(|p|Scope::current(&p).ok());
-        match scope {Some(scope)=>self.load_scope(scope),None=>{self.snapshot=None;self.scope=None;self.targets.clear();self.loaded=false;return None;}}
-        self.snapshot.as_ref()
+    /// What the editor providers read: the stored snapshot of the document's project, never network, polling or view state.
+    fn document_snapshot(&mut self,path:&str)->Option<(&Snapshot,&Lookup)> {
+        let scope=spring_text::index::project_of(path).and_then(|p|Scope::current(&p).ok())?;
+        if self.loaded && self.scope.as_ref()==Some(&scope) {
+            let snapshot=self.snapshot.as_ref()?;
+            let lookup=self.lookup.get_or_insert_with(||Lookup::new(snapshot));
+            return Some((snapshot,lookup));
+        }
+        if !self.others.contains_key(&scope) {
+            if self.others.len()>=8 {self.others.clear();}
+            let loaded=persistence::read(&scope).ok().flatten().map(|snapshot|{let lookup=Lookup::new(&snapshot);(snapshot,lookup)});
+            self.others.insert(scope.clone(),loaded);
+        }
+        self.others.get(&scope)?.as_ref().map(|(snapshot,lookup)|(snapshot,lookup))
     }
     fn refresh(&mut self, project:&Project) -> Result<String, Error> {
         let scope=Scope::current(project)?;
@@ -639,7 +695,9 @@ impl Runtime {
             })?;
             let current=Scope::current(project)?;
             if current!=scope {return Err(Error::Stale);}
+            let mut snapshot=snapshot;
             if let Some(previous)=&self.snapshot {
+                snapshot.keep_unreachable(previous);
                 let lost:Vec<_>=snapshot.missing.iter().filter(|m|m.split(' ').next().is_some_and(|e|previous.has(e))).cloned().collect();
                 if !lost.is_empty() {return Err(Error::Failed(format!("Refresh lost previously available endpoints: {}. Previous snapshot retained; Clear first if endpoint removal was intentional.",lost.join(", "))));}
             }
@@ -650,10 +708,11 @@ impl Runtime {
         self.polling=suspended_polling;
         match result {
             Ok(snapshot)=> {
-                self.panes.clear();self.graph.clear();
+                self.panes.clear();self.graph.clear();self.lookup=None;self.others.remove(&scope);
                 persistence::success(&scope);self.error=None;self.poll_status=None;self.targets.clear();
                 let mut summary=format!("Read {} beans and {} property sources from {}.",snapshot.beans.len(),snapshot.sources.len(),snapshot.url);
                 if !snapshot.missing.is_empty() {summary.push_str(&format!(" Not available: {}.",snapshot.missing.join(", ")));}
+                if !snapshot.kept.is_empty() {summary.push_str(&format!(" Kept from the previous read: {}.",snapshot.kept.join(", ")));}
                 self.snapshot=Some(snapshot);self.loaded=true;invalidate_snapshot_views();Ok(summary)
             }
             Err(error)=> {
@@ -663,13 +722,21 @@ impl Runtime {
             }
         }
     }
+    fn confirm_clear(&mut self,project:&Project)->Result<bool,Error> {
+        let scope=Scope::current(project)?;
+        let body=format!("This deletes the saved snapshot of {} for project {} and stops auto-refresh.\nClick Refresh to read the application again.",scope.url,scope.root);
+        if !host::confirm("Clear Spring Runtime snapshot?",&body)? {return Ok(false);}
+        self.clear(project)?;
+        Ok(true)
+    }
+
     fn clear(&mut self,project:&Project)->Result<(),Error> {
-        let scope=Scope::current(project)?;persistence::clear(&scope)?;self.panes.clear();self.graph.clear();self.polling.clear();self.scope=Some(scope);self.snapshot=None;self.loaded=true;self.error=None;self.poll_status=None;self.targets.clear();invalidate_snapshot_views();Ok(())
+        let scope=Scope::current(project)?;persistence::clear(&scope)?;self.panes.clear();self.graph.clear();self.polling.clear();self.others.remove(&scope);self.lookup=None;self.scope=Some(scope);self.snapshot=None;self.loaded=true;self.error=None;self.poll_status=None;self.targets.clear();invalidate_snapshot_views();Ok(())
     }
 
     fn java_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
         let text = doc.text.as_str();
-        let Some(snap) = self.document_snapshot(&doc.path) else {
+        let Some((snap, lookup)) = self.document_snapshot(&doc.path) else {
             let _ = host::publish_diagnostics(&doc.path, &[]);
             return Vec::new();
         };
@@ -715,7 +782,7 @@ impl Runtime {
                 let lines: Vec<String> = placeholders(&s.value)
                     .into_iter()
                     .filter_map(|key| {
-                        let (value, source) = snap.effective(key)?;
+                        let (value, source) = lookup.get(snap, key)?;
                         Some(format!("`{key}` = {value} (from {})", short_source(source)))
                     })
                     .collect();
@@ -734,7 +801,7 @@ impl Runtime {
             }
             let fields = t.fields().filter(|f| !f.modifiers.iter().any(|m| m == "static")).map(|f| (&f.name, f.at));
             for (name, at) in fields.chain(t.components.iter().map(|c| (&c.name, c.at))) {
-                let tip = match snap.effective(&format!("{prefix}.{name}")) {
+                let tip = match lookup.get(snap, &format!("{prefix}.{name}")) {
                     Some((value, source)) => {
                         format!("Runtime: {value} from {}", short_source(source))
                     }
@@ -753,7 +820,7 @@ impl Runtime {
     }
 
     fn config_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
-        let Some(snap) = self.document_snapshot(&doc.path) else {
+        let Some((snap, lookup)) = self.document_snapshot(&doc.path) else {
             return Vec::new();
         };
         let file = doc.path.rsplit(['/', '\\']).next().unwrap_or(&doc.path);
@@ -761,7 +828,7 @@ impl Runtime {
             .into_iter()
             .filter(|k| !k.value.is_empty() && !k.value.starts_with(['|', '>']))
             .filter_map(|k| {
-                let (value, source) = snap.effective(&k.key)?;
+                let (value, source) = lookup.get(snap, &k.key)?;
                 let tip = if is_file_source(source, file) && (value == k.value || value == MASK) {
                     format!("Active (from {})", short_source(source))
                 } else {
@@ -815,22 +882,35 @@ impl Providers for Runtime {
     }
 }
 
+pub(crate) fn refresh_button() -> Button {
+    Button::new("refresh", "Refresh").icon("refresh")
+}
+
+const SETTINGS_PAGE: &str = "plugins.aritti-spring-runtime";
+
+fn open_settings() -> Result<(), Error> {
+    match host::execute_command("file.settings", Some(SETTINGS_PAGE)) {
+        Err(Error::Denied(_)) => Err("Open Settings › Plugins › Spring Runtime Insight. Allow the ide.commands permission to open it from this button.".into()),
+        result => result.map(drop),
+    }
+}
+
 impl Views for Runtime {
     fn render(&mut self, _view: &str, _viewport: Option<Viewport>, _ctx: &Invocation) -> Result<View, Error> {
         (|| -> Result<View, Error> {
             if _view == controls::VIEW {return self.render_controls(_ctx);}
             if _view == graph::VIEW {return self.render_graph(_ctx);}
             if _view == "runtime-snapshot" { return self.render_panes(_ctx); }
-            let refresh = Button::new("refresh", "Refresh").icon("refresh");
-            let Some(project)=_ctx.project() else {self.snapshot=None;self.scope=None;self.loaded=false;self.targets.clear();return Ok(View::message("Open a project to load a scoped runtime snapshot. Scheduled refreshes without verified project ownership are skipped.").button(refresh));};
+            let refresh = refresh_button();
+            let Some(project)=_ctx.project() else {self.snapshot=None;self.scope=None;self.loaded=false;self.targets.clear();return Ok(View::message("Open a project to see its runtime snapshot.").button(refresh));};
             let scope=match Scope::current(&project).and_then(|scope| {controls::verify(&project,&scope)?;Ok(scope)}) {Ok(scope)=>scope,Err(error)=>{self.snapshot=None;self.scope=None;self.loaded=false;self.targets.clear();return Ok(View::message(&error.to_string()).button(refresh));}};
             self.load_scope(scope.clone());
             let Some(snap) = &self.snapshot else {
                 let text = self.error.clone().unwrap_or_else(|| {
                     let url = host::setting_string("actuatorUrl").unwrap_or_else(|| DEFAULT_URL.into());
-                    format!("No runtime data yet. Start the application with Spring Boot Actuator, then click Refresh to read {url}.")
+                    format!("No runtime data yet. Start the application with Spring Boot Actuator, then click Refresh to read {url}. Change the URL in Settings › Plugins › Spring Runtime Insight.")
                 });
-                return Ok(View::message(&text).button(refresh).button(Button::new("clear","Clear Snapshot").icon("trash")));
+                return Ok(View::message(&text).button(refresh).button(Button::new("open-settings","Open Settings").icon("settings")).button(Button::new("clear","Clear Snapshot").icon("trash").enabled(self.error.is_some())));
             };
             self.targets.clear();
             let mut tree = Tree { items: Vec::new(), expanded: &self.expanded, targets: &mut self.targets, bytes:0, limited:false };
@@ -843,7 +923,8 @@ impl Views for Runtime {
             tree.scheduled(snap);
             tree.loggers(snap);
             tree.caches(snap);
-            let mut status = format!("Read {} from {} · project {} · auth {} · cached Actuator snapshot (not debugger state)", age(snap.fetched_at), snap.url,scope.root,scope.auth);
+            let mut status = format!("Read {} from {} · project {} · cached, not live state", age(snap.fetched_at), snap.url,scope.root);
+            if !snap.kept.is_empty() {status.push_str(&format!(" · kept from before: {}", snap.kept.join(", ")));}
             if !snap.missing.is_empty() {
                 status.push_str(&format!(" · not available: {}", snap.missing.join(", ")));
             }
@@ -851,10 +932,10 @@ impl Views for Runtime {
                 status.push_str(&format!(" · {hint}"));
             }
             if snap.trimmed {
-                status.push_str(" · legacy partial snapshot: beans and environment only");
+                status.push_str(" · legacy partial snapshot");
             }
             if let Some(message)=&self.poll_status {status.push_str(&format!(" · {message}"));}
-            if tree.limited {status.push_str(" · partial view: row/message limit reached; saved snapshot remains complete");}
+            if tree.limited {status.push_str(" · partial view: row limit reached");}
             if let Some(e) = &self.error {
                 status = format!("Refresh failed: {e} · {status}");
             }
@@ -900,7 +981,7 @@ impl Views for Runtime {
                 crate::refresh_view(VIEW);
             },
             ViewEvent::Button(b) if b == "runtime-controls"=>{ctx.project().ok_or(Error::Stale)?;crate::reveal_view(controls::VIEW)?;},
-            ViewEvent::Button(b) if b == "poll-start"=>{crate::reveal_view(controls::VIEW)?;},
+            ViewEvent::Button(b) if b == "poll-start"=>{self.request_poll_start(ctx)?;},
             ViewEvent::Button(b) if b == "poll-stop"=>{self.stop_polling(&ctx.project().ok_or(Error::Stale)?)?;},
             ViewEvent::Button(b) if b == "runtime-graph"=>{ctx.project().ok_or(Error::Stale)?;crate::reveal_view(graph::VIEW)?;},
             ViewEvent::Button(b) if b == "graph-back" && view==graph::VIEW=>self.graph_back(),
@@ -909,7 +990,8 @@ impl Views for Runtime {
             ViewEvent::Button(b) if b == "snapshot-details" => {ctx.project().ok_or("Open a project first.")?;crate::reveal_view("runtime-snapshot")?;},
             // A failure is shown in the view.
             ViewEvent::Button(b) if b == "refresh" => {let project=ctx.project().ok_or("Open a project first.")?;drop(self.refresh(&project));},
-            ViewEvent::Button(b) if b == "clear" => {let project=ctx.project().ok_or("Open a project first.")?;self.clear(&project)?;},
+            ViewEvent::Button(b) if b == "clear" => {let project=ctx.project().ok_or("Open a project first.")?;self.confirm_clear(&project)?;},
+            ViewEvent::Button(b) if b == "open-settings" => open_settings()?,
             ViewEvent::Expand(key) => {
                 self.expanded.insert(key);
                 crate::refresh_view(view);
@@ -939,15 +1021,15 @@ impl Plugin for Runtime {
         match id {
             "configure-snapshot-database"=>self.configure_snapshot_database(ctx),
             "runtime-controls"=>{ctx.project().ok_or(Error::Stale)?;crate::reveal_view(controls::VIEW)?;Ok(None)},
-            "poll-start"=>{crate::reveal_view(controls::VIEW)?;Ok(Some("Start polling explicitly in the visible Runtime controls view.".into()))},
+            "poll-start"=>self.request_poll_start(ctx).map(Some),
             "poll-stop"=>self.stop_polling(&ctx.project().ok_or(Error::Stale)?).map(Some),
             "runtime-graph"=>{ctx.project().ok_or(Error::Stale)?;crate::reveal_view(graph::VIEW)?;Ok(None)},
             "snapshot-details" => {ctx.project().ok_or("Open a project first.")?;crate::reveal_view("runtime-snapshot")?;Ok(None)},
             "read-jmx" => self.read_jmx(ctx).map(Some),
             "refresh" => self.refresh(&ctx.project().ok_or("Open a project first.")?).map(Some),
             "clear" => {
-                self.clear(&ctx.project().ok_or("Open a project first.")?)?;
-                Ok(Some("Spring Runtime snapshot cleared.".into()))
+                let cleared = self.confirm_clear(&ctx.project().ok_or("Open a project first.")?)?;
+                Ok(cleared.then(|| "Spring Runtime snapshot cleared.".into()))
             }
             _ => Err(Error::NotFound(format!("command {id}"))),
         }
@@ -1097,6 +1179,15 @@ mod tests {
     }
 
     #[test]
+    fn refreshing_the_snapshot_denied_names_permission() {
+        let _host = MockHost::install().with_capabilities(&["project.read"]);
+        let error = fetch_snapshot().unwrap_err().to_string();
+        assert!(error.contains("needs the net:localhost permission"), "{error}");
+        assert!(error.contains("Settings › Plugins › Spring Runtime Insight"), "{error}");
+        assert!(!error.contains("redirect peer"), "{error}");
+    }
+
+    #[test]
     fn denied_secrets_capability_explains_itself() {
         let host = MockHost::install().with_capabilities(&["net:localhost"]);
         host.set_setting("actuatorAuth", "\"bearer\"");
@@ -1144,6 +1235,7 @@ mod persistence_flow_tests {
         assert!(runtime.run_command("refresh", &host.invocation(), None).is_err());
         assert!(runtime.snapshot.is_some(), "last-good retained");
         assert_eq!(invalidations(&host), [VIEW, graph::VIEW, "runtime-snapshot", VIEW, graph::VIEW, "runtime-snapshot"]);
+        host.answer_next_prompt(Some(&[]));
         runtime.run_command("clear", &host.invocation(), None).unwrap();
         assert_eq!(invalidations(&host).len(), 9);
         for view in [VIEW, graph::VIEW, "runtime-snapshot"] {
@@ -1181,13 +1273,30 @@ mod persistence_flow_tests {
         assert_eq!(invalidations(&host).len(), 3);
     }
     #[test]
+    fn clear_asks_first_and_keeps_the_snapshot_when_cancelled() {
+        let (host, mut runtime, scope) = refreshed();
+        assert_eq!(runtime.run_command("clear", &host.invocation(), None).unwrap(), None);
+        assert!(host.storage().contains_key(&scope.key()));
+        assert!(runtime.snapshot.is_some());
+    }
+    #[test]
+    fn empty_graph_and_observations_offer_refresh() {
+        let host = MockHost::install().with_capabilities(CAPS);
+        let mut runtime = Runtime::default();
+        for view in [graph::VIEW, "runtime-snapshot"] {
+            let rendered = runtime.render(view, None, &host.invocation()).unwrap();
+            assert!(matches!(rendered.body, Body::Message(ref text) if text.contains("click Refresh")));
+            assert!(rendered.toolbar.iter().any(|b| b.id == "refresh"), "{view}");
+        }
+    }
+    #[test]
     fn external_stop_control_notifies_changed_status_without_http() {
         let (host, mut runtime, _) = refreshed();
         let requests = host.requests().len();
         runtime.run_command("poll-stop", &host.invocation(), None).unwrap();
         assert_eq!(invalidations(&host).len(), 6);
         let view = runtime.render(VIEW, None, &host.invocation()).unwrap();
-        assert!(view.status.unwrap().contains("No polling lease"));
+        assert!(view.status.unwrap().contains("Auto-refresh isn't running"));
         assert_eq!(host.requests().len(), requests);
     }
     #[test]
@@ -1219,6 +1328,38 @@ mod persistence_flow_tests {
         assert_eq!(host.requests().len(),requests);assert_eq!(host.storage(),saved);assert_eq!(runtime.scope.as_ref(),Some(&scope));
     }
     #[test]
+    fn transient_timeout_keeps_previous_beans() {
+        let (host, mut runtime, _) = refreshed();
+        assert_eq!(runtime.snapshot.as_ref().unwrap().loggers.len(), 1);
+        host.on_fetch(|request| if request.url.ends_with("/loggers") || request.url.ends_with("/health") { Err(Error::Failed("timed out".into())) } else { response(request) });
+        runtime.run_command("refresh", &host.invocation(), None).unwrap();
+        let snapshot = runtime.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.loggers.len(), 1);
+        assert_eq!(snapshot.health.len(), 1);
+        assert!(snapshot.has("loggers") && snapshot.has("health"));
+        assert_eq!(snapshot.beans.len(), 1);
+        host.on_fetch(|request| if request.url.ends_with("/loggers") { Ok(HttpResponse { status: 404, headers: vec![], body: vec![] }) } else { response(request) });
+        assert!(runtime.run_command("refresh", &host.invocation(), None).is_err(), "a 404 still counts as lost");
+    }
+    #[test]
+    fn line_markers_for_other_project_keep_polling_lease() {
+        let (host, mut runtime, scope) = refreshed();
+        host.add_project("/other");
+        host.set_setting("autoRefresh", "true");
+        runtime.start_polling(&host.invocation().project().unwrap()).unwrap();
+        runtime.expanded.insert("env".into());
+        assert_eq!(runtime.line_markers(&config_doc()).len(), 1);
+        let other = Document { path: "/other/application.properties".into(), ..config_doc() };
+        assert!(runtime.line_markers(&other).is_empty());
+        let outside = Document { path: "/elsewhere/application.properties".into(), ..config_doc() };
+        assert!(runtime.line_markers(&outside).is_empty());
+        assert!(runtime.polling.active(&scope), "provider paths never touch the lease");
+        assert!(runtime.expanded.contains("env"));
+        assert_eq!(runtime.scope.as_ref(), Some(&scope));
+        assert!(runtime.snapshot.is_some());
+        assert_eq!(runtime.line_markers(&config_doc()).len(), 1);
+    }
+    #[test]
     fn transport_auth_partial_and_oversized_failures_keep_last_good_memory_and_storage() {
         let (host,mut runtime,scope)=refreshed();let saved=host.storage()[&scope.key()].clone();let snapshot=runtime.snapshot.clone().unwrap();
         host.on_fetch(|_|Err(Error::Failed("application offline".into())));assert!(runtime.run_command("refresh",&host.invocation(),None).is_err());assert_eq!(runtime.snapshot.as_ref(),Some(&snapshot));assert_eq!(host.storage()[&scope.key()],saved);
@@ -1235,9 +1376,9 @@ mod persistence_flow_tests {
             host.set_setting(key,&serde_json::to_string(value).unwrap());let view=runtime.render(VIEW,None,&host.invocation()).unwrap();assert!(matches!(view.body,Body::Message(_)));assert!(runtime.line_markers(&config_doc()).is_empty());
         }
         host.set_setting("actuatorUrl",&serde_json::to_string(DEFAULT_URL).unwrap());host.set_setting("actuatorAuth","\"none\"");runtime.render(VIEW,None,&host.invocation()).unwrap();assert!(runtime.snapshot.is_some());
-        host.set_project_root(Some("/another"));let view=runtime.render(VIEW,None,&host.invocation()).unwrap();assert!(matches!(view.body,Body::Message(_)));runtime.run_command("clear",&host.invocation(),None).unwrap();assert!(host.storage().contains_key(&first.key()));
+        host.set_project_root(Some("/another"));let view=runtime.render(VIEW,None,&host.invocation()).unwrap();assert!(matches!(view.body,Body::Message(_)));host.answer_next_prompt(Some(&[]));runtime.run_command("clear",&host.invocation(),None).unwrap();assert!(host.storage().contains_key(&first.key()));
         host.set_project_root(Some("/project"));runtime.render(VIEW,None,&host.invocation()).unwrap();assert!(runtime.snapshot.is_some());assert_eq!(host.requests().len(),requests);
-        runtime.run_command("clear",&host.invocation(),None).unwrap();assert!(!host.storage().contains_key(&first.key()));assert!(runtime.snapshot.is_none());
+        host.answer_next_prompt(Some(&[]));runtime.run_command("clear",&host.invocation(),None).unwrap();assert!(!host.storage().contains_key(&first.key()));assert!(runtime.snapshot.is_none());
     }
     #[test]
     fn opt_in_scheduled_refresh_requires_verified_project_and_legacy_global_data_is_not_adopted() {
@@ -1273,6 +1414,28 @@ mod failure_recovery_tests {
     fn corrupt_cache_is_not_replaced_silently_and_clear_remains_available_for_recovery() {
         let host=MockHost::install().with_capabilities(&["project.read","storage"]);let scope=Scope::current(&host.invocation().project().unwrap()).unwrap();host::storage::set(&scope.key(),"invalid json").unwrap();
         let mut runtime=Runtime::default();let view=runtime.render(VIEW,None,&host.invocation()).unwrap();assert!(matches!(view.body,Body::Message(ref text) if text.contains("unreadable")));assert!(view.toolbar.iter().any(|b|b.id=="clear"));
-        runtime.handle(VIEW,ViewEvent::Button("clear".into()),&host.invocation()).unwrap();assert!(!host.storage().contains_key(&scope.key()));assert!(host.requests().is_empty());
+        host.answer_next_prompt(Some(&[]));runtime.handle(VIEW,ViewEvent::Button("clear".into()),&host.invocation()).unwrap();assert!(!host.storage().contains_key(&scope.key()));assert!(host.requests().is_empty());
+    }
+    #[test]
+    fn empty_view_offers_no_clear_when_nothing_is_stored() {
+        let host=MockHost::install().with_capabilities(&["project.read","storage"]);
+        let view=Runtime::default().render(VIEW,None,&host.invocation()).unwrap();
+        assert!(matches!(view.body,Body::Message(ref text) if text.contains("Settings › Plugins")));
+        assert!(!view.toolbar.iter().any(|b|b.id=="clear"));
+    }
+    #[test]
+    fn open_settings_runs_the_settings_action_on_this_plugin_page_and_explains_a_denial() {
+        let host=MockHost::install().with_capabilities(&["project.read","storage"]);
+        let view=Runtime::default().render(VIEW,None,&host.invocation()).unwrap();
+        assert!(view.toolbar.iter().any(|b|b.id=="open-settings"));
+        let opened=std::rc::Rc::new(std::cell::RefCell::new(None));
+        let seen=opened.clone();
+        host.on_command("file.settings",move|arg|{*seen.borrow_mut()=arg.map(str::to_owned);Ok(None)});
+        let denied=Runtime::default().handle(VIEW,ViewEvent::Button("open-settings".into()),&host.invocation()).unwrap_err();
+        assert!(denied.to_string().contains("Settings › Plugins › Spring Runtime Insight"));
+        assert!(opened.borrow().is_none());
+        let host=host.with_capabilities(&["project.read","storage","ide.commands"]);
+        Runtime::default().handle(VIEW,ViewEvent::Button("open-settings".into()),&host.invocation()).unwrap();
+        assert_eq!(opened.borrow().as_deref(),Some(SETTINGS_PAGE));
     }
 }

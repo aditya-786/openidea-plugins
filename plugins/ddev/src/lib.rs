@@ -21,12 +21,12 @@ const CONFIG: &str = ".ddev/config.yaml";
 
 #[derive(Default)]
 pub struct Main {
-    snapshot: Option<(String, Description)>,
+    snapshots: std::collections::BTreeMap<String, Description>,
     selected: Option<String>,
     live_selections: std::collections::BTreeMap<String, Option<String>>,
     current_root: Option<String>,
-    refreshed_at: u64,
-    failure: Option<(String, String)>,
+    refreshed_at: std::collections::BTreeMap<String, u64>,
+    failure: std::collections::BTreeMap<String, String>,
     reported_failures: std::collections::BTreeSet<String>,
     pending_configs: std::collections::BTreeMap<String, support::PendingConfig>,
     setup_drafts: std::collections::BTreeMap<String, support::SetupDraft>,
@@ -41,8 +41,8 @@ pub struct Main {
 
 impl Main {
     fn invalidate(&mut self) {
-        self.snapshot = None;
-        self.failure = None;
+        self.snapshots.clear();
+        self.failure.clear();
         self.cli_available = None;
         host::refresh_view(VIEW);
     }
@@ -67,54 +67,74 @@ impl Main {
     }
 
     fn description(&mut self, project: &Project) -> Result<&Description, Error> {
+        self.load(project, true, &runtime::Prefs::load(project))
+    }
+
+    fn cached_description(&mut self, project: &Project) -> Result<&Description, Error> {
+        self.load(project, false, &runtime::Prefs::load(project))
+    }
+
+    fn is_stale_with(&self, project: &Project, prefs: &runtime::Prefs) -> bool {
+        let Ok(root) = project.root() else {
+            return false;
+        };
+        prefs.enabled("watchDdev")
+            && runtime::now().saturating_sub(self.refreshed_at.get(&root).copied().unwrap_or(0))
+                >= 60
+    }
+
+    fn load(
+        &mut self,
+        project: &Project,
+        refresh: bool,
+        prefs: &runtime::Prefs,
+    ) -> Result<&Description, Error> {
         self.sync_selection(project)?;
-        self.check_target_preferences(project);
+        self.check_target_preferences(project, prefs);
         let root = project.root()?;
         // Configuration can disappear while watching is disabled or before the
         // next filesystem event. Never return a cached runtime for that case.
         if !project.exists(CONFIG)? {
             self.sync_target(project, None);
-            self.snapshot = None;
-            self.failure = None;
+            self.snapshots.remove(&root);
+            self.failure.remove(&root);
             self.cli_available = None;
             return Err(
                 "No .ddev/config.yaml in the project root. Run DDEV: Configure Project first."
                     .into(),
             );
         }
-        let expired = runtime::enabled_for(project, "watchDdev")
-            && runtime::now().saturating_sub(self.refreshed_at) >= 60;
+        let expired = refresh && self.is_stale_with(project, prefs);
         if !expired
-            && let Some((failed_root, message)) = &self.failure
-            && failed_root == &root
+            && let Some(message) = self.failure.get(&root)
         {
             return Err(message.clone().into());
         }
-        if expired || !self.snapshot.as_ref().is_some_and(|(r, _)| r == &root) {
-            self.snapshot = None;
+        if expired || !self.snapshots.contains_key(&root) {
+            self.snapshots.remove(&root);
             let desc = match run_json(project, "describe")
                 .and_then(|output| Description::parse(&output))
             {
                 Ok(desc) => {
-                    self.failure = None;
+                    self.failure.remove(&root);
                     desc
                 }
                 Err(error) => {
                     self.sync_target(project, None);
-                    self.refreshed_at = runtime::now();
+                    self.refreshed_at.insert(root.clone(), runtime::now());
                     self.report_failure(project, &error);
-                    self.failure = Some((root, error.to_string()));
+                    self.failure.insert(root, error.to_string());
                     return Err(error);
                 }
             };
             self.clear_failure_notice(project);
             self.offer_tour(project);
-            self.refreshed_at = runtime::now();
-            self.snapshot = Some((root, desc));
+            self.refreshed_at.insert(root.clone(), runtime::now());
+            self.snapshots.insert(root.clone(), desc);
         }
-        let desc = self.snapshot.as_ref().unwrap().1.clone();
-        self.sync_target(project, Some(&desc));
-        let desc = &self.snapshot.as_ref().unwrap().1;
+        let desc = self.snapshots[&root].clone();
+        self.sync_target_with(project, Some(&desc), prefs);
+        let desc = &self.snapshots[&root];
         // A windowless scheduled refresh can replace the snapshot without
         // entering the interactive load branch. Validate selection on reuse too.
         if self
@@ -128,10 +148,20 @@ impl Main {
         Ok(desc)
     }
 
+    fn fresh_description(&self, project: &Project) -> Option<Description> {
+        let root = project.root().ok()?;
+        let age = runtime::now().saturating_sub(*self.refreshed_at.get(&root)?);
+        (age < 60).then(|| self.snapshots.get(&root).cloned())?
+    }
+
     // Upstream permits Start when DDEV is installed and configured even when
     // describe fails (for example before the first successful project start).
     fn can_start(&mut self, project: &Project) -> bool {
-        if let Ok(desc) = self.description(project) {
+        self.can_start_with(project, true, &runtime::Prefs::load(project))
+    }
+
+    fn can_start_with(&mut self, project: &Project, refresh: bool, prefs: &runtime::Prefs) -> bool {
+        if let Ok(desc) = self.load(project, refresh, prefs) {
             return runtime::allowed(desc, "start");
         }
         if !project.exists(CONFIG).unwrap_or(false) {
@@ -165,12 +195,12 @@ impl Main {
 
     fn target(&mut self, project: &Project, arg: Option<&str>) -> Result<String, Error> {
         // Loading a new project's snapshot clears any selection from the previous project.
-        self.description(project)?;
+        self.cached_description(project)?;
         let key = arg
             .map(str::to_owned)
             .or_else(|| self.selected.clone())
             .unwrap_or(PROJECT.into());
-        let desc = self.description(project)?;
+        let desc = self.cached_description(project)?;
         if key != PROJECT && desc.service(&key).is_none() {
             return Err(Error::NotFound(format!("DDEV service {key}")));
         }
@@ -178,7 +208,7 @@ impl Main {
     }
 
     fn log(&mut self, project: &Project, key: &str) -> Result<ProcessLog, Error> {
-        let desc = self.description(project)?;
+        let desc = self.cached_description(project)?;
         if !model::safe_name(&desc.name) {
             return Err("DDEV returned an invalid project name for log streaming.".into());
         }
@@ -367,7 +397,7 @@ impl Plugin for Main {
                 }
             }
             "actions" => self.actions(ctx)?,
-            "help" | "setup" => {
+            "setup" => {
                 host::reveal_view(support::SETUP)?;
             }
             "diagnose" => {
@@ -395,15 +425,15 @@ impl Plugin for Main {
                     database::connect(&project)?;
                     self.connected_databases.insert(project.root()?);
                 }
-                host::notify(
-                    NotificationLevel::Info,
-                    "DDEV database",
-                    if native {
-                        "Data source configured with a secure credential. Database connection and introspection requested."
-                    } else {
-                        "Database permission unavailable: connection file maintained without credentials. Grant database.sources for secure setup and automatic connection, or enter the password in Database."
-                    },
-                );
+                let message = if native {
+                    "Data source configured with a secure credential. Database connection and introspection requested.".into()
+                } else {
+                    format!(
+                        "Connection saved without the password; enter it in Database. {}",
+                        ui_kit::denied::message("Saving the password and connecting automatically", "database.sources", "DDEV Integration")
+                    )
+                };
+                host::notify(NotificationLevel::Info, "DDEV database", &message);
             }
             "copy-db-password" => {
                 let db = database::connection(self.description(&project)?)?;
@@ -480,31 +510,38 @@ impl Plugin for Main {
                         Err(_) => self.cli_is_available(&project),
                     };
                     if !allowed {
-                        return Err(format!("DDEV: {id} requires a running project, or an installed CLI with configuration when status is unavailable.").into());
+                        return Err(format!("DDEV: {} needs a running project. Start it first, or Refresh Status if it was started outside the IDE.", command_name(id)).into());
                     }
                 }
                 if matches!(id, "share" | "shell")
                     && !runtime::allowed(self.description(&project)?, id)
                 {
-                    return Err(format!("DDEV: {id} is unavailable while the project is {}. Refresh status after external changes.", self.description(&project)?.status).into());
+                    return Err(format!("DDEV: {} can't run while the project is {}. Start it first, or Refresh Status if it was started outside the IDE.", command_name(id), self.description(&project)?.status).into());
                 }
                 let confirmation = match id {
-                    "delete" => Some((
-                        "Delete DDEV project",
-                        "DDEV will delete this project's containers and database. Continue?",
-                    )),
+                    "delete" => {
+                        let name = self.description(&project).ok().map(|desc| desc.name.clone());
+                        Some(("Delete DDEV project", delete_question(name.as_deref(), &project.root()?)))
+                    }
                     "poweroff" => Some((
                         "Power off DDEV",
-                        "Stop all DDEV projects and the shared router on this machine?",
+                        "Stop all DDEV projects and the shared router on this machine?".into(),
+                    )),
+                    "share" => Some((
+                        "Share DDEV project",
+                        format!(
+                            "Share {} on a public URL? Anyone with the link can reach the site until you stop sharing.",
+                            self.description(&project).map_or_else(|_| "this project".to_owned(), |d| d.name.clone())
+                        ),
                     )),
                     "config" => Some((
                         "Configure DDEV project",
-                        "Run ddev config --auto in this project? It can create or update .ddev/config.yaml.",
+                        "Run ddev config --auto in this project? It can create or update .ddev/config.yaml.".into(),
                     )),
                     _ => None,
                 };
                 if let Some((title, body)) = confirmation
-                    && !host::confirm(title, body)?
+                    && !host::confirm(title, &body)?
                 {
                     return Ok(None);
                 }
@@ -566,6 +603,25 @@ fn run_json(project: &Project, command: &str) -> Result<String, Error> {
         .into());
     }
     Ok(output.stdout)
+}
+
+/// The command title after "DDEV: ", for errors that name the command.
+fn command_name(id: &str) -> &str {
+    match id {
+        "restart" => "Restart Project",
+        "stop" => "Stop Project",
+        "share" => "Share Project",
+        "shell" => "Open Shell",
+        other => other,
+    }
+}
+
+fn delete_question(name: Option<&str>, root: &str) -> String {
+    let project = match name {
+        Some(name) => format!("{name} ({root})"),
+        None => root.to_owned(),
+    };
+    format!("Delete DDEV project {project}? DDEV will delete its containers and database.")
 }
 
 fn run_ddev(project: &Project, args: &[String]) -> Result<openidea_plugin::ProcessOutput, Error> {
@@ -693,14 +749,22 @@ impl openidea_plugin::RunTargetValidation for Main {
         else {
             return Ok(());
         };
-        let Ok(desc) = run_json(&project, "describe").and_then(|o| Description::parse(&o)) else {
-            return Ok(());
+        let desc = match self.fresh_description(&project) {
+            Some(desc) => desc,
+            None => {
+                let Ok(desc) =
+                    run_json(&project, "describe").and_then(|o| Description::parse(&o))
+                else {
+                    return Ok(());
+                };
+                desc
+            }
         };
         if desc.status == "running" {
             return Ok(());
         }
         Err(format!(
-            "DDEV project \"{}\" is {}. Start it with DDEV: Start first.",
+            "DDEV project \"{}\" is {}. Run DDEV: Start first.",
             desc.name, desc.status
         ))
     }

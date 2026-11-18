@@ -1,10 +1,47 @@
-//! Managed comparison core. Production start is deliberately gated: no installed,
-//! versioned offline profile has been established. MockHost exercises the child
-//! lifecycle independently; a user-entered version is never a runtime permit.
+//! Managed comparison core: snapshot, diff and diffText stages run offline (schema model and
+//! snapshot files only) with the installed Flyway CLI that `offline_profile` detects. A
+//! user-entered version is never a runtime permit.
 use super::*;
 use openidea_plugin::host::{Child, Chunk, Command};
 const CAP: usize = 1 << 20;
-pub(super) const BLOCKED: &str = "Managed comparison blocked: no accepted installed offline CLI profile. Required: exact version/Enterprise runtime, schemaModel snapshot semantics, configuration/overlay isolation and offline licensing/startup behavior. Reported version/edition and a reviewed recipe are not proof.";
+pub(super) const BLOCKED: &str = "Install the Flyway CLI so flyway runs from this project, then prepare the comparison again.";
+/// The installed CLI the stages run, and the project configuration it reads from the working directory.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Profile {
+    pub edition: String,
+    pub version: String,
+    pub config: Option<String>,
+    pub locations: Vec<String>,
+}
+/// Detects `flyway --version` through `process:flyway`, the same program the stages launch.
+pub(super) fn offline_profile(project: &Project) -> Result<Profile, Error> {
+    let _task = host::begin_task("Checking the Flyway CLI", false);
+    let failed = |reason: &str| Error::from(format!("Flyway CLI check failed: {reason}").as_str());
+    let output = match project.run_process("flyway", &["--version".to_owned()], None) {
+        Ok(output) => output,
+        Err(Error::Denied(_)) => return Err("Allow running flyway for Flyway Migrations in Settings › Plugins to start a comparison.".into()),
+        Err(Error::NotFound(_)) => return Err(BLOCKED.into()),
+        // The real host may report a missing program as Invalid.
+        Err(Error::Invalid(reason)) if ["no such file", "not found"].iter().any(|missing| reason.to_ascii_lowercase().contains(missing)) => {
+            return Err(BLOCKED.into());
+        }
+        Err(Error::Invalid(reason) | Error::Failed(reason)) => return Err(failed(&reason)),
+        Err(error) => return Err(failed(&error.to_string())),
+    };
+    if output.status != Some(0) {
+        let code = output.status.map_or("was stopped".to_owned(), |code| format!("exited with {code}"));
+        return Err(failed(&format!("flyway --version {code}.")));
+    }
+    let banner = output.stdout.lines().find_map(|line| line.trim().strip_prefix("Flyway ")?.split_once(" Edition "));
+    let unrecognised = || failed("flyway --version did not print an edition and version.");
+    let Some((edition, rest)) = banner else { return Err(unrecognised()) };
+    let version = rest.split_whitespace().next().filter(|version| version.len() <= 64).ok_or_else(unrecognised)?;
+    if edition.is_empty() || edition.len() > 64 || edition.chars().chain(version.chars()).any(char::is_control) {
+        return Err(unrecognised());
+    }
+    let config = config::CONFIG_FILES.iter().find(|file| project.exists(file).unwrap_or(false)).map(|file| (*file).to_owned());
+    Ok(Profile { edition: edition.into(), version: version.into(), config, locations: config::load(project).locations })
+}
 #[derive(Clone)]
 pub(super) struct Plan {
     root: String,
@@ -141,17 +178,13 @@ impl Plan {
     }
     pub fn review(&self) -> String {
         format!(
-            "Project: {}\nInput proof: {} bounded text files\nCandidate stage argv (NOT approved for execution):\n{}\n{}\nExisting imported change IDs are not reused. New diffText output must be parsed and explicitly selected. No cleanup/rollback or exclusive output reservation is promised.",
+            "Project: {}\nSchema model: {} text files\nPreparing checks the installed Flyway CLI with flyway --version.\nStages, each started by you and checked before the next:\n{}\nThe stages read the schema model and snapshot files only and never connect to a database. Cancelling keeps partial snapshot and diff files. Select definitions from the new report; earlier change IDs are not reused.",
             self.root,
             self.inputs.len(),
             serde_json::to_string_pretty(&[self.args(0), self.args(1), self.args(2)])
                 .unwrap_or_default(),
-            BLOCKED
         )
     }
-}
-fn offline_profile() -> Result<(), Error> {
-    Err(BLOCKED.into())
 }
 fn bounded_read(project: &Project, path: &str) -> Result<String, Error> {
     let st = stat(project, path)?;
@@ -169,6 +202,7 @@ fn bounded_read(project: &Project, path: &str) -> Result<String, Error> {
 #[derive(Default)]
 pub(super) struct Core {
     plan: Option<Plan>,
+    profile: Option<Profile>,
     child: Option<Child>,
     step: usize,
     ready: bool,
@@ -184,13 +218,37 @@ impl Core {
     pub fn prepared(&self) -> bool {
         self.plan.is_some()
     }
-    pub fn prepare(&mut self, plan: Plan) -> Result<(), Error> {
+    /// Start is offered once an installed CLI profile exists and no stage has run yet.
+    pub fn startable(&self) -> bool {
+        self.profile.is_some() && self.step == 0 && !self.running()
+    }
+    pub fn continuable(&self) -> bool {
+        self.ready && !self.running()
+    }
+    pub fn prepare(&mut self, plan: Plan, profile: Result<Profile, Error>) -> Result<(), Error> {
         if self.running() {
-            return Err("Cancel the owned comparison child first.".into());
+            return Err("Stop the running comparison first.".into());
         }
+        let profile = profile.and_then(|profile| {
+            if profile.edition.eq_ignore_ascii_case("Community") {
+                return Err(format!("Ready check: Flyway {} Edition {} cannot run snapshot or diff; Flyway Teams or Enterprise is required.", profile.edition, profile.version).into());
+            }
+            Ok(profile)
+        });
+        let status = match &profile {
+            Ok(profile) => format!(
+                "Ready with Flyway {} Edition {} (configuration: {}; locations: {}). Start runs the snapshot stage.",
+                profile.edition,
+                profile.version,
+                profile.config.as_deref().unwrap_or("none"),
+                profile.locations.join(", ")
+            ),
+            Err(error) => error.to_string(),
+        };
         *self = Self {
             plan: Some(plan),
-            status: BLOCKED.into(),
+            profile: profile.ok(),
+            status,
             ..Self::default()
         };
         Ok(())
@@ -200,9 +258,10 @@ impl Core {
             .as_ref()
             .ok_or("Prepare the managed comparison first.")?
             .fresh(project)?;
-        // No production caller can convert a self-reported profile into a permit.
-        self.status = BLOCKED.into();
-        offline_profile()?;
+        // Only a CLI detected at prepare time admits a launch; reported fields never do.
+        if self.profile.is_none() {
+            return Err(BLOCKED.into());
+        }
         self.launch_admitted(project)
     }
     fn fresh(&self, project: &Project) -> Result<(), Error> {
@@ -215,11 +274,10 @@ impl Core {
         }
         Ok(())
     }
-    // Called only after a future authoritative offline profile admission. Today
-    // production start above refuses; tests isolate orchestration with MockHost.
+    // Called after `start` admitted the detected profile; tests drive it directly.
     fn launch_admitted(&mut self, project: &Project) -> Result<(), Error> {
         if self.running() {
-            return Err("A comparison child is already owned.".into());
+            return Err("A comparison is already running.".into());
         }
         if self.step >= 3 {
             return Err("Comparison already finished.".into());
@@ -254,7 +312,6 @@ impl Core {
         if !self.ready {
             return Err("Check the completed stage before continuing.".into());
         }
-        // The runtime profile is still absent; never export a bypass via Continue.
         self.start(project)
     }
     pub fn check(&mut self, project: &Project) -> Result<(), Error> {
@@ -335,7 +392,7 @@ impl Core {
         self.ready = self.step < 3;
         self.status = if self.ready {
             format!(
-                "Stage {} completed; outputs observed, not runtime-certified. Continue requires an admitted offline profile.",
+                "Stage {} completed. Continue runs the next stage.",
                 self.step
             )
         } else {
@@ -424,7 +481,7 @@ mod tests {
         let project = host.invocation().project().unwrap();
         let plan = Plan::capture(&project, review.draft.as_ref().unwrap()).unwrap();
         let mut core = Core::default();
-        core.prepare(plan).unwrap();
+        core.prepare(plan, Err(BLOCKED.into())).unwrap();
         core
     }
     fn done(core: &mut Core, project: &Project, stdout: &str) -> Result<bool, Error> {
@@ -471,16 +528,7 @@ mod tests {
             &host.invocation(),
         )
         .unwrap();
-        assert!(
-            plugin
-                .comparison
-                .draft
-                .as_ref()
-                .unwrap()
-                .managed
-                .status
-                .contains("no accepted installed offline CLI profile")
-        );
+        assert_eq!(plugin.comparison.draft.as_ref().unwrap().managed.status, BLOCKED);
         for key in ["start-managed", "continue-managed"] {
             assert!(
                 openidea_plugin::views::Views::handle(
@@ -493,7 +541,75 @@ mod tests {
             );
         }
         assert!(!plugin.comparison.draft.as_ref().unwrap().managed.running());
-        assert!(host.process_runs().is_empty() && host.requests().is_empty());
+        assert!(host.process_runs().iter().all(|run| run.args == ["--version"]) && host.requests().is_empty());
+    }
+    /// Profile contract `Core::start` relies on: the stages run `flyway <stage> … -outputType=json
+    /// -workingDirectory=<root>` through `process:flyway`, reading only the schema model and snapshot
+    /// files (no database URL), so the profile must prove that this exact `flyway` program is installed
+    /// (its `--version` banner gives edition and version) and record the project configuration the CLI
+    /// reads from the working directory (config file and migration locations) for the review.
+    #[test]
+    fn offline_profile_from_installed_cli() {
+        let (host, _review) = setup();
+        host.add_file("flyway.toml", "[flyway]\nlocations = [\"filesystem:sql\"]\n");
+        host.on_process("flyway", |args, _| {
+            assert_eq!(args, ["--version"]);
+            Ok(openidea_plugin::ProcessOutput { status: Some(0), stdout: "\nFlyway Community Edition 10.x by Redgate\n".into(), stderr: String::new() })
+        });
+        let project = host.invocation().project().unwrap();
+        let profile = offline_profile(&project).unwrap();
+        assert_eq!(profile.edition, "Community");
+        assert_eq!(profile.version, "10.x");
+        assert_eq!(profile.config.as_deref(), Some("flyway.toml"));
+        assert_eq!(profile.locations, ["filesystem:sql"]);
+        assert!(!host.tasks().is_empty(), "the JVM start-up runs inside a task");
+        host.on_process("flyway", |_, _| Err(Error::NotFound("flyway".into())));
+        assert_eq!(offline_profile(&project).unwrap_err().to_string(), BLOCKED);
+        host.on_process("flyway", |_, _| Err(Error::Invalid("flyway: No such file or directory".into())));
+        assert_eq!(offline_profile(&project).unwrap_err().to_string(), BLOCKED, "the real host may report a missing program as Invalid");
+        host.on_process("flyway", |_, _| Err(Error::Failed("spawn timed out".into())));
+        assert_eq!(offline_profile(&project).unwrap_err().to_string(), "Flyway CLI check failed: spawn timed out");
+        host.on_process("flyway", |_, _| Ok(openidea_plugin::ProcessOutput { status: Some(1), stdout: "Flyway Community Edition 10.x by Redgate\n".into(), stderr: "ERROR: license".into() }));
+        assert_eq!(offline_profile(&project).unwrap_err().to_string(), "Flyway CLI check failed: flyway --version exited with 1.");
+        host.on_process("flyway", |_, _| Ok(openidea_plugin::ProcessOutput { status: Some(0), stdout: "Picked up JAVA_TOOL_OPTIONS\nversion 10\n".into(), stderr: String::new() }));
+        assert_eq!(offline_profile(&project).unwrap_err().to_string(), "Flyway CLI check failed: flyway --version did not print an edition and version.");
+        let denied = host.with_capabilities(&["project.read", "events", "storage"]);
+        assert!(offline_profile(&denied.invocation().project().unwrap()).unwrap_err().to_string().contains("Allow running flyway for Flyway Migrations in Settings › Plugins"));
+    }
+    #[test]
+    fn start_enabled_with_profile() {
+        let (host, _review) = setup();
+        let mut plugin = Flyway::default();
+        let start_button = |plugin: &mut Flyway| {
+            let view = openidea_plugin::views::Views::render(plugin, VIEW, None, &host.invocation()).unwrap();
+            view.toolbar.into_iter().find(|button| button.id.starts_with("start-managed@"))
+        };
+        let prepare = |plugin: &mut Flyway| {
+            plugin.run_command("review-comparison", &host.invocation(), None).unwrap();
+            let token = plugin.comparison.draft.as_ref().unwrap().token.clone();
+            let runs = host.process_runs().len();
+            host.answer_next_prompt(None);
+            openidea_plugin::views::Views::handle(plugin, VIEW, ViewEvent::Button(format!("prepare-managed@{token}")), &host.invocation()).unwrap();
+            assert_eq!(host.process_runs().len(), runs, "a declined review never runs flyway --version");
+            host.answer_next_prompt(Some(&[]));
+            openidea_plugin::views::Views::handle(plugin, VIEW, ViewEvent::Button(format!("prepare-managed@{token}")), &host.invocation()).unwrap();
+            token
+        };
+        let token = prepare(&mut plugin);
+        assert!(start_button(&mut plugin).is_none(), "no installed CLI, no Start");
+        assert_eq!(plugin.comparison.draft.as_ref().unwrap().managed.status, BLOCKED);
+        assert!(openidea_plugin::views::Views::handle(&mut plugin, VIEW, ViewEvent::Button(format!("start-managed@{token}")), &host.invocation()).is_err());
+        host.on_process("flyway", |_, _| Ok(openidea_plugin::ProcessOutput { status: Some(0), stdout: "Flyway Enterprise Edition 11.3.0 by Redgate\n".into(), stderr: String::new() }));
+        host.on_process("flyway", |_, _| Ok(openidea_plugin::ProcessOutput { status: Some(0), stdout: "Flyway Community Edition 11.3.0 by Redgate\n".into(), stderr: String::new() }));
+        prepare(&mut plugin);
+        assert!(start_button(&mut plugin).is_none(), "Community cannot snapshot or diff");
+        assert!(plugin.comparison.draft.as_ref().unwrap().managed.status.contains("Teams or Enterprise is required"));
+        host.on_process("flyway", |_, _| Ok(openidea_plugin::ProcessOutput { status: Some(0), stdout: "Flyway Enterprise Edition 11.3.0 by Redgate\n".into(), stderr: String::new() }));
+        let token = prepare(&mut plugin);
+        assert!(start_button(&mut plugin).is_some_and(|button| button.enabled));
+        openidea_plugin::views::Views::handle(&mut plugin, VIEW, ViewEvent::Button(format!("start-managed@{token}")), &host.invocation()).unwrap();
+        assert!(plugin.comparison.draft.as_ref().unwrap().managed.running());
+        assert!(host.process_runs().iter().all(|run| run.args == ["--version"]), "stages run as an owned child, never a blocking process");
     }
     #[test]
     fn mock_admitted_stages_require_explicit_continuation_and_pair_the_new_report() {
@@ -649,7 +765,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .managed
-            .prepare(plan)
+            .prepare(plan, Err(BLOCKED.into()))
             .unwrap();
         review
             .draft

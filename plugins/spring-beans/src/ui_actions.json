@@ -1,0 +1,10 @@
+[
+  {
+    "menu": "viewItem.context",
+    "view": "beans",
+    "command": "focus-in-graph",
+    "when": "viewItemKind == b",
+    "icon": "hierarchy",
+    "label": "Focus in Graph"
+  }
+]

@@ -9,6 +9,8 @@ use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
 const MAX_ZIP: usize = 1 << 20;
 const MAX_FILE: usize = 128 << 10;
+/// Read as `plugin.aritti.spring-initializr.importReady` by the Tools menu entry of Open Source Folder.
+pub(crate) const IMPORT_READY: &str = "importReady";
 const WRAPPERS: [&str; 4] = ["mvnw", "mvnw.cmd", ".mvn/wrapper/maven-wrapper.properties", ".mvn/wrapper/maven-wrapper.jar"];
 #[derive(Clone)]
 struct Plan {
@@ -30,7 +32,9 @@ pub(crate) struct State {
 }
 impl State {
     pub(crate) fn invalidate(&mut self) {
-        self.plan = None;
+        if self.plan.take().is_some_and(|plan| plan.issued) {
+            host::remove_context(IMPORT_READY);
+        }
         self.pending.clear();
     }
 }
@@ -282,6 +286,20 @@ fn preview(plan: &Plan) -> String {
     }
     body
 }
+/// Creates every file of a vacant plan, refusing any path that already exists.
+fn create_files(project: &Project, plan: &Plan) -> Result<(), Error> {
+    for (created, (name, text)) in plan.files.iter().enumerate() {
+        let path = format!("{}/{name}", plan.target);
+        let result = if project.exists(&path)? { Err(format!("{path} already exists and wasn't overwritten.").into()) } else { project.write_file(&path, text) };
+        match result {
+            Err(Error::Invalid(error) | Error::Failed(error)) if created > 0 => {
+                return Err(format!("Created {created} of {} files in {}, then stopped: {error}", plan.files.len(), plan.target).into());
+            }
+            result => result?,
+        }
+    }
+    Ok(())
+}
 fn verify_visible(project: &Project, plan: &Plan) -> Result<(), Error> {
     if host::project_of(&plan.target).and_then(|p| p.root().ok()).as_deref() != Some(&plan.root) {
         return Err(Error::Stale);
@@ -306,7 +324,7 @@ fn verify_visible(project: &Project, plan: &Plan) -> Result<(), Error> {
             parent = parent.rsplit_once('/').map(|(p, _)| p).ok_or(Error::Stale)?;
         }
         if project.stat(&path)?.kind != FileKind::File || project.read_file(&path)? != *text {
-            return Err("Expected source files are missing, partial or changed; folder not opened.".into());
+            return Err("Some imported files are missing or were changed, so the folder wasn't opened. Open it with File › Open… instead.".into());
         }
     }
     Ok(())
@@ -364,7 +382,7 @@ impl Launcher {
             }
         }
         if self.get("dependencies").split([',', ' ']).filter(|id| !id.is_empty()).count() > 64 {
-            return Err("Source import supports at most64 selected plain Boot-managed starters.".into());
+            return Err("Source import supports at most 64 selected plain Boot-managed starters.".into());
         }
         for id in self.get("dependencies").split([',', ' ']).filter(|s| !s.is_empty()) {
             let dep = metadata["dependencies"]["values"]
@@ -404,13 +422,6 @@ impl Launcher {
         };
         vacant(&project, &plan)?;
         let url = format!("{START}/starter.zip?{}", plan.query);
-        let request = format!(
-            "Fetch source archive: {url}\nDestination proposal: {}\n\nSelected starters also require version-bound dependency metadata. No disk extraction occurs. Known Maven wrappers will be explicitly excluded. A complete exact-source preview must be approved in the later FileAction before any source is created.",
-            plan.target
-        );
-        if !ui_kit::prompts::confirm_exact("Prepare Maven source-only import?", &request)? {
-            return Err(Error::Cancelled);
-        }
         let response = host::fetch(&HttpRequest::get(&url))?;
         if response.status != 200 || response.body.len() > MAX_ZIP {
             return Err("Source archive request failed or exceeded 1 MiB; no source was written.".into());
@@ -437,8 +448,48 @@ impl Launcher {
         }
         vacant(&project, &plan)?;
         self.import_identity(&plan)?;
+        let reason = if self.granted.as_ref().is_some_and(|g| !g.iter().any(|c| c == "project.write")) {
+            ui_kit::denied::message("Creating the files directly", "project.write", "Spring Initializr Launcher")
+        } else {
+            let body = format!(
+                "Folder: {}\nFiles: {}\n\nExisting files are never overwritten. The Maven wrapper (mvnw) is left out; use your installed Maven. Nothing is built or run.",
+                plan.target,
+                plan.files.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+            let name = plan.target.rsplit('/').next().unwrap_or_default();
+            if !ui_kit::prompts::confirm_exact(&format!("Create {} files in {name}?", plan.files.len()), &body)? {
+                return Err(Error::Cancelled);
+            }
+            self.import_identity(&plan)?;
+            vacant(&project, &plan)?;
+            match create_files(&project, &plan) {
+                Err(Error::Denied(_)) => ui_kit::denied::message("Creating the files directly", "project.write", "Spring Initializr Launcher"),
+                result => {
+                    result?;
+                    self.imports.plan = Some(plan);
+                    self.issue_import();
+                    return Ok(None);
+                }
+            }
+        };
+        let count = plan.files.len();
         self.imports.plan = Some(plan);
-        Ok(Some("Source-only ZIP validated in memory. Open a small existing project editor and invoke Preview Import Maven Sources…; after applying its atomic edit, Open Reviewed Source Folder independently verifies expected files before normal project trust/open flow.".into()))
+        Ok(Some(format!("Downloaded {count} files for {}. {reason} Or press ⌥⏎ in any open file of this project and choose Preview Import Maven Sources… to create them.", self.get("artifactId"))))
+    }
+    /// Marks the import created and offers Open Folder.
+    fn issue_import(&mut self) {
+        let Some(plan) = self.imports.plan.as_mut() else {
+            return;
+        };
+        self.imports.pending.clear();
+        plan.issued = true;
+        let _ = host::set_context(IMPORT_READY, true);
+        let _ = host::notify_with_actions(
+            NotificationLevel::Info,
+            "Spring Initializr",
+            &format!("Created {} files in {}.", plan.files.len(), plan.target),
+            &[openidea_plugin::NotificationAction::new("Open Folder", "open-reviewed-import")],
+        );
     }
     fn import_identity(&mut self, plan: &Plan) -> Result<(), Error> {
         if self.owner != format!("project:{}", plan.root)
@@ -493,7 +544,7 @@ impl Launcher {
             return Err(Error::Stale);
         }
         vacant(&project, &plan)?;
-        if !ui_kit::prompts::confirm_exact("Create reviewed source-only project files?", &preview(&plan))? {
+        if !ui_kit::prompts::confirm_exact("Create these project files?", &preview(&plan))? {
             return Err(Error::Cancelled);
         }
         self.import_identity(&plan)?;
@@ -501,10 +552,9 @@ impl Launcher {
         if project.read_file(&doc.path)? != doc.text {
             return Err(Error::Stale);
         }
-        self.imports.pending.clear();
-        self.imports.plan.as_mut().ok_or(Error::Stale)?.issued = true;
+        self.issue_import();
         Ok(FileAction {
-            title: "Import reviewed Maven sources".into(),
+            title: "Import Maven sources".into(),
             kind: Some("source".into()),
             operations: plan
                 .files
@@ -520,20 +570,11 @@ impl Launcher {
             .plan
             .clone()
             .filter(|p| p.issued)
-            .ok_or("No issued source import in this session. Apply its atomic FileAction first.")?;
+            .ok_or("Nothing to open yet. Run Import Maven Project… first.")?;
         let project = ctx.project().ok_or(Error::Stale)?;
         verify_visible(&project, &plan)?;
-        let message = format!(
-            "Folder: {}\nVerified: {} expected files physically exist and match current project-visible text.\n\nUnsaved editor buffers may mask disk contents; disk bytes, extra files, Maven build/runtime state and original archive completeness are NOT verified. Known wrappers were excluded. This requests the normal project trust/open flow in a new window; it does not mark the folder trusted or certify a build.",
-            plan.target,
-            plan.files.len()
-        );
-        if !ui_kit::prompts::confirm_exact("Open reviewed source folder?", &message)? {
-            return Err(Error::Cancelled);
-        }
-        verify_visible(&project, &plan)?;
         host::open_project(&plan.target, true)?;
-        Ok(Some("Requested normal trust/open flow for the reviewed source folder.".into()))
+        Ok(None)
     }
 }
 
@@ -567,7 +608,10 @@ mod tests {
         ])
     }
     fn setup(bytes: Vec<u8>) -> (MockHost, Launcher, Document) {
-        let host = MockHost::install().with_capabilities(&["storage", "project.read", "editor.read", "net:start.spring.io"]);
+        setup_with(bytes, &["storage", "project.read", "editor.read", "net:start.spring.io"])
+    }
+    fn setup_with(bytes: Vec<u8>, capabilities: &[&str]) -> (MockHost, Launcher, Document) {
+        let host = MockHost::install().with_capabilities(capabilities);
         host.add_file("README.md", "anchor");
         host.open_editor("/project/README.md", "markdown", "anchor", &[]);
         host.on_fetch(move |req| {
@@ -709,19 +753,28 @@ mod tests {
         assert_eq!(host.editor_text(), "anchor");
     }
     #[test]
+    fn created_import_enables_open_folder_menu_and_offers_it_in_a_notification() {
+        let (host, mut l, d) = prepared();
+        assert!(!host.context_keys().contains_key(IMPORT_READY));
+        let error = l.run_command("open-reviewed-import", &host.invocation(), None).unwrap_err();
+        assert!(error.to_string().contains("Nothing to open yet"), "{error}");
+        resolve(&host, &mut l, &d).unwrap();
+        assert!(host.context_keys().contains_key(IMPORT_READY));
+        let notified = host.notifications_with_actions();
+        assert_eq!(notified.last().unwrap().actions[0].command, "open-reviewed-import");
+        l.imports.invalidate();
+        assert!(!host.context_keys().contains_key(IMPORT_READY));
+    }
+    #[test]
     fn cancellation_and_outside_or_colliding_parent_prevent_archive_fetch() {
-        for mode in 0..4 {
+        for mode in 0..3 {
             let (host, mut l, _) = setup(valid());
             match mode {
                 0 => host.answer_next_prompt(None),
                 1 => host.answer_next_prompt(Some(&["/outside"])),
-                2 => {
+                _ => {
                     host.add_dir("demo");
                     host.answer_next_prompt(Some(&["/project"]));
-                }
-                _ => {
-                    host.answer_next_prompt(Some(&["/project"]));
-                    host.answer_next_prompt(None);
                 }
             }
             assert!(l.run_command("prepare-import", &host.invocation(), None).is_err());
@@ -791,19 +844,78 @@ mod tests {
     }
     #[test]
     fn reviewed_open_refuses_partial_or_changed_manifest_and_cancel() {
-        for mode in 0..4 {
+        for mode in 0..3 {
             let (host, mut l, d) = prepared();
             let action = resolve(&host, &mut l, &d).unwrap();
             mock_apply(&host, &action);
             match mode {
                 0 => host.add_file("demo/pom.xml", "changed"),
                 1 => host.add_file("demo/src", "file in place of directory"),
-                2 => host.set_project_root(Some("/other")),
-                _ => host.answer_next_prompt(None),
+                _ => host.set_project_root(Some("/other")),
             }
             assert!(l.run_command("open-reviewed-import", &host.invocation(), None).is_err());
             assert!(host.opened_projects().is_empty());
         }
+    }
+    const WRITABLE: [&str; 5] = ["storage", "project.read", "project.write", "editor.read", "net:start.spring.io"];
+    fn read(path: &str) -> Option<String> {
+        host::project_of(path).unwrap().read_file(path).ok()
+    }
+    #[test]
+    fn with_project_write_the_command_creates_the_files_after_one_confirm_and_offers_open_folder() {
+        let (host, mut l, d) = setup_with(valid(), &WRITABLE);
+        host.answer_next_prompt(Some(&["/project"]));
+        host.answer_next_prompt(Some(&["yes"]));
+        assert_eq!(l.run_command("prepare-import", &host.invocation(), None).unwrap(), None);
+        assert_eq!(read("/project/demo/pom.xml").as_deref(), Some(POM));
+        assert_eq!(read("/project/demo/.gitignore").as_deref(), Some("target/\n"));
+        assert!(read("/project/demo/mvnw").is_none());
+        assert!(l.import_issued());
+        assert!(host.context_keys().contains_key(IMPORT_READY));
+        let notified = host.notifications_with_actions();
+        assert!(notified.last().unwrap().notification.body.contains("Created 3 files in /project/demo"));
+        assert_eq!(notified.last().unwrap().actions[0].command, "open-reviewed-import");
+        assert!(l.file_actions(&d, Range::default()).is_empty());
+        for dir in ["/project/demo", "/project/demo/src", "/project/demo/src/main", "/project/demo/src/main/java", "/project/demo/src/main/java/com", "/project/demo/src/main/java/com/example", "/project/demo/src/main/java/com/example/demo"] {
+            host.add_dir(dir);
+        }
+        l.run_command("open-reviewed-import", &host.invocation(), None).unwrap();
+        assert_eq!(host.opened_projects(), vec![("/project/demo".into(), true)]);
+    }
+    #[test]
+    fn cancelling_the_create_confirm_writes_nothing() {
+        let (host, mut l, _) = setup_with(valid(), &WRITABLE);
+        host.answer_next_prompt(Some(&["/project"]));
+        host.answer_next_prompt(None);
+        assert!(matches!(l.run_command("prepare-import", &host.invocation(), None), Err(Error::Cancelled)));
+        assert!(read("/project/demo/pom.xml").is_none());
+        assert!(l.imports.plan.is_none());
+    }
+    #[test]
+    fn creating_files_never_overwrites_an_existing_file() {
+        let (_, mut l, _) = prepared();
+        let plan = l.imports.plan.take().unwrap();
+        let host = MockHost::install().with_capabilities(&WRITABLE);
+        host.add_file("demo/pom.xml", "mine");
+        let error = create_files(&host::project_of("/project/README.md").unwrap(), &plan).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(read("/project/demo/pom.xml").as_deref(), Some("mine"));
+    }
+    #[test]
+    fn without_project_write_the_import_waits_for_alt_enter_with_the_standard_message() {
+        let (host, mut l, _) = setup(valid());
+        host.answer_next_prompt(Some(&["/project"]));
+        host.answer_next_prompt(Some(&["yes"]));
+        let message = l.run_command("prepare-import", &host.invocation(), None).unwrap().unwrap();
+        assert!(message.contains("needs the project.write permission. Allow it in Settings › Plugins › Spring Initializr Launcher."), "{message}");
+        assert!(message.contains("Preview Import Maven Sources…"), "{message}");
+        assert!(read("/project/demo/pom.xml").is_none());
+        assert!(!l.import_issued());
+        let (host, mut l, _) = setup(valid());
+        l.granted = Some(vec!["storage".into()]);
+        host.answer_next_prompt(Some(&["/project"]));
+        assert!(l.run_command("prepare-import", &host.invocation(), None).unwrap().unwrap().contains("project.write"));
+        assert!(l.imports.plan.is_some());
     }
     #[test]
     fn unsafe_names_binary_modes_duplicate_case_prefix_and_size_are_rejected() {

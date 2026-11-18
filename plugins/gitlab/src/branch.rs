@@ -132,6 +132,17 @@ fn git(project: &Project, args: &[&str]) -> Result<ProcessOutput, Error> {
     project.run_process("git", &args, None)
 }
 
+/// `rev-parse --verify --quiet` exits 1 for a missing ref; any other status (a signal, 128) is an error, not "absent".
+fn branch_exists(project: &Project, local: &str) -> Result<bool, Error> {
+    let output = git(project, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{local}")])?;
+
+    match output.status {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        status => Err(Error::Failed(format!("Git rev-parse failed (status {status:?}): {}", output.stderr.trim()))),
+    }
+}
+
 pub fn git_ok(project: &Project, args: &[&str]) -> Result<String, Error> {
     let output = git(project, args)?;
     if output.status != Some(0) {
@@ -158,6 +169,15 @@ pub fn checkout(project: &Project, remote: &str, mr: &MergeRequest) -> Result<St
 
     if mr.source_project_id != mr.target_project_id {
         // ponytail: forks come from the target's refs/merge-requests/<iid>/head, never a fork remote.
+        let exists = branch_exists(project, &local)?;
+        if exists
+            && !host::confirm(
+                "Overwrite local branch",
+                &format!("The local branch {local} already exists. Checking out this merge request resets it, and commits only on it become unreachable. Continue?"),
+            )?
+        {
+            return Ok(format!("Left {local} unchanged."));
+        }
         git_ok(project, &["fetch", "--", remote, &format!("+refs/merge-requests/{}/head:refs/heads/{local}", mr.iid)])?;
         git_ok(project, &["checkout", &local])?;
         return Ok(format!("Checked out {local}."));
@@ -166,7 +186,7 @@ pub fn checkout(project: &Project, remote: &str, mr: &MergeRequest) -> Result<St
     let tracking = format!("{remote}/{local}");
     git_ok(project, &["fetch", "--", remote, &format!("+refs/heads/{local}:refs/remotes/{tracking}")])?;
 
-    let exists = git(project, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{local}")])?.status == Some(0);
+    let exists = branch_exists(project, &local)?;
     if !exists {
         git_ok(project, &["checkout", "-b", &local, "--track", &tracking])?;
         return Ok(format!("Checked out {local}."));
@@ -392,6 +412,7 @@ impl GitLab {
             None => host::remove_status_item(STATUS_ITEM),
         }
 
+        let _ = host::set_context("branchMergeRequest", mr.is_some());
         self.branch = Some(BranchReview { key, checked_at: now_secs(), root: status.root, mr, threads });
         self.republish();
 
@@ -514,10 +535,10 @@ impl GitLab {
         self.set_section(Section::Overview)?;
 
         if ui_kit::web::reveal_view(DETAILS, include_str!("ui_config.json")).is_ok() {
-            return Ok(Some(format!("!{iid} is open in the Merge Request tool window.")));
+            return Ok(Some(format!("!{iid} is open in the GitLab window.")));
         }
 
-        Ok(Some(format!("!{iid} is open in the Merge Request tool window.")))
+        Ok(Some(format!("!{iid} is open in the GitLab window.")))
     }
 }
 

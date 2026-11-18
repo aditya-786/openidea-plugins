@@ -74,7 +74,7 @@ fn snapshot(p: &Project, root: &str) -> Result<BTreeMap<String, String>, Error> 
         let text = p.read_file(&path)?;
         bytes += text.len();
         if bytes > 4 << 20 || before.len() >= 500 {
-            return Err("sbt sources exceed500 files/4MiB.".into());
+            return Err("sbt sources exceed 500 files or 4 MiB.".into());
         }
         before.insert(path, text);
     }
@@ -124,7 +124,7 @@ fn decode(s: &str) -> Result<String, Error> {
 }
 fn parse(root: &str, text: &str) -> Result<Evidence, Error> {
     if text.len() > 4 << 20 {
-        return Err("sbt export exceeds4MiB.".into());
+        return Err("sbt export exceeds 4MiB.".into());
     }
     let mut lines = text.lines();
     let header: Vec<_> = lines
@@ -220,7 +220,7 @@ fn parse(root: &str, text: &str) -> Result<Evidence, Error> {
         let package = format!("{group}:{name}");
         let key = format!("{package} {version}");
         let text = format!(
-            "Resolved sbt2.0.12 update; module {module} ({}); configuration {configuration}. Root build.sbt location, not an exact declaration span.",
+            "Resolved sbt 2.0.12 update; module {module} ({}); configuration {configuration}. Root build.sbt location, not an exact declaration span.",
             if relative.is_empty() {
                 "project root"
             } else {
@@ -273,7 +273,7 @@ impl State {
         if !host::confirm(
             "Resolve sbt dependencies",
             &format!(
-                "Project: {root}\nApproved official sbt2.0.12 runner/runtime, Java17+\n\nAfter this review the runner version is probed, then a managed --server --batch session loads this executable Scala build and plugins. It may execute arbitrary configured tasks, contact configured repositories and update normal sbt/build caches. Project/global JVM/sbt options and external build inputs are not fully captured by the bounded snapshot. No project wrapper is invoked and no build definition is modified.\n\nAn owned temporary command resolves every owned project ref's update report and exports non-evicted modules across its reported configurations. External project bases refuse export. Poll/cancel the owned child, then explicitly Audit resolved dependencies to send coordinates to OSV. Failed/incomplete/stale exports retain the previous report."
+                "Project: {root}\nApproved official sbt 2.0.12 runner/runtime, Java 17+\n\nAfter this review the runner version is probed, then a managed --server --batch session loads this executable Scala build and plugins. It may execute arbitrary configured tasks, contact configured repositories and update normal sbt/build caches. Project/global JVM/sbt options and external build inputs are not fully captured by the bounded snapshot. No project wrapper is invoked and no build definition is modified.\n\nAn owned temporary command resolves every owned project ref's update report and exports non-evicted modules across its reported configurations. External project bases refuse export. Poll/cancel the owned child, then explicitly Audit resolved dependencies to send coordinates to OSV. Failed/incomplete/stale exports retain the previous report."
             ),
         )? {
             return Ok(());
@@ -286,9 +286,16 @@ impl State {
             status: None,
         };
         current(&check, ctx)?;
-        let version = p.run_process("sbt", &["--script-version".into()], None)?;
-        if version.status != Some(0) || version.stdout.trim() != VERSION {
-            return Err("Approve the official sbt2.0.12 runner for this profile.".into());
+        let version = p
+            .run_process("sbt", &["--script-version".into()], None)
+            .map_err(|e| ui_kit::denied::map(e, "sbt dependency resolution", "process:sbt", "Dependency Audit"))?;
+        let found = version.stdout.trim();
+        if version.status != Some(0) || found != VERSION {
+            return Err(Error::Invalid(if version.status == Some(0) && !found.is_empty() && found.len() <= 64 {
+                format!("Found sbt {found}; needs sbt {VERSION}. Install that version and try again.")
+            } else {
+                format!("Couldn't read the sbt version; needs sbt {VERSION}.")
+            }));
         }
         current(&check, ctx)?;
         let stamp = SystemTime::now()
@@ -396,7 +403,7 @@ impl State {
                 "Status",
                 FieldValue::readonly_text(
                     &format!(
-                        "{}\nOfficial sbt2.0.12; all owned project refs/configurations\n{}",
+                        "{}\nOfficial sbt 2.0.12; all project modules and configurations\n{}",
                         self.message, r.output
                     ),
                     true,
@@ -587,6 +594,17 @@ mod tests {
         assert_eq!(state.evidence(&h.invocation()).unwrap().modules, 3);
         h.add_file("/project/build.sbt", "drift");
         assert!(state.evidence(&h.invocation()).is_err());
+    }
+    #[test]
+    fn a_wrong_sbt_runner_says_what_was_found() {
+        use openidea_plugin::{ProcessOutput, mock::MockHost};
+        let h = MockHost::install().with_capabilities(&["project.read", "project.write", "editor.read", "process:sbt"]);
+        h.add_file("/project/build.sbt", "fixture");
+        h.add_file("/project/project/build.properties", "sbt.version=2.0.12");
+        h.on_process("sbt", |_, _| Ok(ProcessOutput { status: Some(0), stdout: "1.10.0\n".into(), stderr: String::new() }));
+        h.answer_next_prompt(Some(&["ok"]));
+        let error = State::default().start(&h.invocation()).unwrap_err().to_string();
+        assert!(error.contains("Found sbt 1.10.0; needs sbt 2.0.12"), "{error}");
     }
     #[test]
     fn review_cancellation_never_invokes_sbt() {

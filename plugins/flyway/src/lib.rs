@@ -12,10 +12,26 @@ mod config;
 mod execution;
 mod generate;
 mod hibernate_schema;
-mod indexer;
 mod info;
 mod naming;
 pub(crate) const PLACEHOLDER_MARKER: &str = "icons/marker-placeholder.svg";
+pub(crate) const TABLE_MARKER: &str = "icons/flyway.svg";
+/// Markers one gutter button lists at most; the IDE merges a line's same-icon markers into one chooser.
+const MAX_LINE_TARGETS: usize = 200;
+
+/// One marker per target on `line`, all with `icon`: one target jumps, several open the chooser.
+pub(crate) fn line_markers(line: u32, icon: &str, tooltip: &str, targets: Vec<openidea_plugin::Location>) -> Vec<openidea_plugin::providers::LineMarker> {
+    let targets: Vec<_> = targets.into_iter().filter(|target| target.range.start != target.range.end).collect();
+    let tooltip = match targets.len() > MAX_LINE_TARGETS {
+        true => format!("{tooltip} (first {MAX_LINE_TARGETS} of {})", targets.len()),
+        false => tooltip.to_owned(),
+    };
+    targets
+        .into_iter()
+        .take(MAX_LINE_TARGETS)
+        .map(|target| openidea_plugin::providers::LineMarker { line, icon: Some(icon.into()), tooltip: tooltip.clone(), target: Some(target) })
+        .collect()
+}
 
 mod navigation;
 mod table_navigation;
@@ -26,14 +42,15 @@ use openidea_plugin::host;
 use openidea_plugin::providers::{CompletionItem, Document, Providers};
 use openidea_plugin::text::offset;
 use openidea_plugin::views::{Body, Button, TreeItem, View, ViewEvent, Viewport, Views};
-use openidea_plugin::{Diagnostic, Error, Event, Invocation, NotificationLevel, Plugin, Position, Project};
+use openidea_plugin::{Diagnostic, Error, Event, Invocation, NotificationLevel, Plugin, Position, Project, StatusItem};
 use spring_text::config::is_config_file;
-use spring_text::index::project_of;
+use spring_text::index::{glob_matches, project_of};
 
 use config::{Config, is_flyway_config, load, location_glob, migration_files, vendor_prefixes};
-use naming::{Kind, Name, next_version, parse, version_key};
+use naming::{Kind, Name, next_version, numeric_key, parse, version_key};
 
 const TITLE: &str = "Flyway";
+const PLUGIN: &str = "Flyway Migrations";
 
 #[derive(Default)]
 pub struct Flyway {
@@ -59,7 +76,33 @@ pub struct Flyway {
     targets_root: Option<String>,
     /// Migration file by tree item key, from the last render of the migrations view.
     targets: BTreeMap<String, String>,
+    /// Local migration inventory and checks by project root.
+    local: BTreeMap<String, Local>,
+    local_root: Option<String>,
+    /// Migration file by local row key (`l:<n>`), from the last local render.
+    local_targets: BTreeMap<String, String>,
+    /// Whether migration files carry notes from the accepted Info result.
+    info_noted: bool,
+    /// Table cells by migrations row key (`l:` local, `m:` Info), for the packaged view's columns.
+    row_cells: BTreeMap<String, Vec<String>>,
 }
+
+#[derive(Clone, PartialEq)]
+struct Local {
+    naming: naming::Naming,
+    locations: Vec<String>,
+    files: Vec<String>,
+    results: BTreeMap<String, Vec<Diagnostic>>,
+}
+
+fn configured(project: &Project) -> bool {
+    config::CONFIG_FILES.iter().any(|file| project.exists(file).unwrap_or(false))
+}
+
+/// Project-tree note set for Info states on migration files.
+const INFO_NOTES: &str = "flyway-info";
+/// Window status item showing the best-known target database.
+const STATUS_ITEM: &str = "flyway-target";
 
 /// The configured runner and its arguments for a goal; `json` asks for machine-readable output.
 fn runner_args(goal: &str, json: bool) -> (&'static str, Vec<String>) {
@@ -86,6 +129,31 @@ fn root_relative<'a>(path: &'a str, root: &str) -> &'a str {
 fn refresh_migrations() {
     ui_kit::web::refresh_view("migrations", include_str!("ui_config.json"));
 }
+fn notify_runner_denied(goal: &str) {
+    let (program, _) = runner_args(goal, false);
+    host::notify(NotificationLevel::Warning, TITLE, &ui_kit::denied::message("Running Flyway", &format!("process:{program}"), PLUGIN));
+}
+/// Shows the confirmation's redacted target hint in the window's status bar while the
+/// project has a Flyway config file; clicking opens the Flyway panel.
+fn update_status(ctx: &Invocation) {
+    let Some(project) = ctx.project() else { return };
+    let item = open_root(&project).and_then(|_| execution::status_target(&project)).map(|target| match target {
+        Some((short, hint)) => StatusItem {
+            text: format!("Flyway: {short}"),
+            tooltip: Some(format!("Target database: {hint}. Click to open the Flyway panel.")),
+            command: Some("show-migrations".into()),
+        },
+        None => StatusItem {
+            text: "Flyway".into(),
+            tooltip: Some("Target database unknown from the project's Flyway config files. Click to open the Flyway panel.".into()),
+            command: Some("show-migrations".into()),
+        },
+    });
+    let _ = match item {
+        Some(item) => host::set_window_status_item(STATUS_ITEM, &item),
+        None => host::remove_window_status_item(STATUS_ITEM),
+    };
+}
 fn open_root(project: &Project) -> Option<String> {
     let root = project.root().ok()?;
     (root.starts_with('/') && !root.chars().any(char::is_control)
@@ -94,17 +162,103 @@ fn open_root(project: &Project) -> Option<String> {
         .then_some(root)
 }
 impl Flyway {
+    fn drop_info(&mut self) {
+        self.info_cache = None;
+        self.info_scope = None;
+        self.targets.clear();
+        self.targets_root = None;
+        self.clear_info_notes();
+    }
+    fn clear_info_notes(&mut self) {
+        if std::mem::take(&mut self.info_noted) {
+            let _ = host::clear_file_decorations(INFO_NOTES);
+        }
+    }
+    fn show_info_notes(&mut self, notes: &BTreeMap<String, String>) {
+        // ponytail: one shared set, matching the single cached Info result.
+        self.clear_info_notes();
+        self.info_noted = !notes.is_empty();
+        for (path, note) in notes.iter().take(2_000) {
+            if host::set_file_note(path, INFO_NOTES, note, Some("State from the last Flyway Info run")).is_err() {
+                break;
+            }
+        }
+    }
     fn scan(&mut self, project: &Project) -> (Config, Vec<String>, BTreeMap<String, Vec<Diagnostic>>) {
         let config = load(project);
         let files = migration_files(project, &config);
+        self.analyse(project, config, files)
+    }
+
+    fn analyse(&mut self, project: &Project, config: Config, files: Vec<String>) -> (Config, Vec<String>, BTreeMap<String, Vec<Diagnostic>>) {
         self.navigation.warm(project, &config);
         self.table_navigation.warm(project, &files);
         let root = project.root().unwrap_or_default();
         self.placeholders.insert(root.clone(), config.placeholders.clone());
         self.placeholder_syntax.insert(root.clone(), config.placeholder_syntax.clone());
-        let vendors = vendor_prefixes(&config.locations, &root);
-        let results = checks::check(&root, &files, &config.naming, &vendors);
+        let results = self.record_local(&root, &config, &files);
         (config, files, results)
+    }
+
+    fn record_local(&mut self, root: &str, config: &Config, files: &[String]) -> BTreeMap<String, Vec<Diagnostic>> {
+        let vendors = vendor_prefixes(&config.locations, root);
+        let results = checks::check(root, files, &config.naming, &vendors);
+        let local = Local { naming: config.naming.clone(), locations: config.locations.clone(), files: files.to_vec(), results: results.clone() };
+        self.local.insert(root.to_owned(), local);
+        results
+    }
+
+    /// A Flyway project has a Flyway config file or migration files; the inventory is computed once, then kept current by events.
+    pub(crate) fn flyway_project(&mut self, project: &Project) -> bool {
+        if configured(project) {
+            return true;
+        }
+        let Ok(root) = project.root() else { return false };
+        if !self.local.contains_key(&root) {
+            let config = load(project);
+            let files = migration_files(project, &config);
+            self.record_local(&root, &config, &files);
+        }
+        self.local.get(&root).is_some_and(|local| !local.files.is_empty())
+    }
+
+    /// Drops a cached "no migrations" result when a config file or a file in its locations changes.
+    fn forget_empty_inventory(&mut self, path: &str) {
+        let config = is_flyway_config(path) || is_config_file(path);
+        self.local.retain(|root, local| {
+            let Some(relative) = path.strip_prefix(&format!("{}/", root.trim_end_matches('/'))) else { return true };
+            let in_location = || local.locations.iter().filter_map(|location| location_glob(location, root)).any(|glob| glob_matches(&glob, relative));
+            !(local.files.is_empty() && (config || in_location()))
+        });
+    }
+
+    /// The file behind a migrations tree row, still owned by `root`.
+    fn target(&self, root: &str, key: &str) -> Option<String> {
+        let path = if key.starts_with("l:") {
+            self.local_targets.get(key).filter(|_| self.local_root.as_deref() == Some(root))
+        } else {
+            self.targets.get(key).filter(|_| {
+                self.info_scope.as_ref().is_some_and(|scope| scope.settings_current(root)) && self.targets_root.as_deref() == Some(root)
+            })
+        }?;
+        (host::project_of(path).and_then(|project| project.root().ok()).as_deref() == Some(root)).then(|| path.clone())
+    }
+
+    /// Render may poll the owned managed child (never start one) so a finished Info lands without another click.
+    fn poll_owned(&mut self, project: &Project, root: &str) {
+        for _ in 0..4 {
+            if !self.execution.running(root) {
+                return;
+            }
+            match self.execution.poll(root) {
+                Ok(Some(finished)) => {
+                    let _ = self.accept_finished(project, finished);
+                    return;
+                }
+                Ok(None) => {}
+                Err(_) => return,
+            }
+        }
     }
 
     fn publish(&mut self, root: &str, results: &BTreeMap<String, Vec<Diagnostic>>, everything: bool) {
@@ -151,8 +305,6 @@ impl Flyway {
         let naming = &config.naming;
         let root = project.root()?;
 
-        let numeric_key =
-            |version: &str| -> Vec<(usize, String)> { version_key(version).into_iter().map(|part| (part.len(), part)).collect() };
         let mut versions: Vec<String> = Vec::new();
         let mut highest: Option<(Vec<(usize, String)>, &str)> = None;
         for path in &files {
@@ -198,7 +350,8 @@ impl Flyway {
                 NotificationLevel::Warning,
                 TITLE,
                 &format!(
-                    "Next migration: {next}<description>{suffix} in {directory}. Allow the clipboard for Flyway Migrations in Settings › Plugins to copy it."
+                    "Next migration: {next}<description>{suffix} in {directory}. {}",
+                    ui_kit::denied::message("Copying it", "clipboard", PLUGIN)
                 ),
             ),
             Err(e) => return Err(e),
@@ -209,14 +362,7 @@ impl Flyway {
     fn run_flyway(&mut self, goal: &str, ctx: &Invocation) -> Result<Option<String>, Error> {
         match self.execution.start(ctx, goal, false, false) {
             Ok(()) | Err(Error::Cancelled) => {}
-            Err(Error::Denied(_)) => {
-                let (program, _) = runner_args(goal, false);
-                host::notify(
-                    NotificationLevel::Warning,
-                    TITLE,
-                    &format!("Allow running {program} for Flyway Migrations in Settings › Plugins."),
-                );
-            }
+            Err(Error::Denied(_)) => notify_runner_denied(goal),
             Err(error) => return Err(error),
         }
         Ok(None)
@@ -227,18 +373,19 @@ impl Flyway {
             return Err(Error::Stale);
         }
         if finished.goal == "info" {
-            // Explicit Status may read bounded source proof; automatic render never does.
+            // Accepting reads the bounded source proof (Status or a render poll); it never runs a command.
             if execution::info_scope(&project).as_ref().ok() != Some(&finished.proof) {
-                self.info_cache = None;self.info_scope = None;self.targets.clear();self.targets_root = None;
+                self.drop_info();
                 refresh_migrations();
                 return Err(Error::Stale);
             }
+            self.clear_info_notes();
             self.info_scope = Some(finished.proof.clone());
             self.info_at = Some(std::time::Instant::now());
             self.targets.clear();
             self.targets_root = Some(root.clone());
             let view = if let Some(error) = finished.info_error {
-                View::message(error).button(Button::new("refresh", "Refresh…").icon("refresh"))
+                View::message(error).button(Button::new("refresh", "Run Info…").icon("refresh"))
             } else {
                 self.accept_info(&project, finished.output, &finished.redactor)
             };
@@ -264,7 +411,12 @@ impl Plugin for Flyway {
         Ok(())
     }
     fn run_command(&mut self, id: &str, ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
+        update_status(ctx);
         match id {
+            "show-migrations" => {
+                ui_kit::web::reveal_view("migrations", include_str!("ui_config.json"))?;
+                Ok(None)
+            }
             "hibernate-schema" => self.generate_hibernate_schema(ctx),
             "review-comparison" => {
                 self.comparison.begin(ctx)?;
@@ -318,13 +470,17 @@ impl Plugin for Flyway {
                 || self.targets.values().any(|source|source==path || !path.is_empty() && source.starts_with(&format!("{}/",path.trim_end_matches('/'))))),
             _ => false,
         }));
-        if affected {self.info_cache=None;self.info_scope=None;self.targets.clear();self.targets_root=None;refresh_migrations();}
+        if affected {self.drop_info();refresh_migrations();}
         for event in events {
-            if let Event::FileSaved(path) = event { self.table_navigation.invalidate(path); }
+            if let Event::FileSaved(path) = event {
+                self.table_navigation.invalidate(path);
+                self.forget_empty_inventory(path);
+            }
             if let Event::FilesChanged(batch) = event {
                 for path in batch.created.iter().chain(&batch.modified).chain(&batch.removed) {
                     self.navigation.invalidate(path);
                     self.table_navigation.invalidate(path);
+                    self.forget_empty_inventory(path);
                 }
             }
         }
@@ -343,13 +499,31 @@ impl Plugin for Flyway {
             _ => None,
         });
         let Some(path) = qualifying else { return };
+        update_status(_ctx);
         let Some(project) = project_of(path) else {
             return;
         };
 
-        let (_, _, results) = self.scan(&project);
         let root = project.root().unwrap_or_default();
+        let prefix = format!("{}/", root.trim_end_matches('/'));
+        let flyway = configured(&project) || self.flagged.iter().any(|path| path.starts_with(&prefix));
+        let before = self.local.get(&root).cloned();
+        // A project already found without migrations is not searched again until config or a location changes.
+        if !flyway && before.as_ref().is_some_and(|local| local.files.is_empty()) {
+            return;
+        }
+        let config = load(&project);
+        let files = migration_files(&project, &config);
+        if !flyway && files.is_empty() {
+            self.record_local(&root, &config, &files);
+            return;
+        }
+
+        let (_, _, results) = self.analyse(&project, config, files);
         self.publish(&root, &results, false);
+        if self.local.get(&root) != before.as_ref() {
+            refresh_migrations();
+        }
     }
 }
 
@@ -437,24 +611,85 @@ impl Flyway {
     }
 
     fn migrations_view(&mut self, project: &Project) -> View {
-        let Some(root) = open_root(project) else {return View::message("Current project identity is unavailable; cached Flyway info withheld.");};
+        let Some(root) = open_root(project) else {return View::message("This project is not open in this window. Reopen it to see its Flyway migrations.");};
+        if self.info_cache.as_ref().is_some_and(|(owner, _)| owner == &root) && !self.info_scope.as_ref().is_some_and(|scope| scope.settings_current(&root)) {
+            self.clear_info_notes();
+        }
         let shown = match self.info_cache.as_ref().filter(|(owner, _)| owner == &root && self.info_scope.as_ref().is_some_and(|scope|scope.settings_current(&root))) {
             Some((_, cached)) => {
                 let mut shown = cached.clone();
-                shown.status = Some(format!("Captured Info · {}s ago · {}", self.info_at.map(|at|at.elapsed().as_secs()).unwrap_or(0), shown.status.as_deref().unwrap_or("source-linked rows")));
+                shown.status = Some(format!("Flyway Info from {}s ago · {}", self.info_at.map(|at|at.elapsed().as_secs()).unwrap_or(0), shown.status.as_deref().unwrap_or("Run Info… to update")));
                 shown
             }
-            None => View::message("No explicit Flyway info result for this project. Refresh Info starts an approved managed command; opening/rendering never connects to a database.")
-                .button(Button::new("refresh", "Refresh…").icon("refresh")),
+            None => self.local_view(project, &root),
         };
         let mut shown = shown;
         if let Some(status) = self.execution.migration_status(&root) {
-            shown.status = Some(format!("{} · Captured instance command status: {status}",shown.status.as_deref().unwrap_or("No accepted Info snapshot")));
+            shown.status = Some(format!("{} · Command status: {status}",shown.status.as_deref().unwrap_or("No Info result yet")));
         }
         shown.button(Button::new("execution-output", "Output").icon("terminal"))
     }
+    /// Local migrations from the last scan (version, description, kind, problems); Info replaces it once captured.
+    fn local_view(&mut self, project: &Project, root: &str) -> View {
+        if !self.local.contains_key(root) && self.flyway_project(project) {
+            self.scan(project);
+        }
+        let refresh = Button::new("refresh", "Run Info…").icon("refresh");
+        let Some(local) = self.local.get(root) else { return View::message("Could not list local migrations.").button(refresh) };
+        let mut rows = Vec::new();
+        for path in &local.files {
+            let file_name = path.rsplit('/').next().unwrap_or(path);
+            let (rank, order, label, kind_name, version, description) = match parse(file_name, &local.naming) {
+                Name::Migration { kind, version, description } => {
+                    let (prefix, kind_name) = match kind {
+                        Kind::Versioned => (&local.naming.versioned, "Versioned"),
+                        Kind::Undo => (&local.naming.undo, "Undo"),
+                        Kind::Baseline => (&local.naming.baseline, "Baseline"),
+                        Kind::Repeatable => (&local.naming.repeatable, "Repeatable"),
+                    };
+                    let text = format!("{prefix}{version} {}", description.replace('_', " ")).trim_end().to_owned();
+                    (usize::from(kind == Kind::Repeatable), numeric_key(&version), text, kind_name, version, description.replace('_', " "))
+                }
+                Name::Invalid(_) => (2, Vec::new(), file_name.to_owned(), "Invalid", String::new(), file_name.to_owned()),
+                Name::Callback | Name::NotMigration => continue,
+            };
+            let detail = match local.results.get(path).and_then(|problems| problems.first()) {
+                Some(problem) => format!("Problems · {}", problem.message),
+                None => kind_name.to_owned(),
+            };
+            let problem = local.results.get(path).and_then(|problems| problems.first()).map_or(String::new(), |problem| problem.message.clone());
+            rows.push(((rank, order, path.clone()), label, detail, vec![version, description, kind_name.to_owned(), problem]));
+        }
+        if rows.is_empty() {
+            return View::message(&format!(
+                "No local Flyway migrations in {}. Create one with New…, or press Run Info… to read the database's migration history.",
+                local.locations.join(", ")
+            ))
+            .button(refresh);
+        }
+        rows.sort();
+        let problems = rows.iter().filter(|(_, _, detail, _)| detail.starts_with("Problems · ")).count();
+        let mut status = format!("{} local migrations, {problems} with problems", rows.len());
+        if let Some((indexed, total)) = self.table_navigation.coverage(root).filter(|(indexed, total)| indexed < total) {
+            status.push_str(&format!(" · table navigation covers {indexed} of {total} migrations"));
+        }
+        status.push_str(" · Run Info… adds the database state");
+        self.local_targets.clear();
+        self.local_root = Some(root.to_owned());
+        self.row_cells.retain(|key, _| !key.starts_with("l:"));
+        let mut items = Vec::new();
+        for (index, ((_, _, path), label, detail, cells)) in rows.into_iter().enumerate() {
+            let key = format!("l:{index}");
+            self.row_cells.insert(key.clone(), cells);
+            let icon = if detail.starts_with("Problems · ") { "warning" } else { "file" };
+            items.push(TreeItem::new(&key, &label).detail(&detail).icon(icon));
+            self.local_targets.insert(key, path);
+        }
+        View::new(Body::Tree(items)).button(refresh).status(&status)
+    }
+
     fn accept_info(&mut self, project: &Project, output: openidea_plugin::ProcessOutput, redactor: &execution::Redactor) -> View {
-        let refresh = Button::new("refresh", "Refresh…").icon("refresh");
+        let refresh = Button::new("refresh", "Run Info…").icon("refresh");
         if output.status != Some(0) {
             let reason = output.stderr.trim();
             let reason = if reason.is_empty() { output.stdout.trim() } else { reason };
@@ -468,21 +703,31 @@ impl Flyway {
             Err(message) => return View::message(&message).button(refresh),
         };
         if migrations.is_empty() {
-            return View::message("Flyway reports no migrations.").button(refresh);
+            return View::message("Flyway reports no migrations. Create one with Flyway: New Migration…, then Run Info… again.").button(refresh);
         }
 
         let config = load(project);
         let files = migration_files(project, &config);
         self.targets.clear();
+        self.row_cells.retain(|key, _| !key.starts_with("m:"));
         let mut items = Vec::new();
+        let mut notes = BTreeMap::new();
         for (index, migration) in migrations.iter().enumerate() {
             let key = format!("m:{index}");
             if let Some(path) = self.migration_file(project, &files, migration, &config.naming) {
+                // Info lists history in order, so a file's latest row wins.
+                match migration.note() {
+                    Some(note) => notes.insert(path.clone(), note),
+                    None => notes.remove(&path),
+                };
                 self.targets.insert(key.clone(), path);
             }
             items.push(TreeItem::new(&key, &redactor.label(&migration.label)).detail(migration.state).icon(migration.icon));
+            let kind = match migration.kind { Kind::Versioned => "Versioned", Kind::Undo => "Undo", Kind::Baseline => "Baseline", Kind::Repeatable => "Repeatable" };
+            self.row_cells.insert(key, vec![redactor.label(&migration.version), redactor.label(&migration.description), kind.into(), migration.state.into(), migration.installed_on.clone().unwrap_or_default()]);
         }
 
+        self.show_info_notes(&notes);
         let pending = migrations.iter().filter(|m| m.state == "Pending").count();
         View::new(Body::Tree(items)).button(refresh).status(&format!("{} migrations, {pending} pending", migrations.len()))
     }
@@ -497,7 +742,8 @@ impl Views for Flyway {
             let Some(project) = ctx.project() else {
                 return Ok(View::message("Open a project to see its Flyway migrations."));
             };
-            let Some(root) = open_root(&project) else {return Ok(View::message("Current project identity is unavailable; cached Flyway state withheld."));};
+            let Some(root) = open_root(&project) else {return Ok(View::message("This project is not open in this window. Reopen it to see its Flyway migrations."));};
+            self.poll_owned(&project, &root);
             if view == execution::VIEW {
                 return Ok(self.execution.view(&root));
             }
@@ -528,6 +774,7 @@ impl Views for Flyway {
                         self.poll_execution(_ctx)?;
                     }
                     Err(Error::Cancelled) => {}
+                    Err(Error::Denied(_)) => notify_runner_denied("info"),
                     Err(error) => return Err(error),
                 }
                 ui_kit::web::refresh_view(view, include_str!("ui_config.json"));
@@ -540,14 +787,8 @@ impl Views for Flyway {
                 ui_kit::web::refresh_view(execution::VIEW, include_str!("ui_config.json"));
             }
             ViewEvent::Activate(key) => {
-                if let Some(path) = self.targets.get(&key).filter(|path| {
-                    _ctx.project().and_then(|project| project.root().ok()).is_some_and(|root| {
-                        self.info_scope.as_ref().is_some_and(|scope|scope.settings_current(&root))
-                            && self.targets_root.as_deref() == Some(root.as_str())
-                            && host::project_of(path).and_then(|project| project.root().ok()).as_deref() == Some(root.as_str())
-                    })
-                }) {
-                    if let Err(e) = host::open_location(path, 0, 0) {
+                if let Some(path) = _ctx.project().and_then(|project| project.root().ok()).and_then(|root| self.target(&root, &key)) {
+                    if let Err(e) = host::open_location(&path, 0, 0) {
                         host::notify(NotificationLevel::Warning, TITLE, &format!("Could not open {path}: {e}"));
                     }
                 }
@@ -559,7 +800,7 @@ impl Views for Flyway {
 }
 
 // API 1.3 registers the optional exports on the same component.
-openidea_plugin::register_plugin!(Flyway, providers, views, indexing, file_actions, run_configurations);
+openidea_plugin::register_plugin!(Flyway, providers, views, file_actions, run_configurations);
 
 #[cfg(test)]
 mod tests {
@@ -657,6 +898,61 @@ mod tests {
     }
 
     #[test]
+    fn non_flyway_project_event_does_no_scan() {
+        let host = MockHost::install();
+        host.add_file("scripts/seed.sql", "CREATE TABLE seed(id int);");
+        host.add_file("src/main/resources/application.properties", "server.port=8080\n");
+        let mut flyway = Flyway::default();
+        flyway.handle_events(&[Event::FileOpened("/project/scripts/seed.sql".into())], &host.invocation());
+        flyway.handle_events(&[Event::FileSaved("/project/src/main/resources/application.properties".into())], &host.invocation());
+        assert!(flyway.scanned.is_empty() && flyway.placeholders.is_empty());
+        assert!(flyway.table_navigation.coverage("/project").is_none());
+        assert!(host.diagnostics().is_empty());
+        host.add_file("src/main/resources/db/custom/V1__a.sql", "CREATE TABLE a(id int);");
+        host.add_file("src/main/resources/application.properties", "spring.flyway.locations=classpath:db/custom\n");
+        flyway.handle_events(&[Event::FileOpened("/project/scripts/seed.sql".into())], &host.invocation());
+        assert!(flyway.local["/project"].files.is_empty(), "the cached empty result skips the migration search");
+        flyway.handle_events(&[Event::FileSaved("/project/src/main/resources/application.properties".into())], &host.invocation());
+        assert!(flyway.scanned.contains("/project"), "a config file event drops the cached empty result");
+        let mut flyway = Flyway::default();
+        host.add_file("src/main/resources/application.properties", "server.port=8080\n");
+        flyway.handle_events(&[Event::FileOpened("/project/scripts/seed.sql".into())], &host.invocation());
+        host.add_file("src/main/resources/db/migration/V1__init.sql", "CREATE TABLE b(id int);");
+        flyway.handle_events(&[Event::FileOpened("/project/scripts/seed.sql".into())], &host.invocation());
+        assert!(flyway.scanned.is_empty());
+        let created = openidea_plugin::FilesChanged { created: vec!["/project/src/main/resources/db/migration/V1__init.sql".into()], ..Default::default() };
+        flyway.handle_events(&[Event::FilesChanged(created)], &host.invocation());
+        assert!(flyway.scanned.contains("/project"), "a new file in a migration location drops the cached empty result");
+    }
+
+    #[test]
+    fn view_lists_local_migrations_without_info() {
+        let host = host();
+        host.add_file("src/main/resources/db/migration/V3__function.sql", "CREATE FUNCTION f() RETURNS int AS $$ select 1 $$;");
+        host.on_process("flyway", |_, _| panic!("rendering never runs Flyway"));
+        let mut flyway = Flyway::default();
+        let view = flyway.render("migrations", None, &host.invocation()).unwrap();
+        let status = view.status.clone().unwrap();
+        assert!(status.contains("4 local migrations, 3 with problems"), "{status}");
+        assert!(status.contains("table navigation covers 3 of 4 migrations"), "{status}");
+        let Body::Tree(items) = view.body else { panic!("local migrations tree") };
+        let row = |label: &str| items.iter().find(|item| item.key.starts_with("l:") && item.label == label).unwrap_or_else(|| panic!("{label}: {items:?}"));
+        assert_eq!(row("V1 init").detail.as_deref(), Some("Problems · Version 1 is also used by src/main/resources/db/migration/V1_0__again.sql."));
+        assert!(row("V1_0 again").detail.as_deref().unwrap().starts_with("Problems · "));
+        assert!(row("V2_bad.sql").detail.as_deref().unwrap().starts_with("Problems · "));
+        assert_eq!(row("V3 function").detail.as_deref(), Some("Versioned"));
+        assert_eq!(row("V3 function").parent.as_deref(), Some("state:Versioned"));
+        assert_eq!(row("V1 init").parent.as_deref(), Some("state:Problems"));
+        let key = row("V3 function").key.clone();
+        flyway.handle("migrations", ViewEvent::Activate(key.clone()), &host.invocation()).unwrap();
+        flyway.handle("migrations", ViewEvent::Select(key), &host.invocation()).unwrap();
+        flyway.handle("migrations", ViewEvent::Button("browser-open".into()), &host.invocation()).unwrap();
+        let opened: Vec<String> = host.opened_locations().into_iter().map(|location| location.0).collect();
+        assert_eq!(opened, [format!("{DIR}/V3__function.sql"), format!("{DIR}/V3__function.sql")]);
+        assert!(host.process_runs().is_empty());
+    }
+
+    #[test]
     fn check_command_publishes_and_summarises() {
         let host = host();
         Flyway::default().run_command("check", &host.invocation(), None).unwrap();
@@ -692,7 +988,7 @@ mod tests {
         assert_eq!(Flyway::default().run_command("copy-next-version", &host.invocation(), None).unwrap(), None);
         assert_eq!(
             host.notifications()[0].body,
-            "Next migration: V8__<description>.sql in src/main/resources/db/migration. Allow the clipboard for Flyway Migrations in Settings › Plugins to copy it."
+            "Next migration: V8__<description>.sql in src/main/resources/db/migration. Copying it needs the clipboard permission. Allow it in Settings › Plugins › Flyway Migrations."
         );
     }
 
@@ -726,6 +1022,7 @@ mod tests {
         assert!(host.terminals().is_empty());
 
         host.answer_next_prompt(Some(&[]));
+        host.answer_next_prompt(Some(&["clean"]));
         flyway.run_command("clean", &host.invocation(), None).unwrap();
         assert_eq!(host.terminals()[0].args, ["clean"]);
     }
@@ -745,7 +1042,7 @@ mod tests {
         let host = MockHost::install().with_capabilities(&["project.read", "events"]);
         host.answer_next_prompt(Some(&["yes"]));
         assert_eq!(Flyway::default().run_command("validate", &host.invocation(), None).unwrap(), None);
-        assert_eq!(host.notifications()[0].body, "Allow running flyway for Flyway Migrations in Settings › Plugins.");
+        assert_eq!(host.notifications()[0].body, "Running Flyway needs the process:flyway permission. Allow it in Settings › Plugins › Flyway Migrations.");
     }
 
     #[test]
@@ -804,7 +1101,7 @@ mod tests {
         match project.run_process(runner, &args, None) {
             Ok(output) => flyway.accept_info(&project, output, &execution::Redactor::default()),
             Err(Error::Denied(_)) => {
-                View::message(&format!("Allow running {runner} for Flyway Migrations in Settings › Plugins to list migrations."))
+                View::message(&ui_kit::denied::message("Listing migrations", &format!("process:{runner}"), PLUGIN))
             }
             Err(error) => View::message(&format!("Could not run {runner}: {error}")),
         }
@@ -858,7 +1155,7 @@ mod tests {
         host.on_process("flyway", |_, _| {
             Ok(openidea_plugin::ProcessOutput { status: Some(0), stdout: "{\"migrations\":[]}".into(), stderr: String::new() })
         });
-        assert_eq!(message(&host), "Flyway reports no migrations.");
+        assert_eq!(message(&host), "Flyway reports no migrations. Create one with Flyway: New Migration…, then Run Info… again.");
 
         host.on_process("flyway", |_, _| {
             Ok(openidea_plugin::ProcessOutput { status: Some(0), stdout: "not json".into(), stderr: String::new() })
@@ -874,7 +1171,7 @@ mod tests {
         assert!(message(&host).contains("flyway"));
 
         let denied = MockHost::install().with_capabilities(&["project.read", "events"]);
-        assert_eq!(message(&denied), "Allow running flyway for Flyway Migrations in Settings › Plugins to list migrations.");
+        assert_eq!(message(&denied), "Listing migrations needs the process:flyway permission. Allow it in Settings › Plugins › Flyway Migrations.");
     }
 
     #[test]
@@ -1014,6 +1311,18 @@ mod custom_group_tests {
         serde_json::from_str(&host.view_messages().last().unwrap().1).unwrap()
     }
     #[test]
+    fn packaged_migrations_view_shows_local_migrations_as_columns() {
+        let host=MockHost::install().with_capabilities(&["storage","project.read"]);
+        host.add_file("flyway.conf","flyway.locations=filesystem:db/migration");
+        host.add_file("db/migration/V1__create_users.sql","select 1;");
+        let mut plugin=Flyway::default();
+        let rendered=request(&mut plugin,&host,json!({"op":"render"}));
+        let body=&rendered["model"]["body"];
+        assert_eq!(body["kind"],"resources","{rendered}");
+        assert_eq!(body["columns"],json!(["Version","Description","Type","Problems"]));
+        assert_eq!(body["items"][0]["cells"],json!(["1","create users","Versioned",""]));
+    }
+    #[test]
     fn one_custom_container_routes_tabs_and_rejects_hidden_tab_mutations_without_cli() {
         let host=MockHost::install().with_capabilities(&["storage","project.read"]);
         let mut plugin=Flyway::default();
@@ -1032,11 +1341,23 @@ mod custom_group_tests {
 }
 
 #[cfg(test)]
+mod indexer_guard {
+    /// Table/entity/migration links stay definition navigation: as Rename anchors they would rewrite
+    /// applied migrations (immutable Flyway history) and dialect-folded or class-derived names.
+    #[test]
+    fn no_document_indexer_is_contributed() {
+        let manifest = include_str!("../plugin.toml");
+        assert!(!manifest.contains("[[contributes.documentIndexers]]"));
+        assert!(!include_str!("lib.rs").contains(concat!("views, ", "indexing")));
+    }
+}
+
+#[cfg(test)]
 mod marker_icon_guard {
     #[test]
     fn marker_icons_are_declared_in_the_manifest() {
         let manifest = include_str!("../plugin.toml");
-        for icon in [crate::PLACEHOLDER_MARKER] {
+        for icon in [crate::PLACEHOLDER_MARKER, crate::TABLE_MARKER] {
             assert!(manifest.contains(&format!("icon = \"{icon}\"")), "{icon}");
             assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(icon).is_file(), "{icon}");
         }

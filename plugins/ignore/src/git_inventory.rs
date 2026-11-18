@@ -184,10 +184,10 @@ impl PositiveSamples {
 impl State {
     pub(crate) fn positive_samples(&self, ctx: &Invocation) -> Result<PositiveSamples, Error> {
         let (project, root) = owner(ctx)?;
-        if self.job.as_ref().is_some_and(|job| job.scope.root == root) { return Err(invalid("Wait for the explicit Git collection to finish first.")); }
-        let snapshot = self.snapshots.get(&root).ok_or_else(|| invalid("No scoped positive Git observations. Run the explicit collection first."))?;
+        if self.job.as_ref().is_some_and(|job| job.scope.root == root) { return Err(invalid("Wait for Ignore: Scan Git for Ignored Files… to finish first.")); }
+        let snapshot = self.snapshots.get(&root).ok_or_else(|| invalid("No Git scan yet. Run Ignore: Scan Git for Ignored Files… first."))?;
         if snapshot.state != "Partial" || snapshot.at.elapsed() >= TTL { return Err(Error::Stale); }
-        let proof = snapshot.scope.as_ref().ok_or_else(|| invalid("Only successful-exit scoped observations can publish hints; bounded/error samples stay review-only."))?;
+        let proof = snapshot.scope.as_ref().ok_or_else(|| invalid("The last Git scan stopped early, so its files can't be marked. Run Ignore: Scan Git for Ignored Files… again."))?;
         let result = PositiveSamples { root, paths: snapshot.paths.iter().take(crate::file_hints::MAX_FILES).cloned().collect(), observed: snapshot.paths.len(), scope: proof.clone(), at: snapshot.at };
         result.validate(&project)?;
         Ok(result)
@@ -424,7 +424,7 @@ impl State {
             };
         }
         let Some(s) = self.snapshots.get(&root) else {
-            return "Git observations: Not scanned (explicit opt-in required)".into();
+            return "Git observations: Not scanned. Run Ignore: Scan Git for Ignored Files…".into();
         };
         format!(
             "Git observations: {} · {} observed samples · {}",
@@ -445,14 +445,14 @@ impl State {
         let summary = self.summary(ctx);
         let snapshot = self.snapshots.get(&root);
         if snapshot.is_none() && !self.job.as_ref().is_some_and(|job| job.scope.root == root) {
-            return Err(invalid("No cached observations for this project. Start an explicit scan first."));
+            return Err(invalid("No Git scan for this project yet. Run Ignore: Scan Git for Ignored Files… first."));
         }
         let paths = snapshot.map(|s| s.paths.as_slice()).unwrap_or(&[]);
         let mut rows = vec![PickItem::new("status", &summary)];
         if let Some(snapshot) = snapshot {
             let provenance = match snapshot.scope.as_ref() {
                 Some(captured) => format!("Historical capture: HEAD {}; snapshot {}. Root-ignore/exclude/index proof only; no full recursive-source or current-policy proof.", captured.commit.as_deref().unwrap_or("unknown").chars().filter(|c|!c.is_control()).take(80).collect::<String>(),snapshot.state),
-                None => "Historical samples without a successful-exit capture proof; bounded/error samples remain review-only.".into(),
+                None => "The scan stopped early; these files can be listed but not marked.".into(),
             };
             rows.push(PickItem::new("provenance",&provenance));
         }
@@ -880,7 +880,7 @@ mod tests {
         assert!(status.contains("2 historical positive") && status.contains("partial"));
         let hints=h.file_decorations();assert_eq!(hints.len(),2);
         assert!(hints.keys().all(|(_,path)|path.starts_with("/project/target/")));
-        for value in hints.values(){assert_eq!(value.style,"muted");assert_eq!(value.badge.as_deref(),Some("I"));let tip=value.tooltip.as_ref().unwrap();assert!(tip.contains("Historical")&&tip.contains("may be stale")&&tip.contains("Not current/effective Git status"));}
+        for value in hints.values(){assert_eq!(value.style,"muted");assert_eq!(value.badge.as_deref(),Some("I"));let tip=value.tooltip.as_ref().unwrap();assert!(tip.contains("last scan")&&tip.contains("may be stale")&&tip.contains("not the current Git status"));}
         assert!(h.process_runs().is_empty());
         p.run_command("clear-git-sample-hints",&h.invocation(),None).unwrap();assert!(h.file_decorations().is_empty());
     }

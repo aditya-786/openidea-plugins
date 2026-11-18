@@ -5,7 +5,6 @@ use openidea_plugin::file_actions::FileAction;
 
 const PREFIX: &str = "spring-property:";
 const TITLE: &str = "Move annotation string to property…";
-const MAX_SOURCE: usize = 8 * 1024;
 #[derive(Clone)]
 struct Pending {
     root: String,
@@ -28,7 +27,6 @@ fn normalized(path: &str) -> bool {
 fn literal(doc: &Document, at: usize) -> Option<(Range, String, String)> {
     if doc.language != "java"
         || !doc.path.ends_with(".java")
-        || doc.text.len() > MAX_SOURCE
         || !normalized(&doc.path)
     {
         return None;
@@ -90,8 +88,7 @@ fn target(project: &openidea_plugin::Project, root: &str, path: &str) -> Result<
     let text = project.read_file(path)?;
     // The shared navigation parser does not decode Java-properties key escapes.
     // Refuse that ambiguity, continued lines and BOM/CR-only/mixed-newline files.
-    if text.len() > MAX_SOURCE
-        || text.starts_with('\u{feff}')
+    if text.starts_with('\u{feff}')
         || text
             .chars()
             .any(|c| c.is_control() && !matches!(c, '\t' | '\r' | '\n'))
@@ -105,7 +102,7 @@ fn target(project: &openidea_plugin::Project, root: &str, path: &str) -> Result<
         })
         || text.contains('\r') && (text.replace("\r\n", "").contains(['\r', '\n']))
     {
-        return Err("Choose a properties file at most 8 KiB with unescaped keys, no continued lines and uniform LF or CRLF lines.".into());
+        return Err("Choose a properties file with unescaped keys, no continued lines and uniform LF or CRLF lines.".into());
     }
     Ok(text)
 }
@@ -124,6 +121,9 @@ fn encoded(value: &str) -> String {
     }
     out
 }
+/// Runs the same reviewed flow as the intention, then writes the property and
+/// applies the Java edit: the property first, so a refused Java edit leaves
+/// only an unused key behind.
 pub(crate) fn command(ctx: &Invocation) -> Result<Option<String>, Error> {
     let editor = ctx.editor().ok_or("Open a Java annotation string first.")?;
     let source = editor.document()?;
@@ -141,12 +141,38 @@ pub(crate) fn command(ctx: &Invocation) -> Result<Option<String>, Error> {
     literal(&doc, at).ok_or(
         "Put the caret inside one literal Java annotation string without escapes or placeholders.",
     )?;
-    host::notify(
-        NotificationLevel::Info,
-        "Spring Beans",
-        "Open editor intentions at this string and choose ‘Move annotation string to property…’. That action previews and applies both files atomically; this command leaves both files unchanged.",
-    );
-    Ok(None)
+    let project = host::project_of(&doc.path).ok_or("Open the Java source inside a project.")?;
+    let root = project.root()?;
+    if !normalized(&root) || !crate::cache::owned(&doc.path, &root) {
+        return Err(Error::Stale);
+    }
+    let pending = Pending { root, doc: doc.clone(), at };
+    let change = match review(&pending, &doc) {
+        Err(Error::Cancelled) => return Ok(None),
+        other => other?,
+    };
+    let current = editor.document()?;
+    if editor.path() != doc.path || current.version != doc.version || current.text != doc.text {
+        return Err(Error::Stale);
+    }
+    match project.write_file(&change.target, &change.after) {
+        Err(Error::Denied(_)) => {
+            host::notify(NotificationLevel::Warning, "Spring Beans", &ui_kit::denied::message("Adding the property", "project.write", crate::PLUGIN_NAME));
+            return Ok(None);
+        }
+        other => other?,
+    }
+    match editor.apply_edits(doc.version, &[change.source]) {
+        Ok(_) => Ok(None),
+        Err(error) => {
+            let reason = match error {
+                Error::Denied(_) => ui_kit::denied::message("Changing the Java source", "editor.write", crate::PLUGIN_NAME),
+                _ => "The Java source changed before the edit could be applied.".to_owned(),
+            };
+            host::notify(NotificationLevel::Warning, "Spring Beans", &format!("{reason} The property was added to {}.", change.target));
+            Ok(None)
+        }
+    }
 }
 pub(crate) fn actions(nav: &mut Navigator, doc: &Document, selection: Range) -> Vec<FileAction> {
     let Some(at) = offset(&doc.text, selection.start) else {
@@ -200,7 +226,24 @@ pub(crate) fn resolve(
         .pending
         .remove(action.data.as_deref().ok_or(Error::Stale)?)
         .ok_or(Error::Stale)?;
-    let project = current(&pending, doc)?;
+    let change = review(&pending, doc)?;
+    Ok(FileAction {
+        title: "Move annotation string to property".into(),
+        kind: Some("refactor".into()),
+        edits: vec![(doc.path.clone(), vec![change.source]), (change.target, vec![change.property])],
+        ..Default::default()
+    })
+}
+/// A reviewed externalization: the Java edit, the properties file, its edit and resulting text.
+struct Change {
+    source: TextEdit,
+    target: String,
+    property: TextEdit,
+    after: String,
+}
+/// Asks for the properties file and key, then confirms the changed lines of both files.
+fn review(pending: &Pending, doc: &Document) -> Result<Change, Error> {
+    let project = current(pending, doc)?;
     let (source_range, value, suggestion) = literal(doc, pending.at).ok_or(Error::Stale)?;
     let files = project.find_files("**/*.properties", 101)?;
     if files.len() > 100 {
@@ -211,8 +254,7 @@ pub(crate) fn resolve(
         .filter(|p| {
             normalized(p)
                 && crate::cache::owned(p, &pending.root)
-                && !p.contains("/target/")
-                && !p.contains("/build/")
+                && !crate::cache::build_output(p)
                 && host::project_of(p).and_then(|p| p.root().ok()).as_deref()
                     == Some(pending.root.as_str())
         })
@@ -258,10 +300,7 @@ pub(crate) fn resolve(
         range: source_range,
         text: format!("${{{key}}}"),
     };
-    let from = offset(&doc.text, source_range.start).ok_or(Error::Stale)?;
-    let to = offset(&doc.text, source_range.end).ok_or(Error::Stale)?;
-    let mut source_after = doc.text.clone();
-    source_after.replace_range(from..to, &source_edit.text);
+    let (_, source_changes) = crate::reviewed(&doc.text, std::slice::from_ref(&source_edit))?;
     let newline = if before.contains("\r\n") {
         "\r\n"
     } else {
@@ -273,34 +312,20 @@ pub(crate) fn resolve(
         newline
     };
     let added = format!("{separator}{key}={}{newline}", encoded(&value));
-    let after = format!("{before}{added}");
+    let property = TextEdit { range: range(&before, before.len(), before.len()), text: added };
+    let (after, property_changes) = crate::reviewed(&before, std::slice::from_ref(&property))?;
     let body = format!(
-        "Project: {}\nJava source: {}\nProperties: {chosen}\n\nApply both complete proposed sources as one workspace edit? Placeholder resolution/configuration is not verified. No process or direct write runs.\n\nJAVA:\n{source_after}\n\nPROPERTIES:\n{after}",
+        "Project: {}\nJava source: {}\nProperties: {chosen}\n\nApply the changes to both files together? Placeholder resolution/configuration is not verified. No process runs.\n\nJAVA:\n{source_changes}\n\nPROPERTIES:\n{property_changes}",
         pending.root, doc.path
     );
     if !ui_kit::prompts::confirm_exact("Review property externalization", &body)? {
         return Err(Error::Cancelled);
     }
-    current(&pending, doc)?;
+    current(pending, doc)?;
     if target(&project, &pending.root, &chosen)? != before {
         return Err(Error::Stale);
     }
-    let end = range(&before, before.len(), before.len());
-    Ok(FileAction {
-        title: "Move annotation string to property".into(),
-        kind: Some("refactor".into()),
-        edits: vec![
-            (doc.path.clone(), vec![source_edit]),
-            (
-                chosen,
-                vec![TextEdit {
-                    range: end,
-                    text: added,
-                }],
-            ),
-        ],
-        ..Default::default()
-    })
+    Ok(Change { source: source_edit, target: chosen, property, after })
 }
 
 #[cfg(test)]
@@ -533,5 +558,28 @@ mod tests {
             nav.resolve_file_action(&d, old),
             Err(Error::Stale)
         ));
+    }
+    #[test]
+    fn externalize_command_applies_reviewed_edit() {
+        let at = position(SOURCE, SOURCE.find("0 0 * * * *").unwrap());
+        let caret = [(at.line, at.character, at.line, at.character)];
+        let h = MockHost::install().with_capabilities(&["project.read", "editor.read", "editor.write", "project.write"]);
+        h.add_file("Jobs.java", SOURCE);
+        h.add_file("application.properties", "a=1\n");
+        h.open_editor(PATH, "java", SOURCE, &caret);
+        answers(&h);
+        Navigator::default().run_command("externalize-annotation-string", &h.invocation(), None).unwrap();
+        assert_eq!(h.editor_text(), SOURCE.replace("0 0 * * * *", "${jobs.cron}"));
+        assert_eq!(
+            host::project_of(TARGET).unwrap().read_file(TARGET).unwrap(),
+            "a=1\njobs.cron=0\\ 0\\ *\\ *\\ *\\ *\n"
+        );
+        assert!(h.process_runs().is_empty());
+        let (h, _d, mut nav) = fixture(SOURCE, "a=1\n");
+        h.open_editor(PATH, "java", SOURCE, &caret);
+        answers(&h);
+        nav.run_command("externalize-annotation-string", &h.invocation(), None).unwrap();
+        assert_eq!(h.editor_text(), SOURCE, "nothing changes without project.write");
+        assert!(h.notifications().iter().any(|n| n.body == "Adding the property needs the project.write permission. Allow it in Settings › Plugins › Spring Beans Navigator."));
     }
 }

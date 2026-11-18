@@ -16,8 +16,8 @@
       "default": true
     },
     "springData.checkQueryTypes": {
+      "title": "Show query hovers and parameter hints",
       "type": "boolean",
-      "title": "Show cached repository/query hover and known source parameter hints",
       "default": true,
       "description": "Uses source-owned cached domain facts and explicit query aliases. Effective runtime parameter/return types and query execution are not inferred."
     }

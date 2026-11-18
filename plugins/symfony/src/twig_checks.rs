@@ -120,13 +120,13 @@ pub(crate) fn source_references(index: &crate::Index, text: &str) -> Vec<Finding
             refs::Kind::Template if index.template_scan_observed && !index.template_paths_unknown
                 && !name.starts_with('@') && !name.contains(':') && !index.ambiguous_templates.contains(name)
                 && static_template_tail(text,&reference) && !index.templates.contains_key(name) => {
-                out.push(Finding::warn(range,"missing-template",format!("Template \"{name}\" is absent from the cached source template index; runtime overrides are unverified.")));
+                out.push(Finding::warn(range,"missing-template",format!("Template \"{name}\" wasn't found in the project's templates. Check the name, or run Symfony: Reindex Project if you just added it.")));
             }
             refs::Kind::Translation => {
                 let Some(literal)=literals.iter().find(|literal|literal.range.start==reference.start && literal.range.end==reference.end) else {continue;};
                 let Some(domain)=domain_in_scope(&text[..literal.code_end],&reference,default.as_deref()) else {continue;};
                 if cached_translation_key(index,&domain,name)==Some(false) {
-                    let mut finding=Finding::warn(range,"missing-translation",format!("Translation key \"{name}\" is absent from cached domain \"{domain}\"; locale/runtime catalogs are unverified."));
+                    let mut finding=Finding::warn(range,"missing-translation",format!("Translation key \"{name}\" wasn't found in domain \"{domain}\". Add it to the translation files or check the domain."));
                     finding.severity=openidea_plugin::Severity::Info;out.push(finding);
                 }
             }
@@ -148,7 +148,7 @@ pub(crate) fn source_names(index: &crate::Index, text: &str) -> Vec<Finding> {
     assets_tags(&ctx, text, &regions, &mut out);
     path_replacements(&ctx, text, &regions, &mut out);
     retain_literal_facts(text,&mut out);
-    for finding in &mut out { finding.message.push_str(" [Cached project-source index; runtime overrides are unverified.]"); }
+    for finding in &mut out { finding.message.push_str(" (From the last project scan; run Symfony: Reindex Project to refresh.)"); }
     out.sort_by_key(|finding| finding.start);
     out
 }
@@ -635,7 +635,7 @@ fn component_mistakes(text: &str, regions: &[Range<usize>], out: &mut Vec<Findin
     for region in regions {
         let mut i = region.start;
 
-        while let Some(found) = text[i..region.end].find(['{', '<']) {
+        while let Some(found) = text.get(i..region.end).and_then(|slice| slice.find(['{', '<'])) {
             let at = i + found;
             i = at + 1;
             let rest = &text[at..region.end];

@@ -17,6 +17,20 @@ pub(crate) struct Registration {
     pub offset: usize,
     pub hash: String,
 }
+/// One line for the notification after connecting.
+pub(crate) fn summary(value: &Value) -> String {
+    let count = |key: &str| value[key].as_array().map_or(0, Vec::len).to_string();
+    crate::ui_text::format(
+        "process.mcp.summary",
+        "Connected to {server}: {tools} tools, {resources} resources, {prompts} prompts.",
+        &[
+            ("server", value["registration"]["server"].as_str().unwrap_or("the application MCP server")),
+            ("tools", &count("tools")),
+            ("resources", &count("resources")),
+            ("prompts", &count("prompts")),
+        ],
+    )
+}
 fn clean(s: &str, max: usize) -> bool {
     !s.is_empty() && s.len() <= max && !s.chars().any(char::is_control)
 }
@@ -325,7 +339,7 @@ fn response(value: Value, id: u64) -> Result<Value, Error> {
 }
 fn local(project: &Project, runner: Runner, argv: &[String]) -> Result<Value, Error> {
     let executable = runner.argv(project, argv, false)?;
-    let child = crate::artisan_runner::start_background(runner.name(), &executable, project)?;
+    let child = crate::artisan_runner::start_background(runner, &executable, project)?;
     let result = stdio_discover(
         |text| child.write(text),
         || {
@@ -581,16 +595,19 @@ impl State {
                 "mcp:start".into(),
                 registration.name.clone(),
             ];
-            let preview = json!({"program":runner.name(),"argv":runner.argv(&project,&argv,false)?,"project":root,"registration":registration.file,"server":registration.server});
+            let command = std::iter::once(runner.name().to_owned())
+                .chain(runner.argv(&project, &argv, false)?)
+                .collect::<Vec<_>>()
+                .join(" ");
             if !ui_kit::prompts::confirm_exact(
                 &crate::ui_text::t(
                     "process.mcp.text18",
                     "Discover application MCP metadata (executes project PHP)?",
                 ),
                 &crate::ui_text::format(
-                    "process.mcp.localReview",
-                    "{preview}\nOnly initialize/tools/list/resources/list/prompts/list are requested. No tool calls or resource contents are executed. Application bootstrap and server lifecycle run; the process is stopped after discovery.",
-                    &[("preview", &preview.to_string())],
+                    "process.mcp.localSummary",
+                    "Runs: {command}\nProject: {root}\nServer: {server} ({file})\nThis boots your application to list the server's tools, resources and prompts. No tool is called, and the process stops afterwards.",
+                    &[("command", &command), ("root", &root), ("server", &registration.server), ("file", &registration.file)],
                 ),
             )? {
                 return Err(Error::Cancelled);

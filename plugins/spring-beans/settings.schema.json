@@ -12,13 +12,14 @@
     },
     "springBeans.checkDuplicateNames": {
       "type": "boolean",
-      "title": "Warn when two beans of the project share a name",
+      "title": "Warn when two beans of the project share a name (Check Spring Configuration only)",
       "default": true
     },
     "springBeans.checkConfiguration": {
+      "title": "Check @Configuration classes and @Bean methods",
       "type": "boolean",
-      "title": "Warn about private or final @Bean methods in proxied @Configuration classes, @Bean calls in proxyBeanMethods = false classes, and initMethod/destroyMethod names a project class lacks",
-      "default": true
+      "default": true,
+      "description": "Warn about private or final @Bean methods in proxied @Configuration classes, @Bean calls in proxyBeanMethods = false classes, and initMethod/destroyMethod names a project class lacks"
     },
     "springBeans.checkNaming": {
       "type": "boolean",
@@ -26,24 +27,28 @@
       "default": true
     },
     "springBeans.checkSelfInvocation": {
+      "title": "Warn about calls to proxied methods in the same class",
       "type": "boolean",
-      "title": "Warn when a method calls a @Transactional, @Async or @Cacheable method of its own class (text-based, may miss or over-report)",
-      "default": false
+      "default": false,
+      "description": "Warn when a method calls a @Transactional, @Async or @Cacheable method of its own class (text-based, may miss or over-report)"
     },
     "springBeans.checkUnresolvedReferences": {
+      "title": "Warn about names and files no project source defines",
       "type": "boolean",
-      "title": "Warn about names and files no project source defines (@DependsOn, @Lookup, @Scheduled scheduler, @ComponentScan, @PropertySource and similar paths, XML ref/depends-on/placeholders). Library beans are invisible, so it may over-report",
-      "default": false
+      "default": false,
+      "description": "Warn about names and files no project source defines (@DependsOn, @Lookup, @Scheduled scheduler, @ComponentScan and @PropertySource paths, XML ref/depends-on/placeholders). Runs in Check Spring Configuration only; library beans are invisible, so it may over-report"
     },
     "springBeans.checkAop": {
+      "title": "Check AOP configuration",
       "type": "boolean",
-      "title": "Report incomplete AOP configuration (aop:config, pointcuts, aspects, advisors, advice) in Spring XML files, and pointcut designators Spring AOP does not support in XML and Java @Aspect classes",
-      "default": true
+      "default": true,
+      "description": "Report incomplete AOP configuration (aop:config, pointcuts, aspects, advisors, advice) in Spring XML files, and pointcut designators Spring AOP does not support in XML and Java @Aspect classes. Java classes are checked by Check Spring Configuration only"
     },
     "springBeans.checkInjectionAnnotations": {
+      "title": "Check injection annotations",
       "type": "boolean",
-      "title": "Report @Autowired, @Value, @Inject and @Resource on static members, conflicting @Autowired constructors, and @Required outside a setter",
-      "default": true
+      "default": true,
+      "description": "Report @Autowired, @Value, @Inject and @Resource on static members, conflicting @Autowired constructors, and @Required outside a setter"
     },
     "springBeans.checkProfiles": {
       "type": "boolean",
@@ -56,19 +61,22 @@
       "default": true
     },
     "springBeans.checkCache": {
+      "title": "Check cache annotations",
       "type": "boolean",
-      "title": "Report cache annotations without a cache name, on interfaces, combined @Cacheable and @CachePut, unbalanced SpEL brackets, and key with keyGenerator (or cacheManager with cacheResolver)",
-      "default": true
+      "default": true,
+      "description": "Report cache annotations without a cache name, on interfaces, combined @Cacheable and @CachePut, unbalanced SpEL brackets, and key with keyGenerator (or cacheManager with cacheResolver)"
     },
     "springBeans.checkKotlinSpringPlugin": {
+      "title": "Check Kotlin Spring usage",
       "type": "boolean",
-      "title": "Kotlin: missing kotlin-spring plugin, redundant open modifiers when it is on, router pathVariable names no path declares, and ::class.java arguments that reified extensions replace",
-      "default": true
+      "default": true,
+      "description": "Kotlin: missing kotlin-spring plugin, redundant open modifiers when it is on, router pathVariable names no path declares, and ::class.java arguments that reified extensions replace"
     },
     "springBeans.checkXml": {
+      "title": "Check Spring XML",
       "type": "boolean",
-      "title": "Check Spring XML: bean attributes, values, scopes, abstract references, style hints, component-scan filters, missing imports, and project bean classes (abstract, factory-method, constructor-arg, init/destroy, @Required)",
-      "default": true
+      "default": true,
+      "description": "Check Spring XML: bean attributes, values, scopes, abstract references, style hints, component-scan filters, missing imports, and project bean classes (abstract, factory-method, constructor-arg, init/destroy, @Required)"
     }
   }
 }

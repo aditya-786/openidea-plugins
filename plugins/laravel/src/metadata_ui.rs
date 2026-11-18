@@ -102,10 +102,10 @@ fn render(message: &str) -> Option<String> {
         "metadata inventories exceed aggregate cache budget; remaining rules withheld" => {
             Some(crate::ui_text::t("metadata.issue.65de58d90e1a", message))
         }
-        "Blade icon provider source count exceeds128; remaining providers withheld" => {
+        "Blade icon provider source count exceeds 128; remaining providers withheld" => {
             Some(crate::ui_text::t("metadata.issue.f64f79804286", message))
         }
-        "Blade icon provider sources exceed aggregate4MiB budget; remaining providers withheld" => {
+        "Blade icon provider sources exceed aggregate 4MiB budget; remaining providers withheld" => {
             Some(crate::ui_text::t("metadata.issue.256300cb0ad3", message))
         }
         "Blade icon provider call candidates exceed128; remaining registrations withheld" => {

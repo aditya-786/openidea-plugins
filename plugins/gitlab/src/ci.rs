@@ -618,7 +618,7 @@ pub fn completions(text: &str, offset: Option<usize>) -> Vec<Candidate> {
     let typed = before.trim_start_matches(' ');
     let word = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
 
-    let word_in_line = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |i| i + 1);
+    let word_in_line = before.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |i| i + before[i..].chars().next().map_or(1, char::len_utf8));
     let word_start = line_start + word_in_line;
     let after_dollar = before[..word_in_line].trim_end_matches('{').ends_with('$');
     if after_dollar {

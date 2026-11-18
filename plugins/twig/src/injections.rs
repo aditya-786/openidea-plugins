@@ -53,7 +53,8 @@ fn bodies(text: &str) -> Vec<(usize, usize, &'static str)> {
             continue;
         }
         let Some(end) = tag_end(bytes, i) else {
-            break;
+            i += 1;
+            continue;
         };
         let header = &text[i + 1..end];
         let name_end = header.bytes().take_while(u8::is_ascii_alphabetic).count();
@@ -105,9 +106,11 @@ fn bodies(text: &str) -> Vec<(usize, usize, &'static str)> {
     out.sort_by_key(|(start,_,_)|*start);
     out
 }
+const MAX_TAG_BYTES: usize = 4096;
+
 fn tag_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut quote = None;
-    for (i, &b) in bytes.iter().enumerate().skip(start + 1) {
+    for (i, &b) in bytes.iter().enumerate().skip(start + 1).take(MAX_TAG_BYTES) {
         if let Some(q) = quote {
             if b == q {
                 quote = None;
@@ -116,6 +119,8 @@ fn tag_end(bytes: &[u8], start: usize) -> Option<usize> {
             quote = Some(b);
         } else if b == b'>' {
             return Some(i);
+        } else if b == b'<' {
+            return None;
         }
     }
     None
@@ -187,5 +192,19 @@ mod tests {
             bodies("<script>{{ x }}</script><style>p{}</style>").len(),
             1
         );
+    }
+    #[test]
+    fn unquoted_lt_before_a_script_does_not_hide_it() {
+        let found = bodies("a < b <script>x</script>");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].2, "javascript");
+    }
+    #[test]
+    fn stray_lt_does_not_stop_injections() {
+        let found = bodies("<p>a <' b</p><script>let x=1</script>");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].2, "javascript");
+        let quoted = format!("<p a=' {}<script>x()</script>", "< ".repeat(20_000));
+        assert!(bodies(&quoted).len() <= 1);
     }
 }

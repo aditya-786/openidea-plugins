@@ -3,9 +3,9 @@ use crate::*;
 use openidea_plugin::Project;
 use openidea_plugin::file_actions::{FileAction, FileActions};
 use quick_xml::{events::Event as XmlEvent, reader::NsReader};
-use spring_text::index::Index;
 use spring_text::xml;
-const MAX_TEXT: usize = 12 << 10;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::time::Duration;
 #[derive(Clone)]
 struct Pending {
     root: String,
@@ -39,7 +39,6 @@ pub(crate) fn qualified(name: &str) -> bool {
 pub(crate) fn generation_document(doc: &Document) -> bool {
     if doc.language != "xml"
         || !doc.path.ends_with(".xml")
-        || doc.text.len() > MAX_TEXT
         || !normalized(&doc.path)
     {
         return false;
@@ -50,7 +49,7 @@ pub(crate) fn generation_document(doc: &Document) -> bool {
     let mut count = 0usize;
     loop {
         count += 1;
-        if count > 2048 {
+        if count > 65_536 {
             return false;
         }
         match reader.read_event() {
@@ -174,44 +173,25 @@ fn current(pending: &Pending, doc: &Document) -> Result<Project, Error> {
     }
     Ok(project)
 }
-pub(crate) fn names(project: &Project, doc: &Document) -> Result<BTreeSet<String>, Error> {
-    // Fresh command-owned index: preserve navigation cache and refuse incomplete
-    // inventories rather than trusting TTL facts when choosing a new source ID.
-    let mut index = Index::new(GLOBS, model::parse);
-    index.scan(project, COMMAND_BUDGET);
-    index.update(&doc.path, &doc.text);
-    if !index.complete() {
+/// Every bean name and alias of the project's warm source cache, read on for
+/// at most `budget`; refused unless the inventory is complete.
+pub(crate) fn names(nav: &mut Navigator, doc: &Document, budget: Duration) -> Result<BTreeSet<String>, Error> {
+    let cache = nav.indexes.for_document(&doc.path, &doc.text, budget).ok_or(Error::Stale)?;
+    if !cache.complete() {
         return Err("Project source inventory incomplete; cannot safely choose a bean ID.".into());
     }
-    Ok(index
-        .files()
-        .values()
-        .flat_map(|model| &model.beans)
-        .flat_map(checks::names_of)
-        .map(str::to_owned)
-        .collect())
+    Ok(cache.files().values().flat_map(|model| &model.beans).flat_map(checks::names_of).map(str::to_owned).collect())
 }
+
+/// A fingerprint of a bean-name inventory, compared again after the user confirms.
+pub(crate) fn fingerprint(names: &BTreeSet<String>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    names.hash(&mut hasher);
+    hasher.finish()
+}
+#[cfg(test)]
 fn resulting(doc: &Document, edits: &[TextEdit]) -> Result<String, Error> {
-    let mut ranges: Vec<_> = edits
-        .iter()
-        .map(|edit| {
-            let start = offset(&doc.text, edit.range.start).ok_or(Error::Stale)?;
-            let end = offset(&doc.text, edit.range.end).ok_or(Error::Stale)?;
-            if start > end {
-                return Err(Error::Stale);
-            }
-            Ok((start, end, &edit.text))
-        })
-        .collect::<Result<_, Error>>()?;
-    ranges.sort_by_key(|(start, end, _)| (*start, *end));
-    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
-        return Err(Error::Stale);
-    }
-    let mut text = doc.text.clone();
-    for (start, end, replacement) in ranges.into_iter().rev() {
-        text.replace_range(start..end, replacement);
-    }
-    Ok(text)
+    crate::reviewed(&doc.text, edits).map(|(text, _)| text)
 }
 impl FileActions for Navigator {
     fn file_actions(&mut self, doc: &Document, selection: Range) -> Vec<FileAction> {
@@ -268,11 +248,12 @@ impl FileActions for Navigator {
             .pending
             .remove(action.data.as_deref().ok_or(Error::Stale)?)
             .ok_or(Error::Stale)?;
-        let project = current(&pending, doc)?;
+        current(&pending, doc)?;
         if !eligible(doc, pending.at) {
             return Err(Error::Stale);
         }
-        let before = names(&project, doc)?;
+        let before = names(self, doc, COMMAND_BUDGET)?;
+        let inventory = fingerprint(&before);
         let suggestion = xml_actions::suggested_bean_id(&doc.text, pending.at, before.clone())
             .ok_or(Error::Stale)?;
         let id = host::input(
@@ -282,19 +263,18 @@ impl FileActions for Navigator {
         .ok_or(Error::Cancelled)?;
         let edits=xml_actions::introduce_bean_named(&doc.text,pending.at,||before.clone(),Some(&id))
             .ok_or("Use a new literal ASCII bean ID (letter/underscore, then letters/digits/underscore/dot/hyphen), absent from the source inventory.")?;
-        let text = resulting(doc, &edits)?;
+        let (_, changes) = crate::reviewed(&doc.text, &edits)?;
         let preview = format!(
-            "Source: {}\nVersion: {}\n\nExtract the selected inner bean to this same root <beans>, choosing an ID absent from the current source inventory. This is source refactoring, not a runtime classpath claim. No files are created or overwritten.\n\nExact resulting XML ({} bytes):\n{}",
+            "Source: {}\nVersion: {}\n\nExtract the selected inner bean to this same root <beans>, choosing an ID absent from the current source inventory. This is source refactoring, not a runtime classpath claim. No files are created or overwritten.\n\nChanged lines of the resulting XML:\n{}",
             doc.path,
             doc.version,
-            text.len(),
-            text
+            changes
         );
         if !ui_kit::prompts::confirm_exact("Introduce Spring XML bean?", &preview)? {
             return Err(Error::Cancelled);
         }
         current(&pending, doc)?;
-        if names(&project, doc)? != before {
+        if fingerprint(&names(self, doc, Duration::ZERO)?) != inventory {
             return Err(Error::Stale);
         }
         Ok(FileAction {
@@ -440,10 +420,6 @@ mod tests {
             },
             Document {
                 text: good.text.replace("a.Child", "a.Child&amp;Other"),
-                ..good.clone()
-            },
-            Document {
-                text: format!("<!-- {} -->{}", "x".repeat(MAX_TEXT), good.text),
                 ..good.clone()
             },
         ] {
@@ -619,5 +595,25 @@ mod tests {
         };
         let at = position(&legal.text, legal.text.find("<bean class").unwrap() + 2);
         assert!(!nav.file_actions(&legal, Range::new(at, at)).is_empty());
+    }
+    #[test]
+    fn introduce_bean_uses_warm_cache() {
+        let host = MockHost::install();
+        let doc = source();
+        host.add_file(PATH, &doc.text);
+        host.add_file("other.xml", &document("<bean id=\"taken\" class=\"a.Taken\"/>").text);
+        let mut nav = Navigator::default();
+        nav.run_command("reindex", &host.invocation(), None).unwrap();
+        host.add_file("other.xml", &document("").text);
+        let lazy = action(&mut nav, &doc);
+        host.answer_next_prompt(Some(&["taken"]));
+        assert!(
+            matches!(nav.resolve_file_action(&doc, lazy), Err(Error::Failed(message)) if message.contains("absent from the source inventory")),
+            "the warm inventory still holds taken: no rescan"
+        );
+        let lazy = action(&mut nav, &doc);
+        host.answer_next_prompt(Some(&["fresh"]));
+        host.answer_next_prompt(Some(&[]));
+        assert!(nav.resolve_file_action(&doc, lazy).is_ok());
     }
 }

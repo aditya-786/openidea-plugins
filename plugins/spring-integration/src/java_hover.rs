@@ -7,17 +7,7 @@ struct Token {
     range: Range,
     declaration: bool,
 }
-fn literal(value: &str) -> bool {
-    let mut bytes=value.bytes();value.len()<=128 && bytes.next().is_some_and(|b|b.is_ascii_alphabetic()||b==b'_') && bytes.all(|b|b.is_ascii_alphanumeric()||b"_.-".contains(&b))
-}
-fn owned(file:&JavaFile, written:&str, qualified:&str)->bool {
-    if written==qualified {
-        return !file.types.iter().any(|t|t.name=="org") && !file.imports.iter().any(|i|i.path.rsplit('.').next()==Some("org"));
-    }
-    let short=qualified.rsplit('.').next().unwrap();
-    written==short && !file.types.iter().any(|t|t.name==short)
-        && file.imports.iter().filter(|i|!i.is_static&&i.path.rsplit('.').next()==Some(short)).map(|i|i.path.as_str()).collect::<Vec<_>>()==[qualified]
-}
+use spring_text::provenance::{literal, source_type_owned as owned};
 fn annotation_owned(file:&JavaFile,doc:&Document,annotation:&Annotation,qualified:&str)->bool {
     owned(file,&doc.text[annotation.at+1..annotation.name_at+annotation.name.len()],qualified)
 }
@@ -84,9 +74,9 @@ pub(crate) fn definition(doc:&Document,at:Position)->Option<Vec<Location>> {
     Some(match declarations.as_slice() { [declaration] if !selected.declaration=>vec![Location{path:doc.path.clone(),range:declaration.range}],_=>vec![] })
 }
 pub(crate) fn occurrences(ctx:&Invocation)->Result<Option<String>,Error> {
-    let root=ctx.project().ok_or(Error::Stale)?.root()?;let editor=ctx.editor().ok_or("Open Java channel configuration and grant optional editor.read.")?;
+    let root=ctx.project().ok_or("Open a project first.")?.root()?;let editor=ctx.editor().ok_or_else(||format!("Open a Java or XML file with channels first. {}",ui_kit::denied::message("Find Channel Usages in This File","editor.read","Spring Structure Tools")))?;
     let source=editor.document()?;let doc=Document{path:editor.path(),language:editor.language(),text:source.text,version:source.version};
-    if crate::source_scope::Scope::for_path(&doc.path).is_none()||host::project_of(&doc.path).and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str()) {return Err(Error::Stale);}
+    if spring_text::index::owning_root(&doc.path).is_none()||host::project_of(&doc.path).and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str()) {return Err(Error::Stale);}
     let selections=editor.selections()?;let [selection]=selections.as_slice() else{return Err(Error::Invalid("Use a single caret.".into()));};
     if selection.start!=selection.end {return Err(Error::Invalid("Use a collapsed caret on a supported Java channel name.".into()));}
     let tokens=model(&doc).ok_or("Use literal Spring Bean/ServiceActivator names with explicit supported MessageChannel ownership.")?;
@@ -106,7 +96,7 @@ pub(crate) fn hover(doc:&Document,at:Position)->Option<Hover> {
     let declarations:Vec<_>=tokens.iter().filter(|t|t.declaration&&t.name==selected.name).collect();
     let [declaration]=declarations.as_slice() else{return None;};
     let references=tokens.iter().filter(|t|!t.declaration&&t.name==selected.name).count();
-    Some(Hover::new(format!("**Spring Integration Java channel source** `{}`\n\nOne supported current-file `@Bean` declaration explicitly returns Spring `MessageChannel`, at line {}. {references} supported literal `ServiceActivator` input/output reference(s) in this file.\n\nPositive physical-source facts only; configuration imports/composed annotations/effective contexts/runtime types and global usages/Rename are unresolved. No project discovery or runtime data is read.",selected.name,declaration.range.start.line+1)).range(selected.range))
+    Some(Hover::new(format!("**Spring Integration channel** `{}`\n\nDeclared by a `@Bean` returning `MessageChannel` at line {}.\n\n{references} reference(s) in this file.",selected.name,declaration.range.start.line+1)).range(selected.range))
 }
 
 #[cfg(test)]
@@ -137,7 +127,7 @@ mod tests {
         let h=MockHost::install().with_capabilities(&[]);let mut owner=structure::Structure::default();
         let d=doc("@Bean MessageChannel orders(){return null;}\r\n/* 😀 café */ @ServiceActivator(inputChannel=\"orders\", outputChannel=\"orders\") void consume(){}");
         let position=at(&d,"orders");let hover=owner.hover(&d,position).unwrap();
-        assert!(hover.markdown.contains("2 supported literal"));assert!(hover.markdown.contains("Positive physical-source"));
+        assert!(hover.markdown.contains("2 reference"));assert!(hover.markdown.contains("Declared by a `@Bean`"));
         let r=hover.range.unwrap();assert_eq!(r.start,position);assert_eq!(r.end.character-r.start.character,6);
         let declaration=openidea_plugin::text::position(&d.text,d.text.find("orders()").unwrap());
         assert!(owner.hover(&d,declaration).is_some());
@@ -149,7 +139,7 @@ mod tests {
     fn full_qualified_annotation_type_and_explicit_bean_name_show_only_exact_written_source() {
         let _h=MockHost::install().with_capabilities(&[]);let mut owner=structure::Structure::default();
         let d=doc("@org.springframework.context.annotation.Bean(\"orders\") org.springframework.messaging.MessageChannel method(){return null;}\r\n@org.springframework.integration.annotation.ServiceActivator(inputChannel=\"orders\") void consume(){}");
-        assert!(owner.hover(&d,at(&d,"orders")).unwrap().markdown.contains("1 supported literal"));
+        assert!(owner.hover(&d,at(&d,"orders")).unwrap().markdown.contains("1 reference"));
         let method=openidea_plugin::text::position(&d.text,d.text.find("method()").unwrap());
         assert!(owner.hover(&d,method).is_none(),"explicit bean name replaces the default method spelling");
     }

@@ -7,7 +7,7 @@
     {
       "view": "endpoints",
       "id": "copy-endpoint-curl",
-      "label": "Copy as cURL",
+      "label": "Copy Endpoint as cURL",
       "kind": "route",
       "icon": "copy"
     },

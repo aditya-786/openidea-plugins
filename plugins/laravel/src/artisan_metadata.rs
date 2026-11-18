@@ -321,7 +321,7 @@ fn execute(project: &Project, args: &[String]) -> Result<String, Error> {
         ),
         true,
     );
-    let child = crate::artisan_runner::start_background("php", args, project)?;
+    let child = crate::artisan_runner::start_background(crate::artisan_runner::Runner::Php, args, project)?;
     child.close_stdin()?;
     let result = collect(|timeout| child.wait(timeout), || task.is_cancelled());
     if result.is_err() {
@@ -569,7 +569,7 @@ mod tests {
         let host = MockHost::install().with_capabilities(&["project.read", "storage"]);
         host.add_file("artisan", "<?php");
         host.answer_next_prompt(Some(&["ok"]));
-        assert!(matches!(refresh(&host.invocation()), Err(Error::Denied(_))));
+        assert!(matches!(refresh(&host.invocation()), Err(Error::Invalid(message)) if message.contains("process:php permission")));
         assert!(host.storage().get(&key("/project")).is_none());
     }
 }

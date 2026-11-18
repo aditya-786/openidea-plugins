@@ -18,11 +18,7 @@ struct Context {
     states: Vec<(String, String)>,
     occupied: BTreeSet<String>,
 }
-fn literal(value: &str) -> bool {
-    let mut bytes = value.bytes();
-    value.len() <= 128 && bytes.next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-        && bytes.all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
-}
+use spring_text::provenance::literal;
 fn descendant(elements: &[xml::Element], mut at: usize, owner: usize) -> bool {
     while let Some(parent) = elements[at].parent {
         if parent == owner { return true; }
@@ -33,7 +29,7 @@ fn descendant(elements: &[xml::Element], mut at: usize, owner: usize) -> bool {
 fn context(doc: &Document, selection: Range) -> Option<Context> {
     if selection.start != selection.end || doc.language != "xml" || !doc.path.ends_with(".xml")
         || beans::ignored(&doc.path) || doc.text.len() > 32 * 1024 || doc.text.contains('&')
-        || !crate::xml_namespaces::document_valid(&doc.text) { return None; }
+        || !spring_text::xml::generation_valid(&doc.text) { return None; }
     let deadline = Instant::now() + Duration::from_millis(10);
     let mut reader = quick_xml::Reader::from_str(&doc.text);
     let mut complete = false;
@@ -99,7 +95,7 @@ fn context(doc: &Document, selection: Range) -> Option<Context> {
     if references.len()+1>64 { return None; }
     Some(Context {job:job_id,old,kind,declaration,references,states,occupied})
 }
-fn normalized(path:&str)->bool {
+pub(crate) fn normalized(path:&str)->bool {
     path.starts_with('/') && path.len()<=512 && path!="/" && !path.contains(['\\','*','?','[',']','{','}'])
         && !path.chars().any(char::is_control) && path.split('/').skip(1).all(|p|!matches!(p,""|"."|".."))
 }
@@ -125,7 +121,7 @@ fn focused_source(ctx:&Invocation)->Result<(String,Document,Range),Error> {
     let [selection]=selections.as_slice() else{return Err(Error::Invalid("Use one collapsed caret on a step ID or a proved direct target reference.".into()));};
     let doc=Document {path:editor.path(),language:editor.language(),text:source.text,version:source.version};
     if !normalized(&root) || !normalized(&doc.path) || !doc.path.starts_with(&format!("{root}/"))
-        || crate::source_scope::Scope::for_path(&doc.path).is_none()
+        || spring_text::index::owning_root(&doc.path).is_none()
         || host::project_of(&doc.path).and_then(|p|p.root().ok()).as_deref()!=Some(root.as_str()) {return Err(Error::Stale);}
     Ok((root,doc,*selection))
 }
@@ -158,7 +154,7 @@ pub(crate) fn usages(ctx:&Invocation)->Result<Option<String>,Error> {
 #[derive(Clone)]
 struct Pending { root:String, doc:Document, selection:Range, context:Context }
 fn current(pending:&Pending,doc:&Document)->Result<(),Error> {
-    if *doc!=pending.doc || crate::source_scope::Scope::for_path(&doc.path).is_none() {return Err(Error::Stale);}
+    if *doc!=pending.doc || spring_text::index::owning_root(&doc.path).is_none() {return Err(Error::Stale);}
     let project=host::project_of(&doc.path).ok_or(Error::Stale)?;
     if project.root()?!=pending.root || project.read_file(&doc.path)?!=doc.text || usage_context(doc,pending.selection).as_ref()!=Some(&pending.context) {return Err(Error::Stale);}
     Ok(())
@@ -168,7 +164,7 @@ pub(crate) struct Rename { next:u64, pending:BTreeMap<String,Pending> }
 impl Rename {
     pub(crate) fn actions(&mut self,doc:&Document,selection:Range)->Vec<FileAction> {
         let Some(context)=usage_context(doc,selection) else{return vec![];};
-        if crate::source_scope::Scope::for_path(&doc.path).is_none() {return vec![];}
+        if spring_text::index::owning_root(&doc.path).is_none() {return vec![];}
         let Some(root)=host::project_of(&doc.path).and_then(|p|p.root().ok()) else{return vec![];};
         if !normalized(&root) || !normalized(&doc.path) || !doc.path.starts_with(&format!("{root}/")) {return vec![];}
         let Some(next)=self.next.checked_add(1) else{return vec![];};self.next=next;

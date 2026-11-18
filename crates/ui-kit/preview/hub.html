@@ -3,7 +3,7 @@
 <body class="ui-embedded-panel">
 
 <progress id="request-progress" class="ui-progress request-progress" aria-label="Loading resources" hidden></progress>
-<div class="shell"><nav id="view-tabs" class="ui-tabs" role="tablist" aria-label="Plugin views" hidden></nav><nav id="sections" class="ui-tabs" aria-label="Sections" hidden></nav><main>
+<div class="shell"><div class="view-nav"><label class="view-section-picker" hidden><span class="ui-visually-hidden">View group</span><select id="view-sections"></select></label><nav id="view-tabs" class="ui-tabs" role="tablist" aria-label="Plugin views" hidden></nav></div><nav id="sections" class="ui-tabs" aria-label="Sections" hidden></nav><main>
 <div id="toolbar" class="toolbar ui-toolbar" role="toolbar" aria-label="Actions"></div>
 <div id="filters" class="filters"><label class="search"><span class="ui-visually-hidden">Search</span><span class="search-icon" data-ui-icon="search" aria-hidden="true"></span><input id="search" class="ui-input" type="search" placeholder="Search…"></label><div id="facets"></div><button id="clear" hidden class="ui-button ui-icon-button" title="Clear filters" type="button"><span data-ui-icon="close"></span><span class="ui-visually-hidden">Clear filters</span></button></div>
 <div class="workspace"><section id="content" class="ui-scroll-area" aria-label="Resources" tabindex="-1"></section><dialog id="details" class="ui-dialog" aria-label="Resource details"></dialog></div><footer id="status" role="status"></footer>

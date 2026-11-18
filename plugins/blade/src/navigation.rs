@@ -1,8 +1,8 @@
 //! Current-document syntax relationships only. Named Laravel symbols deliberately
 //! stay with aritti.laravel; these directive tokens are never Rename anchors.
 use crate::{BLOCKS, Blade, directive_opens, lex};
-use openidea_plugin::providers::{Document, Providers};
-use openidea_plugin::{Location, Position, Range, text};
+use openidea_plugin::providers::{CodeAction, Document, Providers};
+use openidea_plugin::{Location, Position, Range, TextEdit, text};
 
 impl Providers for Blade {
     fn definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
@@ -48,6 +48,32 @@ impl Providers for Blade {
         }
         Vec::new()
     }
+
+    /// Quick fixes for the unclosed-directive findings the diagnostics report on the selected lines.
+    fn code_actions(&mut self, doc: &Document, selection: Range) -> Vec<CodeAction> {
+        if !doc.path.ends_with(".blade.php") {
+            return Vec::new();
+        }
+
+        crate::enabled_findings(&doc.text)
+            .into_iter()
+            .filter_map(|finding| {
+                let fix = finding.fix?;
+                let start = text::position(&doc.text, finding.start);
+                let end = text::position(&doc.text, finding.end);
+                let touches = start.line <= selection.end.line && end.line >= selection.start.line;
+                let at = text::position(&doc.text, fix.at);
+
+                touches.then(|| CodeAction {
+                    title: fix.title,
+                    kind: Some("quickfix".into()),
+                    preferred: true,
+                    edits: vec![(doc.path.clone(), vec![TextEdit { range: Range::new(at, at), text: fix.text }])],
+                    data: None,
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -59,6 +85,25 @@ mod tests {
     }
     fn target(text: &str, needle: &str) -> Vec<Location> {
         Blade.definition(&doc(text), text::position(text, text.rfind(needle).unwrap() + 2))
+    }
+    #[test]
+    fn unclosed_directive_offers_an_insert_closer_quick_fix_on_its_line_only() {
+        let host = MockHost::install().with_capabilities(&[]);
+        let source = "😀 @endfor\n<div>\n    @if($a)\n</div>\n";
+        let line = |n: u32| Range::new(Position::new(n, 0), Position::new(n, 0));
+        let actions = Blade.code_actions(&doc(source), line(2));
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].title, "Insert @endif at end of file");
+        let (path, edits) = &actions[0].edits[0];
+        assert_eq!(path, "/project/view.blade.php");
+        assert_eq!((edits[0].range.start, edits[0].range.end, edits[0].text.as_str()), (Position::new(4, 0), Position::new(4, 0), "    @endif\n"));
+        assert!(Blade.code_actions(&doc(source), line(0)).is_empty());
+        assert!(Blade.code_actions(&doc(source), line(1)).is_empty());
+        host.set_setting("checkDirectivePairs", "false");
+        assert!(Blade.code_actions(&doc(source), line(2)).is_empty());
+        let mut php = doc(source);
+        php.path = "/project/view.php".into();
+        assert!(Blade.code_actions(&php, line(2)).is_empty());
     }
     #[test]
     fn opener_navigation_finds_its_exact_matching_closer_in_unsaved_text() {

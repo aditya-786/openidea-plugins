@@ -350,17 +350,26 @@ pub fn create(route: &Route, ctx: &Invocation) -> Result<(), Error> {
         .collect::<Vec<_>>()
         .join("-");
     let slug = if slug.is_empty() { "root".into() } else { slug };
-    let path = format!(
-        "{}/http/{}-{slug}.http",
+    let first_line = content.lines().next().unwrap_or_default().to_owned();
+    let stem = format!(
+        "{}/http/{}-{slug}",
         project.root()?.trim_end_matches('/'),
         route.method.to_ascii_lowercase()
     );
-    if project.exists(&path)? {
-        return host::open_location(&path, 0, 0);
+    let mut path = format!("{stem}.http");
+    for n in 2.. {
+        if !project.exists(&path)? {
+            break;
+        }
+        let existing = project.read_file(&path).unwrap_or_default();
+        if existing.lines().next() == Some(first_line.as_str()) {
+            return host::open_location(&path, 0, 0);
+        }
+        path = format!("{stem}-{n}.http");
     }
     match project.write_file(&path, &content) {
         Ok(()) => host::open_location(&path, 0, 0),
-        Err(Error::Denied(_)) => host::copy_to_clipboard(&content),
+        Err(Error::Denied(_)) => crate::copy_after_write_denied(&content),
         Err(error) => Err(error),
     }
 }
@@ -433,5 +442,40 @@ mod tests {
         host.answer_next_prompt(Some(&["http://localhost:8080"]));
         assert!(create(&route, &host.invocation()).is_err());
         assert!(host.opened_locations().is_empty());
+    }
+    fn create_for(host: &openidea_plugin::mock::MockHost, path: &str) {
+        let source = format!("@RestController class C {{ @GetMapping(\"{path}\") void list(){{}} }}");
+        host.add_file("C.java", &source);
+        host.answer_next_prompt(Some(&["http://localhost:8080"]));
+        create(&route(&source), &host.invocation()).unwrap();
+    }
+    #[test]
+    fn request_example_slug_collision_suffixed() {
+        let host = openidea_plugin::mock::MockHost::install()
+            .with_capabilities(&["project.read", "project.write"]);
+        create_for(&host, "/a-b");
+        create_for(&host, "/a/b");
+        create_for(&host, "/a/b");
+        let opened: Vec<_> = host.opened_locations().into_iter().map(|(path, ..)| path).collect();
+        assert_eq!(
+            opened,
+            [
+                "/project/http/get-a-b.http",
+                "/project/http/get-a-b-2.http",
+                "/project/http/get-a-b-2.http"
+            ]
+        );
+        let project = host.invocation().project().unwrap();
+        assert!(project.read_file("http/get-a-b-2.http").unwrap().starts_with("### GET /a/b\n"));
+    }
+    #[test]
+    fn denied_write_and_clipboard_give_a_friendly_message() {
+        let host = openidea_plugin::mock::MockHost::install().with_capabilities(&["project.read"]);
+        let source = "@RestController class C { @GetMapping(\"/users\") void list(){} }";
+        host.add_file("C.java", source);
+        host.answer_next_prompt(Some(&["http://localhost:8080"]));
+        let error = create(&route(source), &host.invocation()).unwrap_err();
+        assert!(error.to_string().contains("needs the clipboard permission"), "{error}");
+        assert!(host.notifications().iter().any(|n| n.body.contains("needs the project.write permission")));
     }
 }

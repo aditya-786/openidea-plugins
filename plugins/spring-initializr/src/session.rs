@@ -239,7 +239,7 @@ mod tests {
         l.handle("initializr", ViewEvent::Button("generate".into()), &host.invocation()).unwrap();
         assert!(host.opened_urls().is_empty());
         field(&mut l, &host, "dependencies", "");
-        assert!(l.problem().is_none(), "metadata without Java range does not prove Boot4 requires Java21");
+        assert!(l.problem().is_none(), "metadata without Java range does not prove Boot4 requires Java 21");
         field(&mut l, &host, "javaVersion", "Java 21");
         assert_eq!(l.get("javaVersion"), "21");
         field(&mut l, &host, "type", "gradle-project");

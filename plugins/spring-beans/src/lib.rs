@@ -23,7 +23,7 @@ mod model;
 mod resources;
 mod sites;
 mod spel;
-mod gutter;
+mod graph;
 mod target_checks;
 mod xml_actions;
 mod xml_checks;
@@ -35,21 +35,22 @@ pub use model::{Bean, FileModel, Injection, TypeInfo, parse};
 
 pub(crate) const BEAN_MARKER: &str = "icons/marker-bean.svg";
 
-use cache::{Index, Indexes};
+use cache::{Cache, Indexes};
 use openidea_plugin::diagnostics::DiagnosticsProvider;
 use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Document, LineMarker, Providers};
 use openidea_plugin::text::{offset, position};
 use openidea_plugin::views::{Body, Button, TreeItem, View, ViewEvent, Viewport, Views};
 use openidea_plugin::{
-    Context, Diagnostic, Error, Event, EventKind, Invocation, Location, LogLevel, Plugin, Position, Range, Severity, TextEdit, host,
+    Context, Diagnostic, Error, Event, EventKind, Invocation, Location, LogLevel, Plugin, Position, Project, Range, Severity, TextEdit, host,
 };
 use sites::{Hit, Site, Word};
-use spring_text::diagram;
 use spring_text::index::COMMAND_BUDGET;
 use spring_text::java::{self, MemberKind};
 use spring_text::tree::Expansion;
 use spring_text::{contains, range};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::time::Duration;
 use ui_kit::sections::{SectionDef, Switcher};
 
@@ -68,29 +69,131 @@ const REPORT_SECTION: &str = "report";
 const MAX_GRAPH: usize = 400;
 const MAX_CLASSES: usize = 200;
 
-/// The project's models, with the type hierarchy for lookups.
+/// What providers look up across the project, derived once per cache change:
+/// beans by name and by type (active ones only), the type hierarchy both ways,
+/// types by simple and qualified name, injection points by the type or name
+/// they ask for, configuration literals, related-source links, and the
+/// inactive beans.
+pub(crate) struct Lookups {
+    by_name: BTreeMap<String, Vec<(String, usize)>>,
+    by_type: BTreeMap<String, Vec<(String, usize)>>,
+    supertypes: BTreeMap<String, Vec<String>>,
+    subtypes: BTreeMap<String, Vec<String>>,
+    types_by_name: BTreeMap<String, Vec<(String, usize)>>,
+    types_by_qualified: BTreeMap<String, Vec<(String, usize)>>,
+    injections_by_type: BTreeMap<String, Vec<(String, usize)>>,
+    injections_by_name: BTreeMap<String, Vec<(String, usize)>>,
+    /// The value of each canonical key set once, to a plain literal, in base
+    /// `application.*` files; `None` when repeated, profile-scoped or not plain.
+    literals: BTreeMap<String, Option<String>>,
+    /// `spring.config.import` appears: no literal can be trusted.
+    config_imports: bool,
+    /// `spring.profiles.include` or `spring.profiles.group` appears.
+    profile_names_set: bool,
+    resolver: ui_kit::navigation::Resolver,
+    inactive: BTreeSet<(String, usize)>,
+}
+
+impl Lookups {
+    fn build(files: &BTreeMap<String, FileModel>, complete: bool, modules: &RefCell<BTreeMap<String, Option<String>>>) -> Self {
+        let mut lookups = Lookups {
+            by_name: BTreeMap::new(),
+            by_type: BTreeMap::new(),
+            supertypes: BTreeMap::new(),
+            subtypes: BTreeMap::new(),
+            types_by_name: BTreeMap::new(),
+            types_by_qualified: BTreeMap::new(),
+            injections_by_type: BTreeMap::new(),
+            injections_by_name: BTreeMap::new(),
+            literals: BTreeMap::new(),
+            config_imports: false,
+            profile_names_set: false,
+            resolver: ui_kit::navigation::Resolver::new(files.iter().map(|(p, m)| (p.as_str(), &m.navigation))),
+            inactive: BTreeSet::new(),
+        };
+        let imports = spring_text::config::canonical("spring.config.import");
+        let profile_names = [spring_text::config::canonical("spring.profiles.include"), spring_text::config::canonical("spring.profiles.group")];
+        for config in files.values().filter_map(|m| m.config.as_ref()) {
+            for (key, value) in &config.keys {
+                let key = spring_text::config::canonical(key);
+                lookups.config_imports |= key == imports;
+                lookups.profile_names_set |= profile_names.iter().any(|n| key.starts_with(n.as_str()));
+                let plain = !config.profile_scoped && !value.is_empty() && !value.contains("${");
+                lookups.literals.entry(key).and_modify(|once| *once = None).or_insert(plain.then(|| value.clone()));
+            }
+        }
+        for (path, model) in files {
+            for (at, t) in model.types.iter().enumerate() {
+                lookups.types_by_name.entry(t.name.clone()).or_default().push((path.clone(), at));
+                lookups.types_by_qualified.entry(t.qualified.clone()).or_default().push((path.clone(), at));
+                lookups.supertypes.entry(t.name.clone()).or_default().extend(t.supers.iter().cloned());
+                for s in &t.supers {
+                    lookups.subtypes.entry(s.clone()).or_default().push(t.name.clone());
+                }
+            }
+            for (at, inj) in model.injections.iter().enumerate() {
+                let key = (path.clone(), at);
+                match (&inj.qualifier, inj.ty.is_empty()) {
+                    (_, false) => lookups.injections_by_type.entry(inj.ty.clone()).or_default().push(key),
+                    (Some(q), true) => lookups.injections_by_name.entry(q.clone()).or_default().push(key),
+                    (None, true) => {}
+                }
+            }
+        }
+        let lookups = Rc::new(lookups);
+        let inactive: BTreeSet<(String, usize)> = {
+            let probe = World { files, lookups: lookups.clone(), complete, modules };
+            files
+                .iter()
+                .flat_map(|(p, m)| m.beans.iter().enumerate().map(move |(at, b)| (p, at, b)))
+                .filter(|(p, _, b)| probe.inactive_reason(p, b).is_some())
+                .map(|(p, at, _)| (p.clone(), at))
+                .collect()
+        };
+        let Ok(mut lookups) = Rc::try_unwrap(lookups) else { unreachable!("the probe world is gone") };
+        for (path, model) in files {
+            for (at, bean) in model.beans.iter().enumerate() {
+                let key = (path.clone(), at);
+                if inactive.contains(&key) {
+                    continue;
+                }
+                let names: BTreeSet<&String> = std::iter::once(&bean.name).chain(&bean.aliases).chain(&bean.qualifiers).collect();
+                for name in names {
+                    lookups.by_name.entry(name.clone()).or_default().push(key.clone());
+                }
+                if !bean.ty.is_empty() {
+                    lookups.by_type.entry(bean.ty.clone()).or_default().push(key);
+                }
+            }
+        }
+        lookups.inactive = inactive;
+        lookups
+    }
+}
+
+/// The project's models, with the lookups providers need.
 struct World<'a> {
     files: &'a BTreeMap<String, FileModel>,
-    supers: BTreeMap<&'a str, Vec<&'a str>>,
+    lookups: Rc<Lookups>,
     /// Every file has been read at least once.
     complete: bool,
+    /// The build module of each path asked so far, until a build file changes.
+    modules: &'a RefCell<BTreeMap<String, Option<String>>>,
 }
 
 type Found<'a> = (&'a str, &'a Bean);
 
 impl<'a> World<'a> {
-    fn new(index: &'a Index<FileModel>) -> Self {
-        let mut supers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for m in index.files().values() {
-            for t in &m.types {
-                supers.entry(&t.name).or_default().extend(t.supers.iter().map(String::as_str));
-            }
-        }
-        Self { files: index.files(), supers, complete: index.complete() }
+    fn new(cache: &'a Cache) -> Self {
+        let (files, complete, modules) = (cache.files(), cache.complete(), &cache.modules);
+        let lookups = cache.lookups(|| Lookups::build(files, complete, modules));
+        Self { files, lookups, complete, modules }
     }
 
-    fn active_beans(&self) -> impl Iterator<Item = Found<'a>> + '_ {
-        self.beans().filter(|(p, b)| self.inactive_reason(p, b).is_none())
+    /// The bean at `key` of the lookups.
+    fn found(&self, (path, at): &(String, usize)) -> Option<Found<'a>> {
+        let (path, model) = self.files.get_key_value(path)?;
+        Some((path.as_str(), model.beans.get(*at)?))
     }
 
     fn beans(&self) -> impl Iterator<Item = Found<'a>> + '_ {
@@ -99,54 +202,108 @@ impl<'a> World<'a> {
 
     /// Whether `ty` is `target` or one of its subtypes.
     fn is_a(&self, ty: &str, target: &str) -> bool {
+        self.related(ty, &self.lookups.supertypes).contains(target)
+    }
+
+    /// `ty` and every type `links` reaches from it.
+    fn related<'l>(&self, ty: &'l str, links: &'l BTreeMap<String, Vec<String>>) -> BTreeSet<&'l str> {
         let mut seen = BTreeSet::new();
         let mut todo = vec![ty];
         while let Some(t) = todo.pop() {
-            if t == target {
-                return true;
-            }
             if seen.insert(t) {
-                todo.extend(self.supers.get(t).into_iter().flatten());
+                todo.extend(links.get(t).into_iter().flatten().map(String::as_str));
             }
         }
-        false
+        seen
+    }
+
+    /// Whether `a` and `b` share a source set and build module, reading each path's module once.
+    fn same_scope(&self, a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        if checks::is_test_source(a) != checks::is_test_source(b) {
+            return false;
+        }
+        let module = |path: &str| {
+            if let Some(known) = self.modules.borrow().get(path) {
+                return known.clone();
+            }
+            let found = checks::build_module(path);
+            self.modules.borrow_mut().insert(path.to_owned(), found.clone());
+            found
+        };
+        match (module(a), module(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => true,
+        }
+    }
+
+    /// The type at `key` of the lookups.
+    fn type_at(&self, (path, at): &(String, usize)) -> Option<&'a TypeInfo> {
+        self.files.get(path)?.types.get(*at)
+    }
+
+    /// The one project type `keys` name, if exactly one.
+    fn only_type(&self, keys: Option<&Vec<(String, usize)>>) -> Option<&'a TypeInfo> {
+        match keys.map(Vec::as_slice) {
+            Some([key]) => self.type_at(key),
+            _ => None,
+        }
     }
 
     /// The type `start` and its supertypes, when every one is a project type with all members listed.
     /// `qualified` pins the first one; nothing when a name is ambiguous or comes from a library.
     fn member_chain(&self, start: &str, qualified: Option<&str>) -> Option<Vec<&'a TypeInfo>> {
         const LIBRARY_MARKERS: [&str; 6] = ["Object", "Serializable", "Cloneable", "Comparable", "AutoCloseable", "Closeable"];
+        let lookups = self.lookups.clone();
         let mut found: Vec<&TypeInfo> = Vec::new();
         let mut seen = BTreeSet::new();
-        let mut todo = vec![start];
+        let mut todo = vec![start.to_owned()];
         while let Some(name) = todo.pop() {
-            if !seen.insert(name) || LIBRARY_MARKERS.contains(&name) {
+            if LIBRARY_MARKERS.contains(&name.as_str()) || !seen.insert(name.clone()) {
                 continue;
             }
-            let mut matches = self.files.values().flat_map(|m| &m.types).filter(|t| t.name == name);
-            let (Some(ty), None) = (matches.next(), matches.next()) else {
-                return None;
-            };
+            let ty = self.only_type(lookups.types_by_name.get(&name))?;
             if !ty.members_known || (found.is_empty() && qualified.is_some_and(|q| q != ty.qualified)) {
                 return None;
             }
-            todo.extend(ty.supers.iter().map(String::as_str));
+            todo.extend(ty.supers.iter().cloned());
             found.push(ty);
         }
         Some(found)
     }
 
     fn project_type(&self, qualified: &str) -> Option<&'a TypeInfo> {
-        let mut matches = self.files.values().flat_map(|m| &m.types).filter(|t| t.qualified == qualified);
-        let (Some(ty), None) = (matches.next(), matches.next()) else {
-            return None;
-        };
-        Some(ty)
+        let lookups = self.lookups.clone();
+        self.only_type(lookups.types_by_qualified.get(qualified))
     }
 
     fn path_of(&self, ty: &TypeInfo) -> &'a str {
-        let owner = self.files.iter().find(|(_, m)| m.types.iter().any(|t| std::ptr::eq(t, ty)));
+        let lookups = self.lookups.clone();
+        let keys = lookups.types_by_qualified.get(&ty.qualified).into_iter().flatten();
+        let owner = keys.filter(|key| self.type_at(key).is_some_and(|t| std::ptr::eq(t, ty))).find_map(|(path, _)| self.files.get_key_value(path));
         owner.map_or("", |(p, _)| p.as_str())
+    }
+
+    /// Whether a project type's qualified name starts with `prefix`.
+    fn declares_under(&self, prefix: &str) -> bool {
+        self.lookups.types_by_qualified.range(prefix.to_owned()..).next().is_some_and(|(q, _)| q.starts_with(prefix))
+    }
+
+    /// Whether a project type is qualified `qualified`, under any spelling count.
+    fn declares(&self, qualified: &str) -> bool {
+        self.lookups.types_by_qualified.contains_key(qualified)
+    }
+
+    /// Whether a project type extends or implements `name`.
+    fn has_subtypes(&self, name: &str) -> bool {
+        self.lookups.subtypes.contains_key(name)
+    }
+
+    /// The links between related sources of the cached files.
+    fn resolver(&self) -> &ui_kit::navigation::Resolver {
+        &self.lookups.resolver
     }
 
     /// The value of a string expression made of literals and `static final` project constants.
@@ -176,7 +333,8 @@ impl<'a> World<'a> {
     }
 
     fn named(&self, name: &str) -> Vec<Found<'a>> {
-        self.active_beans().filter(|(_, b)| b.answers_to(name)).collect()
+        let lookups = self.lookups.clone();
+        lookups.by_name.get(name).map_or_else(Vec::new, |keys| keys.iter().filter_map(|key| self.found(key)).collect())
     }
 
     /// The beans Spring would consider for `inj`: by type, then qualifier,
@@ -185,7 +343,11 @@ impl<'a> World<'a> {
         if inj.ty.is_empty() {
             return self.named(inj.qualifier.as_deref().unwrap_or(&inj.name));
         }
-        let typed: Vec<Found> = self.active_beans().filter(|(_, b)| !b.ty.is_empty() && self.is_a(&b.ty, &inj.ty)).collect();
+        let lookups = self.lookups.clone();
+        let mut keys: Vec<&(String, usize)> =
+            self.related(&inj.ty, &lookups.subtypes).into_iter().filter_map(|t| lookups.by_type.get(t)).flatten().collect();
+        keys.sort();
+        let typed: Vec<Found> = keys.into_iter().filter_map(|key| self.found(key)).collect();
         if let Some(q) = &inj.qualifier {
             return typed.into_iter().filter(|(_, b)| b.answers_to(q)).collect();
         }
@@ -202,18 +364,21 @@ impl<'a> World<'a> {
 
     /// Where the bean declared at `path`/`range` is injected: (location, into what).
     fn users(&self, path: &str, bean: &Bean) -> Vec<(Location, String)> {
+        let lookups = self.lookups.clone();
+        let mut asking: BTreeSet<&(String, usize)> = BTreeSet::new();
+        if !bean.ty.is_empty() {
+            asking.extend(self.related(&bean.ty, &lookups.supertypes).into_iter().filter_map(|t| lookups.injections_by_type.get(t)).flatten());
+        }
+        for name in std::iter::once(&bean.name).chain(&bean.aliases).chain(&bean.qualifiers) {
+            asking.extend(lookups.injections_by_name.get(name).into_iter().flatten());
+        }
         let mut out = Vec::new();
-        for (p, m) in self.files {
-            for inj in &m.injections {
-                let maybe = if inj.ty.is_empty() {
-                    inj.qualifier.as_deref().is_some_and(|q| bean.answers_to(q))
-                } else {
-                    !bean.ty.is_empty() && self.is_a(&bean.ty, &inj.ty)
-                };
-                if maybe && self.candidates(inj).iter().any(|(cp, b)| *cp == path && b.range == bean.range) {
-                    let into = inj.owner.map_or_else(|| file_name(p).to_owned(), |o| m.beans[o].name.clone());
-                    out.push((Location { path: p.clone(), range: inj.range }, into));
-                }
+        for (p, at) in asking {
+            let Some((p, m)) = self.files.get_key_value(p) else { continue };
+            let Some(inj) = m.injections.get(*at) else { continue };
+            if self.candidates(inj).iter().any(|(cp, b)| *cp == path && b.range == bean.range) {
+                let into = inj.owner.map_or_else(|| file_name(p).to_owned(), |o| m.beans[o].name.clone());
+                out.push((Location { path: p.clone(), range: inj.range }, into));
             }
         }
         out
@@ -231,6 +396,18 @@ impl<'a> World<'a> {
 
 fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// Markers of one line and icon join into one gutter button whose click opens the IDE's target popup.
+const MAX_LINE_TARGETS: usize = 1000;
+
+/// Says on the line's first marker that `total` targets were cut to the bound.
+fn bounded(markers: &mut [LineMarker], total: usize) {
+    if total <= MAX_LINE_TARGETS {
+        return;
+    }
+    let first = &mut markers[markers.len() - MAX_LINE_TARGETS];
+    first.tooltip = format!("{} ({MAX_LINE_TARGETS} of {total} shown)", first.tooltip);
 }
 
 fn describe(b: &Bean) -> String {
@@ -362,7 +539,7 @@ fn constructor_injection(text: &str, line: u32) -> Option<Vec<TextEdit>> {
 fn merge_into(text: &str, constructor: &java::Member, params: &[(String, String)]) -> Option<Vec<TextEdit>> {
     let (from, to) = constructor.body?;
     let body = text.get(from..to)?;
-    if !body.starts_with('{') || !body.ends_with('}') || !braces_balanced(text) || body.contains("this(") {
+    if !body.starts_with('{') || !body.ends_with('}') || !spring_text::text::balanced(text, false) || body.contains("this(") {
         return None;
     }
     for (_, name) in params {
@@ -420,6 +597,57 @@ fn merge_into(text: &str, constructor: &java::Member, params: &[(String, String)
     Some(edits)
 }
 
+/// Applies non-overlapping `edits` to `text`; returns the result and its
+/// changed lines, each with 3 lines of context, for a confirmation that shows
+/// the change rather than the whole file.
+pub(crate) fn reviewed(text: &str, edits: &[TextEdit]) -> Result<(String, String), Error> {
+    let mut ranges = edits
+        .iter()
+        .map(|edit| {
+            let start = offset(text, edit.range.start).ok_or(Error::Stale)?;
+            let end = offset(text, edit.range.end).ok_or(Error::Stale)?;
+            if start > end {
+                return Err(Error::Stale);
+            }
+            Ok((start, end, edit.text.as_str()))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    ranges.sort_by_key(|(start, end, _)| (*start, *end));
+    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(Error::Stale);
+    }
+    let mut after = String::with_capacity(text.len());
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for (start, end, replacement) in ranges {
+        after.push_str(&text[at..start]);
+        spans.push((after.len(), after.len() + replacement.len()));
+        after.push_str(replacement);
+        at = end;
+    }
+    after.push_str(&text[at..]);
+    let starts: Vec<usize> = std::iter::once(0).chain(after.match_indices('\n').map(|(i, _)| i + 1)).collect();
+    let line = |offset: usize| starts.partition_point(|&start| start <= offset) - 1;
+    let last = starts.len() - 1;
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    for (from, to) in spans {
+        let first = line(from).saturating_sub(3);
+        let end = (line(to.saturating_sub(1).max(from)) + 3).min(last);
+        match blocks.last_mut() {
+            Some(block) if first <= block.1 + 1 => block.1 = block.1.max(end),
+            _ => blocks.push((first, end)),
+        }
+    }
+    let shown: Vec<String> = blocks
+        .into_iter()
+        .map(|(first, end)| {
+            let to = starts.get(end + 1).copied().unwrap_or(after.len());
+            format!("Lines {}–{}:\n{}", first + 1, end + 1, after[starts[first]..to].trim_end_matches(['\r', '\n']))
+        })
+        .collect();
+    Ok((after, shown.join("\n\n")))
+}
+
 fn indent_of(text: &str, at: usize) -> String {
     let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
     text[line_start..].chars().take_while(|c| *c == ' ' || *c == '\t').collect()
@@ -436,21 +664,6 @@ fn assigns(body: &str, name: &str) -> bool {
         let rest = rest.trim_start();
         boundary && (this_prefixed || bare) && rest.starts_with('=') && !rest.starts_with("==")
     })
-}
-
-fn braces_balanced(text: &str) -> bool {
-    let mut depth = 0i32;
-    for c in text.chars() {
-        match c {
-            '{' => depth += 1,
-            '}' => depth -= 1,
-            _ => {}
-        }
-        if depth < 0 {
-            return false;
-        }
-    }
-    depth == 0
 }
 
 /// Events maintain navigation caches; the host owns live diagnostic publication.
@@ -491,9 +704,24 @@ enum Report {
     Dump(String),
 }
 
+/// The last parse of an open document, shared by the provider calls of one version.
+struct Parsed {
+    path: String,
+    version: u64,
+    text: String,
+    model: Option<FileModel>,
+    java: Option<Rc<java::JavaFile>>,
+}
+
+impl Parsed {
+    fn of(&self, doc: &Document) -> bool {
+        self.path == doc.path && self.version == doc.version && self.text == doc.text
+    }
+}
+
 pub struct Navigator {
     indexes: Indexes,
-    gutter: gutter::State,
+    parsed: Vec<Parsed>,
     expansion: Expansion,
     xml_generation: xml_file_actions::Generation,
     property_generation: property_file_actions::Generation,
@@ -502,13 +730,14 @@ pub struct Navigator {
     report_root: Option<String>,
     report_incomplete: bool,
     sections: Switcher,
+    graph: graph::State,
 }
 
 impl Default for Navigator {
     fn default() -> Self {
         Self {
-            indexes: Indexes::new(GLOBS, model::parse),
-            gutter: gutter::State::default(),
+            indexes: Indexes::default(),
+            parsed: Vec::new(),
             expansion: Expansion::default(),
             xml_generation: xml_file_actions::Generation::default(),
             property_generation: property_file_actions::Generation::default(),
@@ -517,31 +746,50 @@ impl Default for Navigator {
             report_root: None,
             report_incomplete: false,
             sections: Switcher::new("beans.section", SECTIONS),
+            graph: graph::State::default(),
         }
     }
 }
 
 impl Navigator {
+    /// The cache of the project owning `doc`, with `doc` applied once per
+    /// version; never starts I/O.
+    fn document_cache(&mut self, doc: &Document) -> Option<&mut Cache> {
+        let cache = self.indexes.document(&doc.path)?;
+        let applied = self.parsed.iter().find(|parsed| parsed.of(doc)).is_some_and(|parsed| cache.files().get(&doc.path) == parsed.model.as_ref());
+        if !applied {
+            cache.update(&doc.path, &doc.text);
+            self.parsed.retain(|parsed| parsed.path != doc.path);
+            if self.parsed.len() >= 8 {
+                self.parsed.remove(0);
+            }
+            let model = cache.files().get(&doc.path).cloned();
+            self.parsed.push(Parsed { path: doc.path.clone(), version: doc.version, text: doc.text.clone(), model, java: None });
+        }
+        Some(cache)
+    }
+
+    /// The Java syntax of `doc`, parsed once per version.
+    fn java_of(&mut self, doc: &Document) -> Rc<java::JavaFile> {
+        let Some(parsed) = self.parsed.iter_mut().find(|parsed| parsed.of(doc)) else {
+            return Rc::new(java::parse(&doc.text));
+        };
+        parsed.java.get_or_insert_with(|| Rc::new(java::parse(&doc.text))).clone()
+    }
+
     /// Uses current-document facts and the owning cached project; never starts I/O.
     fn with_doc<R: Default>(&mut self, doc: &Document, f: impl FnOnce(&World, &FileModel) -> R) -> R {
         if doc.text.len() > 128 * 1024 {
             return R::default();
         }
-        if doc.language=="xml" && !xml_namespace::beans_document(&doc.text) {
-            let _=self.indexes.for_cached_document(&doc.path,&doc.text);
+        let beans = doc.language != "xml" || xml_namespace::beans_document(&doc.text);
+        let Some(cache) = self.document_cache(doc) else {
+            return R::default();
+        };
+        if !beans {
             return R::default();
         }
-        let Some(index) = self.indexes.for_cached_document(&doc.path, &doc.text) else {
-            return R::default();
-        };
-        let mut local = Index::new(GLOBS, model::parse);
-        let index = if index.files().len() <= 512 {
-            index
-        } else {
-            local.update(&doc.path, &doc.text);
-            &local
-        };
-        let world = World::new(index);
+        let world = World::new(cache);
         let empty = FileModel::default();
         let model = world.files.get(&doc.path).unwrap_or(&empty);
         f(&world, model)
@@ -591,41 +839,31 @@ impl Navigator {
 impl DiagnosticsProvider for Navigator {
     fn diagnostics(&mut self, doc: &Document) -> Vec<Diagnostic> {
         if !matches!(doc.language.as_str(), "java" | "kotlin" | "xml") {return Vec::new();}
-        if doc.text.len()>512*1024 {
-            let _=self.indexes.for_cached_document(&doc.path,&doc.text);
+        if doc.text.len() > 512 * 1024 || doc.language == "xml" && !xml_namespace::beans_document(&doc.text) {
+            let _ = self.document_cache(doc);
             return Vec::new();
         }
-        if doc.language=="xml"&&!xml_namespace::beans_document(&doc.text) {
-            let _=self.indexes.for_cached_document(&doc.path,&doc.text);
-            return Vec::new();
-        }
-        let mut local = Index::new(GLOBS, model::parse);
-        local.update(&doc.path, &doc.text);
-        let index = self.indexes.for_cached_document(&doc.path, &doc.text).unwrap_or(&mut local);
-        let bounded = index.files().len() <= 512
-            && index
-                .files()
-                .values()
-                .try_fold(0usize, |count, m| {
-                    let count = count + m.beans.len() + m.injections.len() + m.types.len() + m.pointcuts.len() + m.constants.len();
-                    if count > 4096 {
-                        return None;
-                    }
-                    m.types.iter().try_fold(count, |count, t| {
-                        let count = count + t.supers.len() + t.methods.len() + t.ctors.len();
-                        (count <= 4096).then_some(count)
-                    })
-                })
-                .is_some();
-        let index = if bounded { index } else { &local };
-        let world = World::new(index);
+        let in_project = self.document_cache(doc).is_some();
+        let java = (doc.language == "java").then(|| self.java_of(doc));
+        let mut local = Cache::new();
+        let cache: &Cache = match self.indexes.document(&doc.path).filter(|_| in_project) {
+            Some(cache) => cache,
+            None => {
+                local.update(&doc.path, &doc.text);
+                &local
+            }
+        };
+        let world = World::new(cache);
         let mut groups = checks::Groups::from_settings();
         // These require external resources or build configuration, which is unknown here.
         groups.aop = false;
         groups.duplicate_names = false;
         groups.unresolved_references = false;
         let findings = match doc.language.as_str() {
-            "java" => checks::check_java(&doc.path, &java::parse(&doc.text), &doc.text, &world, groups),
+            "java" => match java.as_deref() {
+                Some(file) => checks::check_java(&doc.path, file, &doc.text, &world, groups),
+                None => Vec::new(),
+            },
             "xml" => {
                 groups.aop = checks::Groups::from_settings().aop;
                 let mut findings = xml_checks::check_xml_cached(&doc.path, &doc.text, &world, groups);
@@ -641,9 +879,8 @@ impl DiagnosticsProvider for Navigator {
         };
         let mut problems: Vec<_> = findings.iter().take(512).map(|f| f.diagnostic(&doc.text)).collect();
         if doc.language != "xml" {
-            problems.extend(
-                field_injection_problems(&model::parse(&doc.path, &doc.text).unwrap_or_default()).into_iter().take(512 - problems.len()),
-            );
+            let model = world.files.get(&doc.path).cloned().unwrap_or_default();
+            problems.extend(field_injection_problems(&model).into_iter().take(512 - problems.len()));
         }
         problems
     }
@@ -652,8 +889,8 @@ impl DiagnosticsProvider for Navigator {
 impl Providers for Navigator {
     fn line_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
         self.with_doc(doc, |world, model| {
-            let resolver = ui_kit::navigation::Resolver::new(world.files.iter().map(|(p, m)| (p.as_str(), &m.navigation)));
-            let mut markers = resolver
+            let mut markers = world
+                .resolver()
                 .checked(|path| {
                     if path == doc.path {
                         return Some(model.navigation.clone());
@@ -661,42 +898,29 @@ impl Providers for Navigator {
                     world.files.get(path).map(|model| model.navigation.clone())
                 })
                 .markers(&model.navigation);
-            let mut chooser_lines=BTreeSet::new();
-            let mut by_line:BTreeMap<u32,BTreeSet<(String,Position,Position)>>=BTreeMap::new();
-            for marker in &markers {if let Some(target)=&marker.target{by_line.entry(marker.line).or_default().insert((target.path.clone(),target.range.start,target.range.end));}}
-            chooser_lines.extend(by_line.into_iter().filter(|(_,targets)|targets.len()>1).map(|(line,_)|line));
             for inj in &model.injections {
                 let found = world.candidates(inj);
-                if found.len()>1 {chooser_lines.insert(inj.range.start.line);continue;}
-                let Some((path, first)) = found.first() else {
-                    continue;
-                };
-                let tooltip = match found.as_slice() {
-                    [(_, one)] => format!("Injected bean: {}", describe(one)),
-                    many => {
-                        let names: Vec<String> = many.iter().map(|(_, b)| describe(b)).collect();
-                        format!("{} candidate beans: {}", many.len(), names.join(", "))
-                    }
-                };
-                let target = Location { path: path.to_string(), range: first.range };
-                markers.push(LineMarker { line: inj.range.start.line, icon: Some(BEAN_MARKER.into()), tooltip, target: Some(target) });
+                let candidate = !inj.multiple && found.len() > 1;
+                for (path, bean) in found.iter().take(MAX_LINE_TARGETS) {
+                    let described = describe(bean);
+                    let tooltip = if candidate { format!("Candidate bean: {described}") } else { format!("Injected bean: {described}") };
+                    let target = Location { path: path.to_string(), range: bean.range };
+                    markers.push(LineMarker { line: inj.range.start.line, icon: Some(BEAN_MARKER.into()), tooltip, target: Some(target) });
+                }
+                bounded(&mut markers, found.len());
             }
             for bean in &model.beans {
                 let users = world.users(&doc.path, bean);
-                if users.len()>1 {chooser_lines.insert(bean.range.start.line);continue;}
-                let Some((first, _)) = users.first() else {
-                    continue;
-                };
-                let names: BTreeSet<&str> = users.iter().map(|(_, into)| into.as_str()).collect();
-                let names: Vec<&str> = names.into_iter().collect();
-                markers.push(LineMarker {
-                    line: bean.range.start.line,
-                    icon: Some(BEAN_MARKER.into()),
-                    tooltip: format!("Injected into {}", names.join(", ")),
-                    target: Some(first.clone()),
-                });
+                for (location, into) in users.iter().take(MAX_LINE_TARGETS) {
+                    markers.push(LineMarker {
+                        line: bean.range.start.line,
+                        icon: Some(BEAN_MARKER.into()),
+                        tooltip: format!("Injected into {into}"),
+                        target: Some(location.clone()),
+                    });
+                }
+                bounded(&mut markers, users.len());
             }
-            markers.retain(|marker|!chooser_lines.contains(&marker.line));
             markers
         })
     }
@@ -720,7 +944,8 @@ impl Providers for Navigator {
                 }
             }
             let related = || {
-                ui_kit::navigation::Resolver::new(world.files.iter().map(|(p, m)| (p.as_str(), &m.navigation)))
+                world
+                    .resolver()
                     .checked(|path| {
                         if path == doc.path {
                             return Some(model.navigation.clone());
@@ -1002,7 +1227,7 @@ fn location_key(path: &str, range: Range) -> String {
 }
 
 impl Navigator {
-    fn tree(index: &Index<FileModel>) -> View {
+    fn tree(index: &Cache, empty: &str) -> View {
         let world = World::new(index);
         let mut groups: BTreeMap<&str, Vec<Found>> = BTreeMap::new();
         for (path, b) in world.beans() {
@@ -1010,8 +1235,8 @@ impl Navigator {
         }
         let refresh = Button::new("refresh", "Refresh").icon("refresh");
         if groups.is_empty() {
-            let text = if index.complete() { "No Spring beans found in inventoried sources." } else { index.state() };
-            return View::message(text).button(refresh);
+            let text = if index.complete() { empty.to_owned() } else { index.state() };
+            return View::message(&text).button(refresh);
         }
         let mut items = Vec::new();
         let mut total = 0;
@@ -1046,16 +1271,18 @@ impl Navigator {
 
     fn report_view(&self) -> View {
         match &self.report {
-            Report::Empty => View::message("Run Check Spring Configuration or Dump Spring Configuration from the Tools menu."),
+            Report::Empty => View::message("Check the project for Spring configuration problems.").button(check_button()),
             Report::Dump(text) => {
                 let escaped = text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
                 View::new(Body::Html(format!("<pre class=\"ui-code\" style=\"font-family: var(--ui-mono); white-space: pre-wrap\">{escaped}</pre>")))
+                    .button(Button::new("dump", "Dump Spring Configuration").icon("refresh"))
             }
             Report::Problems(files) if files.is_empty() => View::message(if self.report_incomplete {
-                "Partial source check: no findings in checked sources; unavailable/capped facts cannot prove absence."
+                "No problems found in the files checked so far, but the scan isn't finished. Click Refresh in Spring Beans, then check again."
             } else {
                 "No problems found."
-            }),
+            })
+            .button(check_button()),
             Report::Problems(files) => {
                 let mut items = Vec::new();
                 let mut total = 0;
@@ -1068,7 +1295,7 @@ impl Navigator {
                     }
                     total += problems.len();
                 }
-                View::new(Body::Tree(items)).status(&format!(
+                View::new(Body::Tree(items)).button(check_button()).status(&format!(
                     "{total} problems in {} files{}",
                     files.len(),
                     if self.report_incomplete { " · partial source check" } else { "" }
@@ -1076,38 +1303,47 @@ impl Navigator {
             }
         }
     }
+}
 
-    fn graph(index: &Index<FileModel>) -> View {
-        let world = World::new(index);
-        let total = world.beans().count();
-        let beans: Vec<Found> = world.beans().take(MAX_GRAPH).collect();
-        let refresh = Button::new("refresh", "Refresh").icon("refresh");
-        if beans.is_empty() {
-            return View::message(if index.complete() { "No Spring beans found in inventoried sources." } else { index.state() })
-                .button(refresh);
-        }
-        let node_of: BTreeMap<(&str, Range), usize> = beans.iter().enumerate().map(|(i, (p, b))| ((*p, b.range), i)).collect();
-        let mut edges = BTreeSet::new();
-        for (path, m) in world.files {
-            for inj in &m.injections {
-                let Some(from) = inj.owner.and_then(|o| node_of.get(&(path.as_str(), m.beans[o].range))) else {
-                    continue;
-                };
-                for (p, b) in world.candidates(inj) {
-                    if let Some(&to) = node_of.get(&(p, b.range)) {
-                        edges.insert((*from, to));
-                    }
-                }
+pub(crate) const PLUGIN_NAME: &str = "Spring Beans Navigator";
+/// One read step of a Refresh; the task's progress reports renew the call's time budget.
+const SCAN_STEP: Duration = Duration::from_secs(1);
+
+impl Navigator {
+    /// Reads the whole project in steps under a cancellable IDE task, so one Refresh finishes the scan.
+    fn scan_project(&mut self, project: &Project) -> String {
+        let task = host::begin_task("Scanning Spring beans", true);
+        let mut step = 0;
+        loop {
+            let index = self.indexes.get(project, SCAN_STEP);
+            if !index.scanning() || task.is_cancelled() {
+                return index.state();
             }
+            step += 1;
+            task.report(step, None, Some(&format!("Scanning… {} source files read", index.files().len())));
         }
-        let nodes: Vec<diagram::Node> =
-            beans.iter().map(|(p, b)| diagram::Node::new(&location_key(p, b.range), &b.name).detail(&b.kind)).collect();
-        let edges: Vec<diagram::Edge> = edges.into_iter().map(|(a, b)| diagram::Edge::new(&nodes[a].id, &nodes[b].id)).collect();
-        let shown = if total > nodes.len() { format!("{} of {total} beans shown", nodes.len()) } else { bean_count(total) };
-        let status = format!("{shown} · {} dependencies · arrows point to dependencies{}", edges.len(), scanning(index));
-        View::new(Body::Html(diagram::html(&nodes, &edges, "No Spring beans found in inventoried sources.")))
-            .button(refresh)
-            .status(&status)
+    }
+
+    /// Asks for a bean name or type and focuses the graph on the first match; Escape clears the search.
+    fn find_in_graph(&mut self, ctx: &Invocation) -> Result<(), Error> {
+        let project = ctx.project().ok_or("Open a project first.")?;
+        let current = (!self.graph.query.is_empty()).then(|| self.graph.query.clone());
+        let query = host::input("Find bean by name or type", current.as_deref())?.unwrap_or_default();
+        let index = self.indexes.get(&project, COMMAND_BUDGET);
+        self.graph.search(&query, index);
+        Ok(())
+    }
+}
+
+fn check_button() -> Button {
+    Button::new("check", "Check Spring Configuration").icon("check")
+}
+
+fn no_beans_message(project: &Project) -> &'static str {
+    if checks::BUILD_FILES.iter().any(|file| project.exists(file).unwrap_or(false)) {
+        "No Spring beans found."
+    } else {
+        "No Spring beans found. This project doesn't look like a Spring project: it has no pom.xml or build.gradle."
     }
 }
 
@@ -1115,7 +1351,7 @@ fn bean_count(n: usize) -> String {
     if n == 1 { "1 bean".into() } else { format!("{n} beans") }
 }
 
-fn scanning(index: &Index<FileModel>) -> String {
+fn scanning(index: &Cache) -> String {
     if index.complete() { String::new() } else { format!(" · {}", index.state()) }
 }
 
@@ -1127,29 +1363,30 @@ impl Views for Navigator {
             };
             let root = match project.root() {
                 Ok(root) if !root.is_empty() => root,
-                _ => return Ok(View::message("Project identity is unavailable. Allow project.read to see this project's Spring beans.")),
+                _ => return Ok(View::message("Project identity is unavailable.")),
             };
             let section = self.sections.active();
             let mut shown = if section == REPORT_SECTION {
                 if self.report_root.as_deref() != Some(root.as_str()) {
-                    View::message("No configuration report for this project; run Check or Dump Spring Configuration.")
+                    View::message("No configuration report for this project yet.").button(check_button())
                 } else {
                     self.report_view()
                 }
             } else {
                 let Some(index) = self.indexes.cached(&project) else {
                     return Ok(self.sections.buttons(
-                        View::message("Source cache cold; Refresh to index this project.")
+                        View::message("Not scanned yet. Click Refresh to find this project's Spring beans.")
                             .button(Button::new("refresh", "Refresh").icon("refresh")),
                         &[],
                     ));
                 };
+                let empty = no_beans_message(&project);
                 if section == GRAPH_SECTION {
-                    Self::graph(index)
+                    graph::view(index, empty, &self.graph)
                 } else if ui_kit::web::is_rendering() {
-                    resources::view(index)
+                    resources::view(index, empty)
                 } else {
-                    Self::tree(index)
+                    Self::tree(index, empty)
                 }
             };
             if let Body::Tree(items) = &mut shown.body {
@@ -1160,7 +1397,9 @@ impl Views for Navigator {
     }
 
     fn handle(&mut self, view: &str, event: ViewEvent, ctx: &Invocation) -> Result<(), Error> {
-        if ui_kit::web::handle(self, view, &event, ctx, include_str!("ui_config.json"))? {
+        // Row actions belong to bean rows, not to the Report's problem rows that share their keys.
+        let row_actions = |nav: &Self, _: &str, _: &View| Ok((nav.sections.active() != "beans").then(Vec::new));
+        if ui_kit::web::handle_with_actions(self, view, &event, ctx, include_str!("ui_config.json"), row_actions)? {
             return Ok(());
         }
 
@@ -1170,15 +1409,38 @@ impl Views for Navigator {
         }
 
         let key = match event {
+            ViewEvent::Button(b) if b == "check" => {
+                commands::check_configuration(self, ctx)?;
+                return Ok(());
+            }
+            ViewEvent::Button(b) if b == "dump" => {
+                commands::dump_configuration(self, ctx)?;
+                return Ok(());
+            }
             ViewEvent::Button(b) if b == "refresh" => {
                 if let Some(project) = ctx.project() {
                     if !self.indexes.cached(&project).is_some_and(|index| index.scanning()) {
                         self.indexes.reset_project(&project);
                     }
-                    self.indexes.get(&project, COMMAND_BUDGET);
+                    self.scan_project(&project);
                 }
                 refresh_beans_view();
                 return Ok(());
+            }
+            ViewEvent::Button(b) if b == graph::FIND => {
+                self.find_in_graph(ctx)?;
+                refresh_beans_view();
+                return Ok(());
+            }
+            ViewEvent::Message(message) if self.sections.active() == GRAPH_SECTION => {
+                let index = ctx.project().and_then(|project| self.indexes.cached(&project));
+                match self.graph.handle(&message, index)? {
+                    Some(key) => key,
+                    None => {
+                        refresh_beans_view();
+                        return Ok(());
+                    }
+                }
             }
             ViewEvent::Activate(key) | ViewEvent::Message(key) => key,
             _ => return Ok(()),
@@ -1310,13 +1572,29 @@ impl Plugin for Navigator {
 
     fn run_command(&mut self, id: &str, ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
         match id {
-            "choose-source-gutter-target"=>self.choose_source_gutter_target(ctx,_arg),
+            "focus-in-graph" => {
+                let project = ctx.project().ok_or("Open a project first.")?;
+                match _arg {
+                    Some(key) => {
+                        if !self.indexes.cached(&project).is_some_and(|index| graph::has_bean(index, key)) {
+                            return Err(Error::Stale);
+                        }
+                        self.graph.focus = Some(key.into());
+                    }
+                    None => self.find_in_graph(ctx)?,
+                }
+                self.sections.set(GRAPH_SECTION);
+                host::reveal_view(BEANS_VIEW)?;
+                refresh_beans_view();
+                Ok(None)
+            }
             "reindex" => {
                 let project = ctx.project().ok_or("Open a project first.")?;
                 self.indexes.reset_project(&project);
-                self.indexes.get(&project, COMMAND_BUDGET);
+                let state = self.scan_project(&project);
                 refresh_beans_view();
-                Ok(None)
+                let complete = self.indexes.cached(&project).is_some_and(|index| index.complete());
+                Ok(Some(if complete { "Spring Beans finished reindexing this project.".into() } else { state }))
             }
             "generate-setter" => commands::generate(self, ctx, commands::Generate::Setter),
             "generate-constructor-dependency" => commands::generate(self, ctx, commands::Generate::Constructor),
@@ -1332,7 +1610,7 @@ impl Plugin for Navigator {
 }
 
 // API 1.3 registers the optional exports on the same component.
-openidea_plugin::register_plugin!(Navigator, providers, views, indexing, diagnostics, file_actions, hover, injections, syntax, language_features);
+openidea_plugin::register_plugin!(Navigator, providers, views, indexing, diagnostics, file_actions, hover, injections, syntax);
 
 #[cfg(test)]
 mod tests;

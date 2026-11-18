@@ -61,7 +61,7 @@ fn split_entry(line: &str) -> Option<(String, String)> {
     Some((scalar(&key)?, value.trim().to_owned()))
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Clone)]
 pub struct Block {
     pub default_path: Option<String>,
     pub paths: Vec<(String, Option<String>)>,

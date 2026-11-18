@@ -1,14 +1,17 @@
 id = "aritti.ddev"
 name = "DDEV Integration"
 version = "0.2.0" # x-release-please-version
-description = "DDEV project controls, service links and streaming logs in Services. Requires an approved DDEV executable and OpenIDEA API 1.4. Native database credentials, keyed terminals and a project execution target for PHP, Node and Composer."
+description = "DDEV project controls, service links and streaming logs in Services. Requires an approved DDEV executable. Native database credentials, keyed terminals and a project execution target for PHP, Node and Composer."
 authors = ["Arnaud Ritti <arnaud.ritti@gmail.com>"]
 homepage = "https://github.com/arnaud-ritti/openidea-plugins/tree/main/plugins/ddev"
 license = "MIT"
 icon = "icon.svg"
-change-notes = "Run target maps Composer to `ddev composer` and refuses Run/Test when the project is not running. 0.1.0: first release, targeting API 1.4. Native Services, readable Overview, redacted Inspect, root logo and streaming logs. State-aware lifecycle controls and guided project preferences. Native owned Database sources, secure credentials and connection requests; non-secret legacy fallback/migration. DDEV execution target for host-selected PHP/Node/Composer runs and tests with project/cwd mapping. Keyed native terminals with command environment, exit-triggered refresh and success-only Configure opening. Window-scoped status and direct service links. Offline official v1.25.5 schema completion, hover and validation. Host-approved global/project executable selection."
+change-notes = """\
+Next release: Delete Project names the project and its path, Guided Setup shows the checklist first, the unavailable row says why and offers Help and Diagnostics, and Start, Restart and Stop are named the same everywhere. Composer runs use `ddev composer`, and Run/Test tell you when the project is not running; Services show the last DDEV status of each project window instead of running DDEV on every refresh, and Run and Test reuse a recent status; double-clicking a row without a link, or while the project is stopped, no longer shows an error; Share Project asks before putting the site on a public URL, the status bar item and project commands show only in DDEV projects, one name per action, clearer messages and shorter setting titles; the duplicate Help and Diagnostics command is gone. \
+0.2.0: consolidated panels and native service actions. \
+0.1.0: first release with Services, lifecycle controls, logs, database connections and PHP/Node/Composer run target."""
 categories = ["tools"]
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-language:yaml", "on-view:ddev", "on-startup-finished", "on-schedule:60", "on-event:file-saved", "on-event:files-changed", "on-event:editor-focused"]
 
@@ -29,19 +32,19 @@ languages = ["yaml"]
 
 [[contributes.commands]]
 id = "start"
-title = "DDEV: Start"
+title = "DDEV: Start Project"
 category = "DDEV"
 when = "workspaceContains:.ddev/config.yaml && (!plugin.aritti.ddev.known || plugin.aritti.ddev.can-start)"
 
 [[contributes.commands]]
 id = "restart"
-title = "DDEV: Restart"
+title = "DDEV: Restart Project"
 category = "DDEV"
 when = "workspaceContains:.ddev/config.yaml && (!plugin.aritti.ddev.known || plugin.aritti.ddev.can-restart-stop)"
 
 [[contributes.commands]]
 id = "stop"
-title = "DDEV: Stop"
+title = "DDEV: Stop Project"
 category = "DDEV"
 when = "workspaceContains:.ddev/config.yaml && (!plugin.aritti.ddev.known || plugin.aritti.ddev.can-restart-stop)"
 
@@ -96,11 +99,13 @@ when = "workspaceContains:.ddev/config.yaml && (!plugin.aritti.ddev.known || plu
 id = "refresh"
 title = "DDEV: Refresh Status"
 category = "DDEV"
+when = "workspaceContains:.ddev/config.yaml"
 
 [[contributes.commands]]
 id = "check-updates"
 title = "DDEV: Check for Updates"
 category = "DDEV"
+when = "workspaceContains:.ddev/config.yaml"
 
 [[contributes.menus]]
 menu = "viewItem.context"
@@ -137,12 +142,6 @@ menu = "viewItem.context"
 view = "ddev"
 command = "open-config"
 
-[[contributes.statusBar]]
-id = "ddev-status"
-text = "DDEV"
-tooltip = "DDEV project actions"
-command = "actions"
-
 [contributes.settings]
 title = "DDEV Integration"
 schema = "settings.schema.json"
@@ -151,6 +150,7 @@ schema = "settings.schema.json"
 id = "actions"
 title = "DDEV: Project Actions"
 category = "DDEV"
+when = "workspaceContains:.ddev/config.yaml"
 
 [[contributes.commands]]
 id = "setup-database"
@@ -181,11 +181,6 @@ id = "node"
 title = "DDEV: Run Node.js…"
 category = "DDEV"
 when = "workspaceContains:.ddev/config.yaml && (!plugin.aritti.ddev.known || plugin.aritti.ddev.running)"
-
-[[contributes.commands]]
-id = "help"
-title = "DDEV: Help and Diagnostics"
-category = "DDEV"
 
 [[contributes.menus]]
 menu = "viewItem.context"
@@ -235,15 +230,9 @@ view = "ddev"
 command = "node"
 submenu = "DDEV"
 
-[[contributes.menus]]
-menu = "viewItem.context"
-view = "ddev"
-command = "help"
-submenu = "DDEV"
-
 [[contributes.views]]
 id = "setup"
-title = "DDEV Setup"
+title = "DDEV Guided Setup"
 icon = "icons/ddev.svg"
 location = "right"
 web = "web/resources/hub.html"
@@ -282,6 +271,7 @@ category = "DDEV"
 id = "disable-update-checks"
 title = "DDEV: Disable Automatic Update Checks for Project"
 category = "DDEV"
+when = "workspaceContains:.ddev/config.yaml"
 
 
 [[contributes.menus]]

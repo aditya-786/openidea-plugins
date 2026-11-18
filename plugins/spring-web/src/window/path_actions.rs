@@ -103,7 +103,7 @@ fn candidates(doc: &Document) -> Vec<Binding> {
         || !doc.path.ends_with(".java")
         || doc.text.len() > 128 << 10
         || doc.text.contains("\\u")
-        || !super::live::balanced(&doc.text)
+        || !spring_text::text::balanced(&doc.text, doc.language == "kotlin")
         || !closed(&doc.text)
     {
         return vec![];

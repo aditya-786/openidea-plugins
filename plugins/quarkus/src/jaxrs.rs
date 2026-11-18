@@ -329,9 +329,8 @@ pub fn check(file: &JavaFile, text: &str, module: Option<&Facts>, out: &mut Vec<
             }
             if let [verb] = found.as_slice()
                 && verb.name == "GET"
-                && m.params.iter().any(|p| p.annotations.is_empty() && !vars.contains(&p.name.as_str()) && !IMPLICIT_TYPES.contains(&p.ty.name.as_str()))
+                && let Some(p) = m.params.iter().find(|p| p.annotations.is_empty() && !vars.contains(&p.name.as_str()) && !IMPLICIT_TYPES.contains(&p.ty.name.as_str()))
             {
-                let p = m.params.iter().find(|p| p.annotations.is_empty() && !vars.contains(&p.name.as_str()) && !IMPLICIT_TYPES.contains(&p.ty.name.as_str())).unwrap();
                 out.push(Finding::new(p.at, p.at + p.name.len(), "get-with-entity", "A @GET method with an entity (unannotated) parameter; Jakarta REST 3.3.2.1 defines no semantics for a GET request body and Quarkus REST logs a warning.").with_severity(Severity::Info));
             }
         }

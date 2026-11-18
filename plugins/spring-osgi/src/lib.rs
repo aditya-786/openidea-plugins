@@ -10,7 +10,7 @@ use openidea_plugin::text::offset;
 use openidea_plugin::{
     Context, Diagnostic, Error, Event, EventKind, Invocation, Location, PickItem, Plugin, Position, Range, Severity, TextEdit, host, register_plugin,
 };
-use spring_text::index::{Index, Indexes, PROVIDER_BUDGET};
+use spring_text::index::{DIAGNOSTICS_WARM, Index, Indexes, PROVIDER_BUDGET};
 use spring_text::xml::{self, Attr, Element};
 use spring_text::{beans, java, range};
 
@@ -19,6 +19,7 @@ mod bean_facts;
 mod ownership;
 use ownership::Facts;
 
+const GLOBS: &[&str] = &["**/*.java", "**/*.kt", "**/*.xml"];
 const BEANS: &str = "http://www.springframework.org/schema/beans";
 const OSGI: &str = "http://www.springframework.org/schema/osgi";
 const COMPENDIUM: &str = "http://www.springframework.org/schema/osgi-compendium";
@@ -71,6 +72,9 @@ struct Info {
 }
 
 fn parse(path: &str, text: &str) -> Option<Info> {
+    if path.ends_with(".kt") {
+        return Some(Info { complete: true, ..Info::default() });
+    }
     if text.len() > 512 * 1024 {
         return Some(Info { complete: false, ..Info::default() });
     }
@@ -80,7 +84,7 @@ fn parse(path: &str, text: &str) -> Option<Info> {
     if beans::ignored(path) || !text.contains("springframework.org/schema/") {
         return None;
     }
-    if validate_generation_xml(text).is_err() { return Some(Info::default()); }
+    if !xml::analysis_valid(text) { return Some(Info::default()); }
     let els = xml::elements(text);
     if xml::root(&els) != Some("beans") { return None; }
     if xml::namespace(&els,0).is_some_and(|namespace|namespace!=BEANS) { return Some(Info::default()); }
@@ -111,7 +115,7 @@ fn declared_xml_class(element:&Element)->Option<String> {
 }
 fn java_info(text: &str) -> Info {
     let f = java::parse(text);
-    if !hierarchy::balanced(text) || f.types.len() > 512 || f.types.iter().map(|t| t.members.len()).sum::<usize>() > 4096 {
+    if !spring_text::text::balanced(text, false) || f.types.len() > 512 || f.types.iter().map(|t| t.members.len()).sum::<usize>() > 4096 {
         return Info::default();
     }
     let classes = f
@@ -269,6 +273,7 @@ struct OsgiXml<'a> {
     els: Vec<Element>,
     core: std::collections::BTreeSet<usize>,
     beans: std::collections::BTreeSet<usize>,
+    kids: Vec<Vec<usize>>,
 }
 
 impl<'a> OsgiXml<'a> {
@@ -288,7 +293,13 @@ impl<'a> OsgiXml<'a> {
         let legacy=xml::root(&els)==Some("beans") && xml::namespace(&els,0).is_none();
         let core=els.iter().enumerate().filter(|(i,e)|xml::namespace(&els,*i)==Some(OSGI) && e.name.matches(':').count()<=1 && !e.name.starts_with("xml:") && !e.name.starts_with("xmlns:")).map(|(_,e)|e.at).collect();
         let beans=els.iter().enumerate().filter(|(i,_)|xml::namespace(&els,*i)==Some(BEANS) || legacy && xml::namespace(&els,*i).is_none()).map(|(_,e)|e.at).collect();
-        Some(Self { text, els, core, beans })
+        let mut kids = vec![Vec::new(); els.len()];
+        for (i, e) in els.iter().enumerate() {
+            if let Some(parent) = e.parent {
+                kids[parent].push(i);
+            }
+        }
+        Some(Self { text, els, core, beans, kids })
     }
 
     fn osgi(&self, e: &Element) -> bool { self.core.contains(&e.at) }
@@ -302,7 +313,7 @@ impl<'a> OsgiXml<'a> {
     }
 
     fn children(&self, i: usize) -> impl Iterator<Item = &Element> {
-        self.els.iter().filter(move |c| c.parent == Some(i))
+        self.kids[i].iter().map(|&c| &self.els[c])
     }
 
     fn child(&self, i: usize, local: &str) -> Option<&Element> {
@@ -326,7 +337,7 @@ impl<'a> OsgiXml<'a> {
     fn interfaces(&self, i: usize) -> Vec<(String, usize, usize)> {
         let e = &self.els[i];
         let mut out: Vec<_> = e.attr("interface").map(|a| (a.value.clone(), a.value_at, a.value_end)).into_iter().collect();
-        if let Some(list) = self.els.iter().position(|c| c.parent == Some(i) && c.local() == "interfaces" && self.osgi(c)) {
+        if let Some(list) = self.kids[i].iter().copied().find(|&c| self.els[c].local() == "interfaces" && self.osgi(&self.els[c])) {
             for v in self.children(list).filter(|c| c.local() == "value" && self.value(c)) {
                 if let Some((from, to)) = self.content(v) {
                     out.push((self.text[from..to].to_owned(), from, to));
@@ -442,11 +453,20 @@ fn check_refs(doc: &OsgiXml, index: &impl Facts, out: &mut Vec<Diagnostic>) {
         if name.is_empty() || name.contains('&') || beans::is_expression(name) || named(index, name).next().is_some() {
             continue;
         }
-        let message = format!("No cached source declaration named '{name}' is known; imported, computed or runtime beans remain unresolved.");
+        let message = format!("No bean named '{name}' was found in the project sources. It may come from a library or be created at runtime.");
         out.push(Diagnostic {
             code: Some("unresolved-osgi-ref".into()),
             ..Diagnostic::new(range(doc.text, a.value_at, a.value_end), Severity::Info, message)
         });
+    }
+}
+
+fn setting_of(code: &str) -> &'static str {
+    match code {
+        "osgi-service-common" => "checkService",
+        "osgi-listener" => "checkListener",
+        "unresolved-osgi-ref" => "checkUnresolvedRef",
+        _ => "checkElements",
     }
 }
 
@@ -576,17 +596,22 @@ pub struct SpringOsgi {
     known_roots: Option<Vec<String>>,
     generation: std::collections::BTreeMap<u64, (String, Document, u32)>,
     next_generation: u64,
+    project_notice: std::sync::atomic::AtomicBool,
 }
 
 impl Default for SpringOsgi {
     fn default() -> Self {
-        Self { indexes: Indexes::new(&["**/*.java", "**/*.xml"], parse), known_roots:None, generation: Default::default(), next_generation: 0 }
+        Self { indexes: Indexes::new(GLOBS, parse), known_roots:None, generation: Default::default(), next_generation: 0, project_notice: Default::default() }
     }
 }
 
 impl SpringOsgi {
-    fn source_scope(&mut self,path:&str)->ownership::Scope {
+    fn source_scope(&mut self,path:&str,text:&str)->ownership::Scope {
         let roots=ownership::roots();
+        // Only OSGi documents lose cross-file checks; a pom.xml must not raise the notice.
+        if roots.is_none() && text.contains(OSGI) && matches!(host::projects(),Err(Error::Denied(_))) {
+            ui_kit::denied::notify_once(&self.project_notice,"Service checks across files","project.read","Spring OSGi");
+        }
         if roots.is_none() || self.known_roots.as_ref().is_some_and(|old|Some(old)!=roots.as_ref()) {self.indexes.reset();}
         self.known_roots=roots.clone();
         ownership::Scope::new(roots,path)
@@ -595,7 +620,7 @@ impl SpringOsgi {
     fn open<'d>(&mut self, doc: &'d Document, at: Position) -> Option<(OsgiXml<'d>, usize, ownership::Scoped<'_>)> {
         let osgi = OsgiXml::new(&doc.text)?;
         let at = offset(&doc.text, at)?;
-        let scope=self.source_scope(&doc.path);
+        let scope=self.source_scope(&doc.path, &doc.text);
         if !scope.known() {return None;}
         let index = self.indexes.for_document(&doc.path, &doc.text, PROVIDER_BUDGET)?;
         Some((osgi, at, ownership::Scoped::new(index,&scope)))
@@ -605,18 +630,19 @@ impl SpringOsgi {
 impl DiagnosticsProvider for SpringOsgi {
     fn diagnostics(&mut self, doc: &Document) -> Vec<Diagnostic> {
         if !doc.path.ends_with(".xml") { return Vec::new(); }
-        let scope=self.source_scope(&doc.path);
+        let scope=self.source_scope(&doc.path, &doc.text);
         if doc.text.len()>512*1024 {
             let _=self.indexes.for_cached_document(&doc.path,&doc.text);
             return Vec::new();
         }
-        let mut local = Index::new(&["**/*.java", "**/*.xml"], parse);
-        let index = match self.indexes.for_cached_document(&doc.path,&doc.text) {
+        let mut local = Index::new(GLOBS, parse);
+        let index = match self.indexes.for_cached_document_warm(&doc.path,&doc.text,DIAGNOSTICS_WARM) {
             Some(index)=>index,
             None=>{local.update(&doc.path,&doc.text);&mut local}
         };
         let index=ownership::Scoped::new(index,&scope);
-        let mut found = validate_generation_xml(&doc.text).ok().and_then(|_|OsgiXml::new(&doc.text)).map(|osgi| check(&osgi, &index)).unwrap_or_default();
+        let mut found = Some(&doc.text).filter(|text|xml::analysis_valid(text)).and_then(|text|OsgiXml::new(text)).map(|osgi| check(&osgi, &index)).unwrap_or_default();
+        found.retain(|d| host::setting_bool(setting_of(d.code.as_deref().unwrap_or_default())).unwrap_or(true));
         found.truncate(500);
         found
     }
@@ -624,7 +650,7 @@ impl DiagnosticsProvider for SpringOsgi {
 
 impl Providers for SpringOsgi {
     fn definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
-        if doc.language!="xml" || !doc.path.ends_with(".xml") || doc.text.len()>512*1024 || validate_generation_xml(&doc.text).is_err() {return Vec::new();}
+        if doc.language!="xml" || !doc.path.ends_with(".xml") || doc.text.len()>512*1024 || !xml::analysis_valid(&doc.text) {return Vec::new();}
         let Some((osgi, at, index)) = self.open(doc, at) else {
             return Vec::new();
         };
@@ -748,31 +774,22 @@ fn compendium_tags(doc: &OsgiXml, text: &str, at: usize) -> Vec<CompletionItem> 
 impl Plugin for SpringOsgi {
     fn activate(&mut self, _ctx: &Context) -> Result<(), Error> {
         // Event delivery maintains caches only; providers own diagnostic publication.
-        let _ = host::subscribe_paths("files-changed", &["**/*.java", "**/*.xml"]);
+        let _ = host::subscribe_paths("files-changed", GLOBS);
         for kind in [EventKind::FileOpened, EventKind::FileSaved] { let _ = host::subscribe(kind); }
         Ok(())
     }
     fn handle_events(&mut self, events: &[Event], _ctx: &Invocation) {
-        let source = |path: &str| path.ends_with(".java") || path.ends_with(".xml");
-        let mut count = 0usize;
-        let mut changed = events.len() > 256;
-        for event in events.iter().take(256) {
-            match event {
-                Event::FileOpened(path) | Event::FileSaved(path) => { changed |= source(path); }
-                Event::FilesChanged(batch) => {
-                    for path in batch.created.iter().chain(&batch.modified).chain(&batch.removed).take(257) {
-                        count += 1;
-                        changed |= source(path) || count > 256;
-                    }
-                }
-                _ => {}
-            }
-            if changed { break; }
-        }
-        if changed {
-            self.indexes.reset();
-            self.generation.clear();
-        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        self.indexes.on_events(events, deadline);
+        let changed: Vec<&str> = events
+            .iter()
+            .flat_map(|event| match event {
+                Event::FileSaved(path) => vec![path.as_str()],
+                Event::FilesChanged(batch) => batch.created.iter().chain(&batch.modified).chain(&batch.removed).map(String::as_str).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        self.generation.retain(|_, (_, document, _)| !changed.contains(&document.path.as_str()));
     }
     fn run_command(&mut self, id: &str, _ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
         Err(Error::NotFound(format!("command {id}; use the OSGi generation editor intention")))
@@ -781,98 +798,17 @@ impl Plugin for SpringOsgi {
 
 // Generator ownership is independent of the navigation/source cache.
 fn generation_owner(doc: &Document) -> Result<String, Error> {
-    if doc.language != "xml"
-        || !doc.path.ends_with(".xml")
-        || !doc.path.starts_with('/')
-        || doc.path.len() > 1024
-        || doc.path.contains('\\')
-        || doc.path.chars().any(char::is_control)
-        || doc.path.split('/').any(|p| matches!(p, "." | ".."))
-    {
+    if doc.language != "xml" || !doc.path.ends_with(".xml") || doc.path.len() > 1024 {
         return Err(Error::Stale);
     }
-    let root = host::project_of(&doc.path).and_then(|p| p.root().ok()).ok_or(Error::Stale)?;
-    if !doc.path.strip_prefix(root.trim_end_matches('/')).is_some_and(|tail| tail.starts_with('/')) {
-        return Err(Error::Stale);
-    }
-    Ok(root)
-}
-// NsReader enforces scoped bindings and the library's reserved-prefix rules.
-// Its raw namespace resolver does not reject reserved default URIs or normalize
-// character references, so validate decoded declaration values as well.
-fn validate_generation_namespaces<R>(
-    reader: &quick_xml::reader::NsReader<R>,
-    element: &quick_xml::events::BytesStart<'_>,
-) -> Result<(), Error> {
-    use quick_xml::name::ResolveResult;
-    const XML: &str = "http://www.w3.org/XML/1998/namespace";
-    const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
-    if element.name().as_ref().starts_with(b"xmlns:") || element.name().as_ref().iter().filter(|b|**b==b':').count()>1
-        || matches!(reader.resolver().resolve_element(element.name()).0, ResolveResult::Unknown(_))
-    {
-        return Err("Invalid or unbound element namespace.".into());
-    }
-    for attribute in element.attributes() {
-        let attribute = attribute.map_err(|_| Error::Invalid("Malformed or duplicate XML attributes.".into()))?;
-        let key = std::str::from_utf8(attribute.key.as_ref()).map_err(|_| Error::Stale)?;
-        if key.matches(':').count()>1 { return Err("Invalid qualified attribute name.".into()); }
-        if key == "xmlns" || key.starts_with("xmlns:") {
-            let value = attribute.decode_and_unescape_value(reader.decoder()).map_err(|_| Error::Stale)?;
-            if key == "xmlns:xmlns"
-                || key.starts_with("xmlns:") && value.is_empty()
-                || key == "xmlns:xml" && value != XML
-                || key != "xmlns:xml" && matches!(value.as_ref(), XML | XMLNS)
-            {
-                return Err("Reserved XML namespace declaration is invalid.".into());
-            }
-        } else if matches!(reader.resolver().resolve_attribute(attribute.key).0, ResolveResult::Unknown(_)) {
-            return Err("Unbound attribute namespace.".into());
-        }
-    }
-    Ok(())
+    spring_text::index::owning_root(&doc.path).ok_or(Error::Stale)
 }
 
 fn validate_generation_xml(text: &str) -> Result<(), Error> {
-    use quick_xml::{events::Event, reader::NsReader};
-    let mut reader = NsReader::from_str(text);
-    reader.config_mut().check_comments=true;
-    let mut depth = 0usize;
-    let mut roots = 0usize;
-    for _ in 0..8192 {
-        match reader.read_event() {
-            Ok(Event::Start(e) | Event::Empty(e)) => {
-                validate_generation_namespaces(&reader, &e)?;
-                if depth == 0 {
-                    roots += 1;
-                }
-                // Empty tags have no matching End event.
-                let empty = text[..reader.buffer_position() as usize].ends_with("/>");
-                if !empty {
-                    depth += 1;
-                }
-                if depth > 128 {
-                    return Err("XML nesting exceeds generation budget.".into());
-                }
-            }
-            Ok(Event::End(_)) => {
-                depth = depth.checked_sub(1).ok_or(Error::Stale)?;
-            }
-            Ok(Event::DocType(_) | Event::GeneralRef(_)) => {
-                return Err("DTD/entity XML is not supported for generation.".into());
-            }
-            Ok(Event::Text(t)) if depth == 0 && !t.as_ref().iter().all(u8::is_ascii_whitespace) => {
-                return Err("Text outside the beans root.".into());
-            }
-            Ok(Event::CData(_)) if depth == 0 => return Err(Error::Stale),
-            Ok(Event::Decl(_)) if depth!=0 || roots!=0 => return Err(Error::Stale),
-            Ok(Event::Eof) if depth == 0 && roots == 1 => return Ok(()),
-            Ok(Event::Eof) | Err(_) => {
-                return Err("Complete well-formed XML is required for generation.".into());
-            }
-            _ => {}
-        }
+    if xml::generation_valid(text) {
+        return Ok(());
     }
-    Err("XML element budget exceeded.".into())
+    Err("Complete well-formed XML is required for generation.".into())
 }
 
 // Only root declarations apply to generated top-level children. Nested or shadowed
@@ -1060,7 +996,7 @@ impl FileActions for SpringOsgi {
                 return Err(Error::Stale);
             }
             let project=host::project_of(&doc.path).ok_or(Error::Stale)?;
-            if project.read_file(&doc.path)?!=doc.text {return Err(Error::Stale);}
+            if project.read_file(&doc.path)?!=doc.text {return Err(Error::Invalid("Save the file first".into()));}
             Ok(())
         };
         current()?;
@@ -1175,6 +1111,65 @@ public class AuditListener implements OsgiServiceLifecycleListener {
     }
 
     #[test]
+    fn diagnostics_survive_file_opened() {
+        let host = setup();
+        let d = doc("context.xml", CONTEXT);
+        let mut plugin = SpringOsgi::default();
+        plugin.indexes.for_document(&d.path, &d.text, PROVIDER_BUDGET);
+        let before = plugin.diagnostics(&d).len();
+        assert!(before >= 8, "{before}");
+        plugin.handle_events(&[Event::FileOpened(d.path.clone())], &host.invocation());
+        assert_eq!(plugin.diagnostics(&d).len(), before);
+        plugin.handle_events(&[Event::FileSaved(format!("{ROOT}java/com/acme/impl/Plain.java"))], &host.invocation());
+        assert_eq!(plugin.diagnostics(&d).len(), before);
+    }
+
+    #[test]
+    fn generation_tickets_clear_only_for_their_own_path() {
+        let host = setup();
+        let d = doc("context.xml", CONTEXT);
+        let other = doc("other.xml", CONTEXT);
+        let mut plugin = SpringOsgi::default();
+        plugin.generation.insert(1, ("/project".into(), d.clone(), 0));
+        plugin.generation.insert(2, ("/project".into(), other.clone(), 0));
+        plugin.handle_events(&[Event::FileSaved(d.path.clone())], &host.invocation());
+        assert!(!plugin.generation.contains_key(&1));
+        assert!(plugin.generation.contains_key(&2));
+    }
+
+    #[test]
+    fn doctype_and_amp_keep_diagnostics() {
+        let _host = setup();
+        let text = CONTEXT.replace("<beans ", "<!DOCTYPE beans>\n<beans ").replace("</beans>", "<!-- a &amp; b --><x>a &amp; b</x></beans>");
+        let d = doc("doctype.xml", &text);
+        assert!(!warmed_diagnostics(&d).is_empty());
+        let mut plugin = SpringOsgi::default();
+        assert_eq!(plugin.definition(&d, after(&text, "interface=\"com.acme.api.Gre")).len(), 1);
+        assert!(validate_generation_xml(&text).is_err());
+    }
+
+    #[test]
+    fn oversized_unrelated_java_keeps_service_checks() {
+        let host = setup();
+        host.add_file("src/main/java/com/acme/Big.java", &format!("package com.acme;\nclass Big {{ /* {} */ }}\n", "x".repeat(600 * 1024)));
+        let d = doc("context.xml", CONTEXT);
+        let mut plugin = SpringOsgi::default();
+        plugin.indexes.for_document(&d.path, &d.text, PROVIDER_BUDGET);
+        assert!(plugin.diagnostics(&d).iter().any(|p| p.code.as_deref() == Some("osgi-service-common")));
+    }
+
+    #[test]
+    fn kotlin_project_no_false_unresolved_ref() {
+        let host = setup();
+        host.add_file("src/main/kotlin/App.kt", "package com.acme\n@Component class Cmp\n");
+        let text = CONTEXT.replace("ref=\"auditListener\"", "ref=\"unknownBean\"");
+        let d = doc("context.xml", &text);
+        let mut plugin = SpringOsgi::default();
+        plugin.indexes.for_document(&d.path, &d.text, PROVIDER_BUDGET);
+        assert!(plugin.diagnostics(&d).iter().all(|p| p.code.as_deref() != Some("unresolved-osgi-ref")));
+    }
+
+    #[test]
     fn foreign_rebound_xml_cannot_borrow_osgi_prefix_or_child_names() {
         let _host=setup(); let mut plugin=SpringOsgi::default();
         for body in [
@@ -1217,7 +1212,6 @@ public class AuditListener implements OsgiServiceLifecycleListener {
             good.replace("xmlns:o=", "xmlns:xml="),
             good.replace("<bean", "<unbound:bean"),
             good.replace("<bean", "<?xml version='1.0'?><bean"),
-            good.replace("<bean", "<!-- invalid--comment --><bean"),
             "x".repeat(512*1024+1),
         ] {
             let invalid=Document {text,version:d.version+1,..d.clone()}; assert!(plugin.diagnostics(&invalid).is_empty());
@@ -1331,13 +1325,30 @@ public class AuditListener implements OsgiServiceLifecycleListener {
             host.refresh_diagnostics(&mut plugin);
             let problems = host.provider_diagnostics();
             let problems = &problems[&path];
-            assert_eq!(problems.len(), 1, "cold missing refs and external types are unknown: {problems:?}");
-            assert_eq!(problems[0].code.as_deref(), Some("osgi-attribute-value"));
+            let unresolved = problems.iter().filter(|p| p.code.as_deref() == Some("unresolved-osgi-ref")).count();
+            assert_eq!(unresolved, usize::from(!caps.is_empty()), "a cold cache leaves missing refs unknown: {problems:?}");
+            assert_eq!(problems.len(), 1 + unresolved);
+            assert!(problems.iter().any(|p| p.code.as_deref() == Some("osgi-attribute-value")));
             assert!(host.diagnostics().is_empty());
             host.open_editor(&path, "xml", &bad.replace("auto-export=\"bad\"", "auto-export=\"disabled\""), &[]);
             host.refresh_diagnostics(&mut plugin);
-            assert!(host.provider_diagnostics().is_empty());
+            let remaining = host.provider_diagnostics();
+            assert!(remaining.values().flatten().all(|p| p.code.as_deref() == Some("unresolved-osgi-ref")));
         }
+    }
+
+    #[test]
+    fn service_check_notice_shown_once() {
+        let host = MockHost::install().with_capabilities(&[]);
+        let mut plugin = SpringOsgi::default();
+        plugin.diagnostics(&doc("plain.xml", "<beans/>"));
+        assert!(host.notifications().is_empty(), "non-OSGi XML stays quiet");
+        let osgi = format!("<beans xmlns:osgi=\"{OSGI}\"/>");
+        plugin.diagnostics(&doc("osgi.xml", &osgi));
+        plugin.diagnostics(&doc("osgi.xml", &osgi));
+        let notices: Vec<_> = host.notifications().into_iter().filter(|n| n.body.contains("needs the project.read permission")).collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].body.contains("Settings › Plugins › Spring OSGi"));
     }
 
     #[test]
@@ -1368,6 +1379,17 @@ public class AuditListener implements OsgiServiceLifecycleListener {
             ]
         );
         assert!(problems.iter().all(|d| d.severity == Severity::Error));
+    }
+
+    #[test]
+    fn unresolved_ref_check_can_be_disabled() {
+        let host = setup();
+        let text = "<beans xmlns=\"http://www.springframework.org/schema/beans\"\n       xmlns:osgi=\"http://www.springframework.org/schema/osgi\">\n<osgi:service ref=\"ghost\"/>\n</beans>\n";
+        assert_eq!(warmed_diagnostics(&doc("refs.xml", text)).len(), 1);
+
+        host.set_setting("checkUnresolvedRef", "false");
+
+        assert!(warmed_diagnostics(&doc("refs.xml", text)).is_empty());
     }
 
     #[test]
@@ -1646,21 +1668,21 @@ public class AuditListener implements OsgiServiceLifecycleListener {
     }
 
     #[test]
-    fn lifecycle_changes_invalidate_source_facts_and_generation_without_discovery() {
-        for event in [Event::FileSaved("/project/src/main/Greeter.java".into()), Event::FileOpened("/project/ctx.xml".into()), Event::FilesChanged(openidea_plugin::FilesChanged { created: vec![], modified: vec![], removed: vec!["/project/src/main/Greeter.java".into()] })] {
-            let host=setup();
-            let d=doc("context.xml",CONTEXT);
-            let mut plugin=SpringOsgi::default();
-            plugin.completion(&d,after(CONTEXT,"ref=\""),None);
-            assert!(class(plugin.indexes.for_cached_document(&d.path,&d.text).unwrap(),"com.acme.impl.GreeterImpl").is_some());
-            plugin.generation.insert(1,("/project".into(),d.clone(),0));
-            plugin.handle_events(&[event],&host.invocation());
-            assert!(class(plugin.indexes.for_cached_document(&d.path,&d.text).unwrap(),"com.acme.impl.GreeterImpl").is_none());
-            assert!(plugin.generation.is_empty());
-            assert!(host.process_runs().is_empty() && host.requests().is_empty());
-            plugin.completion(&d,after(CONTEXT,"ref=\""),None);
-            assert!(class(plugin.indexes.for_cached_document(&d.path,&d.text).unwrap(),"com.acme.impl.GreeterImpl").is_some());
-        }
+    fn lifecycle_events_update_only_the_changed_path() {
+        let host = setup();
+        let d = doc("context.xml", CONTEXT);
+        let mut plugin = SpringOsgi::default();
+        plugin.completion(&d, after(CONTEXT, "ref=\""), None);
+        let has = |plugin: &mut SpringOsgi, fqn: &str| class(plugin.indexes.for_cached_document(&d.path, &d.text).unwrap(), fqn).is_some();
+        assert!(has(&mut plugin, "com.acme.impl.GreeterImpl") && has(&mut plugin, "com.acme.impl.Plain"));
+        let renamed = format!("{ROOT}java/com/acme/impl/GreeterImpl.java");
+        host.add_file("src/main/java/com/acme/impl/GreeterImpl.java", &IMPL.replace("GreeterImpl", "Renamed"));
+        plugin.handle_events(&[Event::FileSaved(renamed)], &host.invocation());
+        assert!(has(&mut plugin, "com.acme.impl.Renamed") && !has(&mut plugin, "com.acme.impl.GreeterImpl"));
+        let removed = openidea_plugin::FilesChanged { created: vec![], modified: vec![], removed: vec![format!("{ROOT}java/com/acme/impl/Plain.java")] };
+        plugin.handle_events(&[Event::FilesChanged(removed)], &host.invocation());
+        assert!(!has(&mut plugin, "com.acme.impl.Plain") && has(&mut plugin, "com.acme.impl.Renamed"));
+        assert!(host.process_runs().is_empty() && host.requests().is_empty());
     }
 
     #[test]
@@ -1804,14 +1826,37 @@ public class AuditListener implements OsgiServiceLifecycleListener {
     }
 
     #[test]
-    fn generation_resolution_refuses_changed_actual_source_behind_an_unchanged_ticket_document() {
+    fn generation_works_under_a_windows_drive_root() {
+        let host = MockHost::install();
+        host.set_project_root(Some(r"C:\work\app"));
+        let path = "C:/work/app/ctx.xml";
+        host.add_file(path, EMPTY_CONTEXT);
+        let d = Document { path: path.into(), language: "xml".into(), version: 1, text: EMPTY_CONTEXT.into() };
+        let mut plugin = SpringOsgi::default();
+        let action = plugin.file_actions(&d, Range::new(Position::new(2, 0), Position::new(2, 0))).pop().expect("offered under C:");
+        for answer in [Some(&["reference"][..]), Some(&["a.Api"][..]), Some(&[][..])] {
+            host.answer_next_prompt(answer);
+        }
+        assert_eq!(plugin.resolve_file_action(&d, action).unwrap().edits.len(), 1);
+    }
+
+    #[test]
+    fn ownership_scopes_windows_roots() {
+        let roots = vec![r"C:\work".to_owned(), r"C:\work\app".to_owned()];
+        let scope = ownership::Scope::new(Some(roots), r"c:\work\app\ctx.xml");
+        assert!(scope.known());
+    }
+
+    #[test]
+    fn generation_unsaved_says_save_first() {
         let host=MockHost::install(); let mut plugin=SpringOsgi::default();
         let d=doc("actual.xml",EMPTY_CONTEXT);
         host.open_editor(&d.path,"xml",&d.text,&[(2,0,2,0)]);
         let action=plugin.file_actions(&d,Range::new(Position::new(2,0),Position::new(2,0))).pop().unwrap();
         host.type_in_editor("<!-- current source changed -->");
         for answer in [Some(&["reference"][..]),Some(&["a.Api"][..]),Some(&[][..])] {host.answer_next_prompt(answer);}
-        assert!(matches!(plugin.resolve_file_action(&d,action),Err(Error::Stale)));
+        let result=plugin.resolve_file_action(&d,action);
+        assert!(matches!(result,Err(Error::Invalid(ref m)) if m=="Save the file first"),"{result:?}");
         assert!(host.editor_text().contains("current source changed"));
     }
     #[test]

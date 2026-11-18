@@ -1,6 +1,6 @@
 //! Source-model details for the Beans resource page, not a runtime context model.
-use crate::cache::Index;
-use crate::{FileModel, World, location_key};
+use crate::cache::Cache;
+use crate::{World, location_key};
 use openidea_plugin::views::{Body, Button, View};
 use serde_json::{Value, json};
 
@@ -20,7 +20,7 @@ fn fact(label: &str, value: &str) -> Value {
     json!({"label":label,"value":clip(value)})
 }
 
-pub(crate) fn view(index: &Index<FileModel>) -> View {
+pub(crate) fn view(index: &Cache, empty: &str) -> View {
     let world = World::new(index);
     let mut beans: Vec<_> = world
         .files
@@ -30,7 +30,8 @@ pub(crate) fn view(index: &Index<FileModel>) -> View {
     beans.sort_by(|a, b| a.3.name.cmp(&b.3.name).then_with(|| a.0.cmp(b.0)).then_with(|| a.3.range.start.cmp(&b.3.range.start)));
     let total = beans.len();
     if total == 0 {
-        return View::message(if index.complete() { "No Spring beans found in inventoried sources." } else { index.state() })
+        let text = if index.complete() { empty.to_owned() } else { index.state() };
+        return View::message(&text)
             .button(Button::new("refresh", "Refresh").icon("refresh"));
     }
     let mut rows = Vec::new();
@@ -90,26 +91,37 @@ pub(crate) fn view(index: &Index<FileModel>) -> View {
         };
         rows.push(json!({"key":location_key(path,bean.range),"label":clip(&bean.name),"cells":cells,"icon":icon,"details":details}));
     }
-    let mut data = json!({"columns":["Name","Type","Kind","Profiles","Source"],"facets":[3,4],"groupBy":2,"displayColumns":[0,1],"showRowIcons":true,"items":rows,"totalRows":total});
-    while data.to_string().len() > MAX_BODY {
-        let items = data["items"].as_array_mut().unwrap();
-        if items.is_empty() {
-            break;
-        }
-        items.pop();
-    }
-    let shown = data["items"].as_array().unwrap().len();
+    let mut data = json!({"columns":["Name","Type","Kind","Profiles","Source"],"facets":[3,4],"groupBy":2,"displayColumns":[0,1],"showRowIcons":true,"items":[],"totalRows":total});
+    let rows = fit(&data, rows, MAX_BODY);
+    let shown = rows.len();
+    data["items"] = Value::Array(rows);
     let mut status = format!("{total} source beans · {shown} loaded · source model, not runtime state");
     if shown < total {
         status.push_str(" · presentation capped");
     }
     if !index.complete() {
         status.push_str(" · partial source index · ");
-        status.push_str(index.state());
+        status.push_str(&index.state());
     }
     View::new(Body::Other { kind: "resources".into(), data: data.to_string() })
         .button(Button::new("refresh", "Refresh").icon("refresh"))
         .status(&status)
+}
+
+/// The leading `rows` that fit in `max` bytes of JSON inside `envelope`'s empty
+/// `items`; each row is serialized once.
+fn fit(envelope: &Value, rows: Vec<Value>, max: usize) -> Vec<Value> {
+    let mut size = envelope.to_string().len();
+    let mut kept = Vec::new();
+    for row in rows {
+        let added = row.to_string().len() + usize::from(!kept.is_empty());
+        if size.saturating_add(added) > max {
+            break;
+        }
+        size += added;
+        kept.push(row);
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -128,9 +140,9 @@ mod tests {
         let host = MockHost::install();
         let source = "@org.springframework.stereotype.Service(\"orders\") @org.springframework.context.annotation.Profile(\"dev\") class Orders { @org.springframework.beans.factory.annotation.Autowired Repo repo; }";
         host.add_file("src/Orders.java", source);
-        let mut indexes = Indexes::new(crate::GLOBS, crate::model::parse);
+        let mut indexes = Indexes::default();
         let project = host.invocation().project().unwrap();
-        let model = data(view(indexes.get(&project, COMMAND_BUDGET)));
+        let model = data(view(indexes.get(&project, COMMAND_BUDGET), "No Spring beans found."));
         let row = &model["items"][0];
         assert_eq!(row["cells"][0], "orders");
         assert_eq!(row["cells"][1], "Orders");
@@ -143,9 +155,9 @@ mod tests {
     #[test]
     fn cold_source_rows_do_not_claim_absence_or_runtime_resolution() {
         let host = MockHost::install();
-        let mut indexes = Indexes::new(crate::GLOBS, crate::model::parse);
+        let mut indexes = Indexes::default();
         let index = indexes.for_cached_document("/project/src/C.java", "@org.springframework.stereotype.Component class C {}").unwrap();
-        let shown = view(index);
+        let shown = view(index, "No Spring beans found.");
         assert!(shown.status.as_deref().unwrap().contains("partial source index"));
         assert!(
             data(shown)["items"][0]["details"]
@@ -155,5 +167,20 @@ mod tests {
                 .any(|f| f["value"].as_str().unwrap().contains("absence is not proof"))
         );
         assert!(host.process_runs().is_empty());
+    }
+    #[test]
+    fn resources_payload_truncated_under_max() {
+        let rows: Vec<Value> = (0..50).map(|n| json!({"key": n, "label": "x".repeat(90)})).collect();
+        let envelope = json!({"columns": ["Name"], "items": []});
+        let kept = fit(&envelope, rows.clone(), 1000);
+        let size = |items: &[Value]| {
+            let mut data = envelope.clone();
+            data["items"] = Value::Array(items.to_vec());
+            data.to_string().len()
+        };
+        assert!(!kept.is_empty() && kept.len() < rows.len());
+        assert!(size(&kept) <= 1000);
+        assert!(size(&rows[..kept.len() + 1]) > 1000, "as many rows as fit");
+        assert_eq!(fit(&envelope, rows.clone(), usize::MAX).len(), rows.len());
     }
 }

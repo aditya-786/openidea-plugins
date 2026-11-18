@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 #[test]
 fn native_pages_preserve_every_legacy_key_type_default_and_keep_runtime_values_out() {
-    let legacy: Value = serde_json::from_str(include_str!("../settings.schema.json")).unwrap();
+    let legacy: Value = serde_json::from_str(include_str!("../tests/fixtures/settings.schema.json")).unwrap();
     let mut migrated = BTreeMap::new();
     for source in [
         include_str!("../settings-java.schema.json"),
@@ -59,6 +59,6 @@ fn settings_metadata_action_requires_an_invoking_project_and_never_substitutes_r
     let error = boot
         .run_command("read-dependency-jar-metadata", &host.invocation(), None)
         .unwrap_err();
-    assert!(error.to_string().contains("Open the owning Maven project"));
+    assert!(error.to_string().contains("Open the Maven or Gradle project first"));
     assert!(host.requests().is_empty());
 }

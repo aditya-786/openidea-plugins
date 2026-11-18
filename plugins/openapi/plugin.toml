@@ -4,10 +4,13 @@ version = "0.3.0" # x-release-please-version
 description = "Editing support for OpenAPI 3 and Swagger 2 files in YAML and JSON: $ref completion and navigation, problems for unresolved references, duplicate operationIds and path parameters, the official schema for validation, an endpoints tool window, a Swagger UI preview beside the text, and requests for the HTTP client."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "OpenAPI: Try-it-out also accepts a single literal https://host server when the optional net:ask grant is given; the host asks before the first request to each host and re-checks redirects, nothing is sent without the exact-request Send. Operation gutter markers use a packaged icon. OpenAPI: Draft Spec from Source Mappings… scans project Java/Kotlin sources (bounded files and bytes) for Spring MVC, JAX-RS/Quarkus and Micronaut controllers and, after a review prompt, writes a new openapi-draft.yaml (never overwritten) with literal paths, path/query parameters, request bodies, @ResponseStatus codes, unique operationIds and component schemas for plain records/POJOs; constants, ant patterns, regex path variables and unreadable types are skipped or left as TODO placeholders and listed at the top of the file. OpenAPI: Breaking-Change Report Against Another Spec… picks an older spec in the project and writes a reviewed Markdown report beside the current file that classifies findings as breaking, non-breaking or info with old and new locations (local $refs only, bounded size and depth; a documented subset of openapi-diff/oasdiff rules for paths, operations, parameters, request bodies, responses, enums, schema properties, constraints, nullability, oneOf/anyOf members, readOnly/writeOnly, deprecated and security requirements, with direction-aware severity; allOf is flattened, additionalProperties is not analysed, not full oasdiff parity). Add operation/response quick fixes also work in strict JSON specs (exact token scanner, single reviewed edit; duplicate keys, comments and non-strict JSON are refused), and new Add path (on paths) and Add query parameter (on a path item or operation, merging only into block-style or JSON lists) quick fixes. YAML quick fixes Add get/post/put/delete operation on a path key and Add 200/400/404/default response on an operation responses key insert a minimal skeleton at the exact end of an existing block mapping (flow style, anchors, multi-document, JSON and $ref path items are refused). Configured generation can import a bounded project-relative generator JSON config (known scalar options only, no secrets, shown in the review before staging). Generation now uses isolated staging and reviewed native no-clobber apply; installed config-help options and owned custom templates are supported. Reviewed visible-source multi-file component rename, physical incoming usages, root section additions and installed generator catalog. Reviewed optional Swagger Codegen 3 adapter generates clients, server stubs and documentation into new project directories; preserve endpoint operation identity and source navigation. Add read-only current-document component occurrence navigation with exact JSON/YAML pointer ownership and descendant reference matching. Unreleased: bounded same-project physical sibling references and strict source-backed JSON/YAML object-key definition navigation and current-text local YAML schema-reference hover; source-owned JSON structure locations and pre-allocation JSON/YAML provider scan budgets that preserve partial completion; definition requires literal source reference ownership and complete external target hints and supported complete current-document hints require actual pointer ownership; duplicate operationId diagnostics, local-reference gutter markers and path-parameter lists preserve operation overrides; three-state reference diagnostics preserve known missing targets while ambiguous/duplicate/base/encoded owners stay quiet, without enabling indexed Rename; Copy Reference selects the actual caret key through complete source ownership, array ancestry and canonical pointer/URI escaping. Earlier unreleased: the endpoints view is the shared route list (method icons, controller-style filter by first tag, flat or tree, Copy as curl and Create HTTP Request File on a row, written beside the spec); live templates oas3 (OpenAPI 3.1 root), opnp, endp and swag; key and enum completion in OpenAPI 3 JSON; Extract inline schema and Self-Contained Spec also for JSON; Write Requests for the HTTP Client and Write Self-Contained Spec save a file beside the spec through the optional project.write permission (clipboard without it); specGlobs files get problems and appear in the endpoints view, but the preview patterns stay fixed (use Open With). Earlier unreleased: keyword and enum completion in OpenAPI 3 YAML; Extract inline schema to components/schemas; Copy Self-Contained Spec (bundles external $refs into components); Copy Reference to the Key at the Caret; Compare With Last Revision (git, optional); operation gutter markers that open the operation's first local schema; the specGlobs setting; an OpenAPI file icon; a Redoc view in the preview (bundles Redoc 2.5.4). OpenAPI: Compare With Another Spec… lists added, removed and changed operations, schemas and sections against a spec you pick, in the OpenAPI Changes view. 0.1.0: first release, with $ref completion and go to definition, problems on open and save, the OpenAPI schema modeline, the endpoints tool window, the Swagger UI preview (bundles Swagger UI 5.34.1) and Copy Requests for the HTTP Client."
+change-notes = """\
+Next release: An Operations panel beside spec editors lists operations by tag with a filter and jumps to one on click; Copy as cURL and Create HTTP Request File suggest the spec server as the base URL and let you pick an endpoint from Search Everywhere, and the preview remembers Redoc or Swagger UI; Try it out works with YAML specs, starts from the preview Try button, accepts a single https server with the optional net:ask permission and refuses private, single-label and localhost servers, with plainer messages there and in component rename; Draft Spec from Source Mappings and Breaking-Change Report commands, operation and response quick fixes in JSON, and self-contained export no longer duplicates components; gutter markers skip files that are not OpenAPI specs, list every $ref of an operation in a chooser and mark component declarations with their local $ref uses, files in hidden folders are ignored, setting titles are shorter, spec commands are enabled only in a spec, and code generation says when it finishes and how to apply it. \
+0.3.0: generation with preview and apply, richer checks. \
+0.2.0: plugin icon and audit improvements."""
 categories = ["languages", "tools"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 
 activation = ["on-event:file-opened", "on-event:file-saved", "on-view:endpoints"]
@@ -19,6 +22,10 @@ optional = ["project.write", "clipboard", "process:git", "storage", "net:127.0.0
 [[contributes.markerIcons]]
 id = "ref"
 icon = "icons/marker-ref.svg"
+
+[[contributes.markerIcons]]
+id = "referenced-by"
+icon = "icons/openapiinitiative.svg"
 
 [[contributes.providers]]
 kinds = ["completion", "definition", "code-actions", "line-markers"]
@@ -32,9 +39,16 @@ languages = ["json"]
 kinds = ["hover"]
 languages = ["json", "yaml"]
 
+# Beside the editor of a spec: the active editor's spec status comes from host::set_context.
+[[contributes.editorPanels]]
+id = "operations"
+web = "web/operations.html"
+width = 260
+when = "(editorLangId == yaml || editorLangId == json) && plugin.aritti.openapi.spec"
+
 [[contributes.views]]
 id = "endpoints"
-title = "OpenAPI"
+title = "OpenAPI Endpoints"
 icon = "web"
 location = "right"
 web = "web/resources/hub.html"
@@ -63,20 +77,23 @@ category = "OpenAPI"
 id = "export-self-contained"
 title = "OpenAPI: Write Self-Contained Spec"
 category = "OpenAPI"
+when = "plugin.aritti.openapi.spec"
 
 [[contributes.commands]]
 id = "copy-reference"
 title = "OpenAPI: Copy Reference to the Key at the Caret"
 category = "OpenAPI"
+when = "plugin.aritti.openapi.spec"
 
 [[contributes.commands]]
 id = "copy-http-requests"
 title = "OpenAPI: Write Requests for the HTTP Client"
 category = "OpenAPI"
+when = "plugin.aritti.openapi.spec"
 
 [[contributes.commands]]
 id = "copy-route-curl"
-title = "OpenAPI: Copy as curl"
+title = "OpenAPI: Copy as cURL"
 category = "OpenAPI"
 
 [[contributes.commands]]
@@ -182,11 +199,13 @@ category = "OpenAPI"
 id = "component-occurrences"
 title = "OpenAPI: Find Component Occurrences in This Document"
 category = "OpenAPI"
+when = "plugin.aritti.openapi.spec"
 
 [[contributes.commands]]
 id = "generate-code"
 title = "OpenAPI: Generate Client, Server or Documentation…"
 category = "OpenAPI"
+when = "plugin.aritti.openapi.spec"
 
 [[contributes.commands]]
 id = "export-comparison"
@@ -197,13 +216,15 @@ category = "OpenAPI"
 id = "component-project-usages"
 title = "OpenAPI: Find Component Usages in Project"
 category = "OpenAPI"
+when = "plugin.aritti.openapi.spec"
 
 [[contributes.commands]]
 id = "generate-code-configured"
 title = "OpenAPI: Generate With Options or Templates…"
 category = "OpenAPI"
+when = "plugin.aritti.openapi.spec"
 
 [[contributes.commands]]
 id = "forget-codegen-stage"
-title = "OpenAPI: Forget Completed Generation Stage"
+title = "OpenAPI: Stop Tracking Generated Code"
 category = "OpenAPI"

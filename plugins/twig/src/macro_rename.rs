@@ -366,7 +366,7 @@ pub fn resolve(doc: &Document, action: FileAction) -> Result<FileAction, Error> 
         edits.push(openidea_plugin::TextEdit { range: EditorRange::new(position(&doc.text, r.start), position(&doc.text, r.end)), text: new.clone() });
     }
     preview.push_str("\nCall sites that pass this parameter by name (name: value) are not updated.");
-    if !host::confirm("Apply reviewed macro parameter rename?", &preview)? {
+    if !host::confirm("Rename this macro parameter?", &preview)? {
         return Err(Error::Cancelled);
     }
     Ok(FileAction {

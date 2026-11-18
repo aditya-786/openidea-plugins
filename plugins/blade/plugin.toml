@@ -1,22 +1,22 @@
 id = "aritti.blade"
 name = "Blade"
 version = "0.3.0" # x-release-please-version
-description = "Laravel Blade support for .blade.php files: highlighting of Blade directives, echo statements, PHP and the HTML around them, sections and pushes in the structure view, folding of directive pairs and multi-line comments, static directive hover, and inspections for unpaired directives and unbalanced parentheses in directive arguments."
+description = "Laravel Blade support for .blade.php files: highlighting of Blade directives, echo statements, PHP and the HTML around them, sections and pushes in the structure view, folding of directive pairs and multi-line comments, static directive hover, and inspections for unpaired directives and unbalanced parentheses in directive arguments. Completion comes from the Laravel plugin."
 authors = ["Arnaud Ritti <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Unreleased: bidirectional matching-directive navigation using unsaved source. Unreleased: bounded current-text closing-directive navigation and explicit Laravel/Blade reference ownership, with no unsafe Rename graph. documented that directive completion and its snippets are provided by aritti.laravel, not by this plugin. 0.1.0: 0.1.0: first release, with .blade.php file detection, highlighting, structure view and folding."
+change-notes = """\
+Next release: Quick fix inserts the missing closing directive (@endif, @endforeach and so on) for an unclosed block. Jump between a directive and its matching closing directive, also in unsaved text; injected PHP, JavaScript and CSS keep working after a stray < in the text, and the directive list is no longer re-read on every request; works without project access, though custom directives from ide.json and Composer packages are then not recognised in injections; clearer, consistent command names; directive completion is provided by the Laravel plugin. \
+0.3.0: custom directives are highlighted and project-declared directives are recognised. \
+0.2.0: plugin icon and smoother editor workflows. \
+0.1.0: first release with .blade.php detection, highlighting, structure view and folding."""
 categories = ["languages"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
-# Highlighting, structure, folding and the inspections come from this component;
-# it is loaded when the first Blade file is opened.
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-language:blade"]
 
 [capabilities]
-required = ["project.read"]
-# events: the inspections run when a Blade file is opened or saved.
-optional = ["events"]
+optional = ["project.read"]
 
 [contributes.settings]
 schema = "settings.schema.json"
@@ -26,5 +26,5 @@ title = "Blade"
 path = "languages/blade.toml"
 
 [[contributes.providers]]
-kinds = ["diagnostics", "hover", "definition", "injections"]
+kinds = ["diagnostics", "hover", "definition", "injections", "code-actions"]
 languages = ["blade"]

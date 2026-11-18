@@ -321,7 +321,7 @@ fn names(doc: &Document, f: &JavaFile, m: &Member, modern: bool, out: &mut Vec<D
                         out,
                         rules::literal_range(&doc.text, &s),
                         "ignored-option-name",
-                        "This literal is not classified as a long or short option by the supported legacy registrar.",
+                        "Spring Shell ignores this option name. Use --name for a long option or -x (one character) for a short one.",
                     );
                 }
             }
@@ -341,7 +341,7 @@ fn names(doc: &Document, f: &JavaFile, m: &Member, modern: bool, out: &mut Vec<D
                     out,
                     rules::literal_range(&doc.text, value),
                     "option-default-format",
-                    "Literal default does not match standard conversion for the declared primitive type. Custom converters and runtime defaults are not resolved.",
+                    "This default value can't be converted to the parameter's type. Custom converters are not checked.",
                 );
             }
         }
@@ -349,7 +349,7 @@ fn names(doc: &Document, f: &JavaFile, m: &Member, modern: bool, out: &mut Vec<D
     for ((_, name), ranges) in named {
         if name.is_empty() {
             for &at in &ranges {
-                diag(out, at, "empty-option-name", "An explicit option name is empty before runtime naming modifiers.");
+                diag(out, at, "empty-option-name", "The option name is empty.");
             }
         }
         if ranges.len() > 1 {
@@ -358,7 +358,7 @@ fn names(doc: &Document, f: &JavaFile, m: &Member, modern: bool, out: &mut Vec<D
                     out,
                     at,
                     "duplicate-option-name",
-                    "Literal option name is repeated within this command before runtime naming modifiers.",
+                    "This option name is used more than once in this command.",
                 );
             }
         }
@@ -492,7 +492,7 @@ fn aliases(doc: &Document, f: &JavaFile, out: &mut Vec<Diagnostic>) {
                         out,
                         rules::literal_range(&doc.text, &s),
                         "empty-command-alias",
-                        "Literal alias and its known class alias prefix are both empty.",
+                        "The alias is empty and the class has no alias prefix, so the command has no name.",
                     );
                     continue;
                 }
@@ -508,7 +508,7 @@ fn aliases(doc: &Document, f: &JavaFile, out: &mut Vec<Diagnostic>) {
                         out,
                         *at,
                         "duplicate-command-alias",
-                        "This literal alias/command matches another declared route in the current document.",
+                        "Another command in this file already uses this name.",
                     );
                 }
             }
@@ -745,12 +745,12 @@ fn core_options(doc:&Document,f:&JavaFile,out:&mut Vec<Diagnostic>) {
                 let value=&values[0];if value.value.is_empty(){continue;}
                 let Some(kind)=primitive(doc,f,parameter,&HashSet::new(),&BTreeMap::new()) else {continue;};
                 if default_valid(&value.value,kind)==Some(false) {
-                    diag(out,rules::literal_range(&doc.text,value),if option{"option-default-format"}else{"argument-default-format"},"Literal default does not match standard conversion for the declared primitive type. Custom converters and runtime defaults are not resolved.");
+                    diag(out,rules::literal_range(&doc.text,value),if option{"option-default-format"}else{"argument-default-format"},"This default value can't be converted to the parameter's type. Custom converters are not checked.");
                 }
             }
         }
         for (_,spans) in names.into_iter().filter(|(_,spans)|spans.len()>1) {
-            for span in spans {diag(out,span,"duplicate-option-name","Literal option name is repeated within this command before runtime naming modifiers.");}
+            for span in spans {diag(out,span,"duplicate-option-name","This option name is used more than once in this command.");}
         }
     }
 }

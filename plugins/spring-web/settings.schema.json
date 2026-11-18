@@ -16,9 +16,10 @@
       "default": true
     },
     "springWeb.reportUnresolvedViews": {
+      "title": "Hint at view names with no template",
       "type": "boolean",
-      "title": "Hint when a returned view name matches no template in the known template folders; quiet when a source defines its own ViewResolver",
-      "default": true
+      "default": true,
+      "description": "Hint when a returned view name matches no template in the known template folders; quiet when a source defines its own ViewResolver"
     },
     "springWeb.showUrlMarkers": {
       "type": "boolean",
@@ -42,17 +43,20 @@
     },
     "springGraphql.reportUnmappedFields": {
       "type": "boolean",
-      "title": "Report (Info) a field with arguments on a schema type that no controller method or data fetcher serves",
+      "title": "Report schema fields with arguments that no controller serves",
+      "description": "Info hint on a field with arguments on a schema type that no controller method or data fetcher serves",
       "default": true
     },
     "springCloud.checkStreamBindings": {
       "type": "boolean",
-      "title": "Hint when a StreamBridge destination or binder-specific key names a Stream binding that no configuration declares",
+      "title": "Flag Stream bindings that no configuration declares",
+      "description": "Hint when a StreamBridge destination or binder-specific key names a Stream binding that no configuration declares",
       "default": true
     },
     "springCloud.checkBootstrap": {
       "type": "boolean",
-      "title": "Warn when a bootstrap file is ignored because spring-cloud-starter-bootstrap is missing (Spring Boot 2.4+)",
+      "title": "Warn about ignored bootstrap files",
+      "description": "Warn when a bootstrap file is ignored because spring-cloud-starter-bootstrap is missing (Spring Boot 2.4+)",
       "default": true
     },
     "springCloud.checkLegacyStream": {

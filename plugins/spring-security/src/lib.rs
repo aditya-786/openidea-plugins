@@ -8,13 +8,13 @@ use openidea_plugin::Location;
 use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Document, LineMarker, Providers};
 use openidea_plugin::text::offset;
 use openidea_plugin::{Diagnostic, Error, Invocation, Plugin, Position, Range, Severity, TextEdit, host, register_plugin};
-use spring_text::index::{Indexes, PROVIDER_BUDGET};
+use spring_text::index::{DIAGNOSTICS_WARM, Indexes, PROVIDER_BUDGET};
 use spring_text::java::{self, Annotation, JavaFile};
 use spring_text::sibling::sibling_calls;
 use spring_text::{SOURCE_GLOBS, beans, range, xml};
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
-mod xml_namespaces;
 mod actions;
 mod endpoints;
 mod live;
@@ -225,8 +225,9 @@ fn expression_problems(expr: &str) -> Vec<(usize, usize, &'static str, Severity,
     out
 }
 
-/// `text` with Kotlin comments and string literals blanked out (same byte offsets).
-fn kotlin_code_only(text: &str) -> String {
+/// `text` with comments and string literals blanked out (same byte offsets).
+/// Only Kotlin block comments nest.
+fn code_only(text: &str, kotlin: bool) -> String {
     let b = text.as_bytes();
     let mut out = b.to_vec();
     let blank = |out: &mut [u8], from: usize, to: usize| {
@@ -244,7 +245,7 @@ fn kotlin_code_only(text: &str) -> String {
         } else if b[i..].starts_with(b"/*") {
             let mut depth = 0;
             while i < b.len() {
-                if b[i..].starts_with(b"/*") {
+                if depth == 0 || kotlin && b[i..].starts_with(b"/*") {
                     depth += 1;
                     i += 2;
                 } else if b[i..].starts_with(b"*/") {
@@ -582,43 +583,6 @@ fn matcher_problems(text: &str, code: &str, kotlin: bool) -> Vec<Problem> {
     out
 }
 
-const PATH_PATTERN_CALLS: [&str; 3] = ["requestMatchers", "mvcMatchers", "securityMatcher"];
-
-fn path_pattern_problems(text: &str, code: &str, kotlin: bool) -> Vec<Problem> {
-    let mut out = Vec::new();
-    let bytes = code.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if !is_ident_byte(bytes[i]) || (i > 0 && is_ident_byte(bytes[i - 1])) {
-            i += 1;
-            continue;
-        }
-        let end = (i..bytes.len()).find(|&j| !is_ident_byte(bytes[j])).unwrap_or(bytes.len());
-        let name = &code[i..end];
-        let open = end + code[end..].len() - code[end..].trim_start().len();
-        let is_call = PATH_PATTERN_CALLS.contains(&name) || kotlin && name == "authorize";
-        i = end;
-        if !is_call || bytes.get(open) != Some(&b'(') {
-            continue;
-        }
-        let close = closing(code, open);
-        let (_, patterns) = leading_patterns(text, &argument_ranges(code, open, close));
-        for (from, _, pattern) in patterns {
-            let segments: Vec<&str> = pattern.split('/').collect();
-            let mut offset = from;
-            for (n, segment) in segments.iter().enumerate() {
-                if *segment == "**" && n + 1 < segments.len() {
-                    let message = "A `**` before the last path segment is rejected by PathPatternParser, which Spring MVC request matching uses, and is not supported there: `**` may only end a pattern.";
-                    let diagnostic = problem(text, offset, offset + 2, Severity::Warning, "obsolete-path-pattern", message.to_owned());
-                    out.push(Problem { diagnostic });
-                }
-                offset += segment.len() + 1;
-            }
-        }
-    }
-    out
-}
-
 fn debug_problems(text: &str, code: &str) -> Vec<Problem> {
     let mut out = Vec::new();
     let mut warn = |from: usize, to: usize| {
@@ -741,20 +705,16 @@ fn problems(path: &str, text: &str) -> Vec<Problem> {
     if security && !kotlin && host::setting_bool("springSecurity.checkSelfInvocation").unwrap_or(false) {
         out.extend(self_invocations(text, &file));
     }
+    let code = if security { code_only(text, kotlin) } else { String::new() };
     if security {
-        let code = kotlin_code_only(text);
         if host::setting_bool("springSecurity.checkMatchers").unwrap_or(true) {
             out.extend(matcher_problems(text, &code, kotlin));
-        }
-        if host::setting_bool("springSecurity.checkPathPatterns").unwrap_or(true) {
-            out.extend(path_pattern_problems(text, &code, kotlin));
         }
         if host::setting_bool("springSecurity.checkDebug").unwrap_or(true) {
             out.extend(debug_problems(text, &code));
         }
     }
     if security && kotlin {
-        let code = kotlin_code_only(text);
         for (at, _) in code.match_indices("authorizeRequests") {
             let after = at + "authorizeRequests".len();
             let standalone = !code[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_');
@@ -878,12 +838,20 @@ fn self_invocations(text: &str, file: &JavaFile) -> Vec<Problem> {
     out
 }
 
+struct BeanNames {
+    key: (u64, u64),
+    incomplete: bool,
+    names: Rc<BTreeSet<String>>,
+}
+
 pub struct SecurityTools {
     actions: actions::State,
     watching: bool,
+    events_notice: std::sync::atomic::AtomicBool,
     roles: Indexes<Vec<String>>,
     beans: Indexes<Vec<String>>,
     mappings: Indexes<Vec<endpoints::Mapping>>,
+    bean_names: Option<BeanNames>,
 }
 
 impl Default for SecurityTools {
@@ -891,16 +859,41 @@ impl Default for SecurityTools {
         Self {
             actions: actions::State::default(),
             watching: false,
+            events_notice: Default::default(),
             roles: Indexes::new(&["**/*.java"], roles),
             beans: Indexes::new(&beans::GLOBS, |path, text| {
                 if text.len() > 128 << 10 { Some(vec!["\0incomplete".into()]) } else { refs::bean_names(path, text) }
             }),
             mappings: Indexes::new(SOURCE_GLOBS, endpoints::mappings),
+            bean_names: None,
         }
     }
 }
 
 impl SecurityTools {
+    fn project_bean_names(&mut self, doc: &Document, check_beans: bool) -> Option<Rc<BTreeSet<String>>> {
+        if !check_beans || !self.watching {
+            return None;
+        }
+        let index = self.beans.for_cached_document_warm(&doc.path, &doc.text, DIAGNOSTICS_WARM)?;
+        if !index.fresh() {
+            return None;
+        }
+        let key = (index.id(), index.generation());
+        if self.bean_names.as_ref().is_none_or(|cached| cached.key != key) {
+            self.bean_names = Some(BeanNames {
+                key,
+                incomplete: index.iter().any(|(_, names)| names.iter().any(|n| n == "\0incomplete")),
+                names: Rc::new(index.iter().flat_map(|(_, n)| n.clone()).collect()),
+            });
+        }
+        let cached = self.bean_names.as_ref()?;
+        if cached.incomplete {
+            return None;
+        }
+        Some(Rc::clone(&cached.names))
+    }
+
     /// Table checks of the security XML and, once every bean of the project was read, unknown bean references.
     fn reference_findings(&mut self, doc: &Document) -> Vec<Diagnostic> {
         let xml = doc.path.ends_with(".xml");
@@ -908,13 +901,7 @@ impl SecurityTools {
             return Vec::new();
         }
         let check_beans = host::setting_bool("springSecurity.checkBeanReferences").unwrap_or(true);
-        let names: Option<BTreeSet<String>> = self
-            .beans
-            .for_cached_document(&doc.path, &doc.text)
-            .filter(|index| {
-                index.fresh() && check_beans && self.watching && index.iter().all(|(_, names)| !names.iter().any(|n| n == "\0incomplete"))
-            })
-            .map(|index| index.iter().flat_map(|(_, n)| n.clone()).collect());
+        let names = self.project_bean_names(doc, check_beans);
         let is_bean = |name: &str| names.as_ref().is_some_and(|n| n.contains(name));
         let found = match (xml, names.is_some()) {
             (true, true) => refs::xml_rules(&doc.text, Some(&is_bean)),
@@ -935,15 +922,15 @@ fn overlaps(a: Range, b: Range) -> bool {
 impl Providers for SecurityTools {
     fn line_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
         if doc.text.len() <= 128 << 10 {
-            let _ = self.beans.for_cached_document(&doc.path, &doc.text);
-            let _ = self.mappings.for_cached_document(&doc.path, &doc.text);
+            let _ = self.beans.for_cached_document_warm(&doc.path, &doc.text, DIAGNOSTICS_WARM);
+            let _ = self.mappings.for_cached_document_warm(&doc.path, &doc.text, DIAGNOSTICS_WARM);
         }
         Vec::new()
     }
 
     fn definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
         if doc.text.len() > 128 << 10 { return Vec::new(); }
-        if doc.language == "xml" && !crate::xml_namespaces::document_valid(&doc.text) { return vec![]; }
+        if doc.language == "xml" && !spring_text::xml::analysis_valid(&doc.text) { return vec![]; }
         if let Some(targets) = ownership::definition(doc,at) {return targets;}
         let Some(off) = offset(&doc.text, at) else {
             return Vec::new();
@@ -1574,101 +1561,6 @@ class SecurityConfig : WebSecurityConfigurerAdapter() {
         assert_eq!(d.range.start.character as usize, expected);
     }
 
-    #[test]
-    fn double_star_before_the_last_segment_warns() {
-        let body =
-            "http.securityMatcher(\"/a/**/b\").authorizeHttpRequests(a -> a.requestMatchers(\"/**/*.css\", \"/ok/**\").permitAll());";
-        assert_eq!(java_spans(body, "obsolete-path-pattern"), ["**", "**"]);
-        let located = java_spans("http.securityMatcher(\"/a/**/b\");", "obsolete-path-pattern");
-        assert_eq!(located, ["**"]);
-    }
-
-    #[test]
-    fn trailing_double_star_is_quiet() {
-        let body = "http.authorizeHttpRequests(a -> a.requestMatchers(\"/a/**\", \"/**\", \"/a/*\").permitAll());";
-        assert!(java_spans(body, "obsolete-path-pattern").is_empty());
-    }
-
-    #[test]
-    fn kotlin_authorize_pattern_warns() {
-        let kotlin = "import org.springframework.security.config.annotation.web.invoke\nclass C {\n    fun f(http: HttpSecurity) {\n        http { authorizeHttpRequests { authorize(HttpMethod.GET, \"/x/**/y\", permitAll) } }\n    }\n}\n";
-        assert_eq!(spans("/project/C.kt", kotlin, "obsolete-path-pattern"), ["**"]);
-    }
-
-    #[test]
-    fn path_patterns_are_quiet_for_library_or_dynamic_name() {
-        let wrong = "http.authorizeHttpRequests(a -> a.requestMatchers(\"/a/**/b\").permitAll());";
-        let library = format!("class C {{ void f(Lib http) {{\n{wrong}\n}} }}");
-        assert!(spans("/project/C.java", &library, "obsolete-path-pattern").is_empty());
-        for body in [
-            "http.authorizeHttpRequests(a -> a.requestMatchers(antMatcher(\"/a/**/b\")).permitAll());",
-            "http.authorizeHttpRequests(a -> a.requestMatchers(PATTERN).permitAll());",
-            "http.authorizeHttpRequests(a -> a.requestMatchers(\"/a/**\" + \"/b\").permitAll());",
-            "http.authorizeHttpRequests(a -> a.requestMatchers(\"${p}/**/b\").permitAll());",
-            "// http.requestMatchers(\"/a/**/b\")\nString s = \"requestMatchers(\\\"/a/**/b\\\")\";",
-        ] {
-            assert!(java_spans(body, "obsolete-path-pattern").is_empty(), "{body}");
-        }
-        let method = "http.authorizeHttpRequests(a -> a.requestMatchers(HttpMethod.GET, \"/a/**/b\").permitAll());";
-        assert_eq!(java_spans(method, "obsolete-path-pattern"), ["**"]);
-    }
-
-    #[test]
-    fn ant_matchers_are_not_reported_twice() {
-        let body = "http.authorizeHttpRequests(a -> a.antMatchers(\"/a/**/b\").permitAll().regexMatchers(\"/a/**/b\").denyAll());";
-        assert!(java_spans(body, "obsolete-path-pattern").is_empty());
-    }
-
-    #[test]
-    fn path_pattern_group_can_be_switched_off() {
-        let host = MockHost::install();
-        host.set_setting("springSecurity.checkPathPatterns", "false");
-        let text = format!("{SECURITY_IMPORT}class C {{ void f(HttpSecurity http) {{ http.securityMatcher(\"/a/**/b\"); }} }}");
-        assert!(problems("/project/C.java", &text).iter().all(|p| p.diagnostic.code.as_deref() != Some("obsolete-path-pattern")));
-    }
-
-    #[test]
-    fn live_path_pattern_check_waits_for_version_and_strategy_evidence() {
-        let host = MockHost::install();
-        let mut tools = SecurityTools::default();
-        let bad = format!("{SECURITY_IMPORT}class C {{ void f(HttpSecurity http) {{ http.securityMatcher(\"/a/**/b\"); }} }}");
-        let d = Document { path: "/project/C.java".into(), language: "java".into(), version: 1, text: bad };
-        inspect(&host, &mut tools, &d);
-        assert!(host.provider_diagnostics().get(&d.path).is_none_or(Vec::is_empty));
-        assert!(problems(&d.path, &d.text).iter().any(|p| p.diagnostic.code.as_deref() == Some("obsolete-path-pattern")));
-        let fixed = Document {
-            text: format!("{SECURITY_IMPORT}class C {{ void f(HttpSecurity http) {{ http.securityMatcher(\"/a/**\"); }} }}"),
-            ..d
-        };
-        inspect(&host, &mut tools, &fixed);
-        assert!(host.provider_diagnostics().get(&fixed.path).is_none_or(Vec::is_empty));
-    }
-
-    #[test]
-    fn path_pattern_ranges_use_utf16_columns_with_multibyte_text() {
-        let text =
-            format!("{SECURITY_IMPORT}class C {{ void f(HttpSecurity http) {{ http.securityMatcher(\"/\u{e9}\u{1F600}/**/b\"); }} }}");
-        let _host = MockHost::install();
-        let found = problems("/project/C.java", &text);
-        let d = &found.iter().find(|p| p.diagnostic.code.as_deref() == Some("obsolete-path-pattern")).unwrap().diagnostic;
-        let line = text.lines().nth(1).unwrap();
-        let expected = line.encode_utf16().count() - line[line.find("**").unwrap()..].encode_utf16().count();
-        assert_eq!(d.range.start.character as usize, expected);
-        assert_eq!(d.range.end.character as usize, expected + 2);
-    }
-
-    #[test]
-    fn path_pattern_crlf_files_report_correct_lines() {
-        let text = format!(
-            "{SECURITY_IMPORT}class C {{\n    void f(HttpSecurity http) {{\n        http.securityMatcher(\"/a/**/b\");\n    }}\n}}"
-        )
-        .replace('\n', "\r\n");
-        let _host = MockHost::install();
-        let found = problems("/project/C.java", &text);
-        let d = &found.iter().find(|p| p.diagnostic.code.as_deref() == Some("obsolete-path-pattern")).unwrap().diagnostic;
-        assert_eq!(d.range.start.line, 3);
-        assert_eq!(d.range.start.character, 33);
-    }
 
     #[test]
     fn unknown_bean_references_are_info_once_the_project_is_read() {
@@ -1751,5 +1643,13 @@ class SecurityConfig : WebSecurityConfigurerAdapter() {
         assert_eq!(targets.len(), 1, "GET matcher skips the POST mapping: {targets:?}");
         assert_eq!(targets[0].range.start.line, 2);
         assert!(tools.definition(&d, at("/admin")).is_empty());
+    }
+
+    #[test]
+    fn java_comment_with_glob_does_not_blank_file() {
+        let code = code_only("/** Secures /api/** endpoints */\nint x = 1;", false);
+        assert!(code.contains("int x = 1;"));
+        let kotlin = code_only("/* a /* b */ c */\nval x = 1", true);
+        assert!(kotlin.contains("val x = 1") && !kotlin.contains('c'));
     }
 }

@@ -4,6 +4,7 @@
 //! network, storage, project file reads, or a desktop window.
 #![allow(unused_variables)]
 use ide_core::CancellationToken;
+use ide_extension::ledger::Subject;
 use ide_extension::Capability;
 use ide_plugin::*;
 use std::{
@@ -161,7 +162,11 @@ impl HostApi for ProbeHost {
         );
     }
     fn post_view_message(&self, view: &str, message: String) -> Result<(), HostError> {
-        panic!("Unexpected host callback: post_view_message")
+        assert!(
+            matches!(view, "ddev" | "setup"),
+            "Unexpected view message: {view}"
+        );
+        Ok(())
     }
     fn open_terminal(
         &self,
@@ -220,6 +225,7 @@ fn main() {
             plugin_id: "aritti.ddev".into(),
             version: "0.1.0".into(),
             granted: vec![Capability::ProjectRead],
+            subject: Subject::Installed("aritti.ddev".into()),
             host: Arc::new(ProbeHost),
             limits: Limits::default(),
         },

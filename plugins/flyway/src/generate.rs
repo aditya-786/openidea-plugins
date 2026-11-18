@@ -165,6 +165,24 @@ fn collision(project: &Project, config: &Config, target: &str, source: Option<&s
     }
     Ok(())
 }
+/// The highest-versioned migration in the draft's directory.
+fn newest_in(project: &Project, config: &Config, d: &Draft) -> Option<String> {
+    let root = d.root.trim_end_matches('/');
+    let directory = match d.directory.trim_matches('/') {
+        "" => root.to_owned(),
+        directory => format!("{root}/{directory}"),
+    };
+    migration_files(project, config)
+        .into_iter()
+        .filter_map(|path| {
+            let (parent, name) = path.rsplit_once('/')?;
+            let Name::Migration { kind: Kind::Versioned | Kind::Baseline, version, .. } = parse(name, &config.naming) else { return None };
+            let key: Vec<_> = version_key(&version).into_iter().map(|part| (part.len(), part)).collect();
+            (parent == directory).then_some((key, path))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, path)| path)
+}
 fn unchanged(project: &Project, d: &Draft) -> Result<Config, Error> {
     if root(project)? != d.root {
         return Err(Error::Stale);
@@ -249,7 +267,7 @@ impl Flyway {
             Field::new("generation-preview","Target file",FieldValue::readonly_text(&preview,true)),
             Field::new("generation-content","SQL preview",FieldValue::readonly_text(if sql_preview.trim().is_empty() {"No SQL statements (empty migration)"} else {&sql_preview},true)),
         ])).button(Button::new("prepare-generation","Prepare…").icon("plus")).button(Button::new("close-generation","Cancel").icon("close"))
-            .status(if d.ready {"Prepared. In a project SQL/config editor, choose Create Flyway migration from prepared form… from code actions. Confirmation comes before the atomic create."} else {"Naming preview only. Prepare it, then apply through the editor code action; no file has been written."})))
+            .status(if d.ready {"Prepared. In the opened migration (or any project SQL file), press Alt+Enter and choose Create Flyway migration from prepared form…; you confirm before the file is created."} else {"Naming preview only. Prepare it, then apply through the editor code action; no file has been written."})))
     }
     pub(crate) fn generation_event(&mut self, event: &ViewEvent, ctx: &Invocation) -> Result<bool, Error> {
         let relevant = matches!(event,ViewEvent::Field(key,_) if key.starts_with("generation-"))
@@ -283,6 +301,10 @@ impl Flyway {
                 let target = candidate(d)?;
                 collision(&project, &config, &target, None)?;
                 d.ready = true;
+                // Opening is a convenience for reaching the create code action; the form stays prepared without it.
+                if let Some(path) = newest_in(&project, &config, d) {
+                    let _ = host::open_location(&path, 0, 0);
+                }
             }
             _ => {}
         }
@@ -300,6 +322,7 @@ impl FileActions for Flyway {
         if relative(&root, &doc.path).is_err() {
             return Vec::new();
         }
+        let migrations = self.flyway_project(&project);
         let mut actions = Vec::new();
         if let Some(key) = self.hibernate_schema.as_ref().and_then(|candidate| candidate.key(&root)) {
             actions.push(FileAction { title: "Save Hibernate schema SQL as migration…".into(), kind: Some("refactor.rewrite".into()),
@@ -315,6 +338,9 @@ impl FileActions for Flyway {
             (RENAME, "Rename Flyway migration…"),
         ] {
             if kind == PREPARED && !self.generation.as_ref().is_some_and(|d| d.root == root && d.ready) {
+                continue;
+            }
+            if kind != PREPARED && !migrations {
                 continue;
             }
             if kind == RENAME && doc.language != "sql" {
@@ -641,7 +667,10 @@ mod tests {
         assert!(
             fields.iter().any(|f| f.key == "generation-preview" && format!("{:?}", f.value).contains("/project/sql/M3-add_users.pgsql"))
         );
+        host.add_file("sql/M2-older.pgsql", "select 1;");
+        host.add_file("sql/M10-newest.pgsql", "select 1;");
         plugin.handle("migrations", ViewEvent::Button("prepare-generation".into()), &host.invocation()).unwrap();
+        assert_eq!(host.opened_locations(), [("/project/sql/M10-newest.pgsql".to_owned(), 0, 0)]);
         let prepared = action(&mut plugin, &doc, PREPARED);
         host.answer_next_prompt(Some(&[]));
         let created = plugin.resolve_file_action(&doc, prepared).unwrap();
@@ -672,6 +701,23 @@ mod tests {
         assert!(candidate(d).is_err());
         assert_eq!(next_version(&["340282366920938463463374607431768211455"]), "340282366920938463463374607431768211456");
         assert_eq!(next_version(&["0099"]), "0100");
+    }
+}
+
+#[cfg(test)]
+mod project_gate_tests {
+    use super::*;
+    use openidea_plugin::mock::MockHost;
+    #[test]
+    fn no_create_intentions_in_plain_project() {
+        let host = MockHost::install();
+        host.add_file("scripts/seed.sql", "select 1;");
+        let doc = Document { path: "/project/scripts/seed.sql".into(), language: "sql".into(), version: 1, text: "select 1;".into() };
+        let mut plugin = Flyway::default();
+        assert!(plugin.file_actions(&doc, Range::default()).is_empty());
+        host.add_file("flyway.toml", "[flyway]\nlocations = [\"filesystem:scripts\"]\n");
+        assert!(plugin.file_actions(&doc, Range::default()).iter().any(|action| action.title == "Create Flyway SQL migration…"));
+        assert!(host.process_runs().is_empty());
     }
 }
 

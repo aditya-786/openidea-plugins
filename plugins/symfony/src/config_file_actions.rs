@@ -172,7 +172,7 @@ pub(crate) fn resolve(
             PickItem::new("defaults", "Defaults only (no resource discovery)"),
             PickItem::new(
                 "resources",
-                "Load a selected production PSR4 source root; exclude its Kernel.php",
+                "Load services from a PSR-4 source folder (skips Kernel.php)",
             ),
         ],
     )?
@@ -194,7 +194,7 @@ pub(crate) fn resolve(
                     )
                 })
                 .collect();
-            let Some(selected) = host::pick("Explicit production source root to load", &items)?
+            let Some(selected) = host::pick("Source folder to load services from", &items)?
             else {
                 return Err(Error::Cancelled);
             };
@@ -213,8 +213,7 @@ pub(crate) fn resolve(
     };
     let text = body.replace('\n', intentions::eol_of(&doc.text));
     let preview = format!(
-        "Source: {}\nVersion: {}\nTarget: {target}\nFormat: {format}\n\nExact new service configuration:\n{text}\nChosen mode: {mode}. Source discovery appears only when its production PSR4 root was explicitly selected; that preset excludes Kernel.php in the selected root. No guessed namespace/path, imports, source edits or Kernel edits. Whether this filename is loaded and which runtime services result is unknown. One atomic non-overwriting Create/Open.",
-        doc.path, doc.version
+        "Creates {target} and opens it.\nSymfony loads it only if your configuration imports it.\nDelete the file to undo.\n\n{text}"
     );
     if !ui_kit::prompts::confirm_exact("Create service configuration?", &preview)? {
         return Err(Error::Cancelled);

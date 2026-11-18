@@ -1,14 +1,14 @@
 use super::*;
 impl Messaging {
     pub fn live_diagnostics(&mut self, doc: &Document, allow_absence: bool) -> Vec<openidea_plugin::Diagnostic> {
-        let _ = self.listener_beans.for_cached_document(&doc.path, &doc.text);
+        let _ = self.index.for_cached_document(&doc.path, &doc.text);
         if doc.language == "java" {
             return self.unbound_routing_keys(doc, allow_absence);
         }
         if doc.language != "xml" {
             return Vec::new();
         }
-        let Some(index) = self.listener_beans.for_cached_document(&doc.path, &doc.text) else {
+        let Some(index) = self.index.for_cached_document(&doc.path, &doc.text) else {
             return Vec::new();
         };
         let mut out = listener_xml::problems(&doc.text, index);
@@ -35,7 +35,7 @@ impl Messaging {
         if !index.fresh() {
             return Vec::new();
         }
-        let all: Vec<&Endpoint> = index.iter().flat_map(|(_, es)| es).collect();
+        let all: Vec<&Endpoint> = index.iter().flat_map(|(_, f)| &f.endpoints).collect();
         let unresolved = all.iter().any(|e| e.space == UNRESOLVED_BINDING);
         let keyed = |e: &&&Endpoint| e.space == ROUTING_KEY && e.role == Role::Declaration;
         let routable = |x: &str| {
@@ -43,7 +43,7 @@ impl Messaging {
             let keyless = all.iter().any(|e| e.space == "exchange" && e.role == Role::Consumer && e.name == x);
             !keyless && !declared.is_empty() && declared.iter().all(|v| matches!(*v, "new DirectExchange" | "new TopicExchange" | "ExchangeBuilder.directExchange" | "ExchangeBuilder.topicExchange"))
         };
-        let Some(own) = index.files().get(&doc.path) else { return Vec::new() };
+        let Some(own) = index.files().get(&doc.path).map(|f| &f.endpoints) else { return Vec::new() };
         if unresolved {
             return Vec::new();
         }

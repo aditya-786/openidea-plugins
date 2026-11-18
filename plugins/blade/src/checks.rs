@@ -16,11 +16,20 @@ pub struct Finding {
     pub code: &'static str,
     pub message: String,
     pub severity: Severity,
+    pub fix: Option<Fix>,
+}
+
+/// Inserts `text` at byte offset `at` of the checked document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fix {
+    pub title: String,
+    pub at: usize,
+    pub text: String,
 }
 
 impl Finding {
     fn warning(start: usize, end: usize, code: &'static str, message: String) -> Self {
-        Self { start, end, code, message, severity: Severity::Warning }
+        Self { start, end, code, message, severity: Severity::Warning, fix: None }
     }
 }
 
@@ -44,7 +53,8 @@ pub fn check(text: &str) -> Vec<Finding> {
         }
 
         if let Some(at) = open.iter().rposition(|o| o.closers.contains(&name)) {
-            found.extend(open.drain(at..).skip(1).filter_map(unclosed));
+            let parent_end = Some(directive.range.start);
+            found.extend(open.drain(at..).skip(1).filter_map(|o| unclosed(text, o, parent_end)));
             continue;
         }
 
@@ -61,7 +71,7 @@ pub fn check(text: &str) -> Vec<Finding> {
         }
     }
 
-    if lexed.opaque_from.is_none() {found.extend(open.into_iter().filter_map(unclosed));}
+    if lexed.opaque_from.is_none() {found.extend(open.into_iter().filter_map(|o| unclosed(text, o, None)));}
     found.sort_by_key(|f| f.start);
 
     found
@@ -72,7 +82,8 @@ fn is_closer(name: &str) -> bool {
     name.starts_with("end") && BLOCKS.iter().any(|(_, closers)| closers.contains(&name))
 }
 
-fn unclosed(open: Open) -> Option<Finding> {
+/// `parent_end` is where the enclosing block's closing directive starts; `None` when it is unknown.
+fn unclosed(text: &str, open: Open, parent_end: Option<usize>) -> Option<Finding> {
     // A bare `@empty` is the separator of `@forelse`, not a block.
     if open.name == "empty" {
         return None;
@@ -81,7 +92,39 @@ fn unclosed(open: Open) -> Option<Finding> {
     let end = open.start + 1 + open.name.len();
     let message = format!("`@{}` is never closed: add `@{}`.", open.name, open.closers[0]);
 
-    Some(Finding::warning(open.start, end, UNPAIRED_DIRECTIVE, message))
+    let fix = closing_fix(text, open.start, &format!("@{}", open.closers[0]), parent_end);
+
+    Some(Finding { fix: Some(fix), ..Finding::warning(open.start, end, UNPAIRED_DIRECTIVE, message) })
+}
+
+/// Puts `closer` on its own line with the opener's indentation, before the parent's closer or at the end of the file.
+/// An opener on the parent closer's line gets its closer inline instead, followed by a space: Blade does not
+/// read `@endif@endforeach` as two directives.
+fn closing_fix(text: &str, opener: usize, closer: &str, parent_end: Option<usize>) -> Fix {
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let line_start = |at: usize| text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let indent_of = |at: usize| {
+        let line = &text[line_start(at)..];
+        &line[..line.len() - line.trim_start_matches([' ', '\t']).len()]
+    };
+    let indent = indent_of(opener);
+
+    let title = format!("Insert {closer}");
+
+    let Some(at) = parent_end else {
+        let insert = if text.ends_with('\n') { format!("{indent}{closer}{newline}") } else { format!("{newline}{indent}{closer}") };
+        return Fix { title: format!("{title} at end of file"), at: text.len(), text: insert };
+    };
+
+    if line_start(opener) == line_start(at) {
+        return Fix { title, at, text: format!("{closer} ") };
+    }
+
+    if text[line_start(at)..at].trim().is_empty() {
+        return Fix { title, at: line_start(at), text: format!("{indent}{closer}{newline}") };
+    }
+
+    Fix { title, at, text: format!("{newline}{indent}{closer}{newline}{}", indent_of(at)) }
 }
 
 fn unbalanced_parenthesis(text: &str, directive: &Directive) -> Option<Finding> {
@@ -111,6 +154,47 @@ mod tests {
 
     fn quiet(text: &str) {
         assert_eq!(codes(text), [], "{text}");
+    }
+
+    fn fixed(text: &str) -> Vec<(String, String)> {
+        check(text)
+            .into_iter()
+            .filter_map(|f| f.fix)
+            .map(|fix| (fix.title, format!("{}{}{}", &text[..fix.at], fix.text, &text[fix.at..])))
+            .collect()
+    }
+
+    #[test]
+    fn unclosed_block_at_end_of_file_gets_its_closer_there() {
+        assert_eq!(fixed("@if($a)\n<p></p>\n"), [("Insert @endif at end of file".into(), "@if($a)\n<p></p>\n@endif\n".into())]);
+        assert_eq!(fixed("  @foreach($a as $b)\r\n  x"), [("Insert @endforeach at end of file".into(), "  @foreach($a as $b)\r\n  x\r\n  @endforeach".into())]);
+    }
+
+    #[test]
+    fn nested_unclosed_block_closes_before_its_parent_with_its_own_indentation() {
+        let text = "@section('a')\n    @if($a)\n        x\n@endsection\n";
+        assert_eq!(fixed(text), [("Insert @endif".into(), "@section('a')\n    @if($a)\n        x\n    @endif\n@endsection\n".into())]);
+    }
+
+    #[test]
+    fn closer_goes_on_its_own_line_or_inline_when_the_parent_ends_on_the_openers_line() {
+        assert_eq!(fixed("@foreach($a as $b)\n  @if($b)\n  x </p>@endforeach")[0].1, "@foreach($a as $b)\n  @if($b)\n  x </p>\n  @endif\n  @endforeach");
+        assert_eq!(fixed("@foreach($a as $b) @if($b) x @endforeach")[0].1, "@foreach($a as $b) @if($b) x @endif @endforeach");
+    }
+
+    #[test]
+    fn both_unclosed_blocks_close_at_end_of_file_and_the_result_is_quiet() {
+        let text = "@if($a)\n  @isset($b)\n";
+        let fixes = fixed(text);
+        assert_eq!(fixes.iter().map(|(title, _)| title.as_str()).collect::<Vec<_>>(), ["Insert @endif at end of file", "Insert @endisset at end of file"]);
+        let once = &fixes[0].1;
+        assert_eq!(fixed(once), [("Insert @endisset".into(), "@if($a)\n  @isset($b)\n  @endisset\n@endif\n".into())]);
+        quiet(&fixed(once)[0].1);
+    }
+
+    #[test]
+    fn other_findings_have_no_fix() {
+        assert!(fixed("@endif\n@if($a == ')'\n@endif\n@forelse($a as $b)\n@empty\n@endforelse").is_empty());
     }
 
     #[test]

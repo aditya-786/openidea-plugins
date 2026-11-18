@@ -9,7 +9,7 @@ use crate::{KubeExplorer, REQUEST_TIMEOUT, is_dns_subdomain, without_resource_ve
 fn position(text: &str, offset: usize) -> Position {
     let before = &text[..offset];
     let line = before.matches('\n').count();
-    let column = before.rsplit('\n').next().map_or(0, |last| last.chars().count());
+    let column = before.rsplit('\n').next().map_or(0, |last| last.chars().map(char::len_utf16).sum::<usize>());
     Position::new(line as u32, column as u32)
 }
 
@@ -68,7 +68,7 @@ impl KubeExplorer {
         match editor.apply_edits(document.version, &edits) {
             Ok(_) => {}
             Err(Error::Denied(_)) => {
-                host::notify(NotificationLevel::Warning, "Reload from cluster", "Allow editor changes for Kube Explorer in Settings › Plugins to reload a manifest.");
+                host::notify(NotificationLevel::Warning, "Reload from cluster", &ui_kit::denied::message("Reloading a manifest", "editor.write", "Kube Explorer"));
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -80,6 +80,9 @@ impl KubeExplorer {
 
     fn live_yaml(&self, doc: &Doc) -> Result<String, Error> {
         let kind = resource_type(doc).ok_or("unreadable kind")?;
+        if kind == "secret" && !Self::reveal_allowed() {
+            return Err("Secret values are hidden; turn on \"Allow Show Secret\" to reload it".into());
+        }
         let name = doc.name.as_ref().map(|name| name.text.as_str()).ok_or("no metadata.name")?;
         if !is_dns_subdomain(name) {
             return Err(format!("\"{name}\" is not a resource name").into());
@@ -88,6 +91,9 @@ impl KubeExplorer {
         let namespace = in_file.map(|v| v.text.clone()).or_else(|| self.namespace.clone().filter(|ns| ns != crate::ALL_NAMESPACES));
         let _task = host::begin_task(&format!("Reading {kind}/{name}"), false);
         let text = self.kubectl_in(namespace.as_deref(), &["get", &kind, name, "-o", "yaml", REQUEST_TIMEOUT], None)?;
+        if !Self::reveal_allowed() && manifest::documents(&text).iter().any(|d| resource_type(d).as_deref() == Some("secret")) {
+            return Err("Secret values are hidden; turn on \"Allow Show Secret\" to reload it".into());
+        }
         Ok(without_resource_version(&text))
     }
 }
@@ -119,6 +125,13 @@ mod tests {
     }
 
     #[test]
+    fn reload_range_utf16_with_emoji() {
+        let text = "a😀b: 1";
+        assert_eq!(position(text, text.find('b').unwrap()), Position::new(0, 3));
+        assert_eq!(position("x\n😀y", "x\n😀".len()), Position::new(1, 2));
+    }
+
+    #[test]
     fn a_found_document_is_replaced_keeping_its_comments_and_a_missing_one_is_left() {
         let (host, runs) = fixture();
         host.open_editor("/p/web.yaml", "yaml", FILE, &[(0, 0, 0, 0)]);
@@ -142,6 +155,44 @@ mod tests {
         host.open_editor("/p/web.yaml", "yaml", FILE, &[(0, 0, 0, 0)]);
         KubeExplorer::default().reload_from_cluster(&host.invocation()).unwrap();
         assert_eq!(host.editor_text(), FILE);
-        assert!(host.notifications()[0].body.contains("Allow editor changes"));
+        assert!(host.notifications()[0].body.contains("editor.write permission"));
+    }
+
+    #[test]
+    fn reload_skips_secret_unless_reveal_allowed() {
+        const SECRET_FILE: &str = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: shop\nspec:\n  replicas: 1\n---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: db\n  namespace: shop\ndata:\n  password: b2xk\n";
+        let secret_live = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\n  namespace: shop\ndata:\n  password: bmV3\n";
+
+        let host = MockHost::install().with_capabilities(&["project.read", "process:kubectl", "editor.read", "editor.write", "storage"]);
+        host.set_project_root(Some("/p"));
+        host.on_process(KUBECTL, move |args, _| {
+            let stdout = if args.contains(&"secret".to_owned()) { secret_live } else { "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 3\n" };
+            Ok(ProcessOutput { status: Some(0), stdout: stdout.into(), stderr: String::new() })
+        });
+        host.open_editor("/p/web.yaml", "yaml", SECRET_FILE, &[(0, 0, 0, 0)]);
+        KubeExplorer::default().reload_from_cluster(&host.invocation()).unwrap();
+
+        let text = host.editor_text();
+        assert!(text.contains("replicas: 3") && text.contains("password: b2xk") && !text.contains("bmV3"));
+        assert!(host.notifications()[0].body.contains("not reloaded: db:"));
+
+        host.set_setting("allowRevealSecrets", "true");
+        host.open_editor("/p/web.yaml", "yaml", SECRET_FILE, &[(0, 0, 0, 0)]);
+        KubeExplorer::default().reload_from_cluster(&host.invocation()).unwrap();
+        assert!(host.editor_text().contains("password: bmV3"));
+    }
+
+    #[test]
+    fn reload_refuses_a_fetched_secret_under_another_kind_name() {
+        const PLURAL_FILE: &str = "apiVersion: v1\nkind: Secrets\nmetadata:\n  name: db\n  namespace: shop\ndata:\n  password: b2xk\n";
+        let host = MockHost::install().with_capabilities(&["project.read", "process:kubectl", "editor.read", "editor.write", "storage"]);
+        host.set_project_root(Some("/p"));
+        host.on_process(KUBECTL, |_, _| {
+            Ok(ProcessOutput { status: Some(0), stdout: "apiVersion: v1\nkind: Secret\nmetadata:\n  name: db\ndata:\n  password: bmV3\n".into(), stderr: String::new() })
+        });
+        host.open_editor("/p/db.yaml", "yaml", PLURAL_FILE, &[(0, 0, 0, 0)]);
+        let error = KubeExplorer::default().reload_from_cluster(&host.invocation()).unwrap_err();
+        assert!(error.to_string().contains("Secret values are hidden"));
+        assert!(!host.editor_text().contains("bmV3"));
     }
 }

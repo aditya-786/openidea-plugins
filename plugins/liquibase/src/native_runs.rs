@@ -8,14 +8,12 @@ pub(crate) fn configurations(root: &str) -> Vec<PluginRunConfiguration> {
     if project.root().ok().as_deref() != Some(root)
         || !host::projects().unwrap_or_default().iter().any(|p| p.root().ok().as_deref() == Some(root)) { return Vec::new(); }
     if !FILES.iter().any(|file| project.exists(file).unwrap_or(false)) { return Vec::new(); }
-    let program = "liquibase";
-
-    [        ("status", vec!["status".to_owned(), "--verbose".to_owned()]),
+    [
+        ("status", vec!["status".to_owned(), "--verbose".to_owned()]),
         ("validate", vec!["validate".to_owned()]),
         ("update-sql", vec!["update-sql".to_owned()]),
-    ].into_iter().map(|(goal, mut args)| {
-        if program == "mvn" { args[0] = format!("flyway:{goal}"); }
-        PluginRunConfiguration { id: format!("native-{goal}"), name: format!("Liquibase: {goal}"), program: program.into(), args,
+    ].into_iter().map(|(goal, args)| {
+        PluginRunConfiguration { id: format!("native-{goal}"), name: format!("Liquibase: {goal}"), program: "liquibase".into(), args,
             cwd: Some(root.into()), test: false, framework: None }
     }).collect()
 }

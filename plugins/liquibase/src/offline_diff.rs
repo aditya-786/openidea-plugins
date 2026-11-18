@@ -171,7 +171,7 @@ fn materialize(plan: &Plan) -> Result<(), Error> {
         }
     }
     if existing + new > 96 {
-        return Err("Private staging cap reached (96 known staging/output files; up to32 report sets or24 generated runs). Remove the plugin's empty lb-diff cache files or reinstall before creating more.".into());
+        return Err("Private staging cap reached (96 known staging/output files; up to 32 report sets or 24 generated runs). Remove the plugin's empty lb-diff cache files or reinstall before creating more.".into());
     }
     for (path, text) in &plan.staged {
         if let Err(error) = host::fs::write_bytes(path, text.as_bytes()) {
@@ -362,7 +362,7 @@ impl Liquibase {
         let root = project.root()?;
         let paths = project.find_files("**/*.json", 129)?;
         if paths.len() > 128 {
-            return Err("Choose a smaller project: offline snapshot discovery is limited to128 JSON files.".into());
+            return Err("Choose a smaller project: offline snapshot discovery is limited to 128 JSON files.".into());
         }
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut inputs = Vec::new();
@@ -462,7 +462,7 @@ impl Liquibase {
             self.offline.generated_view = false;
         }
         self.offline.running = Some(Running { plan, child, at: Instant::now(), output: String::new(), bytes: 0, status: None });
-        self.offline.status = "Offline diff started; Poll Status to drain output. Installed CLI version is unverified.".into();
+        self.offline.status = "Offline diff started. Press Refresh Status to read its progress.".into();
         ui_kit::web::reveal_view(VIEW, include_str!("ui_config.json"))?;
         ui_kit::web::refresh_view(VIEW, include_str!("ui_config.json"));
         Ok(())
@@ -542,7 +542,7 @@ impl Liquibase {
             }
         }
         self.offline.running = Some(run);
-        self.offline.status = "Diff running or output still draining; Poll Status or Stop. No automatic polling.".into();
+        self.offline.status = "The diff is still running. Press Refresh Status again, or Stop Diff.".into();
         ui_kit::web::refresh_view(VIEW, include_str!("ui_config.json"));
         Ok(())
     }
@@ -592,7 +592,7 @@ impl Liquibase {
                 })
             }
         } else {
-            Body::Message("No captured offline diff report. Prepare two supported CLI JSON snapshots, then explicitly Run. Private staging and generated empty defaults are reviewed before execution. Rendering never runs Liquibase.".into())
+            Body::Message("No offline diff yet. Press Run Offline Diff… and pick two Liquibase JSON snapshots to compare.".into())
         };
         let provenance = if self.offline.generated_view && generated::owner(&self.offline) == Some(root.as_str()) {
             "Observed generated XML candidate; exact snapshot provenance above; no database apply.".into()
@@ -603,14 +603,19 @@ impl Liquibase {
             .map(|r| format!("{} · {}s old · {} selectable observations", r.source, r.at.elapsed().as_secs(), r.items.len()))
             .unwrap_or_default() };
         let table = matches!(&body, Body::Table(_));
-        let mut view = View::new(body)
-            .button(Button::new("offline-run", "Run Reviewed Offline Diff").enabled(self.offline.running.is_none()))
-            .button(Button::new("offline-generate", "Generate Reviewed Offline Changelog…").enabled(self.offline.running.is_none()))
-            .button(Button::new("offline-poll", "Poll Status").enabled(self.offline.running.is_some()))
-            .button(Button::new("offline-stop", "Stop Process").enabled(self.offline.running.is_some()))
-            .button(Button::new("offline-choose", "Choose Observations to Preview…").enabled(self.offline.running.is_none() && self.offline.report.as_ref().is_some_and(|r| !r.items.is_empty())))
-            .button(Button::new("offline-back", "Report List").enabled(self.offline.selected.is_some() || self.offline.review.is_some() || self.offline.generated_view))
-            .status(&format!("{} · {provenance}", self.offline.status));
+        let running = self.offline.running.is_some();
+        let mut view = View::new(body).status(&format!("{} · {provenance}", self.offline.status));
+        view = if running {
+            view.button(Button::new("offline-poll", "Refresh Status").icon("refresh"))
+                .button(Button::new("offline-stop", "Stop Diff").icon("stop"))
+        } else {
+            view.button(Button::new("offline-run", "Run Offline Diff…").icon("run"))
+                .button(Button::new("offline-choose", "Choose Differences to Preview…").icon("filter").enabled(self.offline.report.as_ref().is_some_and(|r| !r.items.is_empty())))
+                .button(Button::new("offline-more", "More Actions…").icon("more"))
+        };
+        if self.offline.selected.is_some() || self.offline.review.is_some() || self.offline.generated_view {
+            view = view.button(Button::new("offline-back", "Back to Report").icon("arrow-left"));
+        }
         if table && ui_kit::web::is_rendering() {
             let total = self.offline.report.as_ref().map_or(0, |report| report.items.len() as u32);
             let visible = &self.offline.visible;
@@ -618,10 +623,21 @@ impl Liquibase {
                 .button(Button::new("offline-next", "Next Observations").icon("arrow-right").enabled(visible.end < total));
             view.status = Some(format!("{} · Observations {}–{} of {total}", view.status.as_deref().unwrap_or_default(), if visible.is_empty() {0} else {visible.start + 1}, visible.end));
         }
-        Ok(if generated::owner(&self.offline) == Some(root.as_str()) {
-            view.button(Button::new("offline-organize-generated", "Organize Migrations…").enabled(self.offline.running.is_none()))
-                .button(Button::new(if self.offline.generated_view { "offline-select-generated" } else { "offline-show-generated" }, if self.offline.generated_view { "Choose Generated Changesets…" } else { "Review Generated Source" }).enabled(self.offline.running.is_none()))
-        } else { view })
+        Ok(view)
+    }
+    /// The less frequent actions, behind one toolbar button.
+    fn more_offline_actions(&mut self, ctx: &Invocation, root: &str) -> Result<(), Error> {
+        let mut items = vec![PickItem::new("offline-generate", "Generate Changelog from Snapshots…")];
+        if generated::owner(&self.offline) == Some(root) {
+            items.push(PickItem::new("offline-organize-generated", "Organize Migrations…"));
+            items.push(if self.offline.generated_view {
+                PickItem::new("offline-select-generated", "Choose Generated Changesets…")
+            } else {
+                PickItem::new("offline-show-generated", "Show Generated Changelog")
+            });
+        }
+        let Some(key) = host::pick("More offline diff actions", &items)? else { return Ok(()) };
+        self.handle_offline_diff(ViewEvent::Button(key), ctx)
     }
     pub(crate) fn handle_offline_diff(&mut self, event: ViewEvent, ctx: &Invocation) -> Result<(), Error> {
         let current_root = ctx.project().and_then(|p| p.root().ok()).ok_or(Error::Stale)?;
@@ -651,6 +667,7 @@ impl Liquibase {
                     self.offline.generated_view = true;
                 },
                 "offline-poll" => return self.poll_offline_diff(ctx),
+                "offline-more" => return self.more_offline_actions(ctx, &current_root),
                 "offline-choose" => return self.choose_offline_observations(ctx),
                 "offline-stop" => {
                     if let Some(run) = &self.offline.running {
@@ -913,6 +930,19 @@ mod tests {
             assert_eq!(l.offline.report.as_ref().unwrap().items.len(), prior);
             assert!(!l.offline.status.contains("private-password"));
         }
+    }
+    #[test]
+    fn toolbar_shows_only_the_actions_of_the_current_state_with_icons() {
+        let (host, mut l) = setup();
+        let keys = |l: &mut Liquibase| l.render_offline_diff(None, &host.invocation()).unwrap().toolbar.iter().map(|b| (b.id.clone(), b.icon.is_some())).collect::<Vec<_>>();
+        assert_eq!(keys(&mut l), [("offline-run".into(), true), ("offline-choose".into(), true), ("offline-more".into(), true)]);
+        answers(&host);
+        l.start_offline_diff(&host.invocation()).unwrap();
+        assert_eq!(keys(&mut l), [("offline-poll".into(), true), ("offline-stop".into(), true)]);
+        l.handle_offline_diff(ViewEvent::Button("offline-stop".into()), &host.invocation()).unwrap();
+        host.answer_next_prompt(None);
+        l.handle_offline_diff(ViewEvent::Button("offline-more".into()), &host.invocation()).unwrap();
+        assert!(l.offline.running.is_none());
     }
     #[test]
     fn stopping_requires_owner_and_cleans_staging() {

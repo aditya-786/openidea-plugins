@@ -1,7 +1,7 @@
 //! Cache-only route editor adornments. Stale or ambiguous source facts are withheld.
 use crate::{Index, php, routes};
 use openidea_plugin::inlay_hints::InlayHint;
-use openidea_plugin::language_features::{CodeLens, GutterAction};
+use openidea_plugin::language_features::CodeLens;
 use openidea_plugin::{Position, Range, providers::Document, text};
 
 #[derive(Clone)]
@@ -256,7 +256,7 @@ pub(crate) fn lenses(index: &Index, doc: &Document, owns: &impl Fn(&str) -> bool
                 ),
                 (
                     "curl",
-                    crate::ui_text::text("routeEditor.copyCurl", "Copy cURL"),
+                    crate::ui_text::text("routeEditor.copyCurl", "Copy as cURL"),
                 ),
                 (
                     "http",
@@ -278,30 +278,6 @@ pub(crate) fn lenses(index: &Index, doc: &Document, owns: &impl Fn(&str) -> bool
     }
     result
 }
-pub(crate) fn gutters(
-    index: &Index,
-    doc: &Document,
-    owns: &impl Fn(&str) -> bool,
-) -> Vec<GutterAction> {
-    let mut result = Vec::new();
-    for label in labels(index, doc, owns) {
-        if result
-            .iter()
-            .any(|g: &GutterAction| g.line == label.position.line)
-        {
-            continue;
-        }
-        result.push(GutterAction {
-            line: label.position.line,
-            icon: Some("web".into()),
-            tooltip: label.tooltip,
-            command: "route-editor-action".into(),
-            argument: Some(action_target(&label.target, "choose")),
-        });
-    }
-    result
-}
-
 fn route_target(entry: &crate::index::RouteEntry) -> String {
     serde_json::json!({"path":entry.path,"methods":entry.def.methods,"uri":entry.def.uri,"name":entry.def.name,"action":entry.def.action}).to_string()
 }
@@ -418,49 +394,7 @@ pub(crate) fn action(
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| Error::Stale)?;
     let target = value.get("target").ok_or(Error::Stale)?.to_string();
     let (_, entry, _) = resolve(index, ctx, &target)?;
-    let mut action = value["action"].as_str().ok_or(Error::Stale)?.to_owned();
-    if action == "choose" {
-        let mut choices = vec![PickItem::new(
-            "open",
-            crate::ui_text::text("routeEditor.goToDeclaration", "Go to route declaration"),
-        )];
-        if entry.endpoint_uri.is_some() {
-            choices.extend([
-                PickItem::new(
-                    "copy",
-                    crate::ui_text::text("routeEditor.copyUrl", "Copy URL"),
-                ),
-                PickItem::new(
-                    "curl",
-                    crate::ui_text::text("routeEditor.copyCurl", "Copy cURL"),
-                ),
-                PickItem::new(
-                    "http",
-                    crate::ui_text::text("routeEditor.createHttp", "Create HTTP Request"),
-                ),
-            ]);
-            if entry.def.methods.split('|').any(|method| method == "GET") {
-                choices.insert(
-                    1,
-                    PickItem::new(
-                        "browse",
-                        crate::ui_text::text("routeEditor.browse", "Browse"),
-                    ),
-                );
-            }
-        }
-        let Some(selected) = host::pick(
-            crate::ui_text::text("routeEditor.actions", "Route actions"),
-            &choices,
-        )?
-        else {
-            return Ok(());
-        };
-        action = selected;
-    }
-    if action == "open" {
-        return open(index, ctx, &target);
-    }
+    let action = value["action"].as_str().ok_or(Error::Stale)?.to_owned();
     if !matches!(action.as_str(), "browse" | "copy" | "curl" | "http") {
         return Err(Error::Stale);
     }
@@ -696,7 +630,6 @@ mod tests {
             lenses(&index, &doc, &|_| true)[0].command,
             "route-editor-open"
         );
-        assert_eq!(gutters(&index, &doc, &|_| true).len(), 1);
     }
     #[test]
     fn blade_route_references_get_inline_hints_and_reviewed_route_actions() {
@@ -712,7 +645,6 @@ mod tests {
             found[0].position,
             text::position(&doc.text, doc.text.find("hello'").unwrap() + 6)
         );
-        assert_eq!(gutters(&index, &doc, &|_| true).len(), 1);
         assert!(labels(&index, &doc, &|path| !path.contains("/routes/")).is_empty());
         doc.text =
             "{{-- {{ route('hello') }} --}} @verbatim {{ route('hello') }} @endverbatim".into();

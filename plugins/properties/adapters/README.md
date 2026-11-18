@@ -1,4 +1,4 @@
-Properties' optional Java17+ semantic adapter runs only for explicit Inspect or
+Properties' optional Java 17+ semantic adapter runs only for explicit Inspect or
 compiler Rename actions. It invokes JDK `JavacTask` with annotation processing,
 implicit source discovery and class generation disabled; project classes and
 static initializers do not run.
@@ -26,9 +26,9 @@ refused. A dependency resource/class competing with the selected physical
 ResourceBundle makes the graph incomplete. Directory classpaths and modulepaths
 are unsupported; list the required dependency JARs explicitly.
 
-The physical graph additionally admits at most400Java files,128KiB/file,4MiB
+The physical graph additionally admits at most 400Java files,128KiB/file,4MiB
 source/resource bytes,512directories,8192entries,4096entries/directory,depth24,
-200resource siblings,1024literal edges and256KiB output. It includes hidden and
+200resource siblings,1024literal edges and 256KiB output. It includes hidden and
 ignored Java files, overlays current editor snapshots, and verifies physical
 source hashes/directory membership again after analysis. An eight-second internal
 budget and cancellable15-second native process deadline bound each probe.

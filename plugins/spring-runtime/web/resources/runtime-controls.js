@@ -8,7 +8,7 @@
   const document = ownerDocument;
   let disposed = false;
   const random = () => { const b = new Uint8Array(16); crypto.getRandomValues(b); return Array.from(b, x => x.toString(16).padStart(2,"0")).join(""); };
-  const frame = random(); let nonce = random(), sequence = 0, root = null, url = null, auth = null, timer = null, active = false, busy = false, enabled = false, intersecting = false, stopPending = false;
+  const frame = random(); let nonce = random(), sequence = 0, root = null, url = null, auth = null, timer = null, active = false, busy = false, enabled = false, intersecting = false, stopPending = false, startWanted = false;
   const visible = () => !disposed && intersecting && !document.hidden && observed.isConnected;
   const $ = id => mountRoot.getElementById(id);
   function clear() { if(timer !== null) clearTimeout(timer); timer = null; }
@@ -23,10 +23,16 @@
     clear(); busy = true; buttons();
     openidea.postMessage(JSON.stringify({channel:"runtime-controls",frame,nonce,sequence:++sequence,root,url,auth,op}));
   }
+  // Spring Runtime: Start Auto-Refresh asks for a Start; Rust still validates it.
+  function startIfWanted() {
+    if(!startWanted || busy || active || !enabled || !root || !visible()) return false;
+    startWanted=false; nonce=random(); send("start"); return true;
+  }
   function arm() { clear(); if(active && !busy && visible()) timer = setTimeout(() => { timer=null; if(visible() && active) send("tick"); },60000); }
   openidea?.onMessage(raw => {
     if(disposed) return;
     let reply; try { reply=typeof raw === "string" ? JSON.parse(raw) : raw; } catch { return; }
+    if(reply.channel === "runtime-controls" && reply.op === "start-request" && reply.frame === undefined) { startWanted=true; startIfWanted(); return; }
     if(reply.channel !== "runtime-controls" || reply.frame !== frame || reply.nonce !== nonce || reply.sequence !== sequence) return;
     const model=reply.model; if(!model || (root !== null && model.root && root !== model.root)) return;
     busy=false; active=model.active === true; enabled=model.enabled === true;
@@ -35,10 +41,13 @@
     else { root=model.root; url=model.url; auth=model.auth; for(const key of ["root","url","auth","bounds","poll","status"]) $(key).textContent=key === "status" && model.status === model.poll ? "" : model[key] || ""; }
     if((!visible() || stopPending) && active) { active=false; stopPending=false; send("stop"); return; }
     stopPending=false;
+    if(model.autostart === true) startWanted=true;
+    if(!enabled) startWanted=false;
+    if(startIfWanted()) return;
     buttons(); arm();
   });
   $("start").addEventListener("click",() => { nonce=random(); send("start"); });
-  $("stop").addEventListener("click",() => send("stop"));
+  $("stop").addEventListener("click",() => { startWanted=false; send("stop"); });
   $("refresh").addEventListener("click",() => send("refresh"));
   function visibilityChanged() {
     clear();

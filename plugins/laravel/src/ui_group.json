@@ -27,11 +27,6 @@
       "icon": "table"
     },
     {
-      "id": "laravel-schema",
-      "label": "Schema",
-      "icon": "hierarchy"
-    },
-    {
       "id": "laravel-views",
       "label": "Views",
       "icon": "file-html"
@@ -80,6 +75,47 @@
       "id": "laravel-processes",
       "label": "Processes",
       "icon": "run"
+    }
+  ],
+  "sections": [
+    {
+      "id": "browse",
+      "label": "Browse",
+      "tabs": [
+        "laravel-about",
+        "laravel",
+        "laravel-views",
+        "laravel-components",
+        "laravel-middleware",
+        "laravel-config",
+        "laravel-env",
+        "laravel-translations"
+      ]
+    },
+    {
+      "id": "data",
+      "label": "Data",
+      "tabs": [
+        "laravel-models",
+        "laravel-database"
+      ]
+    },
+    {
+      "id": "run",
+      "label": "Run",
+      "tabs": [
+        "laravel-request",
+        "laravel-artisan",
+        "laravel-runtime",
+        "laravel-processes"
+      ]
+    },
+    {
+      "id": "build",
+      "label": "Build",
+      "tabs": [
+        "laravel-generators"
+      ]
     }
   ]
 }

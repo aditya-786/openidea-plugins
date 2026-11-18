@@ -13,17 +13,13 @@ use std::collections::BTreeSet;
 #[path="model_helper_parameters.rs"]
 pub(crate) mod parameters;
 pub(crate) fn configure(ctx:&openidea_plugin::Invocation)->Result<(),Error>{parameters::configure(ctx)}
-pub(crate) fn begin_project(ctx:&openidea_plugin::Invocation,index:&Index)->Result<(),Error>{
-    let project=ctx.project().ok_or(crate::ui_text::text("native.model_actions.a74a0baad4", "Open a Laravel project first"))?;let root=project.root()?;
-    if !crate::index::index_sources_current(&project,index){return Err(Error::Stale);}
-    if index.partial{return Err(Error::Stale);}
+/// A model that anchors the project-wide helper regeneration action.
+pub(crate) fn helper_anchor(ctx:&openidea_plugin::Invocation,index:&Index)->Result<String,Error>{
+    let project=ctx.project().ok_or(crate::ui_text::text("native.model_actions.a74a0baad4", "Open a Laravel project first"))?;
+    if !crate::index::index_sources_current(&project,index)||index.partial{return Err(crate::still_indexing());}
     let models=eloquent_members::model_identities(&index.eloquent_models).into_iter().filter(|(full,path)|helper_codegen::eligible(&index,full)&&crate::owns_current_path(&project,path)).collect::<Vec<_>>();
-    if models.is_empty(){return Err(Error::Invalid(crate::ui_text::text("native.model_actions.99ac7606df", "No owned eligible Eloquent model is indexed").into()));}
-    let (_,path)=models.into_iter().next().ok_or(Error::Stale)?;
-    if ctx.project().and_then(|project|project.root().ok()).as_deref()!=Some(&root)||!crate::owns_current_path(&project,&path){return Err(Error::Stale);}
-    host::open_editor(&path,None)?;
-    host::notify(openidea_plugin::NotificationLevel::Info,"Laravel",crate::ui_text::text("native.model_actions.d1c3e17426", "Choose ‘Regenerate reviewed helpers for indexed models…’ from this model's editor actions. Selected files are reviewed and applied as one undoable edit."));
-    Ok(())
+    let (_,path)=models.into_iter().next().ok_or_else(||Error::Invalid(crate::ui_text::t("native.model_actions.noHelperModels", "No Eloquent model in this project can have helpers generated.")))?;
+    Ok(path)
 }
 
 fn model(index: &Index, path: &str) -> Option<(String, String)> {
@@ -36,10 +32,10 @@ pub(crate) fn actions(index: &Index, doc: &Document) -> Vec<FileAction> {
         return Vec::new();
     }
     [
-        ("helpers", "Generate reviewed model helpers…"),
+        ("helpers", "Generate model helpers…"),
         (
             "helpers-all",
-            "Regenerate reviewed helpers for indexed models…",
+            "Regenerate helpers for all models…",
         ),
         (
             "docs",
@@ -835,7 +831,7 @@ fn resolve_batch(main:Option<&crate::Main>,index:&Index,doc: &Document, action: 
     }
     let post_note=if preferences.post_commands.is_empty(){String::new()}else{crate::ui_text::format("root.formatted.c33933a37b", "\nAfter successful application, run Artisan argv arrays: {argv}", &[("argv", &format!("{}", serde_json::to_string(&preferences.post_commands).map_err(|_|Error::Stale)?))])};
     let summary = crate::ui_text::format("root.formatted.b73d5608b7", "Apply {count} reviewed files in one undoable workspace edit?\nProject: {root}\nStorage: {mode}{post_note}\n{targets}", &[("count", &format!("{}", targets.len())), ("root", &format!("{}", root)), ("mode", &format!("{}", mode)), ("post_note", &format!("{}", post_note)), ("targets", &format!("{}", targets.iter().cloned().collect::<Vec<_>>().join("\n")))]);
-    if !ui_kit::prompts::confirm_exact(crate::ui_text::text("root.formatted.c3eb14176c", "Regenerate reviewed model helpers?"), &summary)? {
+    if !ui_kit::prompts::confirm_exact(crate::ui_text::text("native.model_actions.regenerateConfirm", "Regenerate model helpers?"), &summary)? {
         return Err(Error::Cancelled);
     }
     owner(doc)?;

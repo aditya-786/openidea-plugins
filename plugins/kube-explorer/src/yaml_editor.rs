@@ -183,7 +183,7 @@ impl Editors {
             None,
         )?;
         if out.status != Some(0) {
-            return Err(invalid("Resource read failed; raw tool output withheld."));
+            return Err(invalid(&crate::failure_reason("Reading the resource", context, &out.stderr)));
         }
         let identity = target(&out.stdout)?;
         let scoped = scope.args(&[]);
@@ -234,7 +234,7 @@ impl Editors {
         let path = format!("{directory}/{file}");
         let marker = format!("# Kubernetes private editor lease {nonce}\n");
         let text = format!(
-            "{marker}# Origin project: {root}\n# Context: {context}; object: {kind} {}/{}\n# Saving is LOCAL ONLY. Review Private YAML Apply, then Apply Reviewed Private YAML.\n{}{}",
+            "{marker}# Origin project: {root}\n# Context: {context}; object: {kind} {}/{}\n# Saving is LOCAL ONLY. Review Private YAML Apply, then Apply Private YAML.\n{}{}",
             identity.namespace.as_deref().unwrap_or("(cluster)"),
             name,
             schema::modeline(&out.stdout).unwrap_or_default(),
@@ -277,7 +277,7 @@ impl Editors {
         lease.pending = None;
         validate(lease, &doc, ctx)?;
         let body = format!(
-            "Project: {}\nContext: {}\nTarget: {} {}/{}\nUID: {}\nResource version: {}\nEditor version: {}\nExact UTF-8 bytes: {}\nSHA-256: {}\n\nPrepare replacement from this exact editor text? This is a digest/target review, not a truncated content preview. No mutation yet. Within 60 seconds invoke Apply Reviewed Private YAML in this same file. That separate event rechecks source/root/scope. kubectl replace uses verified text on stdin, never rereads the private path. Server resourceVersion conflict protection remains; no overwrite/rollback/Undo promise.",
+            "Project: {}\nContext: {}\nTarget: {} {}/{}\nUID: {}\nResource version: {}\nEditor version: {}\nExact UTF-8 bytes: {}\nSHA-256: {}\n\nPrepare replacement from this exact editor text? This is a digest/target review, not a truncated content preview. No mutation yet. Within 60 seconds invoke Apply Private YAML in this same file. That separate event rechecks source/root/scope. kubectl replace uses verified text on stdin, never rereads the private path. Server resourceVersion conflict protection remains; no overwrite/rollback/Undo promise.",
             lease.root,
             lease.context,
             lease.target.kind,
@@ -300,7 +300,7 @@ impl Editors {
         host::notify(
             openidea_plugin::NotificationLevel::Info,
             "Private YAML review",
-            "Prepared only. Invoke Apply Reviewed Private YAML in this file within 60 seconds; Save alone never applies.",
+            "Prepared only. Invoke Apply Private YAML in this file within 60 seconds; Save alone never applies.",
         );
         Ok(())
     }
@@ -326,9 +326,10 @@ impl Editors {
             Some(&doc.text),
         )?;
         if out.status != Some(0) {
-            return Err(invalid(
-                "Replacement failed or conflicted; editor text retained. Raw tool output withheld. Review again or reopen the resource.",
-            ));
+            return Err(invalid(&format!(
+                "{} Your editor text is kept.",
+                crate::failure_reason("Applying the YAML", Some(&lease.context), &out.stderr)
+            )));
         }
         self.leases.remove(&doc.path);
         host::notify(

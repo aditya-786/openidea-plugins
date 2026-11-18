@@ -12,13 +12,15 @@
     },
     "allowRevealSecrets": {
       "type": "boolean",
-      "title": "Allow Show Secret and YAML on a secret (off: secret data is never read; on: YAML of a secret is shown unstripped)",
+      "title": "Allow Show Secret and YAML on a secret",
+      "description": "Off: secret data is never read. On: the YAML of a secret is shown unstripped.",
       "default": false
     },
     "yamlInEditor": {
+      "title": "Open built-in YAML in a private editor copy",
       "type": "boolean",
-      "title": "Open supported built-in YAML in a private editor copy (off: panel; Save is local only, explicit review/apply commands required; never Secrets)",
-      "default": false
+      "default": false,
+      "description": "Open supported built-in YAML in a private editor copy (off: panel; Save is local only, explicit review/apply commands required; never Secrets)"
     },
     "checkDeprecatedApiVersions": {
       "type": "boolean",
@@ -56,9 +58,10 @@
       "default": true
     },
     "checkKindSchema": {
+      "title": "Report unknown top-level or spec keys",
       "type": "boolean",
-      "title": "Report an unknown top-level or spec key of a built-in kind (core, apps, batch, networking, rbac) and a kind its API group does not have",
-      "default": true
+      "default": true,
+      "description": "Report an unknown top-level or spec key of a built-in kind (core, apps, batch, networking, rbac) and a kind its API group does not have"
     },
     "checkReadOnlyFields": {
       "type": "boolean",
@@ -71,14 +74,16 @@
       "default": true
     },
     "checkRequiredKeys": {
+      "title": "Hint at missing required keys",
       "type": "boolean",
-      "title": "Hint at a key the API requires but a Pod, workload, CronJob, NetworkPolicy, claim or binding manifest lacks (spec.containers, spec.template, roleRef, ...)",
-      "default": true
+      "default": true,
+      "description": "Hint at a key the API requires but a Pod, workload, CronJob, NetworkPolicy, claim or binding manifest lacks (spec.containers, spec.template, roleRef, ...)"
     },
     "checkFieldValues": {
+      "title": "Hint at invalid field values",
       "type": "boolean",
-      "title": "Hint at a value of a built-in kind that is not one of the field's values (restartPolicy, Service type, strategy, ...) or not an integer or boolean where one is required",
-      "default": true
+      "default": true,
+      "description": "Hint at a value of a built-in kind that is not one of the field's values (restartPolicy, Service type, strategy, ...) or not an integer or boolean where one is required"
     },
     "checkHelmValues": {
       "type": "boolean",
@@ -101,9 +106,10 @@
       "default": true
     },
     "nonKubernetesGlobs": {
+      "title": "YAML files that are not Kubernetes (globs, comma-separated)",
       "type": "string",
-      "title": "Globs of YAML files that are not Kubernetes, separated by commas (no problems are reported for them), e.g. *.compose.yaml, ci/*.yml",
-      "default": ""
+      "default": "",
+      "description": "Globs of YAML files that are not Kubernetes, separated by commas (no problems are reported for them), e.g. *.compose.yaml, ci/*.yml"
     },
     "checkChartKeys": {
       "type": "boolean",

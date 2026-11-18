@@ -3,7 +3,7 @@ use crate::*;
 use openidea_plugin::diagnostics::DiagnosticsProvider;
 impl DiagnosticsProvider for Main {
     fn diagnostics(&mut self, doc: &Document) -> Vec<Diagnostic> {
-        if doc.text.len() > 32 << 10
+        if doc.text.len() > 256 << 10
             || !host::setting_bool("diagnostics").unwrap_or(true)
             || !matches!(
                 (doc.language.as_str(), doc.path.rsplit('.').next()),
@@ -20,7 +20,11 @@ impl DiagnosticsProvider for Main {
         // Keep current-document checks available, without any rejected cache facts.
         let unavailable=Index{partial:true,..Index::default()};
         let index=if cached.settings_current() {cached} else {&unavailable};
-        let groups = Groups::from_settings();
+        let mut groups = Groups::from_settings();
+        if doc.language == "twig" && index.custom_twig_lexer() {
+            groups.twig = false;
+            groups.twig_syntax = false;
+        }
         let mut found = if doc.language == "twig" && groups.twig_syntax {
             twig_checks::syntax(&doc.text)
         } else if doc.language == "yaml" && groups.yaml_syntax {
@@ -34,7 +38,7 @@ impl DiagnosticsProvider for Main {
                     let mut forms = Vec::new();
                     checks::form_type_strings(&doc.text, &mut forms);
                     found.extend(forms.into_iter().map(|mut finding| {
-                        finding.message.push_str(&format!(" [Advisory: cached composer.json requires symfony/framework-bundle {}; installed/runtime version is unknown. Receiver type is unverified.]", evidence.constraint));
+                        finding.message.push_str(&format!(" (based on composer.json constraint {})", evidence.constraint));
                         finding
                     }));
                 }
@@ -54,7 +58,7 @@ impl DiagnosticsProvider for Main {
                     let read = |_: &str| None;
                     let ctx = checks::Context::new(index, &read);
                     found.extend(php_checks::deprecations(&ctx,&doc.text).into_iter().map(|mut f| {
-                        f.message.push_str(&format!(" [Advisory: cached composer.json requires symfony/framework-bundle {}; installed/runtime version is unknown.]",evidence.constraint));
+                        f.message.push_str(&format!(" (based on composer.json constraint {})",evidence.constraint));
                         f
                     }));
                 }
@@ -115,6 +119,37 @@ mod tests {
         owner.indexes.insert("/project".into(), Index::default());
         (host, owner)
     }
+    #[test]
+    fn diagnostics_run_on_64kib_controller() {
+        let (_host, mut owner) = setup();
+        let padding = format!("// {}\n", "x".repeat(64 << 10));
+        let text = format!("<?php\n#[Route('/x')]\nclass C {{}}\n{padding}");
+        let doc = Document { path: "/project/src/C.php".into(), language: "php".into(), version: 1, text };
+        assert!(doc.text.len() > 64 << 10);
+        assert!(owner.diagnostics(&doc).iter().any(|finding| finding.code.as_deref() == Some("controller-method-missing")));
+    }
+
+    #[test]
+    fn custom_twig_lexer_skips_symfony_twig_checks() {
+        let missing = Document { path: "/project/templates/a.twig".into(), language: "twig".into(), version: 1, text: "{{ path('missing') }}".into() };
+        let checked = |lexer: Option<&str>| {
+            let (host, mut owner) = setup();
+            if let Some(source) = lexer {
+                host.add_file("src/Twig/Custom.php", source);
+            }
+            let mut index = Index::build(&host.invocation().project().unwrap());
+            index.partial = false;
+            index.compiled_routes = true;
+            owner.indexes.insert("/project".into(), index);
+            owner.diagnostics(&missing).iter().any(|finding| finding.code.as_deref() == Some("twig-missing-route"))
+        };
+        let twig = "<?php\nuse Twig\\Lexer;\n$twig->setLexer(new Lexer($twig, ['tag_block' => ['<%', '%>']]));\n";
+        let doctrine = "<?php\nuse Doctrine\\ORM\\Query\\Lexer;\n$lexer = new Lexer($dql);\n";
+        assert!(checked(None));
+        assert!(checked(Some(doctrine)));
+        assert!(!checked(Some(twig)));
+    }
+
     #[test]
     fn stale_setting_cache_keeps_source_checks_without_cached_reference_facts() {
         let (host,mut owner)=setup();let mut index=Index::build(&host.invocation().project().unwrap());
@@ -177,7 +212,7 @@ mod tests {
         facts.templates.insert("known.twig".into(),Entry{detail:None,path:"/project/templates/known.twig".into(),at:Position::new(0,0)});
         let out=owner.diagnostics(&doc);assert_eq!(out.len(),2,"ignore missing has static source-file absence, not a runtime-error claim");
         let at=doc.text.find("missing.twig").unwrap();assert_eq!(out[0].range.start,Position::new(0,doc.text[..at].encode_utf16().count() as u32));
-        assert!(out.iter().all(|finding|finding.code.as_deref()==Some("missing-template") && finding.message.contains("cached source template index")));
+        assert!(out.iter().all(|finding|finding.code.as_deref()==Some("missing-template") && finding.message.contains("wasn't found in the project's templates")));
         owner.indexes.get_mut("/project").unwrap().template_paths_unknown=true;assert!(owner.diagnostics(&doc).is_empty());owner.indexes.get_mut("/project").unwrap().template_paths_unknown=false;
         host.set_setting("twigChecks","false");assert!(owner.diagnostics(&doc).is_empty());host.set_setting("twigChecks","true");
         host.add_file("templates/a.twig",&doc.text);owner.check(&host.invocation().project().unwrap(),&doc.path);assert!(host.diagnostics().get(&doc.path).is_none_or(Vec::is_empty));
@@ -226,7 +261,7 @@ mod tests {
         host.add_file("config/services.yaml",&doc.text);owner.check(&host.invocation().project().unwrap(),&doc.path);
         assert!(host.diagnostics().get(&doc.path).unwrap().iter().any(|d|d.code.as_deref()==Some("service-class-missing")),"unproven reader retains saved fallback");
         owner.indexes.get_mut("/project").unwrap().psr4_source_verified=true;
-        let found=owner.diagnostics(&doc);assert_eq!(found.len(),1);assert_eq!(found[0].code.as_deref(),Some("service-class-missing"));assert!(found[0].message.contains("runtime autoloading is unverified"));
+        let found=owner.diagnostics(&doc);assert_eq!(found.len(),1);assert_eq!(found[0].code.as_deref(),Some("service-class-missing"));assert!(found[0].message.contains("wasn't found in this project's source"));
         owner.indexes.get_mut("/project").unwrap().partial=true;assert!(owner.diagnostics(&doc).is_empty());owner.indexes.get_mut("/project").unwrap().partial=false;
         doc.text=doc.text.replace("Missing","Known");doc.version+=1;assert!(owner.diagnostics(&doc).is_empty());
         doc.language="xml".into();doc.path="/project/config/services.xml".into();
@@ -300,7 +335,7 @@ mod tests {
         let mut messages=Names::new();messages.insert("key".into(),Entry{detail:None,path:"/project/translations/messages.en.yaml".into(),at:Position::new(0,0)});
         facts.translations.insert("messages".into(),messages);
         let found=owner.diagnostics(&doc);assert_eq!(found.len(),5,"{found:?}");
-        assert!(found.iter().all(|d|d.message.contains("Cached project-source index")));
+        assert!(found.iter().all(|d|d.message.contains("From the last project scan")));
         let at=doc.text.find("ghost_route").unwrap();assert_eq!(found[0].range.start,Position::new(0,doc.text[..at].encode_utf16().count() as u32));
         owner.indexes.get_mut("/project").unwrap().partial=true;assert!(owner.diagnostics(&doc).is_empty());owner.indexes.get_mut("/project").unwrap().partial=false;
         host.set_setting("twigChecks","false");assert!(owner.diagnostics(&doc).is_empty());host.set_setting("twigChecks","true");
@@ -350,7 +385,7 @@ mod tests {
         facts.assets.insert("img/known.png".into(),Entry {detail:None,path:"/project/public/img/known.png".into(),at:Position::new(0,0)});
         facts.translations.insert("messages".into(),Names::new());
         let found=owner.diagnostics(&doc);assert_eq!(found.len(),2);
-        assert!(found.iter().all(|d|d.message.contains("Cached project-source index")));
+        assert!(found.iter().all(|d|d.message.contains("From the last project scan")));
         assert_eq!(found[0].range.start,Position::new(0,doc.text[..doc.text.find("img/missing.png").unwrap()].encode_utf16().count() as u32));
         owner.indexes.get_mut("/project").unwrap().partial=true;assert!(owner.diagnostics(&doc).is_empty());
         owner.indexes.get_mut("/project").unwrap().partial=false;
@@ -372,7 +407,7 @@ mod tests {
             let evidence=index::VersionEvidence::from_composer(&format!(r#"{{"require":{{"symfony/framework-bundle":"{constraint}"}}}}"#)).unwrap();
             let facts=owner.indexes.get_mut("/project").unwrap();facts.framework_version=Some(evidence.floor);facts.deprecation_version=Some(evidence);
             let found=owner.diagnostics(&doc);assert_eq!(found.len(),count);
-            if count>0 {assert_eq!(found[0].code.as_deref(),Some("form-type-string"));assert!(found[0].message.contains("Receiver type is unverified"));}
+            if count>0 {assert_eq!(found[0].code.as_deref(),Some("form-type-string"));assert!(found[0].message.contains("(based on composer.json constraint "));}
         }
         owner.indexes.get_mut("/project").unwrap().partial=true;assert!(owner.diagnostics(&doc).is_empty());
         owner.indexes.get_mut("/project").unwrap().partial=false;host.set_setting("phpCallChecks","false");assert!(owner.diagnostics(&doc).is_empty());
@@ -405,7 +440,7 @@ mod tests {
         let evidence=index::VersionEvidence::from_composer(r#"{"require":{"symfony/framework-bundle":"^6.4"}}"#).unwrap();
         let facts=owner.indexes.get_mut("/project").unwrap();facts.partial=false;facts.framework_version=Some(evidence.floor);facts.deprecation_version=Some(evidence);
         let found=owner.diagnostics(&doc);assert_eq!(found.len(),3);
-        assert!(found.iter().any(|d|d.message.contains("^6.4; installed/runtime version is unknown")));
+        assert!(found.iter().any(|d|d.message.contains("(based on composer.json constraint ^6.4)")));
         owner.indexes.get_mut("/project").unwrap().framework_version=Some((8,1));assert_eq!(owner.diagnostics(&doc).len(),2,"mismatched loose hint cannot enable annotation warning");
         doc.text="blog:\n  path: /new\n  type: attribute\n  methods: [GET]\n".into();doc.version+=1;assert!(owner.diagnostics(&doc).is_empty());
         doc.path="/project/config/routes.xml".into();doc.language="xml".into();doc.text="<routes><!-- 😀 --><route id=\"blog\" pattern=\"/old\"/></routes>".into();
@@ -425,7 +460,7 @@ mod tests {
         let start=text::offset(&doc.text,found[0].range.start).unwrap();let end=text::offset(&doc.text,found[0].range.end).unwrap();
         assert_eq!(&doc.text[start..end],"pattern");assert_eq!(start,doc.text.find("pattern =").unwrap());
         let start=text::offset(&doc.text,found[1].range.start).unwrap();let end=text::offset(&doc.text,found[1].range.end).unwrap();assert_eq!(&doc.text[start..end],"Blog:Post:index");
-        assert!(found[2].message.contains("Advisory"));
+        assert!(found[2].message.contains("(based on composer.json constraint "));
     }
 
     #[test]
@@ -660,11 +695,11 @@ mod tests {
             found[0].code.as_deref(),
             Some("filesystem-mirror-copy-on-windows")
         );
-        assert!(found[0].message.contains("Advisory: cached composer.json"));
+        assert!(found[0].message.contains("(based on composer.json constraint "));
         assert!(
             found[0]
                 .message
-                .contains("^8.1; installed/runtime version is unknown")
+                .contains("constraint ^8.1)")
         );
         assert!(host.diagnostics().is_empty());
         host.set_setting("deprecationChecks", "false");
@@ -714,7 +749,7 @@ mod tests {
         assert!(
             owner.diagnostics(&doc)[0]
                 .message
-                .contains("8.1.*; installed/runtime version is unknown")
+                .contains("constraint 8.1.*)")
         );
         host.set_project_root(Some("/other"));
         assert!(owner.diagnostics(&doc).is_empty());

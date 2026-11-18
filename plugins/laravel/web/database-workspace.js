@@ -4,15 +4,16 @@
   const SVG = 'http://www.w3.org/2000/svg';
   const diagramViews = new Map();
   const STATUS = {
-    'pending': 'Pending migration',
-    'only-migrations': 'Only in migrations',
-    'only-database': 'Only in the database',
-    'differs': 'Differs'
+    'pending': ['statusPending', 'Pending migration'],
+    'only-migrations': ['statusOnlyMigrations', 'Only in migrations'],
+    'only-database': ['statusOnlyDatabase', 'Only in the database'],
+    'differs': ['statusDiffers', 'Differs']
   };
   const BOX = {width: 230, head: 26, row: 18, rows: 14, gapX: 90, gapY: 28};
 
   window.uiKitDatabaseWorkspace = {mount(root, bridge) {
     const tr = (key, fallback) => window.uiKitI18n?.t(`database.${key}`, fallback) ?? fallback;
+    const format = (key, fallback, args) => tr(key, fallback).replace(/\{(\w+)\}/g, (token, name) => name in args ? String(args[name]) : token);
     const $ = id => root.querySelector(`#${id}`);
     const el = (tag, text, className) => {
       const node = document.createElement(tag);
@@ -26,7 +27,7 @@
       node.append(...children.filter(child => child != null));
       return node;
     };
-    const mode = root.querySelector('[data-database-workspace]').dataset.databaseWorkspace;
+    const hasDiagram = !!$('dbw-diagram');
     const projectKey = bridge.project || '';
     let disposed = false;
     let queue = [];
@@ -39,11 +40,11 @@
     const busy = () => queue.length > 0;
     function refreshControls() {
       const disabled = busy();
-      for (const id of ['dbw-compare', 'dbw-rows-load', 'dbw-refresh']) {
+      for (const id of ['dbw-compare', 'dbw-rows-load', 'dbw-refresh', 'dbw-table-refresh']) {
         const button = $(id);
         if (button) button.disabled = disabled;
       }
-      if (mode === 'database') pager();
+      pager();
       $('dbw-status').textContent = disabled ? tr('working', 'Working…') : '';
     }
     function send(request) {
@@ -95,6 +96,155 @@
     function describeIndex(index) {
       return `${index.kind}(${index.columns.join(', ')})`;
     }
+    const expanded = new Set();
+    function icon(name) {
+      const node = el('span', null, 'dbw-icon');
+      node.dataset.uiIcon = name;
+      node.setAttribute('aria-hidden', '1');
+      return node;
+    }
+    function treeRows(table, query) {
+      const key = `t:${table.name}`;
+      const columnsKey = `${key}:columns`;
+      const indexesKey = `${key}:indexes`;
+      const foreignsKey = `${key}:foreigns`;
+      const count = table.columns.length === 1 ? format('columnCountOne', '{count} column', {count: 1}) : format('columnCount', '{count} columns', {count: table.columns.length});
+      const details = [table.models.join(', '), count].filter(Boolean).join(' · ');
+      const rows = [{key, depth: 0, icon: 'table', label: table.name, details, children: true, open: table.open}];
+      if (!expanded.has(key)) return rows;
+      rows.push({key: columnsKey, depth: 1, icon: 'folder', label: `${tr('columns', 'Columns')} (${table.columns.length})`, children: table.columns.length > 0});
+      if (expanded.has(columnsKey)) {
+        for (const column of table.columns) rows.push({key: `${columnsKey}:${column.name}`, depth: 2, badge: keyLabel(column.key), keyKind: column.key, label: column.name, details: column.kind, hit: !!query && column.name.toLowerCase().includes(query)});
+      }
+      if (table.indexes.length) {
+        rows.push({key: indexesKey, depth: 1, icon: 'folder', label: `${tr('indexes', 'Indexes')} (${table.indexes.length})`, children: true});
+        if (expanded.has(indexesKey)) for (const index of table.indexes) rows.push({key: `${indexesKey}:${describeIndex(index)}`, depth: 2, label: describeIndex(index), details: index.kind});
+      }
+      if (table.foreigns.length) {
+        rows.push({key: foreignsKey, depth: 1, icon: 'folder', label: `${tr('foreignKeys', 'Foreign keys')} (${table.foreigns.length})`, children: true});
+        if (expanded.has(foreignsKey)) for (const foreign of table.foreigns) rows.push({key: `${foreignsKey}:${foreign.column}`, depth: 2, badge: 'FK', keyKind: 'fk', label: foreign.column, details: `${foreign.on ?? '?'}.${foreign.references}`});
+      }
+      for (const row of rows) {
+        row.open = table.open;
+        if (!row.children || row.depth === 0) row.copy = row.depth === 0 ? table.name : row.label.replace(/ \(\d+\)$/, '');
+      }
+      return rows;
+    }
+    function copyText(text) {
+      const done = () => { $('dbw-status').textContent = tr('copied', 'Copied'); setTimeout(() => { if (!busy()) $('dbw-status').textContent = ''; }, 1200); };
+      try { navigator.clipboard.writeText(text).then(done, () => setError(tr('copyFailed', 'Copy is not available here.'))); } catch { setError(tr('copyFailed', 'Copy is not available here.')); }
+    }
+    let menu = null;
+    let menuReturn = null;
+    function closeMenu(refocus) {
+      menu?.remove();
+      menu = null;
+      if (refocus) menuReturn?.focus();
+    }
+    function showMenu(x, y, row, from) {
+      closeMenu();
+      menuReturn = from;
+      const items = [];
+      if (row.children) items.push([expanded.has(row.key) ? tr('collapse', 'Collapse') : tr('expand', 'Expand'), expanded.has(row.key) ? 'chevron-up' : 'chevron-down', () => toggle(row.key)]);
+      if (row.open) items.push([tr('goToMigration', 'Go to Migration'), 'file-php', () => open(row.open)]);
+      if (row.copy) items.push([tr('copyName', 'Copy Name'), 'copy', () => copyText(row.copy)]);
+      items.push([tr('expandAll', 'Expand All'), 'expand-all', () => setAll(true)], [tr('collapseAll', 'Collapse All'), 'collapse-all', () => setAll(false)]);
+      menu = el('ul', null, 'dbw-menu');
+      menu.setAttribute('role', 'menu');
+      for (const [label, iconName, run] of items) {
+        const item = el('li', null, 'dbw-menu-item');
+        item.setAttribute('role', 'menuitem');
+        item.tabIndex = -1;
+        item.append(icon(iconName), el('span', label));
+        item.addEventListener('click', () => { closeMenu(true); run(); });
+        menu.append(item);
+      }
+      menu.addEventListener('contextmenu', event => event.preventDefault());
+      menu.addEventListener('keydown', event => {
+        const entries = [...menu.children];
+        const at = entries.indexOf(event.target);
+        const move = {ArrowDown: at + 1, ArrowUp: at - 1, Home: 0, End: entries.length - 1}[event.key];
+        if (move !== undefined) entries[(move + entries.length) % entries.length].focus();
+        else if (event.key === 'Enter' || event.key === ' ') event.target.click();
+        else if (event.key === 'Escape') closeMenu(true);
+        else if (event.key === 'Tab') closeMenu(true);
+        else return;
+        event.preventDefault();
+        event.stopPropagation();
+      });
+      const host = root.querySelector('[data-database-workspace]');
+      const box = host.getBoundingClientRect();
+      menu.style.left = `${Math.max(0, Math.min(x - box.left, box.width - 190))}px`;
+      menu.style.top = `${Math.max(0, Math.min(y - box.top, box.height - items.length * 26 - 8))}px`;
+      host.append(menu);
+      window.uiKitIcons?.enhance?.(menu);
+      menu.firstElementChild.focus();
+    }
+    function toggle(key) {
+      filterExpanded.delete(key);
+      if (expanded.has(key)) expanded.delete(key); else expanded.add(key);
+      renderTables();
+    }
+    function setAll(open) {
+      expanded.clear();
+      filterExpanded.clear();
+      if (open) for (const table of state?.tables || []) {
+        const key = `t:${table.name}`;
+        expanded.add(key);
+        expanded.add(`${key}:columns`);
+        expanded.add(`${key}:indexes`);
+        expanded.add(`${key}:foreigns`);
+      }
+      renderTables();
+    }
+    let focusKey = null;
+    const focusRow = node => node?.focus();
+    function parentRow(node) {
+      const level = Number(node.getAttribute('aria-level'));
+      let other = node.previousElementSibling;
+      while (other && Number(other.getAttribute('aria-level')) >= level) other = other.previousElementSibling;
+      return other;
+    }
+    function rowKeys(event, node, row) {
+      const rows = [...node.parentElement.children];
+      const at = rows.indexOf(node);
+      const isOpen = expanded.has(row.key);
+      if (event.key === 'ArrowDown') focusRow(rows[at + 1]);
+      else if (event.key === 'ArrowUp') focusRow(rows[at - 1]);
+      else if (event.key === 'Home') focusRow(rows[0]);
+      else if (event.key === 'End') focusRow(rows[rows.length - 1]);
+      else if (event.key === 'ArrowRight') { if (row.children && !isOpen) toggle(row.key); else if (isOpen) focusRow(rows[at + 1]); }
+      else if (event.key === 'ArrowLeft') { if (row.children && isOpen) toggle(row.key); else focusRow(parentRow(node)); }
+      else if (event.key === 'Enter') { if (row.open) open(row.open); else if (row.children) toggle(row.key); }
+      else if (event.key === ' ') { if (row.children) toggle(row.key); }
+      else if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey)) {
+        const box = node.getBoundingClientRect();
+        showMenu(box.left + 24, box.bottom, row, node);
+      }
+      else return;
+      event.preventDefault();
+    }
+    const filterExpanded = new Set();
+    function filterTables() {
+      const query = $('dbw-table-filter').value.trim().toLowerCase();
+      for (const key of filterExpanded) expanded.delete(key);
+      filterExpanded.clear();
+      if (query) for (const table of state?.tables || []) {
+        if (table.name.toLowerCase().includes(query) || !table.columns.some(column => column.name.toLowerCase().includes(query))) continue;
+        for (const key of [`t:${table.name}`, `t:${table.name}:columns`]) {
+          if (expanded.has(key)) continue;
+          expanded.add(key);
+          filterExpanded.add(key);
+        }
+      }
+      renderTables();
+    }
+    function renderUnreadable() {
+      const files = state?.unreadable || [];
+      const note = $('dbw-unreadable');
+      note.hidden = !files.length;
+      note.textContent = files.length ? format('unreadable', '{count} migration files could not be read and are left out: {files}', {count: files.length, files: files.map(path => path.split('/').pop()).join(', ')}) : '';
+    }
     function renderTables() {
       const query = $('dbw-table-filter').value.trim().toLowerCase();
       const all = state?.tables || [];
@@ -105,26 +255,63 @@
       $('dbw-table-count').textContent = query ? `${shown.length} / ${all.length}` : `${all.length}`;
       if (!all.length) return $('dbw-tables').replaceChildren(empty(tr('noTables', 'No table is created by the migrations of this project yet.')));
       if (!shown.length) return $('dbw-tables').replaceChildren(empty(tr('noMatches', 'No table matches the filter.')));
-      const rows = shown.map(table => {
-        const columns = el('details');
-        columns.append(el('summary', String(table.columns.length)));
-        const list = el('ul', null, 'dbw-columns');
-        for (const column of table.columns) {
-          const item = el('li');
-          item.append(el('span', keyLabel(column.key), `dbw-key dbw-key-${column.key || 'none'}`), el('span', column.name), el('span', column.kind, 'dbw-muted'));
-          list.append(item);
+      const hadFocus = $('dbw-tables').contains(root.activeElement ?? document.activeElement);
+      const table = el('table', null, 'ui-table dbw-table dbw-tree');
+      table.setAttribute('role', 'treegrid');
+      table.setAttribute('aria-label', tr('tabTables', 'Tables'));
+      const head = el('tr');
+      head.append(el('th', tr('table', 'Table')), el('th', tr('details', 'Details')));
+      const thead = el('thead');
+      thead.append(head);
+      const body = el('tbody');
+      let roving = null;
+      for (const source of shown) {
+        for (const row of treeRows(source, query)) {
+          const tr_ = el('tr', null, `dbw-tree-row dbw-depth-${row.depth}${row.hit ? ' dbw-hit' : ''}`);
+          tr_.dataset.key = row.key;
+          tr_.tabIndex = -1;
+          tr_.setAttribute('aria-level', String(row.depth + 1));
+          if (row.children) tr_.setAttribute('aria-expanded', String(expanded.has(row.key)));
+          if (!roving || row.key === focusKey) roving = tr_;
+          const first = el('td');
+          first.setAttribute('role', 'gridcell');
+          const line = el('div', null, 'dbw-tree-cell');
+          line.style.paddingLeft = `${row.depth * 20}px`;
+          const slot = el('span', null, 'dbw-tree-slot');
+          if (row.children) {
+            slot.append(icon(expanded.has(row.key) ? 'chevron-down' : 'chevron-right'));
+            slot.addEventListener('click', event => { event.stopPropagation(); toggle(row.key); });
+          }
+          line.append(slot);
+          if (row.icon) line.append(icon(row.icon));
+          if (row.badge !== undefined) line.append(el('span', row.badge, `dbw-badge dbw-badge-${row.keyKind || 'none'}`));
+          line.append(el('span', row.label, 'dbw-tree-label'));
+          first.append(line);
+          const second = el('td', row.details || '', 'dbw-muted-cell');
+          second.setAttribute('role', 'gridcell');
+          tr_.append(first, second);
+          tr_.addEventListener('focus', () => {
+            for (const other of body.children) other.tabIndex = other === tr_ ? 0 : -1;
+            focusKey = row.key;
+          });
+          tr_.addEventListener('keydown', event => rowKeys(event, tr_, row));
+          if (row.children) tr_.addEventListener('click', () => toggle(row.key));
+          tr_.addEventListener('contextmenu', event => {
+            event.preventDefault();
+            showMenu(event.clientX, event.clientY, row, tr_);
+          });
+          if (row.open) {
+            tr_.title = tr('openMigration', 'Open the migration');
+            tr_.addEventListener('dblclick', () => open(row.open));
+          }
+          body.append(tr_);
         }
-        columns.append(list);
-        const foreigns = table.foreigns.map(foreign => `${foreign.column} → ${foreign.on ?? '?'}.${foreign.references}`);
-        return [
-          openLink(table.name, table.open),
-          table.models.join(', '),
-          columns,
-          table.indexes.map(describeIndex).join(' · '),
-          foreigns.join(' · ')
-        ];
-      });
-      $('dbw-tables').replaceChildren(grid([tr('table', 'Table'), tr('models', 'Models'), tr('columns', 'Columns'), tr('indexes', 'Indexes'), tr('foreignKeys', 'Foreign keys')], rows));
+      }
+      roving.tabIndex = 0;
+      table.append(thead, body);
+      $('dbw-tables').replaceChildren(table);
+      window.uiKitIcons?.enhance?.($('dbw-tables'));
+      if (hadFocus) roving.focus();
     }
 
     /* ---------- Compare ---------- */
@@ -137,11 +324,11 @@
       }
       const filter = $('dbw-compare-status').value;
       const rows = live.rows.filter(row => !filter || row.status === filter);
-      $('dbw-compare-summary').textContent = `${live.connection} (${live.driver}) · ${live.rows.length} ${tr('differences', 'differences')} · ${live.tables.length} ${tr('databaseTables', 'tables in the database')}${live.truncated ? ' · ' + tr('truncated', 'list truncated') : ''}`;
+      $('dbw-compare-summary').textContent = `${live.connection} (${live.driver}) · ${format('differences', '{count} differences', {count: live.rows.length})} · ${format('databaseTables', '{count} tables in the database', {count: live.tables.length})}${live.truncated ? ' · ' + tr('truncated', 'list truncated') : ''}`;
       if (!live.rows.length) return target.replaceChildren(empty(tr('inSync', 'The database matches the migrations.')));
-      if (!rows.length) return target.replaceChildren(empty(tr('noMatches', 'Nothing matches the filter.')));
+      if (!rows.length) return target.replaceChildren(empty(tr('noCompareMatches', 'Nothing matches the filter.')));
       target.replaceChildren(grid([tr('table', 'Table'), tr('status', 'Status'), tr('details', 'Details')], rows.map(row => {
-        const badge = el('span', STATUS[row.status] || row.status, `ui-badge dbw-status-${row.status}`);
+        const badge = el('span', STATUS[row.status] ? tr(...STATUS[row.status]) : row.status, `ui-badge dbw-status-${row.status}`);
         const details = el('ul', null, 'dbw-details');
         for (const detail of row.details) details.append(el('li', detail));
         return [row.open ? openLink(row.table, row.open) : (row.table || '—'), badge, details];
@@ -169,7 +356,7 @@
       }
       const reply = rowsReply;
       const from = reply.rows.length ? reply.page * reply.size + 1 : 0;
-      $('dbw-rows-summary').textContent = `${from}–${reply.page * reply.size + reply.rows.length} / ${reply.total}${reply.masked.length ? ' · ' + tr('masked', 'masked') + ': ' + reply.masked.join(', ') : ''}`;
+      $('dbw-rows-summary').textContent = `${from}–${reply.page * reply.size + reply.rows.length} / ${reply.total}${reply.masked.length ? ' · ' + format('masked', 'masked: {columns}', {columns: reply.masked.join(', ')}) : ''}`;
       if (!reply.rows.length) return target.replaceChildren(empty(tr('noRows', 'This table has no rows.')));
       const masked = new Set(reply.masked);
       const headings = reply.columns.map(name => {
@@ -185,9 +372,34 @@
       table.classList.add('dbw-rows');
       table.querySelectorAll('thead th').forEach((th, index) => th.classList.toggle('dbw-masked', masked.has(reply.columns[index])));
     }
+    let tableNames = [];
+    let suggestIndex = -1;
     function renderTableChoices() {
       const names = new Set([...(state?.tables || []).map(table => table.name), ...(state?.live?.tables || [])]);
-      $('dbw-rows-tables').replaceChildren(...[...names].sort().map(name => { const option = el('option'); option.value = name; return option; }));
+      tableNames = [...names].sort();
+    }
+    function suggest(show = true) {
+      const input = $('dbw-rows-table');
+      const list = $('dbw-rows-tables');
+      const query = input.value.trim().toLowerCase();
+      const matches = tableNames.filter(name => !query || name.toLowerCase().includes(query)).slice(0, 50);
+      suggestIndex = -1;
+      list.replaceChildren(...matches.map(name => {
+        const item = el('li', name, 'dbw-suggest-item');
+        item.setAttribute('role', 'option');
+        item.addEventListener('mousedown', event => { event.preventDefault(); input.value = name; suggest(false); });
+        return item;
+      }));
+      const open = show && matches.length > 0;
+      list.hidden = !open;
+      input.setAttribute('aria-expanded', String(open));
+    }
+    function moveSuggest(step) {
+      const items = [...$('dbw-rows-tables').children];
+      if (!items.length) return;
+      suggestIndex = (suggestIndex + step + items.length) % items.length;
+      items.forEach((item, index) => item.classList.toggle('active', index === suggestIndex));
+      items[suggestIndex].scrollIntoView({block: 'nearest'});
     }
 
     /* ---------- Schema diagram ---------- */
@@ -285,7 +497,7 @@
           box.append(svg('text', {class: column.key ? `dbw-col dbw-key-${column.key}` : 'dbw-col', x: 10, y}, `${column.key ? keyLabel(column.key) + ' ' : ''}${column.name}`));
           box.append(svg('text', {class: 'dbw-kind', x: position.w - 8, y, 'text-anchor': 'end'}, column.kind));
         });
-        if (table.columns.length > BOX.rows) box.append(svg('text', {class: 'dbw-kind', x: 10, y: BOX.head + BOX.rows * BOX.row + 14}, `+${table.columns.length - BOX.rows} ${tr('more', 'more')}`));
+        if (table.columns.length > BOX.rows) box.append(svg('text', {class: 'dbw-kind', x: 10, y: BOX.head + BOX.rows * BOX.row + 14}, format('more', '+{count} more', {count: table.columns.length - BOX.rows})));
         box.addEventListener('mouseenter', () => links.forEach(link => link.classList.toggle('on', link.dataset.from === name || link.dataset.to === name)));
         box.addEventListener('mouseleave', () => links.forEach(link => link.classList.remove('on')));
         boxes.set(name, box);
@@ -334,39 +546,61 @@
       container.replaceChildren(canvas);
       renderDiagram = {fit, filter, zoom: factor => { const rect = canvas.getBoundingClientRect(); zoomAt(factor, rect.width / 2, rect.height / 2); }};
       filter();
-      $('dbw-count').textContent = `${diagram.tables.length} ${tr('tables', 'tables')} · ${diagram.links.length} ${tr('links', 'links')}`;
+      $('dbw-count').textContent = `${format('tables', '{count} tables', {count: diagram.tables.length})} · ${format('links', '{count} links', {count: diagram.links.length})}`;
       if (view.fresh) { requestAnimationFrame(fit); view.fresh = false; } else apply();
     }
 
     /* ---------- wiring ---------- */
     function render() {
-      if (mode === 'schema') return drawDiagram();
+      if (!root.querySelector('[data-dbw-panel="schema"]').hidden) drawDiagram();
+      renderUnreadable();
       renderTables();
       renderCompare();
       renderTableChoices();
       renderRows();
     }
-    if (mode === 'schema') {
+    const dismissMenu = event => { if (menu && !menu.contains(event.target)) closeMenu(); };
+    const escapeMenu = event => { if (event.key === 'Escape' && menu) closeMenu(true); };
+    document.addEventListener('pointerdown', dismissMenu);
+    document.addEventListener('keydown', escapeMenu);
+    if (hasDiagram) {
       $('dbw-diagram-filter').addEventListener('input', () => renderDiagram?.filter());
       $('dbw-fit').addEventListener('click', () => renderDiagram?.fit());
       $('dbw-zoom-in').addEventListener('click', () => renderDiagram?.zoom(1.25));
       $('dbw-zoom-out').addEventListener('click', () => renderDiagram?.zoom(1 / 1.25));
       $('dbw-refresh').addEventListener('click', () => send({op: 'state'}));
-    } else {
-      for (const tab of root.querySelectorAll('[data-dbw-tab]')) {
-        tab.addEventListener('click', () => {
-          for (const other of root.querySelectorAll('[data-dbw-tab]')) other.setAttribute('aria-selected', String(other === tab));
-          for (const panel of root.querySelectorAll('[data-dbw-panel]')) panel.hidden = panel.dataset.dbwPanel !== tab.dataset.dbwTab;
-        });
-      }
-      $('dbw-table-filter').addEventListener('input', renderTables);
-      $('dbw-compare').addEventListener('click', () => send({op: 'compare'}));
-      $('dbw-compare-status').addEventListener('change', renderCompare);
-      $('dbw-rows-load').addEventListener('click', () => requestRows(0));
-      $('dbw-rows-table').addEventListener('keydown', event => { if (event.key === 'Enter') requestRows(0); });
-      $('dbw-rows-prev').addEventListener('click', () => rowsReply && requestRows(rowsReply.page - 1));
-      $('dbw-rows-next').addEventListener('click', () => rowsReply && requestRows(rowsReply.page + 1));
     }
+    for (const tab of root.querySelectorAll('[data-dbw-tab]')) {
+      tab.addEventListener('click', () => {
+        for (const other of root.querySelectorAll('[data-dbw-tab]')) other.setAttribute('aria-selected', String(other === tab));
+        for (const panel of root.querySelectorAll('[data-dbw-panel]')) panel.hidden = panel.dataset.dbwPanel !== tab.dataset.dbwTab;
+        if (tab.dataset.dbwTab === 'schema') drawDiagram();
+      });
+    }
+    $('dbw-table-filter').addEventListener('input', filterTables);
+    $('dbw-table-refresh').addEventListener('click', () => send({op: 'state'}));
+    $('dbw-expand-all').addEventListener('click', () => setAll(true));
+    $('dbw-collapse-all').addEventListener('click', () => setAll(false));
+    $('dbw-compare').addEventListener('click', () => send({op: 'compare'}));
+    $('dbw-compare-status').addEventListener('change', renderCompare);
+    $('dbw-rows-load').addEventListener('click', () => requestRows(0));
+    const tableInput = $('dbw-rows-table');
+    tableInput.addEventListener('input', () => suggest());
+    tableInput.addEventListener('focus', () => suggest());
+    tableInput.addEventListener('blur', () => suggest(false));
+    tableInput.addEventListener('keydown', event => {
+      const list = $('dbw-rows-tables');
+      if (event.key === 'ArrowDown') { event.preventDefault(); if (list.hidden) suggest(); moveSuggest(1); }
+      else if (event.key === 'ArrowUp') { event.preventDefault(); moveSuggest(-1); }
+      else if (event.key === 'Escape') suggest(false);
+      else if (event.key === 'Enter') {
+        if (!list.hidden && suggestIndex >= 0) tableInput.value = list.children[suggestIndex].textContent;
+        suggest(false);
+        requestRows(0);
+      }
+    });
+    $('dbw-rows-prev').addEventListener('click', () => rowsReply && requestRows(rowsReply.page - 1));
+    $('dbw-rows-next').addEventListener('click', () => rowsReply && requestRows(rowsReply.page + 1));
     bridge.onMessage(raw => {
       if (disposed) return;
       let reply;
@@ -381,6 +615,11 @@
     });
     render();
     send({op: 'state'});
-    return () => { disposed = true; };
+    return () => {
+      disposed = true;
+      closeMenu();
+      document.removeEventListener('pointerdown', dismissMenu);
+      document.removeEventListener('keydown', escapeMenu);
+    };
   }};
 })();

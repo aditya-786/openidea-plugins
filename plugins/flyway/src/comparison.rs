@@ -1,6 +1,5 @@
-//! Offline review adapter for documented Flyway Enterprise comparison JSON.
-//! Imported review remains offline. Managed child orchestration is profile-gated;
-//! no production offline runtime profile has been accepted.
+//! Offline review adapter for documented Flyway comparison JSON. Imported review stays
+//! offline; the managed comparison runs only with an installed Flyway CLI profile.
 mod managed;
 use super::*;
 use openidea_plugin::PickItem;
@@ -232,7 +231,7 @@ fn accept_managed_report(d:&mut Draft)->Result<(),Error> {
         let rows=parse(source)?;
         d.loaded=Some((d.report.clone(),source.clone(),rows));
         d.loaded_managed=true;d.selected.clear();d.recipe=None;
-        d.notice="Managed stage output parsed; bounded source/output correspondence only, no runtime certification. Select definitions explicitly.".into();
+        d.notice="Comparison finished. Select Changes… to review their definitions.".into();
     }
     Ok(())
 }
@@ -290,7 +289,7 @@ impl Review {
             random.hash_one((&root, self.next, "comparison")),
             random.hash_one((&root, self.next, "controls"))
         );
-        if self.draft.as_ref().is_some_and(|d|d.managed.running()){return Err("Cancel the owned comparison child before replacing this review.".into());}
+        if self.draft.as_ref().is_some_and(|d|d.managed.running()){return Err("Stop the running comparison first.".into());}
         self.draft = Some(Draft {
             root,
             token,
@@ -312,12 +311,12 @@ impl Review {
         Ok(())
     }
     pub(crate) fn view(&self, ctx: &Invocation) -> Result<View, Error> {
-        let Ok((project, root)) = owner(ctx) else { return Ok(View::message("Open the owning project to review comparison data.")); };
+        let Ok((project, root)) = owner(ctx) else { return Ok(View::message("Open a project to review comparison reports.")); };
         let Some(d) = self.draft.as_ref().filter(|d| d.root == root) else {
-            return Ok(View::message("Start Review comparison report… for this project."));
+            return Ok(View::message("No comparison report yet. Run Flyway: Review Local Comparison Report… to load one for this project."));
         };
         if d.loaded.as_ref().is_some_and(|(report,_,_)| scoped_path(&project, report).is_err()) {
-            return Ok(View::message("The cached report is no longer owned by this project. Review it from its owning project."));
+            return Ok(View::message("The loaded report is no longer inside this project. Run Flyway: Review Local Comparison Report… again."));
         }
         let key = |s: &str| format!("{s}@{}", d.token);
         let mut fields = vec![
@@ -398,14 +397,13 @@ impl Review {
             ));
         }
         let mut view=View::new(Body::Form(fields))
-            .button(Button::new(&key("load"), "Load local report…"))
-            .button(Button::new(&key("select"), "Select definitions…"))
-            .button(Button::new(&key("plan"), "Review CLI recipe…"))
-            .button(Button::new(&key("prepare-managed"), "Managed adapter readiness…"))
-            .button(Button::new(&key("clear"), "Clear review"));
-        if d.managed.prepared() {view=view.button(Button::new(&key("start-managed"), "Start comparison — unavailable profile").enabled(false));}
-        if d.managed.running() {view=view.button(Button::new(&key("check-managed"), "Check owned comparison")).button(Button::new(&key("cancel-managed"), "Cancel owned comparison"));}
-        Ok(view.status("Offline report review; managed execution requires an accepted offline CLI profile."))
+            .button(Button::new(&key("load"), "Load Report…").icon("folder-open"))
+            .button(Button::new(&key("select"), "Select Changes…").icon("list").enabled(d.loaded.is_some()));
+        if d.managed.startable() {view=view.button(Button::new(&key("start-managed"), "Start Comparison").icon("run"));}
+        if d.managed.continuable() {view=view.button(Button::new(&key("continue-managed"), "Continue Comparison").icon("run"));}
+        if d.managed.running() {view=view.button(Button::new(&key("check-managed"), "Check Progress").icon("refresh")).button(Button::new(&key("cancel-managed"), "Stop Comparison").icon("stop"));}
+        view=view.button(Button::new(&key("more"), "More…").icon("more"));
+        Ok(view.status("Offline report review, or a managed comparison with the installed Flyway CLI."))
     }
     pub(crate) fn handle(&mut self, event: ViewEvent, ctx: &Invocation) -> Result<(), Error> {
         let (project, root) = owner(ctx)?;
@@ -418,10 +416,20 @@ impl Review {
         if token != d.token {
             return Err(Error::Stale);
         }
+        let picked;
+        let key = if key == "more" && matches!(event, ViewEvent::Button(_)) {
+            let actions = [("plan", "Show CLI Commands…"), ("prepare-managed", "Prepare Comparison…"), ("clear", "Clear")];
+            let items: Vec<_> = actions.iter().map(|(id, label)| PickItem::new(id, label)).collect();
+            let Some(chosen) = host::pick("More comparison actions", &items)? else { return Ok(()) };
+            picked = actions.iter().find(|(id, _)| *id == chosen).ok_or(Error::Stale)?.0;
+            picked
+        } else {
+            key
+        };
         let result: Result<(), Error> = (|| {
             match event {
                 ViewEvent::Field(_, value) => {
-                    if d.managed.running(){return Err("Cancel the owned comparison before changing its inputs.".into());}
+                    if d.managed.running(){return Err("Stop the running comparison before changing its inputs.".into());}
                     if d.loaded_managed {d.loaded=None;d.selected.clear();}
                     d.managed=managed::Core::default();
                     d.loaded_managed=false;
@@ -460,10 +468,11 @@ impl Review {
                 ViewEvent::Button(_) => match key {
                     "prepare-managed" => {
                         let plan=managed::Plan::capture(&project,d)?;
-                        if ui_kit::prompts::confirm_exact("Review blocked managed comparison plan?",&plan.review())? {
+                        if ui_kit::prompts::confirm_exact("Prepare offline comparison?",&plan.review())? {
                             plan.revalidate_prepare(&project)?;
-                            d.managed.prepare(plan)?;
-                            d.notice=managed::BLOCKED.into();
+                            let profile=managed::offline_profile(&project);
+                            d.managed.prepare(plan, profile)?;
+                            d.notice=d.managed.status.clone();
                         }
                     }
                     "start-managed" => d.managed.start(&project)?,
@@ -474,7 +483,7 @@ impl Review {
                         accept_managed_report(d)?;
                     }
                     "clear" => {
-                        if d.managed.running(){return Err("Cancel the owned comparison before clearing it.".into());}
+                        if d.managed.running(){return Err("Stop the running comparison before clearing it.".into());}
                         d.managed=managed::Core::default();d.loaded_managed=false;
                         d.loaded = None;
                         d.selected.clear();
@@ -482,7 +491,7 @@ impl Review {
                         d.notice = "Review cleared; no files changed.".into();
                     }
                     "load" => {
-                        if d.managed.running(){return Err("Cancel the owned comparison before loading another report.".into());}
+                        if d.managed.running(){return Err("Stop the running comparison before loading another report.".into());}
                         d.loaded_managed=false;
                         // Failed reload invalidates old selection rather than mixing reports.
                         d.loaded = None;
@@ -587,7 +596,7 @@ impl Review {
                             return Err("Target snapshot path must be an existing local file.".into());
                         }
                         let changes = if d.selected.is_empty() {
-                            return Err("Load and explicitly select reviewed change IDs first.".into());
+                            return Err("Load a report and select changes first.".into());
                         } else {
                             d.selected.join(",")
                         };
@@ -704,6 +713,21 @@ mod tests {
         assert!(sql[1].label.contains("TARGET object definition"));
         assert!(h.process_runs().is_empty());
         assert!(h.requests().is_empty());
+    }
+    #[test]
+    fn toolbar_keeps_secondary_actions_behind_more() {
+        let h = host();
+        let mut r = Review::default();
+        ready(&mut r, &h);
+        let view = r.view(&h.invocation()).unwrap();
+        assert!(view.toolbar.len() <= 5 && view.toolbar.iter().all(|b| b.icon.is_some()));
+        assert!(view.toolbar.iter().any(|b| b.label == "More…"));
+        h.answer_next_prompt(None);
+        button(&mut r, &h, "more").unwrap();
+        assert!(r.draft.as_ref().unwrap().loaded.is_some(), "a cancelled pick does nothing");
+        h.answer_next_prompt(Some(&["clear"]));
+        button(&mut r, &h, "more").unwrap();
+        assert!(r.draft.as_ref().unwrap().loaded.is_none());
     }
     #[test]
     fn malformed_duplicate_unsafe_and_unknown_report_shapes_are_refused() {

@@ -2,10 +2,12 @@
 //! reports; no editor provider invokes a package manager or network resolver.
 use crate::*;
 use openidea_plugin::host::{Child, Command};
+use openidea_plugin::DependencyStatus;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 pub(crate) const VIEW: &str = "build-resolution";
 const INIT: &str = include_str!("gradle-resolution.init.gradle");
+const IDE_HINT: &str = " Reload the Maven project or open the Dependency Analyzer in the IDE for faster results without running the build tool.";
 #[derive(Clone, Copy)]
 enum Tool {
     Maven,
@@ -45,6 +47,7 @@ pub(crate) struct State {
     run: Option<Run>,
     message: String,
     log: String,
+    ide_note: Option<String>,
 }
 pub(crate) struct Evidence {
     pub root: String,
@@ -70,7 +73,7 @@ fn source_files(project: &Project, root: &str) -> Result<BTreeMap<String, String
         paths.extend(
             found
                 .into_iter()
-                .filter(|path| !path.contains("/.openidea/dependency-audit-resolve-")),
+                .filter(|path| !path.contains("/.openidea/dependency-audit-resolve")),
         );
     }
     for relative in [
@@ -92,11 +95,28 @@ fn source_files(project: &Project, root: &str) -> Result<BTreeMap<String, String
         let text = project.read_file(&path)?;
         bytes += text.len();
         if bytes > 4 << 20 || before.len() >= 500 {
-            return Err("Build-source snapshot exceeds500 files/4MiB.".into());
+            return Err("Build-source snapshot exceeds 500 files/4MiB.".into());
         }
         before.insert(path, text);
     }
     Ok(before)
+}
+fn approved(root: &str, tool: Tool) -> Result<bool, Error> {
+    let key = format!("resolve-approved:{root}");
+    let remembered = host::storage::get(&key).ok().flatten();
+    if let Some(answer) = remembered {
+        return Ok(answer == "yes");
+    }
+    let name = match tool {
+        Tool::Maven => "Maven",
+        Tool::Gradle => "Gradle",
+    };
+    let answer = host::confirm(
+        "Resolve dependencies?",
+        &format!("Run {name} to resolve dependencies? This executes this project's build scripts and plugins, and downloads from its repositories. Your answer is remembered for this project."),
+    )?;
+    let _ = host::storage::set(&key, if answer { "yes" } else { "no" });
+    Ok(answer)
 }
 fn require_saved(root: &str) -> Result<(), Error> {
     if host::open_editors()?.iter().any(|editor| {
@@ -132,6 +152,21 @@ fn version_matches(tool: Tool, output: &str) -> bool {
                 .and_then(|tail| tail.split_whitespace().next())
                 == Some(tool.version())
         })
+}
+fn version_mismatch(tool: Tool, output: &str) -> Error {
+    let (prefix, name) = match tool {
+        Tool::Maven => ("Apache Maven ", "Maven"),
+        Tool::Gradle => ("Gradle ", "Gradle"),
+    };
+    let found = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(prefix)?.split_whitespace().next())
+        .filter(|found| found.len() <= 64);
+    let needed = tool.version();
+    Error::Invalid(match found {
+        Some(found) => format!("Found {name} {found}; needs {name} {needed}. Install that version and try again."),
+        None => format!("Couldn't read the {name} version; needs {name} {needed}. Check that {} runs from the project folder.", tool.program()),
+    })
 }
 fn clean(value: &str) -> bool {
     !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
@@ -180,20 +215,20 @@ fn add(
         }
     }
     if deps.len() > 10000 {
-        return Err("Resolved dependency graph exceeds10000 coordinates.".into());
+        return Err("Resolved dependency graph exceeds 10000 coordinates.".into());
     }
     Ok(())
 }
 fn parse_maven(root: &str, text: &str) -> Result<Evidence, Error> {
     if text.len() > 4 << 20 {
-        return Err("Maven output exceeds4MiB.".into());
+        return Err("Maven output exceeds 4MiB.".into());
     }
     let trees: Vec<Value> = serde_json::Deserializer::from_str(text)
         .into_iter::<Value>()
         .collect::<Result<_, _>>()
         .map_err(|_| Error::Invalid("Maven JSON trees are malformed or truncated.".into()))?;
     if trees.is_empty() || trees.len() > 500 {
-        return Err("Maven exported no complete module trees, or more than500 modules.".into());
+        return Err("Maven exported no complete module trees, or more than 500 modules.".into());
     }
     let root_ids: HashSet<_> = trees
         .iter()
@@ -219,7 +254,7 @@ fn parse_maven(root: &str, text: &str) -> Result<Evidence, Error> {
         sources: &mut HashMap<String, String>,
     ) -> Result<(), Error> {
         if depth > 128 {
-            return Err("Maven tree depth exceeds128.".into());
+            return Err("Maven tree depth exceeds 128.".into());
         }
         let (group, name, version) = (
             tree["groupId"].as_str().ok_or("Missing Maven group")?,
@@ -240,7 +275,7 @@ fn parse_maven(root: &str, text: &str) -> Result<Evidence, Error> {
                 name,
                 version,
                 &format!(
-                    "Resolved Maven3.9.16 dependency:tree3.8.1; module {module}; scope {}. Root POM location, not an exact declaration span.",
+                    "Resolved Maven 3.9.16 dependency:tree 3.8.1; module {module}; scope {}. Root POM location, not an exact declaration span.",
                     tree["scope"].as_str().unwrap_or("unspecified")
                 ),
             )?;
@@ -275,7 +310,7 @@ fn parse_maven(root: &str, text: &str) -> Result<Evidence, Error> {
 }
 fn parse_gradle(root: &str, configuration: &str, text: &str) -> Result<Evidence, Error> {
     if text.len() > 4 << 20 {
-        return Err("Gradle export exceeds4MiB.".into());
+        return Err("Gradle export exceeds 4MiB.".into());
     }
     let mut deps = Vec::new();
     let mut sources = HashMap::new();
@@ -321,7 +356,7 @@ fn parse_gradle(root: &str, configuration: &str, text: &str) -> Result<Evidence,
                 dep["name"].as_str().ok_or("Missing module")?,
                 dep["version"].as_str().ok_or("Missing version")?,
                 &format!(
-                    "Resolved Gradle9.9.1 {module} / {configuration}. Build-file location, not an exact declaration span."
+                    "Resolved Gradle 9.9.1 {module} / {configuration}. Build-file location, not an exact declaration span."
                 ),
             )?;
         }
@@ -338,7 +373,120 @@ fn parse_gradle(root: &str, configuration: &str, text: &str) -> Result<Evidence,
         before: BTreeMap::new(),
     })
 }
+fn gradle_file(before: &BTreeMap<String, String>, root: &str, project_path: &str) -> String {
+    let dir = project_path.trim_matches(':').replace(':', "/");
+    [format!("{root}/{dir}"), root.to_owned()]
+        .iter()
+        .flat_map(|base| ["build.gradle.kts", "build.gradle"].map(|file| format!("{}/{file}", base.trim_end_matches('/'))))
+        .find(|path| before.contains_key(path))
+        .unwrap_or_else(|| format!("{root}/build.gradle"))
+}
+/// The graph the IDE already resolved (last Maven reload, Gradle Dependency
+/// Analyzer), read the way the mvn/gradle exports are: Maven keeps every scope,
+/// Gradle keeps runtimeClasspath, reactor modules and omitted occurrences are
+/// skipped. `Ok(None)` when it holds no such dependency yet.
+fn ide_evidence(project: &Project, root: &str) -> Result<Option<Evidence>, Error> {
+    let graph = project.build_dependencies(None)?;
+    let before = source_files(project, root)?;
+    let modules: HashSet<String> = graph
+        .iter()
+        .filter(|node| node.parent.is_none())
+        .map(|node| format!("{}:{}", node.group, node.artifact))
+        .collect();
+    let mut deps = Vec::new();
+    let mut sources = HashMap::new();
+    for (index, node) in graph.iter().enumerate() {
+        let mut ancestors = Vec::new();
+        let mut at = index;
+        while let Some(parent) = graph[at].parent {
+            if parent as usize >= at {
+                return Err(Error::Invalid("IDE dependency graph is out of order.".into()));
+            }
+            ancestors.push(at);
+            at = parent as usize;
+        }
+        let Some(&direct) = ancestors.last() else {
+            continue;
+        };
+        let module = &graph[at];
+        let gradle = module.group.is_empty();
+        if !matches!(node.status, DependencyStatus::Resolved | DependencyStatus::VersionManaged)
+            || node.group.is_empty()
+            || node.version.is_empty()
+            || modules.contains(&format!("{}:{}", node.group, node.artifact))
+            || (gradle && graph[direct].scope != "runtimeClasspath")
+        {
+            continue;
+        }
+        let via: Vec<String> = ancestors[1..]
+            .iter()
+            .rev()
+            .take(6)
+            .map(|&i| format!("{}:{}", graph[i].group, graph[i].artifact))
+            .collect();
+        let via = if via.is_empty() { String::new() } else { format!("; via {}", via.join(" > ")) };
+        let (path, location, name) = if gradle {
+            (gradle_file(&before, root, &module.artifact), "Build-file", module.artifact.clone())
+        } else {
+            (format!("{root}/pom.xml"), "Root POM", format!("{}:{}", module.group, module.artifact))
+        };
+        add(
+            &mut deps,
+            &mut sources,
+            &path,
+            &node.group,
+            &node.artifact,
+            &node.version,
+            &format!(
+                "Resolved by the IDE; module {name}; scope {}{via}. {location} location, not an exact declaration span.",
+                node.scope
+            ),
+        )?;
+    }
+    if deps.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Evidence {
+        root: root.into(),
+        deps,
+        sources,
+        files: before.keys().cloned().collect(),
+        skipped: 0,
+        before,
+    }))
+}
 impl State {
+    /// Audit the IDE's resolved graph when it has one, else run mvn/gradle when
+    /// `run_tool` allows it (after a scan: the setting; the explicit command: always).
+    pub(crate) fn resolve(&mut self, ctx: &Invocation, run_tool: bool, focus: bool) -> Result<(), Error> {
+        let project = ctx.project().ok_or(Error::Stale)?;
+        let root = project.root()?;
+        let nothing_resolved = match ide_evidence(&project, &root) {
+            Ok(Some(evidence)) => {
+                let count = evidence.deps.len();
+                audit_evidence(&project, evidence)?;
+                self.ide_note = Some(format!(
+                    "Resolved by the IDE: {count} Maven/Gradle dependencies audited from its last Maven reload or Dependency Analyzer read. No build tool ran."
+                ));
+                crate::refresh(VIEW);
+                if focus {
+                    crate::reveal(VIEW)?;
+                }
+                return Ok(());
+            }
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if !run_tool {
+            return Ok(());
+        }
+        self.start(ctx, focus)?;
+        if nothing_resolved {
+            self.message.push_str(IDE_HINT);
+            crate::refresh(VIEW);
+        }
+        Ok(())
+    }
     pub(crate) fn start(&mut self, ctx: &Invocation, focus: bool) -> Result<(), Error> {
         if self.run.as_ref().is_some_and(|run| run.child.is_some()) {
             return Err("Cancel or complete the active resolver before starting another.".into());
@@ -350,7 +498,7 @@ impl State {
         } else if project.exists(&format!("{root}/build.gradle"))? || project.exists(&format!("{root}/build.gradle.kts"))? {
             Tool::Gradle
         } else {
-            return Err("No pom.xml or build.gradle(.kts) in the project root.".into());
+            return Err(Error::NotFound("No pom.xml or build.gradle(.kts) in the project root.".into()));
         };
         let configuration: String = match tool {
             Tool::Maven => "all declared scopes".into(),
@@ -376,6 +524,11 @@ impl State {
         {
             return Err(Error::Stale);
         }
+        if focus {
+            let _ = host::storage::set(&format!("resolve-approved:{root}"), "yes");
+        } else if !approved(&root, tool)? {
+            return Ok(());
+        }
         let args = match tool {
             Tool::Maven => vec![
                 "-B".into(),
@@ -385,28 +538,24 @@ impl State {
             Tool::Gradle => vec!["--version".into()],
         };
         require_saved(&root)?;
-        let version = project.run_process(tool.program(), &args, None)?;
+        let version = project
+            .run_process(tool.program(), &args, None)
+            .map_err(|e| ui_kit::denied::map(e, "Build dependency resolution", &format!("process:{}", tool.program()), "Dependency Audit"))?;
         if version.status != Some(0) || !version_matches(tool, &version.stdout) {
-            return Err(format!("This reviewed profile requires {} {}. Approve that exact official tool version before retrying.",tool.program(),tool.version()).into());
+            return Err(version_mismatch(tool, &version.stdout));
         }
         if ctx.project().ok_or(Error::Stale)?.root()? != root
             || source_files(&project, &root)? != before
         {
             return Err(Error::Stale);
         }
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| Error::Stale)?
-            .as_nanos();
-        let directory = format!("{root}/.openidea/dependency-audit-resolve-{stamp:x}");
-        if project.exists(&directory)? {
-            return Err(Error::Stale);
-        }
+        let directory = format!("{root}/.openidea/dependency-audit-resolve");
         project.write_file(
             &format!("{directory}/review.txt"),
             &format!("{} {} / {configuration}", tool.program(), tool.version()),
         )?;
         let output = format!("{directory}/{}", tool.output());
+        project.write_file(&output, "")?;
         let args = match tool {
             Tool::Maven => vec![
                 "-B".into(),
@@ -446,6 +595,7 @@ impl State {
             "Resolver running; output updates automatically. Cancel kills the owned process."
                 .into();
         self.log.clear();
+        self.ide_note = None;
         if focus {
             crate::reveal(VIEW)?;
         }
@@ -472,7 +622,7 @@ impl State {
             run.status = Some(status);
             run.child = None;
             self.message = if status == 0 {
-                "Export completed.".into()
+                format!("Resolved by running {}; export completed.", run.tool.program())
             } else {
                 format!("Resolver failed with status {status}; previous report retained.")
             };
@@ -522,6 +672,9 @@ impl State {
     }
     pub(crate) fn render(&self, ctx: &Invocation) -> View {
         let resolve = Button::new("resolve-build", "Resolve Dependencies").icon("run").enabled(!self.running());
+        if let Some(note) = self.ide_note.as_ref().filter(|_| !self.running()) {
+            return View::message(note).button(resolve);
+        }
         let Some(run) = &self.run else {
             return View::message(
                 "Resolve the effective Maven or Gradle dependency versions of this project and audit them against OSV.",
@@ -728,7 +881,7 @@ mod tests {
         assert!(state.run.as_ref().unwrap().child.is_some());
         let output = state.run.as_ref().unwrap().output.clone();
         h.add_file(
-            &output,
+            output.strip_prefix("/project/").unwrap(),
             include_str!("../tests/fixtures/maven-resolved-3.9.16.json"),
         );
         state
@@ -772,7 +925,7 @@ mod tests {
         assert!(
             report.rows[0].sources[0]
                 .evidence
-                .contains("Resolved Maven3.9.16")
+                .contains("Resolved Maven 3.9.16")
         );
         let original = host::storage::get(&rows_key(&project).unwrap()).unwrap();
         let mut evidence=parse_maven("/project",r#"{"groupId":"fixture","artifactId":"project","version":"1","children":[{"groupId":"org.example","artifactId":"offline","version":"1"}]}"#).unwrap();
@@ -800,6 +953,95 @@ mod tests {
         assert!(state.start(&h.invocation(), true).is_err());
         assert!(state.run.is_none() && h.process_runs().is_empty());
     }
+    fn node(group: &str, artifact: &str, version: &str, scope: &str, status: DependencyStatus, parent: Option<u32>) -> openidea_plugin::DependencyNode {
+        openidea_plugin::DependencyNode { group: group.into(), artifact: artifact.into(), version: version.into(), scope: scope.into(), status, requested_version: None, parent }
+    }
+    fn ide_host(capabilities: &[&str]) -> openidea_plugin::mock::MockHost {
+        use openidea_plugin::{ProcessOutput, mock::MockHost};
+        let h = MockHost::install().with_capabilities(capabilities);
+        h.add_file("/project/pom.xml", "<project/> ");
+        h.on_fetch(crate::tests::osv);
+        h.on_process("mvn", |_, _| Ok(ProcessOutput { status: Some(0), stdout: "Apache Maven 3.9.16 (official)".into(), stderr: String::new() }));
+        h
+    }
+    const IDE_CAPABILITIES: &[&str] = &["project.read", "project.write", "editor.read", "storage", "net:api.osv.dev", "process:mvn", "build.read"];
+    #[test]
+    fn ide_graph_keeps_resolved_and_managed_versions_and_skips_omitted_modules_and_test_gradle_configurations() {
+        use DependencyStatus::*;
+        let h = ide_host(IDE_CAPABILITIES);
+        h.add_file("/project/web/build.gradle.kts", "");
+        h.set_build_dependencies(vec![
+            node("app", "parent", "1", "", Resolved, None),
+            node("app", "child", "1", "compile", Resolved, Some(0)),
+            node("org.example", "kept", "1.0", "compile", Resolved, Some(1)),
+            node("org.example", "managed", "3.0", "test", VersionManaged, Some(2)),
+            node("org.example", "lost", "2.0", "compile", OmittedForConflict, Some(0)),
+            node("org.example", "kept", "1.0", "compile", OmittedForDuplicate, Some(0)),
+            node("", ":web", "", "", Resolved, None),
+            node("org.yaml", "snakeyaml", "2.2", "runtimeClasspath", Resolved, Some(6)),
+            node("org.junit", "junit", "4.13", "testRuntimeClasspath", Resolved, Some(6)),
+            node("", ":core", "", "runtimeClasspath", Resolved, Some(6)),
+            node("app", "child", "1", "", Resolved, None),
+        ]);
+        let project = h.invocation().project().unwrap();
+        let evidence = ide_evidence(&project, "/project").unwrap().unwrap();
+        let found: Vec<_> = evidence.deps.iter().map(|dep| (dep.path.as_str(), dep.name.as_str(), dep.version.as_str())).collect();
+        assert_eq!(found, [
+            ("/project/pom.xml", "org.example:kept", "1.0"),
+            ("/project/pom.xml", "org.example:managed", "3.0"),
+            ("/project/web/build.gradle.kts", "org.yaml:snakeyaml", "2.2"),
+        ]);
+        assert!(evidence.sources["/project/pom.xml|org.example:managed 3.0"].contains("Resolved by the IDE; module app:parent; scope test; via app:child > org.example:kept"));
+        h.set_build_dependencies(vec![node("app", "parent", "1", "", Resolved, None)]);
+        assert!(ide_evidence(&project, "/project").unwrap().is_none());
+    }
+    #[test]
+    fn after_scan_audits_the_ide_graph_without_running_the_build_tool() {
+        let h = ide_host(IDE_CAPABILITIES);
+        h.set_build_dependencies(vec![
+            node("fixture", "project", "1", "", DependencyStatus::Resolved, None),
+            node("com.fasterxml.jackson.core", "jackson-databind", "2.12.3", "compile", DependencyStatus::Resolved, Some(0)),
+        ]);
+        let mut state = State::default();
+        state.resolve(&h.invocation(), true, false).unwrap();
+        assert!(h.process_runs().is_empty() && state.run.is_none());
+        assert!(state.ide_note.as_ref().unwrap().starts_with("Resolved by the IDE"));
+        let report = stored_report(&h.invocation().project().unwrap()).unwrap().unwrap();
+        assert_eq!(report.rows[0].name, "com.fasterxml.jackson.core:jackson-databind");
+        assert!(report.rows[0].sources[0].evidence.contains("Resolved by the IDE"));
+    }
+    #[test]
+    fn after_scan_falls_back_to_the_build_tool_only_when_allowed_and_hints_when_the_ide_has_nothing() {
+        let h = ide_host(IDE_CAPABILITIES);
+        h.set_build_dependencies(vec![node("fixture", "project", "1", "", DependencyStatus::Resolved, None)]);
+        let mut state = State::default();
+        state.resolve(&h.invocation(), false, false).unwrap();
+        assert!(h.process_runs().is_empty() && state.run.is_none());
+        h.answer_next_prompt(Some(&[]));
+        state.resolve(&h.invocation(), true, false).unwrap();
+        assert!(state.running() && state.message.ends_with(IDE_HINT));
+        let h = ide_host(&IDE_CAPABILITIES[..6]);
+        let mut state = State::default();
+        h.answer_next_prompt(Some(&[]));
+        state.resolve(&h.invocation(), true, false).unwrap();
+        assert!(state.running() && !state.message.contains(IDE_HINT));
+    }
+    #[test]
+    fn resolve_command_prefers_the_ide_graph_and_runs_the_tool_only_without_one() {
+        let h = ide_host(IDE_CAPABILITIES);
+        h.set_setting("autoResolveBuilds", "false");
+        h.set_build_dependencies(vec![
+            node("fixture", "project", "1", "", DependencyStatus::Resolved, None),
+            node("com.fasterxml.jackson.core", "jackson-databind", "2.12.3", "compile", DependencyStatus::Resolved, Some(0)),
+        ]);
+        let mut plugin = crate::DependencyAudit::default();
+        plugin.run_command("resolve-build-dependencies", &h.invocation(), None).unwrap();
+        assert!(h.process_runs().is_empty() && !plugin.build_resolution.running());
+        assert!(plugin.build_resolution.ide_note.as_ref().unwrap().starts_with("Resolved by the IDE"));
+        h.set_build_dependencies(vec![node("fixture", "project", "1", "", DependencyStatus::Resolved, None)]);
+        plugin.run_command("resolve-build-dependencies", &h.invocation(), None).unwrap();
+        assert!(plugin.build_resolution.running() && plugin.build_resolution.message.ends_with(IDE_HINT));
+    }
     #[test]
     fn profiles_accept_only_recorded_official_tool_versions() {
         assert!(version_matches(
@@ -809,5 +1051,92 @@ mod tests {
         assert!(version_matches(Tool::Gradle, "\nGradle 9.9.1\n"));
         assert!(!version_matches(Tool::Maven, "Apache Maven 4.0.0"));
         assert!(!version_matches(Tool::Gradle, "Gradle 9.0.0"));
+    }
+    #[test]
+    fn a_wrong_tool_version_says_what_was_found() {
+        let found = version_mismatch(Tool::Maven, "Apache Maven 3.8.1 (hash)").to_string();
+        assert!(found.contains("Found Maven 3.8.1; needs Maven 3.9.16"), "{found}");
+        let unreadable = version_mismatch(Tool::Gradle, "").to_string();
+        assert!(unreadable.contains("needs Gradle 9.9.1"), "{unreadable}");
+    }
+    #[test]
+    fn a_denied_build_tool_names_the_permission() {
+        let h = openidea_plugin::mock::MockHost::install().with_capabilities(&["project.read", "project.write", "editor.read"]);
+        h.add_file("/project/pom.xml", "<project/> ");
+        h.answer_next_prompt(Some(&[]));
+        let error = State::default().start(&h.invocation(), false).unwrap_err().to_string();
+        assert!(error.contains("process:mvn permission"), "{error}");
+    }
+    fn resolver_host(extra: &[&str]) -> openidea_plugin::mock::MockHost {
+        use openidea_plugin::{ProcessOutput, mock::MockHost};
+        let mut caps = vec!["project.read", "project.write", "editor.read", "process:mvn"];
+        caps.extend_from_slice(extra);
+        let h = MockHost::install().with_capabilities(&caps);
+        h.add_file("/project/pom.xml", "<project/> ");
+        h.on_process("mvn", |args, _| {
+            Ok(ProcessOutput {
+                status: Some(0),
+                stdout: if args.iter().any(|arg| arg == "--version") { "Apache Maven 3.9.16 (official)".into() } else { String::new() },
+                stderr: String::new(),
+            })
+        });
+        h
+    }
+    #[test]
+    fn resolve_asks_once_per_project() {
+        let h = resolver_host(&["storage"]);
+        let mut state = State::default();
+        state.start(&h.invocation(), false).unwrap();
+        assert!(state.run.is_none() && h.process_runs().is_empty(), "declined means nothing runs");
+        h.answer_next_prompt(Some(&[]));
+        State::default().start(&h.invocation(), false).unwrap();
+        assert!(h.process_runs().is_empty(), "a declined project is not asked again");
+
+        let h = resolver_host(&["storage"]);
+        h.answer_next_prompt(Some(&[]));
+        State::default().start(&h.invocation(), false).unwrap();
+        assert!(!h.process_runs().is_empty());
+        let runs = h.process_runs().len();
+        let mut second = State::default();
+        second.start(&h.invocation(), false).unwrap();
+        assert!(second.run.is_some() && h.process_runs().len() > runs, "an approved project is not asked again");
+    }
+    #[test]
+    fn resolve_asks_every_time_when_storage_is_denied() {
+        let h = resolver_host(&[]);
+        h.answer_next_prompt(Some(&[]));
+        State::default().start(&h.invocation(), false).unwrap();
+        assert!(!h.process_runs().is_empty());
+        let runs = h.process_runs().len();
+        State::default().start(&h.invocation(), false).unwrap();
+        assert_eq!(h.process_runs().len(), runs, "no remembered answer, so it asked and was declined");
+    }
+    #[test]
+    fn explicit_resolve_does_not_ask_and_undoes_a_stored_no() {
+        let h = resolver_host(&["storage"]);
+        State::default().start(&h.invocation(), false).unwrap();
+        assert!(h.process_runs().is_empty());
+        let mut state = State::default();
+        state.start(&h.invocation(), true).unwrap();
+        assert!(state.run.is_some());
+        let mut auto = State::default();
+        auto.start(&h.invocation(), false).unwrap();
+        assert!(auto.run.is_some(), "the explicit resolve approved the project");
+    }
+    #[test]
+    fn resolve_dir_is_reused_and_never_accumulates() {
+        let h = resolver_host(&["storage"]);
+        let mut first = State::default();
+        first.start(&h.invocation(), true).unwrap();
+        let output = first.run.as_ref().unwrap().output.clone();
+        assert!(output.starts_with("/project/.openidea/dependency-audit-resolve/"), "{output}");
+        h.add_file(output.strip_prefix("/project/").unwrap(), "stale maven tree");
+        h.add_file(".openidea/dependency-audit-resolve/export.gradle", "// owned");
+        let mut second = State::default();
+        second.start(&h.invocation(), true).unwrap();
+        assert_eq!(second.run.as_ref().unwrap().output, output);
+        let project = host::projects().unwrap().remove(0);
+        assert_eq!(project.read_file(&output).unwrap(), "", "a previous run's output is cleared");
+        assert!(source_files(&project, "/project").unwrap().keys().all(|path| !path.contains("dependency-audit-resolve")));
     }
 }

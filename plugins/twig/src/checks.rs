@@ -13,6 +13,15 @@ pub struct Finding {
     pub code: &'static str,
     pub range: Range<usize>,
     pub message: String,
+    pub fix: Option<Fix>,
+}
+
+/// Inserts `text` at byte offset `at` of the checked document.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Fix {
+    pub title: String,
+    pub at: usize,
+    pub text: String,
 }
 
 pub fn check(text: &str) -> Vec<Finding> {
@@ -28,6 +37,7 @@ pub fn check(text: &str) -> Vec<Finding> {
 
             let Some(at) = open.iter().rposition(|(n, _)| *n == name) else {
                 findings.push(Finding {
+                    fix: None,
                     code: UNEXPECTED_END_TAG,
                     range: tag.range.clone(),
                     message: format!("{{% end{name} %}} has no matching {{% {name} %}}."),
@@ -36,7 +46,7 @@ pub fn check(text: &str) -> Vec<Finding> {
             };
 
             for (name, range) in open.split_off(at + 1) {
-                findings.push(unclosed(name, range));
+                findings.push(unclosed(text, name, range, Some(tag.range.start)));
             }
             open.pop();
             continue;
@@ -47,8 +57,9 @@ pub fn check(text: &str) -> Vec<Finding> {
         }
     }
 
-    findings.extend(open.into_iter().map(|(name, range)| unclosed(name, range)));
+    findings.extend(open.into_iter().map(|(name, range)| unclosed(text, name, range, None)));
     findings.extend(lexed.unterminated.iter().map(|range| Finding {
+        fix: None,
         code: UNTERMINATED,
         range: range.clone(),
         message: format!("\"{}\" is never closed.", &text[range.clone()]),
@@ -100,7 +111,7 @@ pub fn brackets(text: &str) -> Vec<Finding> {
                         }
                         Some((open, at)) => {
                             let message = format!("\"{}\" is closed by \"{}\".", *open as char, b as char);
-                            findings.push(Finding { code: BRACKET, range: *at..*at + 1, message });
+                            findings.push(Finding { fix: None, code: BRACKET, range: *at..*at + 1, message });
                             reported = true;
                             break;
                         }
@@ -109,7 +120,7 @@ pub fn brackets(text: &str) -> Vec<Finding> {
                             break;
                         }
                         None => {
-                            findings.push(Finding { code: BRACKET, range: j..j + 1, message: format!("Unexpected \"{}\".", b as char) });
+                            findings.push(Finding { fix: None, code: BRACKET, range: j..j + 1, message: format!("Unexpected \"{}\".", b as char) });
                             reported = true;
                             break;
                         }
@@ -134,7 +145,7 @@ pub fn brackets(text: &str) -> Vec<Finding> {
         if !reported {
             if let Some((open, at)) = stack.last().filter(|_| j < bytes.len() || !closer.is_empty()) {
                 if text[start..].contains(closer) {
-                    findings.push(Finding { code: BRACKET, range: *at..*at + 1, message: format!("\"{}\" is never closed.", *open as char) });
+                    findings.push(Finding { fix: None, code: BRACKET, range: *at..*at + 1, message: format!("\"{}\" is never closed.", *open as char) });
                 }
             }
         }
@@ -144,12 +155,46 @@ pub fn brackets(text: &str) -> Vec<Finding> {
     findings
 }
 
-fn unclosed(name: &str, range: &Range<usize>) -> Finding {
+/// `parent_end` is where the enclosing tag's end tag starts; `None` when it is unknown.
+fn unclosed(text: &str, name: &str, range: &Range<usize>, parent_end: Option<usize>) -> Finding {
+    let syntax = crate::delimiters::Syntax::current();
+    let closer = format!("{} end{name} {}", syntax.values[0], syntax.values[1]);
+
     Finding {
         code: UNCLOSED_TAG,
         range: range.clone(),
         message: format!("Tag \"{name}\" is never closed: missing {{% end{name} %}}."),
+        fix: Some(closing_fix(text, range.start, &closer, parent_end)),
     }
+}
+
+/// Puts `closer` on its own line with the opener's indentation, before the parent's end tag or at the end of the file.
+/// An opener on the parent end tag's line gets its closer inline instead.
+fn closing_fix(text: &str, opener: usize, closer: &str, parent_end: Option<usize>) -> Fix {
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let line_start = |at: usize| text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let indent_of = |at: usize| {
+        let line = &text[line_start(at)..];
+        &line[..line.len() - line.trim_start_matches([' ', '\t']).len()]
+    };
+    let indent = indent_of(opener);
+
+    let title = format!("Insert {closer}");
+
+    let Some(at) = parent_end else {
+        let insert = if text.ends_with('\n') { format!("{indent}{closer}{newline}") } else { format!("{newline}{indent}{closer}") };
+        return Fix { title: format!("{title} at end of file"), at: text.len(), text: insert };
+    };
+
+    if line_start(opener) == line_start(at) {
+        return Fix { title, at, text: closer.to_owned() };
+    }
+
+    if text[line_start(at)..at].trim().is_empty() {
+        return Fix { title, at: line_start(at), text: format!("{indent}{closer}{newline}") };
+    }
+
+    Fix { title, at, text: format!("{newline}{indent}{closer}{newline}{}", indent_of(at)) }
 }
 
 #[cfg(test)]
@@ -171,6 +216,49 @@ mod tests {
         assert_eq!(codes("{% for a in b %}{% if a %}{% endfor %}"), [("unclosed-tag", "{% if a %}".into())]);
         assert_eq!(codes("{% endif %}"), [("unexpected-end-tag", "{% endif %}".into())]);
         assert_eq!(codes("{% set a %}x"), [("unclosed-tag", "{% set a %}".into())]);
+    }
+
+    fn fixed(text: &str) -> Vec<(String, String)> {
+        check(text)
+            .into_iter()
+            .filter_map(|f| f.fix)
+            .map(|fix| (fix.title, format!("{}{}{}", &text[..fix.at], fix.text, &text[fix.at..])))
+            .collect()
+    }
+
+    #[test]
+    fn unclosed_tag_at_end_of_file_gets_its_end_tag_there() {
+        assert_eq!(fixed("{% if a %}\n<p></p>\n"), [("Insert {% endif %} at end of file".into(), "{% if a %}\n<p></p>\n{% endif %}\n".into())]);
+        assert_eq!(fixed("  {% for a in b %}\r\n  x"), [("Insert {% endfor %} at end of file".into(), "  {% for a in b %}\r\n  x\r\n  {% endfor %}".into())]);
+    }
+
+    #[test]
+    fn nested_unclosed_tag_closes_before_its_parent_with_its_own_indentation() {
+        let text = "{% block a %}\n    {% if a %}\n        x\n{% endblock %}\n";
+        assert_eq!(fixed(text), [("Insert {% endif %}".into(), "{% block a %}\n    {% if a %}\n        x\n    {% endif %}\n{% endblock %}\n".into())]);
+        assert_eq!(fixed("{% for a in b %}{% if a %}{% endfor %}")[0].1, "{% for a in b %}{% if a %}{% endif %}{% endfor %}");
+        assert_eq!(fixed("{% for a in b %}\n  {% if a %}\n  x{% endfor %}")[0].1, "{% for a in b %}\n  {% if a %}\n  x\n  {% endif %}\n  {% endfor %}");
+    }
+
+    #[test]
+    fn both_unclosed_tags_close_at_end_of_file_and_the_result_is_clean() {
+        let fixes = fixed("{% if a %}\n  {% with %}\n");
+        assert_eq!(fixes.iter().map(|(title, _)| title.as_str()).collect::<Vec<_>>(), ["Insert {% endif %} at end of file", "Insert {% endwith %} at end of file"]);
+        let once = &fixes[0].1;
+        assert_eq!(fixed(once), [("Insert {% endwith %}".into(), "{% if a %}\n  {% with %}\n  {% endwith %}\n{% endif %}\n".into())]);
+        assert!(check(&fixed(once)[0].1).is_empty());
+    }
+
+    #[test]
+    fn end_tag_uses_the_configured_delimiters() {
+        let _syntax = crate::delimiters::Syntax { values: ["<%", "%>", "<{", "}>", "<#", "#>"].map(str::to_owned) }.enter();
+        assert_eq!(fixed("<% if a %>x"), [("Insert <% endif %> at end of file".into(), "<% if a %>x\n<% endif %>".into())]);
+    }
+
+    #[test]
+    fn other_findings_have_no_fix() {
+        assert!(fixed("{% endif %}{{ x").is_empty());
+        assert!(brackets("{{ f(a] }}").into_iter().all(|f| f.fix.is_none()));
     }
 
     #[test]

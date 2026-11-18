@@ -6,13 +6,15 @@ use crate::kustomize::{Reference, local, named, owner, references, target};
 use crate::label_refs::{Node, Scalar, parse};
 use openidea_plugin::providers::Document;
 use openidea_plugin::{Diagnostic, Error, FileKind, Location, Position, Project, Range, Severity, host, text};
-use std::collections::BTreeSet;
+use crate::lru::Lru;
+use std::collections::{BTreeMap, BTreeSet};
 
 const LIMIT: usize = 128 << 10;
 const NAMES: [&str; 3] = ["kustomization.yaml", "kustomization.yml", "Kustomization"];
 const MAX_DEPTH: usize = 8;
 const MAX_READS: usize = 64;
 const MAX_RESOURCES: usize = 256;
+const MAX_KUSTOMIZATIONS: usize = 64;
 
 fn remote(value: &str) -> bool {
     value.contains("://")
@@ -27,34 +29,25 @@ fn remote(value: &str) -> bool {
         })
 }
 
-fn reference_diagnostics(doc: &Document, project: &Project, root: &str) -> Vec<Diagnostic> {
-    let mut found = Vec::new();
-    for r in references(doc).into_iter().filter(|r| r.graph).take(64) {
-        let Some(path) = local(root, &doc.path, &r.value) else {
-            continue;
-        };
-        let owned = host::project_of(&path).and_then(|p| p.root().ok()).as_deref() == Some(root);
-        let message = match project.stat(&path) {
-            Err(Error::NotFound(_)) if !remote(&r.value) => Some(format!("kustomization not found: {} does not exist", r.value)),
-            Ok(stat) if stat.kind == FileKind::Directory && owned => {
-                let candidates: Vec<_> = NAMES
-                    .iter()
-                    .map(|n| format!("{path}/{n}"))
-                    .filter(|p| project.stat(p).is_ok_and(|s| s.kind == FileKind::File))
-                    .collect();
-                match candidates.as_slice() {
-                    [] => Some(format!("kustomization not found in {}", r.value)),
-                    [only] => cycle(project, root, &doc.path, only).map(|chain| format!("Kustomization cycle: {chain}")),
-                    _ => None,
-                }
+fn reference_message(project: &Project, root: &str, doc_path: &str, r: &Reference) -> Option<String> {
+    let path = local(root, doc_path, &r.value)?;
+    let owned = host::project_of(&path).and_then(|p| p.root().ok()).as_deref() == Some(root);
+    match project.stat(&path) {
+        Err(Error::NotFound(_)) if !remote(&r.value) => Some(format!("kustomization not found: {} does not exist", r.value)),
+        Ok(stat) if stat.kind == FileKind::Directory && owned => {
+            let candidates: Vec<_> = NAMES
+                .iter()
+                .map(|n| format!("{path}/{n}"))
+                .filter(|p| project.stat(p).is_ok_and(|s| s.kind == FileKind::File))
+                .collect();
+            match candidates.as_slice() {
+                [] => Some(format!("kustomization not found in {}", r.value)),
+                [only] => cycle(project, root, doc_path, only).map(|chain| format!("Kustomization cycle: {chain}")),
+                _ => None,
             }
-            _ => None,
-        };
-        if let Some(message) = message {
-            found.push(diagnostic(&doc.text, &r, message));
         }
+        _ => None,
     }
-    found
 }
 
 fn diagnostic(source: &str, r: &Reference, message: String) -> Diagnostic {
@@ -130,7 +123,7 @@ fn strings(node: Option<&Node>) -> Option<Vec<(String, String)>> {
         .collect()
 }
 
-fn gather(project: &Project, root: &str, source: &str, top: &Node) -> Option<Vec<Res>> {
+fn resource_files(top: &Node) -> Option<&[Node]> {
     const REFUSED: [&str; 9] = [
         "bases", "components", "generators", "transformers", "configMapGenerator", "secretGenerator", "helmCharts", "crds", "helmGlobals",
     ];
@@ -138,9 +131,16 @@ fn gather(project: &Project, root: &str, source: &str, top: &Node) -> Option<Vec
         return None;
     }
     let files = top.get("resources")?.items()?;
-    if files.is_empty() || files.len() > MAX_READS {
-        return None;
-    }
+    (!files.is_empty() && files.len() <= MAX_READS).then_some(files)
+}
+
+fn resources_key(top: &Node) -> Option<String> {
+    let values: Option<Vec<&str>> = resource_files(top)?.iter().map(|file| file.scalar().map(|s| s.value.as_str())).collect();
+    Some(values?.join("\n"))
+}
+
+fn gather(project: &Project, root: &str, source: &str, top: &Node) -> Option<Vec<Res>> {
+    let files = resource_files(top)?;
     let mut found = Vec::new();
     for file in files {
         let value = &file.scalar()?.value;
@@ -300,7 +300,7 @@ fn literal_path(project: &Project, r: &Res, path: &str) -> Option<Location> {
 }
 
 struct Context<'a> {
-    project: &'a Project,
+    project: Option<&'a Project>,
     resources: &'a [Res],
     adds_metadata: bool,
     analysis: Analysis,
@@ -320,6 +320,9 @@ impl Context<'_> {
             return matched;
         }
         for field in ["kind", "name", "namespace", "group", "version"] {
+            if self.project.is_none() {
+                break;
+            }
             let Some(Node::Scalar(s)) = node.get(field) else {
                 continue;
             };
@@ -345,10 +348,13 @@ impl Context<'_> {
     }
 
     fn field_paths(&mut self, matched: &[usize], scalar: &Scalar) {
+        let Some(project) = self.project else {
+            return;
+        };
         let locations: Vec<_> = matched
             .iter()
             .take(8)
-            .filter_map(|i| literal_path(self.project, &self.resources[*i], &scalar.value))
+            .filter_map(|i| literal_path(project, &self.resources[*i], &scalar.value))
             .collect();
         if !locations.is_empty() {
             self.analysis.links.push(Link { range: scalar.range, locations });
@@ -371,16 +377,35 @@ fn implicit_selector(patch: &str) -> Option<Selector> {
     })
 }
 
-fn analyze(doc: &Document, project: &Project, root: &str) -> Option<Analysis> {
+enum Mode<'a> {
+    /// Reads the resource files and builds links.
+    Live(&'a Project, &'a str),
+    /// Matches the selectors against the resources read when the kustomization was warmed.
+    Cached(&'a Facts),
+}
+
+fn analyze(doc: &Document, mode: Mode) -> Option<Analysis> {
     if doc.text.len() > LIMIT || !named(&doc.path) {
         return None;
     }
     let nodes = parse(&doc.text)?;
     let top = nodes.first().filter(|_| nodes.len() == 1)?;
     let yaml = crate::convert::source_documents(&doc.text)?;
-    let resources = gather(project, root, &doc.path, top)?;
+    let gathered;
+    let (resources, project) = match mode {
+        Mode::Live(project, root) => {
+            gathered = gather(project, root, &doc.path, top)?;
+            (gathered.as_slice(), Some(project))
+        }
+        Mode::Cached(facts) => {
+            if facts.resources_key != resources_key(top) {
+                return None;
+            }
+            (facts.resources.as_deref()?, None)
+        }
+    };
     let adds_metadata = ["commonLabels", "labels", "commonAnnotations"].iter().any(|k| top.get(k).is_some());
-    let mut ctx = Context { project, resources: &resources, adds_metadata, analysis: Analysis::default() };
+    let mut ctx = Context { project, resources, adds_metadata, analysis: Analysis::default() };
     for field in ["patches", "patchesJson6902"] {
         for (i, item) in top.get(field).and_then(Node::items).unwrap_or_default().iter().enumerate() {
             if let (Some(target), Some(anchor)) = (item.get("target"), key(item, "target")) {
@@ -422,12 +447,92 @@ fn analyze(doc: &Document, project: &Project, root: &str) -> Option<Analysis> {
     Some(ctx.analysis)
 }
 
-pub(crate) fn diagnostics(doc: &Document) -> Vec<Diagnostic> {
-    let Some((project, root)) = owner(doc) else {
+struct Facts {
+    resources_key: Option<String>,
+    resources: Option<Vec<Res>>,
+    messages: BTreeMap<String, String>,
+    dependencies: Vec<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct Cache {
+    facts: Lru<String, Facts>,
+}
+
+impl Cache {
+    pub(crate) fn clear(&mut self) {
+        self.facts.clear();
+    }
+
+    pub(crate) fn evict(&mut self, path: &str) {
+        self.facts.remove(path);
+    }
+
+    pub(crate) fn warm_file(&mut self, path: &str) {
+        if !named(path) {
+            return;
+        }
+        match host::project_of(path).and_then(|project| project.read_file(path).ok()) {
+            Some(text) => self.warm(path, &text),
+            None => self.evict(path),
+        }
+    }
+
+    pub(crate) fn warm(&mut self, path: &str, text: &str) {
+        let doc = Document { path: path.into(), language: "yaml".into(), version: 0, text: text.into() };
+        let Some((project, root)) = owner(&doc) else {
+            self.evict(path);
+            return;
+        };
+        let mut messages = BTreeMap::new();
+        let mut dependencies = Vec::new();
+        for r in references(&doc).into_iter().filter(|r| r.graph).take(64) {
+            dependencies.extend(local(&root, path, &r.value));
+            if let Some(message) = reference_message(&project, &root, path, &r) {
+                messages.insert(r.value, message);
+            }
+        }
+        let top = parse(text).and_then(|nodes| nodes.into_iter().next());
+        let resources_key = top.as_ref().and_then(resources_key);
+        let resources = top.as_ref().filter(|_| resources_key.is_some()).and_then(|top| gather(&project, &root, path, top));
+        if resources.is_some() {
+            for file in top.as_ref().and_then(resource_files).unwrap_or_default() {
+                dependencies.extend(file.scalar().and_then(|s| local(&root, path, &s.value)));
+            }
+        }
+        self.facts.insert(path.into(), Facts { resources_key, resources, messages, dependencies }, MAX_KUSTOMIZATIONS);
+    }
+
+    /// The warmed kustomizations that read one of `changed` or sit at one of them.
+    pub(crate) fn affected_by(&self, changed: &[&str]) -> Vec<String> {
+        self.facts
+            .iter()
+            .filter(|(path, facts)| {
+                changed.iter().any(|changed| {
+                    changed == path
+                        || facts.dependencies.iter().any(|dependency| changed == dependency || changed.starts_with(&format!("{dependency}/")))
+                })
+            })
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+}
+
+/// Reads only the cache, so an edit never triggers cross-file work.
+pub(crate) fn diagnostics(doc: &Document, cache: &Cache) -> Vec<Diagnostic> {
+    if owner(doc).is_none() {
+        return vec![];
+    }
+    let Some(facts) = cache.facts.get(doc.path.as_str()) else {
         return vec![];
     };
-    let mut found = reference_diagnostics(doc, &project, &root);
-    for (range, message) in analyze(doc, &project, &root).map(|a| a.warnings).unwrap_or_default() {
+    let mut found = Vec::new();
+    for r in references(doc).into_iter().filter(|r| r.graph).take(64) {
+        if let Some(message) = facts.messages.get(&r.value) {
+            found.push(diagnostic(&doc.text, &r, message.clone()));
+        }
+    }
+    for (range, message) in analyze(doc, Mode::Cached(facts)).map(|a| a.warnings).unwrap_or_default() {
         found.push(Diagnostic { code: Some("kustomize-selector".into()), ..Diagnostic::new(range, Severity::Info, &message) });
     }
     found
@@ -437,7 +542,7 @@ pub(crate) fn definition(doc: &Document, at: Position) -> Vec<Location> {
     let Some((project, root)) = owner(doc) else {
         return vec![];
     };
-    analyze(doc, &project, &root)
+    analyze(doc, Mode::Live(&project, &root))
         .into_iter()
         .flat_map(|a| a.links)
         .filter(|l| l.range.start <= at && at < l.range.end)
@@ -462,6 +567,12 @@ mod tests {
         (h, doc)
     }
 
+    fn warmed_diagnostics(doc: &Document) -> Vec<Diagnostic> {
+        let mut cache = Cache::default();
+        cache.warm(&doc.path, &doc.text);
+        diagnostics(doc, &cache)
+    }
+
     fn at(doc: &Document, needle: &str) -> Position {
         text::position(&doc.text, doc.text.find(needle).unwrap() + 1)
     }
@@ -476,7 +587,7 @@ mod tests {
         assert_eq!(found[0].path, "/p/overlays/dev/app.yaml");
         assert_eq!(found[0].range, Range::new(Position::new(3, 8), Position::new(3, 11)));
         assert_eq!(definition(&d, at(&d, "Deployment"))[0].range.start, Position::new(1, 6));
-        let lines: Vec<_> = diagnostics(&d).iter().map(|w| (w.range.start.line, w.severity)).collect();
+        let lines: Vec<_> = warmed_diagnostics(&d).iter().map(|w| (w.range.start.line, w.severity)).collect();
         assert_eq!(lines, [(11, Severity::Info), (18, Severity::Info)]);
     }
 
@@ -492,6 +603,39 @@ mod tests {
         assert!(definition(&d, at(&d, "[name=x]")).is_empty());
     }
 
+    const UNMATCHED: &str = "resources:\n- app.yaml\npatches:\n- target:\n    kind: Deployment\n    name: gone\n  patch: |-\n    x: y\n";
+
+    #[test]
+    fn kustomize_diagnostics_use_cache() {
+        let (h, d) = setup(UNMATCHED);
+        let mut cache = Cache::default();
+        assert!(diagnostics(&d, &cache).is_empty(), "nothing is read before the kustomization is warmed");
+
+        cache.warm(&d.path, &d.text);
+        let before = diagnostics(&d, &cache);
+        assert_eq!(before.len(), 1, "{before:?}");
+
+        h.add_file("overlays/dev/app.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: gone\n");
+        let after = diagnostics(&d, &cache);
+        assert_eq!(after.iter().map(|w| (&w.message, w.range)).collect::<Vec<_>>(), before.iter().map(|w| (&w.message, w.range)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cached_findings_follow_the_typed_text_and_changed_files_refresh_them() {
+        let (h, d) = setup(UNMATCHED);
+        let mut cache = Cache::default();
+        cache.warm(&d.path, &d.text);
+        let shifted = Document { text: format!("# note\n{}", d.text), ..d.clone() };
+        let lines: Vec<_> = diagnostics(&shifted, &cache).iter().map(|w| w.range.start.line).collect();
+        assert_eq!(lines, [4]);
+
+        h.add_file("overlays/dev/app.yaml", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: gone\n");
+        assert_eq!(cache.affected_by(&["/p/overlays/dev/app.yaml"]), ["/p/overlays/dev/kustomization.yaml"]);
+        assert!(cache.affected_by(&["/p/elsewhere.yaml"]).is_empty());
+        cache.warm_file(&d.path);
+        assert!(diagnostics(&d, &cache).is_empty());
+    }
+
     #[test]
     fn regex_remote_generated_and_unparsable_resources_stay_quiet() {
         for source in [
@@ -503,7 +647,7 @@ mod tests {
         ] {
             let (h, d) = setup(source);
             h.add_file("overlays/dev/bad.yaml", "kind: [\n");
-            assert!(diagnostics(&d).is_empty(), "{source}");
+            assert!(warmed_diagnostics(&d).is_empty(), "{source}");
         }
     }
 
@@ -517,7 +661,7 @@ mod tests {
         h.add_file("overlays/empty/readme.md", "x\n");
         h.add_file("comp/kustomization.yaml", "resources:\n- ../overlays/dev\n");
         h.add_file("overlays/loop/kustomization.yaml", "resources:\n- ../dev\n");
-        let rows: Vec<_> = diagnostics(&d).into_iter().map(|w| (w.range.start.line, w.message)).collect();
+        let rows: Vec<_> = warmed_diagnostics(&d).into_iter().map(|w| (w.range.start.line, w.message)).collect();
         assert_eq!(rows.len(), 4, "{rows:?}");
         assert!(rows[0].1.contains("kustomization not found in ../empty"));
         assert!(rows[1].1.starts_with("kustomization not found: ../missing"));
@@ -533,6 +677,6 @@ mod tests {
             h.add_file(&format!("overlays/c{i}/kustomization.yaml"), &format!("resources:\n- ../c{}\n", i + 1));
         }
         h.add_file("overlays/c20/kustomization.yaml", "resources:\n- ../dev\n");
-        assert!(diagnostics(&d).is_empty());
+        assert!(warmed_diagnostics(&d).is_empty());
     }
 }

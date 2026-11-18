@@ -1,7 +1,7 @@
 //! Reviewed physical component rename in visible project sources. Unknown,
 //! transformed, dynamic and incomplete source models never yield partial edits.
 use crate::*;
-const TITLE: &str = "Rename component in visible project sources…";
+const TITLE: &str = "Rename component across the project…";
 fn root_for(path: &str) -> Result<(Project, String), Error> {
     let project = host::project_of(path).ok_or(Error::Stale)?;
     let root = project.root()?;
@@ -74,7 +74,7 @@ fn files(
     for glob in ["**/*.json", "**/*.yaml", "**/*.yml"] {
         let found = project.find_files(glob, 501)?;
         if found.len() >= 501 {
-            return Err("Project discovery is incomplete; no component edits returned.".into());
+            return Err("The project has over 500 JSON or YAML files of one kind, so not every usage can be found. Nothing was renamed.".into());
         }
         files.extend(found);
     }
@@ -122,18 +122,18 @@ pub(crate) fn resolve(doc: &Document, action: CodeAction) -> Result<CodeAction, 
     let old = base.rsplit('/').next().ok_or(Error::Stale)?;
     if old.contains(['~', '%']) {
         return Err(
-            "Encoded component names need a source-encoding adapter; no edits returned.".into(),
+            "Component names with ~ or % can't be renamed here. Nothing was renamed.".into(),
         );
     }
     let Some(new) = host::input(
-        "New physical component name (letters, digits, underscore, dash)",
+        "New component name (letters, digits, _ and -)",
         Some(old),
     )?
     else {
         return Err(Error::Cancelled);
     };
     if !simple_name(&new) || new == old {
-        return Err("Choose a different plain component name; no edits returned.".into());
+        return Err("Use a new name that starts with a letter or _ and has only letters, digits, _ and -. Nothing was renamed.".into());
     }
     let members = files(&project, &path, &target)?;
     let mut before = std::collections::BTreeMap::new();
@@ -145,7 +145,7 @@ pub(crate) fn resolve(doc: &Document, action: CodeAction) -> Result<CodeAction, 
         let text = project.read_file(file)?;
         bytes = bytes.saturating_add(text.len());
         if bytes > 16 * 1024 * 1024 {
-            return Err("Component source graph exceeds16MiB; no edits returned.".into());
+            return Err("The project's JSON and YAML files are over 16 MiB in total. Nothing was renamed.".into());
         }
         before.insert(file.clone(), text);
     }
@@ -154,11 +154,11 @@ pub(crate) fn resolve(doc: &Document, action: CodeAction) -> Result<CodeAction, 
     }
     let target_text = before.get(&target).ok_or(Error::Stale)?;
     let proof = pointer_status::Proof::parse(target_text)
-        .ok_or("Unknown component owner; no edits returned.")?;
+        .ok_or("Couldn't read the file that declares this component. Nothing was renamed.")?;
     let new_base = format!("{}/{}", base.rsplit_once('/').ok_or(Error::Stale)?.0, new);
     if proof.status(&new_base) != pointer_status::Status::Missing {
         return Err(
-            "New component name exists or ownership is ambiguous; no edits returned.".into(),
+            "A component with that name already exists. Choose another name.".into(),
         );
     }
     let declaration = proof.pointer_location(&base).ok_or(Error::Stale)?;
@@ -167,7 +167,7 @@ pub(crate) fn resolve(doc: &Document, action: CodeAction) -> Result<CodeAction, 
         != old
     {
         return Err(
-            "Transformed component declaration needs an encoding adapter; no edits returned."
+            "The component key is quoted or escaped in a way this rename can't edit. Nothing was renamed."
                 .into(),
         );
     }
@@ -180,8 +180,8 @@ pub(crate) fn resolve(doc: &Document, action: CodeAction) -> Result<CodeAction, 
     let mut occurrences = 1usize;
     for (file, text) in &before {
         let proof = pointer_status::Proof::parse(text)
-            .ok_or("A visible source model is unsupported; no partial component edits returned.")?;
-        let refs=proof.complete_refactor_references().ok_or("Dynamic, transformed or incomplete reference ownership; no partial component edits returned.")?;
+            .ok_or("A JSON or YAML file in the project couldn't be read. Nothing was renamed.")?;
+        let refs=proof.complete_refactor_references().ok_or("Some $ref values in the project couldn't be read, so not every usage can be updated. Nothing was renamed.")?;
         for reference in refs {
             let Some((relative, pointer)) = reference.target.split_once('#') else {
                 continue;
@@ -194,7 +194,7 @@ pub(crate) fn resolve(doc: &Document, action: CodeAction) -> Result<CodeAction, 
             }
             if text.get(reference.at..reference.end) != Some(reference.target.as_str()) {
                 return Err(
-                    "Encoded incoming reference needs an encoding adapter; no edits returned."
+                    "A $ref to this component is escaped and can't be edited here. Nothing was renamed."
                         .into(),
                 );
             }
@@ -209,16 +209,16 @@ pub(crate) fn resolve(doc: &Document, action: CodeAction) -> Result<CodeAction, 
             });
             occurrences += 1;
             if occurrences > 512 {
-                return Err("More than512 physical occurrences; no edits returned.".into());
+                return Err("More than 512 usages. Nothing was renamed.".into());
             }
         }
     }
     let summary = format!(
-        "Rename {old} to {new}: {occurrences} physical occurrences in {} visible project files.\n\nOnly discovered JSON/YAML sources are covered. Ignored files, remote/external projects and runtime-generated references are outside this rename.\n\n{}",
+        "Changes {occurrences} places (the declaration and its $ref usages) in {} files.\nFiles outside this project and ignored files aren't updated.\nUndo in each edited file.\n\n{}",
         edits.len(),
-        edits.keys().cloned().collect::<Vec<_>>().join("\n")
+        listed_files(edits.keys())
     );
-    if !host::confirm("Rename physical OpenAPI component", &summary)? {
+    if !host::confirm(&format!("Rename component {old} to {new}?"), &summary)? {
         return Err(Error::Cancelled);
     }
     if root_for(&path)?.1 != root || files(&project, &path, &target)? != members {
@@ -235,8 +235,28 @@ pub(crate) fn resolve(doc: &Document, action: CodeAction) -> Result<CodeAction, 
     Ok(result)
 }
 
+/// The host cuts confirm bodies at 16 KiB, so long lists end with a count.
+fn listed_files<'a>(paths: impl ExactSizeIterator<Item = &'a String>) -> String {
+    const SHOWN: usize = 20;
+    let total = paths.len();
+    let mut lines: Vec<String> = paths.take(SHOWN).cloned().collect();
+    if total > SHOWN {
+        lines.push(format!("…and {} more", total - SHOWN));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn long_file_lists_end_with_a_count() {
+        let paths: Vec<String> = (0..25).map(|i| format!("/p/spec{i}.yaml")).collect();
+        let listed = super::listed_files(paths.iter());
+        assert_eq!(listed.lines().count(), 21);
+        assert!(listed.ends_with("…and 5 more"));
+        assert_eq!(super::listed_files(paths[..3].iter()).lines().count(), 3);
+    }
     use super::*;
     use openidea_plugin::mock::MockHost;
     fn setup() -> (MockHost, Document, CodeAction) {

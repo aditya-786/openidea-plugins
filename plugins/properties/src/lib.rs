@@ -21,10 +21,10 @@ mod views;
 
 use checks::{Settings, lint};
 use format::{is_sorted, reformat_edits, sorted_text};
-use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Document, Providers};
+use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Document, LineMarker, Providers};
 use openidea_plugin::text::offset;
 use openidea_plugin::{
-    Error, Event, Invocation, Location, LogLevel, NotificationLevel, Plugin, Position, Project, Range, TextEdit, TextEditor, host,
+    Error, Event, EventKind, Invocation, Location, LogLevel, NotificationLevel, Plugin, Position, Project, Range, TextEdit, TextEditor, host,
     register_plugin,
 };
 use props::{Prop, append_line, dir, file_name, locale_name, parse, range_of, split_locale, stem, suffix, whole_lines};
@@ -32,6 +32,10 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range as Span;
 use usages::{KeyIndex, implicitly_used, mark_used, markup_uses};
 use views::{BUNDLE, BundleFiles};
+
+const LOCALES_MARKER: &str = "icons/marker-locales.svg";
+/// Markers one gutter button lists at most; the IDE merges a line's same-icon markers into one chooser.
+const MAX_LINE_TARGETS: usize = 200;
 
 fn project_for(path: &str) -> Result<Project, Error> {
     host::project_of(path).ok_or_else(|| format!("{path} isn't in an open project.").into())
@@ -176,8 +180,6 @@ pub struct Properties {
     locales: HashMap<String, usize>,
     /// Keys the last Find Unused Properties found no mention of, per file.
     unused: HashMap<String, HashSet<String>>,
-    /// Files whose candidate text search came from the live setting.
-    live_unused: HashSet<String>,
     /// Keys of the project's `.properties` files, for Java/Kotlin strings.
     index: Option<KeyIndex>,
     bundle: Option<BundleFiles>,
@@ -228,13 +230,13 @@ impl Properties {
 
         let key = prop.exact_key(&text);
         if value {
-            let value = props::unescape_exact(&text[prop.value.clone()]).ok_or("This property value cannot cross the clipboard UTF-8 API losslessly; its source is unchanged.")?;
-            host::copy_to_clipboard(&value)?;
+            let value = props::unescape_exact(&text[prop.value.clone()]).ok_or("This value has an invalid character and can't be copied.")?;
+            host::copy_to_clipboard(&value).map_err(|e| ui_kit::denied::map(e, "Copy Property Value", "clipboard", "Properties"))?;
             let label = key.as_deref().unwrap_or(&text[prop.key.clone()]);
             host::notify(NotificationLevel::Info, "Properties", &format!("Value of '{label}' copied to the clipboard."));
         } else {
-            let key = key.ok_or("This property key cannot cross the clipboard UTF-8 API losslessly; its source is unchanged.")?;
-            host::copy_to_clipboard(&key)?;
+            let key = key.ok_or("This key has an invalid character and can't be copied.")?;
+            host::copy_to_clipboard(&key).map_err(|e| ui_kit::denied::map(e, "Copy Property Key", "clipboard", "Properties"))?;
             host::notify(NotificationLevel::Info, "Properties", &format!("Key '{key}' copied to the clipboard."));
         }
         Ok(None)
@@ -287,7 +289,6 @@ impl Properties {
             1 => format!("1 potentially unused property in {} (text search; no absence warning published).", file_name(&path)),
             n => format!("{n} potentially unused properties in {} (text search; no absence warnings published).", file_name(&path)),
         };
-        self.live_unused.remove(&path);
         self.unused.insert(path.clone(), unused);
         self.inspect(&path)?;
         let mut candidates: Vec<_> = self.unused.get(&path).into_iter().flatten().collect();
@@ -300,26 +301,6 @@ impl Properties {
         };
         host::notify(NotificationLevel::Info, "Properties", &report);
         Ok(None)
-    }
-
-    fn refresh_live_unused(&mut self, path: &str) {
-        if !host::setting_bool("unusedProperties.live").unwrap_or(false) {
-            if self.live_unused.remove(path) {
-                self.unused.remove(path);
-            }
-            return;
-        }
-
-        let Ok(text) = project_for(path).and_then(|p| p.read_file(path)) else {
-            return;
-        };
-        match Self::scan_unused(path, &text, 2_000, 256 * 1024, None) {
-            Ok(unused) => {
-                self.unused.insert(path.to_owned(), unused);
-                self.live_unused.insert(path.to_owned());
-            }
-            Err(e) => host::log(LogLevel::Warn, &format!("scanning unused keys of {path}: {e}")),
-        }
     }
 
     fn reformat(&self, ctx: &Invocation) -> Result<Option<String>, Error> {
@@ -444,6 +425,13 @@ impl Properties {
 }
 
 impl Plugin for Properties {
+    fn activate(&mut self, _ctx: &openidea_plugin::Context) -> Result<(), Error> {
+        for kind in [EventKind::FileOpened, EventKind::FileSaved, EventKind::FilesChanged] {
+            host::subscribe(kind)?;
+        }
+        Ok(())
+    }
+
     fn run_command(&mut self, id: &str, ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
         match id {
             "discard-staged-grid" => self.discard_grid(ctx),
@@ -505,7 +493,6 @@ impl Plugin for Properties {
         }
 
         for path in &inspect {
-            self.refresh_live_unused(path);
             if let Err(e) = self.inspect(path) {
                 host::log(LogLevel::Warn, &format!("inspecting {path}: {e}"));
             }
@@ -517,8 +504,8 @@ impl Plugin for Properties {
             views::refresh_structure();
         }
 
-        // Built here, where there is time, so Java/Kotlin completion finds it ready.
-        if let Some(path) = source_opened {
+        // Built here, where there is time, so Java/Kotlin completion and the locale gutter markers find it ready.
+        if let Some(path) = source_opened.or(inspect.first().copied()) {
             self.key_index(path);
         }
     }
@@ -532,9 +519,36 @@ impl Providers for Properties {
         self.property_actions(doc, selection).into_iter().filter(|a| a.data.is_none()).collect()
     }
 
-    fn resolve_code_action(&mut self, doc: &Document, mut action: CodeAction) -> Result<CodeAction, Error> {
-        let _ = (doc, &mut action);
-        Err("Bundle actions now use the native FileActions provider. Invoke the action again.".into())
+    /// On each key of a resource bundle file, one marker per other locale file of the bundle declaring it, from
+    /// the cached key index only. Files without locale siblings (a lone `application.properties`) get none.
+    fn line_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
+        if doc.language != "properties" || doc.text.len() > diagnostics::MAX_TEXT {
+            return Vec::new();
+        }
+        let Some(root) = host::project_of(&doc.path).and_then(|p| p.root().ok()) else {
+            return Vec::new();
+        };
+        let Some(index) = self.index.as_ref().filter(|index| index.root == root) else {
+            return Vec::new();
+        };
+        let base = split_locale(stem(&doc.path)).0;
+        let same_bundle = |path: &str| path != doc.path && dir(path) == dir(&doc.path) && split_locale(stem(path)).0 == base;
+        if !index.files.iter().any(|file| same_bundle(file)) {
+            return Vec::new();
+        }
+        let props = parse(&doc.text);
+        if props.len() > 4096 {
+            return Vec::new();
+        }
+        let mut markers = Vec::new();
+        for prop in props {
+            let Some(key) = prop.exact_key(&doc.text) else { continue };
+            let mut targets: Vec<Location> =
+                index.keys.get(&key).into_iter().flatten().filter(|d| same_bundle(&d.location.path)).map(|d| d.location.clone()).collect();
+            targets.sort_by(|a, b| suffix(&a.path).cmp(suffix(&b.path)));
+            markers.extend(locale_markers(range_of(&doc.text, &prop.key).start.line, targets));
+        }
+        markers
     }
 
     /// `GotoPropertyParentDeclarationHandler` in `.properties` files (the same
@@ -697,6 +711,20 @@ impl Providers for Properties {
     }
 }
 
+/// One marker per target on `line`, at most [`MAX_LINE_TARGETS`]; the tooltip says when some were left out.
+fn locale_markers(line: u32, targets: Vec<Location>) -> Vec<LineMarker> {
+    let targets: Vec<Location> = targets.into_iter().filter(|target| target.range.start != target.range.end).collect();
+    let tooltip = match targets.len() > MAX_LINE_TARGETS {
+        true => format!("Same key in other locales (first {MAX_LINE_TARGETS} of {})", targets.len()),
+        false => "Same key in other locales".to_owned(),
+    };
+    targets
+        .into_iter()
+        .take(MAX_LINE_TARGETS)
+        .map(|target| LineMarker { line, icon: Some(LOCALES_MARKER.into()), tooltip: tooltip.clone(), target: Some(target) })
+        .collect()
+}
+
 register_plugin!(Properties, providers, views, file_actions, hover, diagnostics, language_features);
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -820,6 +848,39 @@ mod tests {
         let resolved = plugin.resolve_file_action(&doc, bundle).unwrap();
         let files: Vec<&str> = resolved.edits.iter().map(|(path, _)| path.as_str()).collect();
         assert_eq!(files, ["/project/messages.properties", "/project/messages_fr.properties"]);
+    }
+
+    #[test]
+    fn bundle_keys_get_one_marker_per_other_locale_declaring_them() {
+        let host = MockHost::install();
+        host.add_file("/project/i18n/messages.properties", "greeting=Hello\nbye=Bye\n");
+        host.add_file("/project/i18n/messages_fr.properties", "greeting=Bonjour\n");
+        host.add_file("/project/i18n/messages_fr_CA.properties", "# Québec\ngreeting=Allo\nbye=Salut\n");
+        host.add_file("/project/i18n/other.properties", "greeting=x\n");
+        host.add_file("/project/application.properties", "greeting=x\n");
+        let fr = doc("/project/i18n/messages_fr.properties", "properties", "\ngreeting=Bonjour\nonly=x\n");
+        let mut plugin = Properties::default();
+        assert!(plugin.line_markers(&fr).is_empty(), "a cold index gives no marker");
+
+        plugin.handle_events(&[Event::FileOpened(fr.path.clone())], &host.invocation());
+        let markers = plugin.line_markers(&fr);
+        let targets: Vec<_> = markers.iter().map(|m| (m.line, m.target.as_ref().unwrap().path.as_str(), m.target.as_ref().unwrap().range)).collect();
+        let key = |line| Range::new(Position::new(line, 0), Position::new(line, 8));
+        assert_eq!(targets, [(1, "/project/i18n/messages.properties", key(0)), (1, "/project/i18n/messages_fr_CA.properties", key(1))]);
+        assert!(markers.iter().all(|m| m.icon.as_deref() == Some(LOCALES_MARKER)));
+        assert!(include_str!("../plugin.toml").contains(&format!("icon = \"{LOCALES_MARKER}\"")));
+        assert!(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(LOCALES_MARKER).is_file());
+
+        let lone = doc("/project/application.properties", "properties", "greeting=x\n");
+        assert!(plugin.line_markers(&lone).is_empty(), "no locale siblings, no marker");
+    }
+
+    #[test]
+    fn a_line_lists_at_most_200_locales_and_says_so() {
+        let many = (0..250).map(|n| Location { path: format!("/p/m_{n}.properties"), range: Range::new(Position::new(0, 0), Position::new(0, 1)) }).collect();
+        let markers = locale_markers(2, many);
+        assert_eq!(markers.len(), 200);
+        assert_eq!(markers[0].tooltip, "Same key in other locales (first 200 of 250)");
     }
 
     #[test]
@@ -954,28 +1015,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_missing_key_preference_never_publishes_guesses() {
-        let host = MockHost::install();
-        host.add_file("/project/src/messages.properties", "a.b=Value\n");
-        let path = "/project/A.java";
-        host.add_file(path, "messageSource.getMessage(\"no.such\", null, Locale.ENGLISH);");
-        let mut plugin = Properties::default();
-        let event = [Event::FileSaved(path.into())];
-
-        plugin.handle_events(&event, &host.invocation());
-        assert!(host.diagnostics().is_empty(), "events do not publish missing-key absence guesses");
-
-        host.set_setting("reportMissingKeysInCode", "false");
-        plugin.handle_events(&event, &host.invocation());
-        assert!(host.diagnostics().get(path).is_none_or(|d| d.is_empty()));
-
-        let fresh = "/project/B.java";
-        host.add_file(fresh, "messageSource.getMessage(\"no.such\", null, Locale.ENGLISH);");
-        plugin.handle_events(&[Event::FileOpened(fresh.into())], &host.invocation());
-        assert!(host.diagnostics().get(fresh).is_none_or(|d| d.is_empty()));
-    }
-
-    #[test]
     fn missing_key_in_code_stays_quiet_when_unsure() {
         let host = MockHost::install();
         host.add_file("/project/src/messages.properties", "a.b=Value\n");
@@ -1048,29 +1087,6 @@ mod tests {
     }
 
     #[test]
-    fn live_unused_candidate_cache_follows_setting_without_publishing() {
-        let host = MockHost::install();
-        host.add_file("/project/src/App.java", "bundle.getString(\"used.key\");");
-        let path = "/project/src/messages.properties";
-        host.add_file(path, "used.key=1\nunused.key=2\n");
-        let mut plugin = Properties::default();
-        let event = [Event::FileSaved(path.into())];
-
-        plugin.handle_events(&event, &host.invocation());
-        assert!(host.diagnostics().get(path).is_none_or(|d| d.iter().all(|d| !d.unnecessary)));
-
-        host.set_setting("unusedProperties.live", "true");
-        plugin.handle_events(&event, &host.invocation());
-        assert!(plugin.unused[path].contains("unused.key"));
-        assert!(plugin.diagnostics(&doc(path, "properties", "used.key=1\nunused.key=2\n")).iter().all(|d| !d.unnecessary));
-        assert!(host.diagnostics().is_empty());
-
-        host.set_setting("unusedProperties.live", "false");
-        plugin.handle_events(&event, &host.invocation());
-        assert!(host.diagnostics().get(path).is_none_or(|d| d.iter().all(|d| !d.unnecessary)));
-    }
-
-    #[test]
     fn go_to_declaration_lists_every_locale() {
         let host = MockHost::install();
         host.add_file("/project/messages.properties", "hi=Hi\n");
@@ -1114,6 +1130,13 @@ mod tests {
         assert_eq!(bodies, ["Key 'my key' copied to the clipboard.", "Value of 'my key' copied to the clipboard."]);
     }
     #[test]
+    fn denied_clipboard_says_how_to_allow_it() {
+        let host = MockHost::install().with_capabilities(&["project.read", "editor.read", "editor.write", "events"]);
+        host.open_editor("/project/a.properties", "properties", "x=1\n", &[(0, 0, 0, 0)]);
+        let error = Properties::default().run_command("copy-value", &host.invocation(), None).unwrap_err();
+        assert!(matches!(error, Error::Invalid(ref m) if m == "Copy Property Value needs the clipboard permission. Allow it in Settings › Plugins › Properties."), "{error:?}");
+    }
+    #[test]
     fn clipboard_operations_do_not_silently_replace_utf16_units() {
         let host = MockHost::install();
         let mut plugin = Properties::default();
@@ -1137,5 +1160,84 @@ mod tests {
         assert!(plugin.run_command("copy-value", &host.invocation(), None).is_err());
         assert_eq!(host.clipboard().as_deref(), Some("😀"));
         assert!(host.requests().is_empty() && host.process_runs().is_empty());
+    }
+
+    #[test]
+    fn activate_subscribes_to_the_events_the_plugin_handles() {
+        let host = MockHost::install();
+        let mut plugin = Properties::default();
+        plugin.activate(&host.context("aritti.properties")).unwrap();
+        let kinds = host.subscriptions();
+        for kind in [EventKind::FileOpened, EventKind::FileSaved, EventKind::FilesChanged] {
+            assert!(kinds.contains(&kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn java_key_navigation_works_after_a_source_open_event() {
+        let host = MockHost::install();
+        host.add_file("src/main/resources/messages.properties", "greeting=Hello\n");
+        let mut plugin = Properties::default();
+        plugin.activate(&host.context("aritti.properties")).unwrap();
+        let path = "/project/src/main/java/A.java";
+        let text = "java.util.ResourceBundle.getBundle(\"messages\").getString(\"greeting\");";
+        host.add_file(path, text);
+        plugin.handle_events(&[Event::FileOpened(path.into())], &host.invocation());
+        assert!(plugin.index.is_some());
+        let column = text.find("greeting").unwrap() as u32 + 2;
+        let found = plugin.definition(&doc(path, "java", text), Position::new(0, column));
+        assert_eq!(found.len(), 1);
+        assert!(found[0].path.ends_with("messages.properties"));
+    }
+
+    #[test]
+    fn providers_survive_every_offset_of_non_ascii_seeds() {
+        use openidea_plugin::hover::HoverProvider;
+        use openidea_plugin::language_features::LanguageFeatures;
+        let host = MockHost::install();
+        host.add_file("/project/messages.properties", "café=é\n");
+        let seeds = ["{{ x }}{#}", "café", "<?php\nuse $😀", "é::class", "<!-- Paramètres --><a/>", "caf\\\n é=😀\\\r\n x\x0c=\x0c\\u00e9"];
+        for (path, language) in [("/project/messages.properties", "properties"), ("/project/A.java", "java"), ("/project/A.kt", "kotlin")] {
+            for seed in seeds {
+                let d = doc(path, language, seed);
+                let mut plugin = Properties::default();
+                for (i, _) in seed.char_indices().chain([(seed.len(), ' ')]) {
+                    let at = openidea_plugin::text::position(seed, i);
+                    let selection = Range::new(at, at);
+                    let _ = plugin.definition(&d, at);
+                    let _ = plugin.completion(&d, at, None);
+                    let _ = plugin.hover(&d, at);
+                    let _ = plugin.code_actions(&d, selection);
+                    let _ = plugin.file_actions(&d, selection);
+                }
+                let _ = plugin.folding(&d);
+                let _ = plugin.diagnostics(&d);
+            }
+        }
+    }
+
+    #[test]
+    fn html_and_jsp_key_definitions_work_on_a_fresh_instance() {
+        let host = MockHost::install();
+        host.add_file("src/main/resources/messages.properties", "a.b=Value\n");
+        for (language, path, text) in [
+            ("html", "/project/t.html", "<p th:text=\"#{a.b}\"></p>"),
+            ("jsp", "/project/t.jsp", "<fmt:message key=\"a.b\"/>"),
+        ] {
+            let mut plugin = Properties::default();
+            plugin.activate(&host.context("aritti.properties")).unwrap();
+            let at = Position::new(0, text.find("a.b").unwrap() as u32 + 1);
+            let found = plugin.definition(&doc(path, language, text), at);
+            assert_eq!(found.len(), 1, "{language}");
+            assert!(found[0].path.ends_with("messages.properties"));
+        }
+    }
+
+    #[test]
+    fn manifest_activates_for_every_provider_language() {
+        let manifest = include_str!("../plugin.toml");
+        for language in ["properties", "java", "kotlin", "html", "jsp"] {
+            assert!(manifest.contains(&format!("\"on-language:{language}\"")), "{language}");
+        }
     }
 }

@@ -4,16 +4,19 @@ version = "0.3.0" # x-release-please-version
 description = "Reads the Actuator endpoints (beans, environment, conditions, health, mappings, configuration properties, scheduled tasks, loggers, caches) of a Spring Boot application running on localhost and shows them in a Spring Runtime tool window. Editor markers show which beans are loaded, and the runtime value and property source of @Value and configuration keys."
 authors = ["Arnaud RITTI <arnaud.ritti@gmail.com>"]
 license = "MIT"
-change-notes = "Unreleased: custom gutter icon for runtime value markers. Unreleased: Read JMX (localhost)… command: reviewed, read-only getAttribute snapshot (Runtime incl. masked InputArguments, Memory, Threading, OperatingSystem, Spring Boot Health/Info MBean attributes) of a local JVM started with -Dcom.sun.management.jmxremote.port=N (authenticate=false, ssl=false); localhost only, port 1024-65535, bounded output, 15 s timeout, shown as a JMX row in the cached snapshot details; needs optional process:java. Unreleased: runtime-to-source semantics: Auto-configuration shows positive/negative matches per class with Go to source for project classes (exact FQCN; library classes say so), Configuration Properties rows open the project @ConfigurationProperties class (exact type, else unique literal prefix; ambiguity refused) and show bound values with secrets masked, and mapping handlers resolve overloads by JVM descriptor parameter types; snapshot schema 3 migrates older caches (configprops values masked on read). the Health view lists Actuator component details (nested components up to depth 4, 200 nodes, bounded values) with password/secret/token/key/credential/auth values and URL userinfo masked before anything is stored; snapshot schema 2 reads schema 1 caches. the runtime request picker lists the last 10 distinct METHOD/path choices first (stored per project as method and path only; never URLs, headers, bodies or responses). cached snapshot-labeled @Value inlays in Java/Kotlin use physical closing-string anchors, omit source defaults and retain scope/redaction provenance.  one shared-kit runtime window with Overview, bounded Observation/Provenance details, Bean Graph and frame-owned visible polling controls, retaining scoped source navigation and explicit lifecycle checks.  Full 8 MiB project/URL/auth-mode snapshots; cache-only rendering/markers and last-good retention across failed/partial/oversized refreshes. Visible-view scoped opt-in polling; no native scheduled fetch. 0.1.0: first release, with the Actuator snapshot (refresh, clear and optional auto-refresh), the Spring Runtime tool window, runtime markers for beans, @Value and configuration keys, and hints for beans that aren't loaded."
+change-notes = """\
+Next release: An Open Settings button in the empty view, the window appears only in Maven or Gradle projects, and Clear Snapshot is hidden when there is nothing to clear and asks before deleting; new icon for runtime value markers, and markers for one project no longer reset another project's polling or view; Read JMX (localhost) shows memory, threads and health of a local JVM, and JMX Health and Info return real data; auto-configuration and properties rows open the matching source without re-scanning, Health lists component details, and secret-looking values are masked; recent requests and project beans are listed first, a timed-out endpoint keeps its previous data, Start Auto-Refresh starts right away, empty tabs offer Refresh, Observations row actions move to the right-click menu, and commands are named after their tabs with plainer messages. \
+0.3.0: runtime snapshot views and value hints. \
+0.2.0: plugin icon and Actuator support."""
 categories = ["frameworks"]
 icon = "icon.svg"
-engines.openidea = "^1.9"
+engines.openidea = "^1.10"
 wasm = "dist/plugin.wasm"
 activation = ["on-view:runtime", "on-language:java", "on-language:kotlin", "on-file:**/application*.properties", "on-file:**/application*.yml", "on-file:**/application*.yaml", "on-file:**/bootstrap*.properties", "on-file:**/bootstrap*.yml", "on-file:**/bootstrap*.yaml"]
 
 [capabilities]
 required = ["project.read", "storage"]
-optional = ["process:java", "database.sources", "net:localhost", "net:127.0.0.1", "secrets", "clipboard", "project.write"]
+optional = ["process:java", "database.sources", "net:localhost", "net:127.0.0.1", "secrets", "clipboard", "project.write", "ide.commands"]
 
 [[contributes.commands]]
 id = "refresh"
@@ -27,7 +30,7 @@ category = "Spring Runtime"
 
 [[contributes.commands]]
 id = "clear"
-title = "Spring Runtime: Clear"
+title = "Spring Runtime: Clear Snapshot"
 category = "Spring Runtime"
 
 [[contributes.providers]]
@@ -45,6 +48,7 @@ title = "Spring Runtime"
 icon = "icons/spring.svg"
 location = "bottom"
 web = "web/resources/hub.html"
+when = "workspaceContains:pom.xml || workspaceContains:build.gradle || workspaceContains:build.gradle.kts || workspaceContains:settings.gradle || workspaceContains:settings.gradle.kts"
 
 [contributes.settings]
 schema = "settings.schema.json"
@@ -52,7 +56,7 @@ title = "Spring Runtime Insight"
 
 [[contributes.commands]]
 id = "snapshot-details"
-title = "Spring Runtime: Inspect Cached Snapshot"
+title = "Spring Runtime: Show Observations"
 category = "Spring Runtime"
 
 [[contributes.providers]]
@@ -61,32 +65,33 @@ languages = ["properties", "yaml", "java", "kotlin"]
 
 [[contributes.commands]]
 id = "runtime-graph"
-title = "Spring Runtime: Cached Bean Dependency Graph"
+title = "Spring Runtime: Show Bean Graph"
 category = "Spring Runtime"
 
 [[contributes.commands]]
 id = "runtime-controls"
-title = "Spring Runtime: Refresh and Poll Controls"
+title = "Spring Runtime: Show Refresh Controls"
 category = "Spring Runtime"
 
 [[contributes.commands]]
 id = "poll-start"
-title = "Spring Runtime: Start Bounded Scoped Polling"
+title = "Spring Runtime: Start Auto-Refresh"
 category = "Spring Runtime"
 
 [[contributes.commands]]
 id = "poll-stop"
-title = "Spring Runtime: Stop Future Polls"
+title = "Spring Runtime: Stop Auto-Refresh"
 category = "Spring Runtime"
 
 [[contributes.commands]]
 id = "configure-snapshot-database"
-title = "Configure Database from Runtime Snapshot"
+title = "Spring Runtime: Configure Database from Snapshot"
 category = "Spring Runtime"
 
 [[contributes.menus]]
 menu = "tools"
 command = "configure-snapshot-database"
+when = "workspaceContains:pom.xml || workspaceContains:build.gradle || workspaceContains:build.gradle.kts || workspaceContains:settings.gradle || workspaceContains:settings.gradle.kts"
 
 [[contributes.markerIcons]]
 id = "runtime"

@@ -2,7 +2,7 @@
 
 use crate::spec::{Spec, operations};
 
-fn base_url(spec: &Spec) -> String {
+pub(crate) fn base_url(spec: &Spec) -> String {
     let value = |key: &str| spec.keys.iter().find(|k| k.key == key).map(|k| k.value.as_str()).filter(|v| !v.is_empty());
 
     let base = if spec.version.starts_with("2.") {

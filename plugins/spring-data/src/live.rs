@@ -4,8 +4,16 @@ use openidea_plugin::diagnostics::DiagnosticsProvider;
 use openidea_plugin::hover::{Hover, HoverProvider};
 use openidea_plugin::inlay_hints::{InlayHint, InlayHints};
 use openidea_plugin::{Event, EventKind};
-use spring_text::index::project_of;
+use spring_text::index::DIAGNOSTICS_WARM;
+use spring_text::scope::{current_owner, scope_path};
+use spring_text::text::balanced;
+use std::collections::BTreeSet;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+// ponytail: once per instance, re-shown after idle reclaim
+static EVENTS_NOTICE: AtomicBool = AtomicBool::new(false);
 const MAX_TEXT: usize = 128 << 10;
 #[derive(Clone)]
 pub(super) struct Source {
@@ -14,28 +22,8 @@ pub(super) struct Source {
     classes: Vec<Class>,
     complete: bool,
 }
-fn balanced(text: &str) -> bool {
-    let mut stack = Vec::new();
-    for token in java::tokens(text) {
-        if token.s.starts_with('"') && (token.s.len() < 2 || !token.s.ends_with('"')) {
-            return false;
-        }
-        match token.s {
-            "(" => stack.push(")"),
-            "[" => stack.push("]"),
-            "{" => stack.push("}"),
-            ")" | "]" | "}" => {
-                if stack.pop() != Some(token.s) {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    stack.is_empty()
-}
 fn source(path: &str, text: &str) -> Option<Source> {
-    if text.len() > MAX_TEXT || !balanced(text) {
+    if text.len() > MAX_TEXT || !balanced(text, is_kotlin(path)) {
         return Some(Source { identities: Vec::new(), file: JavaFile::default(), classes: Vec::new(), complete: false });
     }
     let file = parse_source(path, text);
@@ -125,13 +113,18 @@ fn source(path: &str, text: &str) -> Option<Source> {
         .collect();
     Some(Source { identities, file, classes: parsed, complete: true })
 }
+type FileKey = (String, u64, u64);
+type FactsKey = (u64, u64, String, Vec<String>);
+
 pub(crate) struct Live {
     files: Indexes<Source>,
     pub(super) watching: bool,
+    file: Option<(FileKey, Rc<JavaFile>)>,
+    facts: Option<(FactsKey, Rc<Facts>)>,
 }
 impl Default for Live {
     fn default() -> Self {
-        Self { files: Indexes::new(SOURCE_GLOBS, source), watching: false }
+        Self { files: Indexes::new(SOURCE_GLOBS, source), watching: false, file: None, facts: None }
     }
 }
 pub(super) fn completion_supported(doc: &Document) -> bool {
@@ -139,20 +132,38 @@ pub(super) fn completion_supported(doc: &Document) -> bool {
         && matches!((doc.language.as_str(), doc.path.rsplit('.').next()), ("java", Some("java")) | ("kotlin", Some("kt")))
 }
 impl DataTools {
-    pub(super) fn cached_index(&mut self, doc: &Document) -> Option<&Index<Source>> {
-        self.live.files.for_cached_document(&doc.path, &doc.text).map(|i| &*i)
+    pub(super) fn repository_file(&mut self, doc: &Document) -> Rc<JavaFile> {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        doc.text.hash(&mut hasher);
+        let key = (doc.path.clone(), doc.version, hasher.finish());
+        if let Some((cached, file)) = &self.live.file
+            && *cached == key
+        {
+            return file.clone();
+        }
+        let file = Rc::new(repository_file(doc));
+        self.live.file = Some((key, file.clone()));
+        file
+    }
+    pub(super) fn model_for<'a>(&'a mut self, doc: &Document, file: &JavaFile, warm: bool) -> Option<Model<'a>> {
+        let live = &mut self.live;
+        let index = if warm {
+            live.files.for_cached_document_warm(&doc.path, &doc.text, DIAGNOSTICS_WARM)?
+        } else {
+            live.files.for_cached_document(&doc.path, &doc.text)?
+        };
+        Some(model(index, &mut live.facts, file, live.watching, &doc.path))
     }
     pub(crate) fn cached_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
         if !supported(doc) {
             return Vec::new();
         }
-        let file = repository_file(doc);
+        let file = self.repository_file(doc);
         let repos = repositories(&file);
-        let watching = self.live.watching;
-        let Some(index) = self.live.files.for_cached_document(&doc.path, &doc.text) else {
+        let Some(model) = self.model_for(doc, &file, false) else {
             return Vec::new();
         };
-        let model = model(index, &file, watching, &doc.path);
         let mut markers = Vec::new();
         let mut derived_markers = Vec::new();
         for (ti, domain) in repos {
@@ -191,8 +202,13 @@ impl DataTools {
 
     pub(crate) fn activate_live(&mut self) {
         self.live.watching = host::subscribe_paths("files-changed", SOURCE_GLOBS).is_ok();
-        let _ = host::subscribe(EventKind::FileOpened);
-        let _ = host::subscribe(EventKind::FileSaved);
+        if matches!(host::subscribe(EventKind::FileSaved), Err(Error::Denied(_))) && !EVENTS_NOTICE.swap(true, Ordering::Relaxed) {
+            host::notify(
+                NotificationLevel::Info,
+                "Spring Data Tools",
+                "Live checking needs the events permission. Allow it in Settings › Plugins › Spring Data Tools.",
+            );
+        }
         let deadline = Instant::now() + Duration::from_secs(3);
         for project in host::projects().unwrap_or_default() {
             let budget = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250));
@@ -203,45 +219,12 @@ impl DataTools {
         }
     }
     pub(crate) fn live_events(&mut self, events: &[Event]) {
-        let deadline = Instant::now() + Duration::from_secs(3);
-        for event in events {
-            let paths: Vec<_> = match event {
-                Event::FileOpened(p) | Event::FileSaved(p) => vec![(p, false)],
-                Event::FilesChanged(f) => {
-                    f.removed.iter().map(|p| (p, true)).chain(f.created.iter().chain(&f.modified).map(|p| (p, false))).collect()
-                }
-                _ => Vec::new(),
-            };
-            for (path, removed) in paths {
-                if Instant::now() >= deadline {
-                    return;
-                }
-                if !SOURCE_GLOBS.iter().any(|g| spring_text::index::glob_matches(g, path)) {
-                    continue;
-                }
-                let Some(project) = project_of(path) else {
-                    continue;
-                };
-                let text = if removed {
-                    None
-                } else {
-                    match project.read_file(path) {
-                        Ok(text) => Some(text),
-                        Err(_) => {
-                            self.live.files.reset();
-                            continue;
-                        }
-                    }
-                };
-                self.live.files.update_existing(&project, path, text.as_deref());
-                self.live.files.get(&project, deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(250)));
-            }
-        }
+        self.live.files.on_events(events, Instant::now() + Duration::from_secs(3));
     }
 }
 fn supported(doc: &Document) -> bool {
     doc.text.len() <= MAX_TEXT
-        && balanced(&doc.text)
+        && balanced(&doc.text, is_kotlin(&doc.path))
         && matches!((doc.language.as_str(), doc.path.rsplit('.').next()), ("java", Some("java")) | ("kotlin", Some("kt")))
 }
 const BASES: &[(&str, &str)] = &[
@@ -342,12 +325,18 @@ pub(super) fn repository_file(doc: &Document) -> JavaFile {
         })
         .collect();
     let special_ok = |name: &str| {
-        !SPECIAL_PARAMS.contains(&name)
-            || file.imports.iter().any(|i| !i.is_static && i.path == format!("org.springframework.data.domain.{name}"))
-                && !file.types.iter().any(|t| t.name == name)
-                && !file.imports.iter().any(|i| {
-                    !i.is_static && i.path.rsplit('.').next() == Some(name) && i.path != format!("org.springframework.data.domain.{name}")
-                })
+        if !SPECIAL_PARAMS.contains(&name) {
+            return true;
+        }
+        if file.types.iter().any(|t| t.name == name) {
+            return false;
+        }
+        let qualified = if name == "Class" { "java.lang.Class".to_owned() } else { format!("org.springframework.data.domain.{name}") };
+        let imported: Vec<_> = file.imports.iter().filter(|i| !i.is_static && i.path.rsplit('.').next() == Some(name)).collect();
+        imported.iter().all(|i| i.path == qualified)
+            && (name == "Class"
+                || !imported.is_empty()
+                || file.imports.iter().any(|i| !i.is_static && i.path == "org.springframework.data.domain.*"))
     };
     let valid_methods: Vec<Vec<bool>> =
         file.types
@@ -393,76 +382,111 @@ pub(super) fn repository_file(doc: &Document) -> JavaFile {
     }
     file
 }
-fn scope_path(path: &str) -> bool {
-    (path.starts_with('/') || path.as_bytes().get(1)==Some(&b':') && path.as_bytes().get(2)==Some(&b'/') && path.as_bytes()[0].is_ascii_alphabetic())
-        && path.len()<=4096 && !path.contains('\\') && !path.chars().any(char::is_control)
-        && !path.split('/').skip(usize::from(path.starts_with('/'))).any(|part| matches!(part,""|"."|".."))
-}
 fn current_roots() -> Option<Vec<String>> {
-    let projects=host::projects().ok()?;
-    if projects.len()>64 { return None; }
-    projects.into_iter().map(|project| {
-        let root=project.root().ok()?;
-        scope_path(&root).then_some(root)
-    }).collect()
-}
-fn current_owner<'a>(roots: &'a [String], path: &str) -> Option<&'a str> {
-    if !scope_path(path) { return None; }
-    roots.iter().filter(|root| path.strip_prefix(root.as_str()).is_some_and(|tail|tail.starts_with('/'))).max_by_key(|root|root.len()).map(String::as_str)
-}
-pub(super) fn model<'a>(index: &'a Index<Source>, file: &JavaFile, watching: bool, current_path: &str) -> Model<'a> {
-    // Re-evaluate open-project membership without discovering or reading files.
-    // An outer cache can predate opening an inner project with the same source.
-    let Some(roots)=current_roots() else { return Model {by_name:BTreeMap::new(),entities:BTreeMap::new(),complete:false}; };
-    let Some(root)=current_owner(&roots,current_path) else { return Model {by_name:BTreeMap::new(),entities:BTreeMap::new(),complete:false}; };
-    let mut ownership_complete=true;
-    let mut all: BTreeMap<&str, Vec<(&str, &Class, &JavaFile)>> = BTreeMap::new();
-    for (path, source) in index.iter() {
-        if current_owner(&roots,path)!=Some(root) { ownership_complete=false; continue; }
-        for (identity, class) in source.identities.iter().zip(&source.classes) {
-            if all.len() >= 5000 {
-                return Model { by_name: BTreeMap::new(), entities: BTreeMap::new(), complete: false };
-            }
-            all.entry(identity).or_default().push((path, class, &source.file));
-        }
+    let projects = host::projects().ok()?;
+    if projects.len() > 64 {
+        return None;
     }
-    let ambiguous_classes = all.values().any(|entries| entries.len() != 1);
-    let mut by_name = BTreeMap::new();
-    let mut entity_candidates: BTreeMap<&str, Vec<&Class>> = BTreeMap::new();
-    for (identity, entries) in &all {
-        if entries.len() != 1 {
+    projects.into_iter().map(|project| scope_path(&project.root().ok()?)).collect()
+}
+const MAX_CLASSES: usize = 5000;
+/// What a whole project's classes say about identities that cannot be told apart.
+#[derive(Default)]
+pub(super) struct Facts {
+    /// Duplicated identities, their simple names and duplicated entity names.
+    pub(super) ambiguous: BTreeSet<String>,
+    ownership_complete: bool,
+    sources_complete: bool,
+    capped: bool,
+}
+fn facts(index: &Index<Source>, roots: &[String], root: &str) -> Facts {
+    let mut identities: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut entities: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut found = Facts { ownership_complete: true, sources_complete: true, ..Facts::default() };
+    for (path, source) in index.iter() {
+        found.sources_complete &= source.complete;
+        if current_owner(path, roots).as_deref() != Some(root) {
+            found.ownership_complete = false;
             continue;
         }
-        let (path, class, owner) = entries[0];
-        by_name.insert(*identity, vec![(path, class)]);
-        if let Some(entity) = &class.entity {
-            entity_candidates.entry(entity).or_default().push(class);
-        }
-        let imported: Vec<_> =
-            file.imports.iter().filter(|i| !i.is_static && i.path.rsplit('.').next() == Some(class.name.as_str())).collect();
-        let visible = if imported.is_empty() {
-            owner.package == file.package
-        } else {
-            imported.len() == 1 && imported[0].path == identity.strip_prefix("@type:").unwrap_or(identity)
-        };
-        if visible {
-            by_name.insert(class.name.as_str(), vec![(path, class)]);
+        for (identity, class) in source.identities.iter().zip(&source.classes) {
+            *identities.entry(identity).or_default() += 1;
+            if let Some(entity) = &class.entity {
+                *entities.entry(entity).or_default() += 1;
+            }
         }
     }
-    let ambiguous_entities = entity_candidates.values().any(|entries| entries.len() != 1);
-    let entities = entity_candidates.into_iter().filter_map(|(name, classes)| (classes.len() == 1).then_some((name, classes[0]))).collect();
-    Model {
-        by_name,
-        entities,
-        complete: watching && ownership_complete && !ambiguous_classes && !ambiguous_entities && index.fresh() && index.iter().all(|(_, s)| s.complete),
+    found.capped = identities.len() > MAX_CLASSES;
+    for (identity, _) in identities.into_iter().filter(|(_, count)| *count > 1) {
+        let name = identity.strip_prefix("@type:").unwrap_or(identity);
+        found.ambiguous.insert(identity.to_owned());
+        found.ambiguous.insert(name.rsplit('.').next().unwrap_or(name).to_owned());
     }
+    found.ambiguous.extend(entities.into_iter().filter(|(_, count)| *count > 1).map(|(name, _)| name.to_owned()));
+    found
+}
+fn model<'a>(
+    index: &'a Index<Source>,
+    cache: &mut Option<(FactsKey, Rc<Facts>)>,
+    file: &JavaFile,
+    watching: bool,
+    current_path: &str,
+) -> Model<'a> {
+    let Some(roots) = current_roots() else {
+        return Model::unknown();
+    };
+    let Some(root) = current_owner(current_path, &roots) else {
+        return Model::unknown();
+    };
+    let key = (index.id(), index.generation(), root.clone(), roots.clone());
+    let facts = match cache {
+        Some((cached, facts)) if *cached == key => facts.clone(),
+        _ => {
+            let facts = Rc::new(facts(index, &roots, &root));
+            *cache = Some((key, facts.clone()));
+            facts
+        }
+    };
+    if facts.capped {
+        return Model::unknown();
+    }
+    let mut by_name = BTreeMap::new();
+    let mut entity_candidates: BTreeMap<&str, &Class> = BTreeMap::new();
+    for (path, source) in index.iter() {
+        if current_owner(path, &roots).as_deref() != Some(root.as_str()) {
+            continue;
+        }
+        for (identity, class) in source.identities.iter().zip(&source.classes) {
+            if facts.ambiguous.contains(identity) {
+                continue;
+            }
+            by_name.insert(identity.as_str(), vec![(path, class)]);
+            if let Some(entity) = &class.entity
+                && !facts.ambiguous.contains(entity)
+            {
+                entity_candidates.insert(entity, class);
+            }
+            let imported: Vec<_> =
+                file.imports.iter().filter(|i| !i.is_static && i.path.rsplit('.').next() == Some(class.name.as_str())).collect();
+            let visible = if imported.is_empty() {
+                source.file.package == file.package
+            } else {
+                imported.len() == 1 && imported[0].path == identity.strip_prefix("@type:").unwrap_or(identity)
+            };
+            if visible {
+                by_name.insert(class.name.as_str(), vec![(path, class)]);
+            }
+        }
+    }
+    let complete = watching && facts.ownership_complete && facts.sources_complete && index.fresh();
+    Model { by_name, entities: entity_candidates, complete, facts }
 }
 impl DiagnosticsProvider for DataTools {
     fn diagnostics(&mut self, doc: &Document) -> Vec<Diagnostic> {
         if !supported(doc) {
             return Vec::new();
         }
-        let file = repository_file(doc);
+        let file = self.repository_file(doc);
         let repos = repositories(&file);
         let ids: Vec<_> = repos.iter().map(|(i, _)| *i).collect();
         let mut found: Vec<_> = checks::check(&file, &ids, checks::Groups::from_settings())
@@ -482,12 +506,20 @@ impl DiagnosticsProvider for DataTools {
             })
             .map(|f| f.diagnostic(&doc.text))
             .collect();
-        let watching = self.live.watching;
-        if let Some(index) = self.live.files.for_cached_document(&doc.path, &doc.text) {
-            let model = model(index, &file, watching, &doc.path);
+        if let Some(model) = self.model_for(doc, &file, true) {
             found.extend(problems(&model, &doc.text, &file).into_iter().filter(|d| {
-                !matches!(d.code.as_deref(), Some("query-parameter-type" | "query-return-type"))
-                    && (model.complete || !matches!(d.code.as_deref(), Some("unknown-property" | "mongo-unknown-field" | "projection-unknown-property" | "projection-property-type" | "entity-graph-unknown-attribute" | "entity-graph-not-association")))
+                model.complete
+                    || !matches!(
+                        d.code.as_deref(),
+                        Some(
+                            "unknown-property"
+                                | "mongo-unknown-field"
+                                | "projection-unknown-property"
+                                | "projection-property-type"
+                                | "entity-graph-unknown-attribute"
+                                | "entity-graph-not-association"
+                        )
+                    )
             }));
         }
         found.truncate(500);
@@ -529,7 +561,7 @@ fn explicit_query_hint(file: &JavaFile, doc: &Document, method: &java::Member) -
     }
     let parameters=declared.iter().filter(|(name,_)|names.contains(**name)).map(|(name,param)|
         (param.at+param.name.len(),format!("query parameter: :{name}"))).collect::<Vec<_>>();
-    Some(Hint {from:query.at,to:query.end,description:format!("Declared literal JPA query with {} named parameter(s) and {} matching explicit @Param source binding(s).\n\nOnly matching literal aliases receive parameter hints. Compiler parameter names, query validity and effective runtime binding are not inferred.",names.len(),parameters.len()),parameters,parameter_tooltip:"Explicit literal @Param alias also present in the declared query text. Source facts only; runtime binding is unverified."})
+    Some(Hint {from:query.at,to:query.end,description:format!("Declared JPA query with {} named parameter(s), {} of them bound by an explicit @Param.",names.len(),parameters.len()),parameters,parameter_tooltip:"Explicit literal @Param alias also present in the declared query text. Source facts only; runtime binding is unverified."})
 }
 fn hover_text(value: &str) -> String {
     let mut text=String::new();
@@ -552,7 +584,7 @@ fn hints(model: &Model, file: &JavaFile, doc: &Document) -> Vec<Hint> {
         let repository=&file.types[ti];
         if repository.name.len()<=128 && domain.len()<=128 {
             out.push(Hint {from:repository.at,to:repository.at+repository.name.len(),
-                description:format!("**Spring Data repository** {}\n\nDeclared source domain: {}.\n\nCached domain source: {}:{}\n\n{} No file is read for this hover. Effective classpath, persistence identifier type, custom base semantics and runtime activation are not resolved.",hover_text(&repository.name),hover_text(&domain),hover_text(path),class.range.start.line.saturating_add(1),if model.complete {"Current watched source inventory is complete within its cache interval."} else {"Source inventory is incomplete or stale; this is a recorded positive match only."}),parameters:Vec::new(),parameter_tooltip:""});
+                description:format!("**Spring Data repository** {}\n\nManages {}, declared in {}:{}{}.",hover_text(&repository.name),hover_text(&domain),hover_text(path),class.range.start.line.saturating_add(1),if model.complete {""} else {" (the project index is incomplete, so this may be out of date)"}),parameters:Vec::new(),parameter_tooltip:""});
         }
         if !model.complete { continue; }
         for m in file.types[ti].methods().filter(|m| m.name.len() <= 256) {
@@ -585,7 +617,7 @@ fn hints(model: &Model, file: &JavaFile, doc: &Document) -> Vec<Hint> {
             if params.next().is_some() {
                 valid = false;
             }
-            out.push(Hint {from:m.at,to:m.at+m.name.len(),description:format!("Derived query on `{domain}`: {}.\n\nResolved from unambiguous visible source properties; not a database query plan or runtime result.",describe(&m.name,&parts)),parameters:if valid {parameters}else{Vec::new()},parameter_tooltip:"Derived criterion bound by source argument order; special Pageable/Sort parameters excluded. Not an SQL binding."});
+            out.push(Hint {from:m.at,to:m.at+m.name.len(),description:format!("Derived query on `{domain}`: {}.",describe(&m.name,&parts)),parameters:if valid {parameters}else{Vec::new()},parameter_tooltip:"Derived criterion bound by source argument order; special Pageable/Sort parameters excluded. Not an SQL binding."});
         }
     }
     out
@@ -596,10 +628,9 @@ impl HoverProvider for DataTools {
             return None;
         }
         let off = offset(&doc.text, at)?;
-        let file = repository_file(doc);
-        let watching = self.live.watching;
-        let index = self.live.files.for_cached_document(&doc.path, &doc.text)?;
-        let hint = hints(&model(index, &file, watching, &doc.path), &file, doc).into_iter().find(|h| h.from <= off && off < h.to)?;
+        let file = self.repository_file(doc);
+        let model = self.model_for(doc, &file, false)?;
+        let hint = hints(&model, &file, doc).into_iter().find(|h| h.from <= off && off < h.to)?;
         Some(Hover::new(hint.description).range(range(&doc.text, hint.from, hint.to)))
     }
 }
@@ -608,12 +639,11 @@ impl InlayHints for DataTools {
         if !supported(doc) {
             return Vec::new();
         }
-        let file = repository_file(doc);
-        let watching = self.live.watching;
-        let Some(index) = self.live.files.for_cached_document(&doc.path, &doc.text) else {
+        let file = self.repository_file(doc);
+        let Some(model) = self.model_for(doc, &file, false) else {
             return Vec::new();
         };
-        hints(&model(index, &file, watching, &doc.path), &file, doc)
+        hints(&model, &file, doc)
             .into_iter()
             .flat_map(|h| h.parameters.into_iter().map(move |(at,label)|(at,label,h.parameter_tooltip)))
             .filter_map(|(at, label, tooltip)| {
@@ -655,6 +685,15 @@ mod tests {
     fn names(tools: &mut DataTools, d: &Document) -> Vec<String> {
         let at = d.text.find("findBy").unwrap() + "findBy".len();
         tools.completion(d, openidea_plugin::text::position(&d.text, at), None).into_iter().map(|c| c.label).collect()
+    }
+    #[test]
+    fn live_checks_notice_shown_once() {
+        let host = MockHost::install().with_capabilities(&["project.read"]);
+        DataTools::default().activate_live();
+        DataTools::default().activate_live();
+        let notices: Vec<_> = host.notifications().into_iter().filter(|n| n.body.contains("needs the events permission")).collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].body.contains("Settings › Plugins › Spring Data Tools"));
     }
     #[test]
     fn newly_opened_nested_project_cannot_supply_outer_cached_positive_facts() {
@@ -707,7 +746,7 @@ mod tests {
         assert_eq!(hints[0].position,openidea_plugin::text::position(&d.text,d.text.find("String input").unwrap()+"String input".len()));
         let at=openidea_plugin::text::position(&d.text,d.text.find("@Query").unwrap()+1);
         let hover=tools.hover(&d,at).unwrap();
-        assert!(hover.markdown.contains("2 named parameter(s) and 1 matching explicit"));
+        assert!(hover.markdown.contains("2 named parameter(s), 1 of them bound"));
         let end=hover.range.unwrap().end; assert!(tools.hover(&d,end).is_none());
         assert!(tools.inlay_hints(&d,Range::new(Position::new(0,0),at)).is_empty());
         let changed=Document {text:d.text.replace("@Param(\"name\")","@Param(\"other\")"),version:d.version+1,..d.clone()};
@@ -749,7 +788,7 @@ mod tests {
         d.text=d.text.replace("interface PersonRepository","/* 😀 */ interface PersonRepository");
         let at=openidea_plugin::text::position(&d.text,d.text.find("PersonRepository").unwrap());
         let hover=tools.hover(&d,at).unwrap();
-        assert!(hover.markdown.contains("Spring Data repository") && hover.markdown.contains("Declared source domain: Person") && hover.markdown.contains("/project/Person.java:1"));
+        assert!(hover.markdown.contains("Spring Data repository") && hover.markdown.contains("Manages Person") && hover.markdown.contains("/project/Person.java:1"));
         assert_eq!(hover.range.unwrap(),range(&d.text,d.text.find("PersonRepository").unwrap(),d.text.find("PersonRepository").unwrap()+"PersonRepository".len()));
         host.add_file("Person.java","package app; class Person {String replaced;}");
         assert!(tools.hover(&d,at).is_some(),"cached positive fact does not re-read source");
@@ -771,7 +810,7 @@ mod tests {
         let d=doc("Person findByName(String value);");
         let at=openidea_plugin::text::position(&d.text,d.text.find("PersonRepository").unwrap());
         let hover=tools.hover(&d,at).unwrap();
-        assert!(hover.markdown.contains("incomplete or stale") && hover.markdown.contains("\\[unsafe\\]"));
+        assert!(hover.markdown.contains("incomplete") && hover.markdown.contains("\\[unsafe\\]"));
         assert!(hover.markdown.len()<1400);
         assert!(tools.hover(&d,hover.range.unwrap().end).is_none());
         host.set_setting("springData.checkQueryTypes","false"); assert!(tools.hover(&d,at).is_none());
@@ -1131,7 +1170,6 @@ mod tests {
     fn repository_definition_cold_or_ambiguous_domain_never_discovers_or_guesses() {
         let host=MockHost::install();host.add_file("Person.java",ENTITY);
         let mut tools=DataTools::default();let d=definition_doc("Person findByNmae(String value);");
-        assert!(tools.diagnostics(&d).is_empty());
         assert!(names(&mut tools,&d).is_empty());
         tools.activate_live();
         assert!(!tools.diagnostics(&d).is_empty());
@@ -1140,6 +1178,73 @@ mod tests {
         assert!(tools.diagnostics(&late).is_empty());assert!(names(&mut tools,&late).is_empty());
         host.add_file("duplicate/Person.java",ENTITY);tools.live_events(&[Event::FileSaved("/project/duplicate/Person.java".into())]);
         assert!(tools.diagnostics(&d).is_empty());assert!(names(&mut tools,&d).is_empty());
+    }
+
+    fn unknown_property(tools: &mut DataTools, d: &Document) -> bool {
+        tools.diagnostics(d).iter().any(|d| d.code.as_deref() == Some("unknown-property"))
+    }
+    #[test]
+    fn derived_query_warnings_survive_ttl() {
+        let (_host, mut tools) = setup();
+        let d = doc("Person findByNmae(String value);");
+        assert!(unknown_property(&mut tools, &d));
+        tools.live.files.for_cached_document(&d.path, &d.text).unwrap().mark_stale();
+        assert!(unknown_property(&mut tools, &d));
+        assert!(tools.live.files.cached(&d.path).unwrap().fresh());
+    }
+    #[test]
+    fn deleted_modified_path_no_global_reset() {
+        let (_host, mut tools) = setup();
+        let d = doc("Person findByNmae(String value);");
+        let gone = "/project/Gone.java".to_owned();
+        tools.live_events(&[Event::FilesChanged(openidea_plugin::FilesChanged { created: vec![], modified: vec![gone], removed: vec![] })]);
+        let index = tools.live.files.cached(&d.path).expect("the index is kept");
+        assert!(index.files().contains_key("/project/Person.java"));
+        assert!(unknown_property(&mut tools, &d));
+    }
+    #[test]
+    fn duplicate_unrelated_fqn_keeps_checks() {
+        let host = MockHost::install();
+        host.add_file("Person.java", ENTITY);
+        for dir in ["a", "b"] {
+            host.add_file(&format!("{dir}/Dup.java"), "package dup; class Dup {}");
+            host.add_file(&format!("{dir}/Same.java"), &format!("package {dir}; @Entity class Same {{}}"));
+        }
+        let mut tools = DataTools::default();
+        tools.activate_live();
+        assert!(unknown_property(&mut tools, &doc("Person findByNmae(String value);")));
+        let duplicated = Document { text: doc("Dup findByNmae(String value);").text.replace("Person,", "Dup,"), ..doc("") };
+        assert!(!unknown_property(&mut tools, &duplicated));
+    }
+    #[test]
+    fn dynamic_projection_method_checked() {
+        let (_host, mut tools) = setup();
+        assert!(unknown_property(&mut tools, &doc("<T> List<T> findByNmae(String value, Class<T> type);")));
+        let local = Document { text: doc("<T> List<T> findByNmae(String value, Class<T> type);").text + " class Class<T> {}", ..doc("") };
+        assert!(!unknown_property(&mut tools, &local));
+    }
+    #[test]
+    fn wildcard_import_keeps_pageable_methods() {
+        let (_host, mut tools) = setup();
+        let mut d = doc("Page<Person> findByNmae(String value, Pageable page);");
+        d.text = d.text.replace(IMPORT, &format!("{IMPORT} import org.springframework.data.domain.*;"));
+        assert!(unknown_property(&mut tools, &d));
+        let foreign = Document { text: d.text.replace("domain.*;", "domain.*; import other.Pageable;"), ..d };
+        assert!(!unknown_property(&mut tools, &foreign));
+    }
+    #[test]
+    fn parsed_file_and_model_facts_are_cached_per_version_and_generation() {
+        let (host, mut tools) = setup();
+        let d = doc("Person findByNmae(String value);");
+        assert!(unknown_property(&mut tools, &d));
+        let file = tools.repository_file(&d);
+        let facts = tools.live.facts.as_ref().map(|(_, facts)| facts.clone()).unwrap();
+        host.add_file("Person.java", "package app; class Person {String nmae;}");
+        assert!(unknown_property(&mut tools, &d));
+        assert!(Rc::ptr_eq(&file, &tools.repository_file(&d)));
+        assert!(Rc::ptr_eq(&facts, &tools.live.facts.as_ref().unwrap().1));
+        let next = Document { version: d.version + 1, ..d };
+        assert!(!Rc::ptr_eq(&file, &tools.repository_file(&next)));
     }
 
 }

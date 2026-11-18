@@ -39,6 +39,19 @@ impl Problem {
     }
 }
 
+/// The setting that turns the inspection `code` on or off.
+pub fn setting_of(code: &str) -> &'static str {
+    match code {
+        "DotEnvIncorrectDelimiterInspection" | "DotEnvLeadingCharacterInspection" | "DotEnvLowercaseKeyInspection" => "checkKeyNames",
+        "DotEnvDuplicateKeyInspection" => "checkDuplicateKeys",
+        "DotEnvSpaceAroundSeparatorInspection" | "DotEnvTrailingWhitespaceInspection" | "DotEnvExtraBlankLineInspection" => {
+            "checkFormatting"
+        }
+        "DotEnvSpaceInsideNonQuotedInspection" | "NestedVariableOutsideDoubleQuotesInspection" => "checkValueQuotes",
+        _ => "checkVariableReferences",
+    }
+}
+
 /// `defined` tells whether a key is declared anywhere (for `${KEY}`).
 pub fn check(text: &str, tokens: &[Token], properties: &[Property], defined: impl Fn(&str) -> bool) -> Vec<Problem> {
     let mut problems = Vec::new();
@@ -123,7 +136,7 @@ pub fn check(text: &str, tokens: &[Token], properties: &[Property], defined: imp
             );
         }
 
-        if raw.contains("${") {
+        if raw.contains("${") && property.quote != Some('\'') {
             let inner = raw.trim();
             let start = value.start + (raw.len() - raw.trim_start().len());
             if !(inner.starts_with('"') && inner.ends_with('"')) {
@@ -265,6 +278,11 @@ mod tests {
         assert_eq!(fixed("A=b c\n", "DotEnvSpaceInsideNonQuotedInspection"), "A='b c'\n");
         assert_eq!(fixed("A=1 \n", "DotEnvTrailingWhitespaceInspection"), "A=1\n");
         assert_eq!(fixed("A=1\n\n\n\nB=2", "DotEnvExtraBlankLineInspection"), "A=1\n\nB=2");
-        assert_eq!(fixed("A='${B}'", "NestedVariableOutsideDoubleQuotesInspection"), "A=\"'${B}'\"");
+    }
+
+    #[test]
+    fn single_quoted_interpolation_not_flagged() {
+        assert!(run("A='${B}'\n").is_empty());
+        assert!(run("A=${B}\n").iter().any(|(code, _)| *code == "NestedVariableOutsideDoubleQuotesInspection"));
     }
 }

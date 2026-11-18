@@ -1,6 +1,6 @@
 //! The built-in Log editor's semantic overlay uses the existing Ideolog
 //! event/field/match rules. It performs no project discovery or file reads.
-use crate::{Ideolog, TIME_GAP, highlights_limited};
+use crate::{Ideolog, MAX_DOCUMENT_BYTES, TIME_GAP, highlights_limited};
 use openidea_plugin::semantic_tokens::{Document, SemanticToken, SemanticTokens, TokenKind};
 use openidea_plugin::syntax::{Highlight, Token};
 use openidea_plugin::{Position, Range, host};
@@ -8,14 +8,18 @@ use std::time::{Duration, Instant};
 
 pub(super) const DECORATION_SET: &str = "log-source-hints";
 
-const MAX_BYTES: usize = 64 << 10;
-const MAX_LINES: usize = 512;
 const MAX_LINE_BYTES: usize = 4096;
-const MAX_TOKENS: usize = 4096;
+const MAX_TOKENS: usize = 65_536;
 const BUDGET: Duration = Duration::from_millis(15);
 
 impl SemanticTokens for Ideolog {
     fn semantic_tokens(&mut self, doc: &Document) -> Vec<SemanticToken> {
+        self.semantic_tokens_within(doc, BUDGET)
+    }
+}
+
+impl Ideolog {
+    fn semantic_tokens_within(&mut self, doc: &Document, budget: Duration) -> Vec<SemanticToken> {
         // A new semantic request (including unsaved edits) withdraws explicit
         // snapshot hints before publishing current semantic results.
         let _ = host::clear_decorations(DECORATION_SET);
@@ -28,7 +32,7 @@ impl SemanticTokens for Ideolog {
         if text.is_empty() {
             return Vec::new();
         }
-        let deadline = Instant::now() + BUDGET;
+        let deadline = Instant::now() + budget;
         // Activation/focus/commands/settings forms compile configuration outside
         // semantic requests. A cold provider never compiles or reads storage.
         let Some((_, config)) = &self.config else { return Vec::new(); };
@@ -86,20 +90,22 @@ pub(super) fn mark(plugin: &mut Ideolog, ctx: &openidea_plugin::Invocation) -> R
         || host::project_of(&path).and_then(|p| p.root().ok()).as_deref() != Some(root.as_str()) {
         return Err(openidea_plugin::Error::Stale);
     }
-    host::set_decorations(&path, DECORATION_SET, &items)
+    host::set_decorations(&path, DECORATION_SET, &items)?;
+    plugin.marked = Some((path, root));
+    Ok(())
 }
 
 /// Stop before an overlong line rather than feeding its partial text to
-/// format detection. Bound line count as well as bytes (including CRLF).
-fn bounded_head(text: &str) -> &str {
+/// format detection. The cooperative deadline bounds the work past that.
+pub(crate) fn bounded_head(text: &str) -> &str {
     // Bound the newline search itself: split_inclusive on the whole input
     // otherwise scans an arbitrarily long line before its length can be refused.
-    let prefix_end=crate::log::floor_char_boundary(text,text.len().min(MAX_BYTES));
+    let prefix_end=crate::log::floor_char_boundary(text,text.len().min(MAX_DOCUMENT_BYTES));
     let prefix=&text[..prefix_end];
     let mut end = 0;
-    for line in prefix.split_inclusive('\n').take(MAX_LINES) {
+    for line in prefix.split_inclusive('\n') {
         let complete=line.ends_with('\n') || prefix_end==text.len();
-        if !complete || line.len() > MAX_LINE_BYTES || end + line.len() > MAX_BYTES {
+        if !complete || line.len() > MAX_LINE_BYTES || end + line.len() > MAX_DOCUMENT_BYTES {
             break;
         }
         end += line.len();
@@ -165,7 +171,7 @@ fn advance(text: &str, cursor: &mut usize, position: &mut Position, to: usize) {
 mod tests {
     use super::*;
     use crate::{Config, highlights_with_gaps};
-    use openidea_plugin::{mock::MockHost, text};
+    use openidea_plugin::{Plugin, mock::MockHost, text};
 
     fn doc(language: &str, text: &str) -> Document {
         Document { path: "/outside/log.txt".into(), language: language.into(), version: 1, text: text.into() }
@@ -301,27 +307,27 @@ mod tests {
     }
     #[test]
     fn bounded_newline_search_never_admits_a_truncated_line_or_utf8_scalar() {
-        let first=format!("INFO {}\n","x".repeat(202)).repeat(300);
-        let source=format!("{first}ERROR {}\nINFO tail\n","x".repeat(3500));
-        assert!(first.len()<MAX_BYTES && first.len()+3507>MAX_BYTES);
+        let line=format!("INFO {}\n","x".repeat(4000));
+        let first=line.repeat(MAX_DOCUMENT_BYTES/line.len());
+        let source=format!("{first}{line}INFO tail\n");
+        assert!(first.len()<=MAX_DOCUMENT_BYTES && first.len()+line.len()>MAX_DOCUMENT_BYTES);
         assert_eq!(bounded_head(&source),first);
-        let first=format!("{}\n","x".repeat(127)).repeat(511);
+        let first=format!("{}\n","x".repeat(127)).repeat(MAX_DOCUMENT_BYTES/128-1);
         let source=format!("{first}{}😀tail\n","a".repeat(127));
-        assert!(!source.is_char_boundary(MAX_BYTES));
+        assert!(!source.is_char_boundary(MAX_DOCUMENT_BYTES));
         assert_eq!(bounded_head(&source),first);
-        let huge=format!("INFO short\n{}\nINFO tail\n","😀".repeat(MAX_BYTES));
+        let huge=format!("INFO short\n{}\nINFO tail\n","😀".repeat(MAX_DOCUMENT_BYTES));
         assert_eq!(bounded_head(&huge),"INFO short\n");
         assert_eq!(bounded_head("INFO short"),"INFO short","real end-of-document line remains complete");
     }
     #[test]
     fn request_limits_skip_oversized_lines_and_preserve_complete_utf8_lines() {
         assert!(bounded_head(&"😀".repeat(MAX_LINE_BYTES)).is_empty());
-        let text = "INFO hello\r\n".repeat(MAX_LINES + 10);
-        let prefix = bounded_head(&text);
-        assert_eq!(prefix.lines().count(), MAX_LINES);
+        let text = "INFO hello\r\n".repeat(10_000);
+        assert_eq!(bounded_head(&text).lines().count(), 10_000, "line count is not capped");
         let line = format!("INFO {}\n", "😀".repeat(500));
-        let bytes = line.repeat(100);
-        assert!(bounded_head(&bytes).len() <= MAX_BYTES);
+        let bytes = line.repeat(400);
+        assert!(bounded_head(&bytes).len() <= MAX_DOCUMENT_BYTES);
         assert!(bounded_head(&bytes).ends_with('\n'));
         let source = "INFO x\n";
         let config = Config::default();
@@ -337,5 +343,119 @@ mod tests {
             Token { range: 0..99, kind: Highlight::Keyword },
         ];
         assert!(convert("😀", malformed).is_empty());
+    }
+
+    #[test]
+    fn highlights_cover_line_2000() {
+        let _host = MockHost::install();
+        let source: String = (0..2500).map(|i| format!("2024-05-01 10:00:00,123 [   1] ERROR - #a.B - failure {i}\n")).collect();
+        let text = bounded_head(&source);
+        assert_eq!(text.len(), source.len(), "no line or byte cap below the document limit");
+        let tokens = convert(text, highlights_limited(&Config::default(), text, 0.0, MAX_TOKENS, None));
+        assert!(tokens.iter().any(|t| t.range.start.line == 2000), "colouring reaches line 2000");
+        let mut plugin = Ideolog::default();
+        plugin.config();
+        let tokens = plugin.semantic_tokens_within(&doc("log", &source), Duration::from_secs(30));
+        assert!(tokens.iter().any(|t| t.range.start.line == 2000), "provider reaches line 2000");
+    }
+
+    #[test]
+    fn an_expired_deadline_returns_partial_tokens_without_panicking() {
+        let line = "2024-05-01 10:00:00,123 [   1] ERROR - #a.B - failure\n";
+        let source = line.repeat(2500);
+        let config = Config::default();
+        let mut total = 0;
+        let full = crate::highlights_checked(&config, &source, 0.0, MAX_TOKENS, || {
+            total += 1;
+            false
+        });
+        let mut checks = 0;
+        let partial = crate::highlights_checked(&config, &source, 0.0, MAX_TOKENS, || {
+            checks += 1;
+            checks > total - 100
+        });
+        assert!(!partial.is_empty() && partial.len() < full.len());
+    }
+
+    #[test]
+    fn a_huge_log_returns_within_the_deadline_without_panicking() {
+        let _host = MockHost::install();
+        let line = "2024-05-01 10:00:00,123 [   1] ERROR - #a.B - something went wrong\n";
+        let source = line.repeat(MAX_DOCUMENT_BYTES / line.len());
+        let mut plugin = Ideolog::default();
+        plugin.config();
+        let started = Instant::now();
+        let tokens = plugin.semantic_tokens(&doc("log", &source));
+        assert!(tokens.len() <= MAX_TOKENS);
+        assert!(started.elapsed() < Duration::from_millis(500), "provider stays under the host hard limit");
+    }
+
+    #[test]
+    fn custom_pattern_change_applies_without_refocus() {
+        let host = MockHost::install();
+        let source = "2024-05-01|ERROR|main|user=alice\n";
+        let mut plugin = Ideolog::default();
+        plugin.config();
+        let before = plugin.semantic_tokens(&doc("log", source));
+        assert!(!strings(source, &before).contains(&("alice", TokenKind::Function)));
+        host.set_setting("customPatterns", &format!("{:?}", r#"<LogHighlightingPattern pattern="user=(\w+)" action="HIGHLIGHT_MATCH" fg="-16776961"/>"#));
+        plugin.handle_events(&[openidea_plugin::Event::Other { kind: "settings-changed".into(), data: String::new() }], &host.invocation());
+        let after = plugin.semantic_tokens(&doc("log", source));
+        assert!(strings(source, &after).contains(&("alice", TokenKind::Function)));
+    }
+
+    #[test]
+    fn unrelated_file_change_keeps_marks() {
+        let host = MockHost::install().with_capabilities(&["editor.read", "project.read", "events"]);
+        let source = "2024-05-01 10:00:00 ERROR first\n";
+        host.open_editor("/project/app.log", "log", source, &[(0, 0, 0, 0)]);
+        let mut plugin = Ideolog::default();
+        mark(&mut plugin, &host.invocation()).unwrap();
+        let key = (DECORATION_SET.to_owned(), "/project/app.log".to_owned());
+        let changed = |path: &str| openidea_plugin::Event::FilesChanged(openidea_plugin::FilesChanged { modified: vec![path.into()], ..Default::default() });
+        plugin.handle_events(&[changed("/project/build/output.class"), openidea_plugin::Event::FileSaved("/project/Other.java".into())], &host.invocation());
+        assert!(host.decorations().contains_key(&key));
+        plugin.handle_events(&[changed("/project/app.log")], &host.invocation());
+        assert!(!host.decorations().contains_key(&key));
+        mark(&mut plugin, &host.invocation()).unwrap();
+        plugin.handle_events(&[openidea_plugin::Event::VcsChanged("/project".into())], &host.invocation());
+        assert!(!host.decorations().contains_key(&key));
+    }
+
+    #[test]
+    fn one_huge_event_with_a_custom_pattern_stays_within_the_deadline() {
+        let host = MockHost::install();
+        host.set_setting("customPatterns", &format!("{:?}", r#"<LogHighlightingPattern pattern="(a+)+b" action="HIGHLIGHT_MATCH" fg="-16776961"/>"#));
+        let header = "2024-05-01 10:00:00,123 [   1] ERROR - #a.B - boom\n";
+        let source = format!("{header}{}", "    at some.pkg.Klass.method(Klass.java:1)\n".repeat(MAX_DOCUMENT_BYTES / 44 - 2));
+        let mut plugin = Ideolog::default();
+        plugin.config();
+        let started = Instant::now();
+        let tokens = plugin.semantic_tokens(&doc("log", &source));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(tokens.len() <= MAX_TOKENS);
+        assert!(tokens.windows(2).all(|pair| pair[0].range.end <= pair[1].range.start));
+    }
+
+    #[test]
+    fn capped_event_cuts_on_a_line_boundary() {
+        let event = "x\n".repeat(crate::MAX_HIGHLIGHTED_EVENT_BYTES);
+        let capped = crate::capped_event(&event);
+        assert!(capped.len() <= crate::MAX_HIGHLIGHTED_EVENT_BYTES && capped.ends_with('\n'));
+        assert_eq!(crate::capped_event("short"), "short");
+    }
+
+    #[test]
+    fn unnamed_events_and_other_files_keep_marks() {
+        let host = MockHost::install().with_capabilities(&["editor.read", "project.read", "events"]);
+        host.open_editor("/project/app.log", "log", "2024-05-01 10:00:00 ERROR first\n", &[(0, 0, 0, 0)]);
+        let mut plugin = Ideolog::default();
+        mark(&mut plugin, &host.invocation()).unwrap();
+        let key = (DECORATION_SET.to_owned(), "/project/app.log".to_owned());
+        let other = |kind: &str, data: &str| openidea_plugin::Event::Other { kind: kind.into(), data: data.into() };
+        plugin.handle_events(&[other("file-closed", "\"/project/Other.java\""), other("settings-changed", ""), other("unknown", ""), openidea_plugin::Event::Scheduled], &host.invocation());
+        assert!(host.decorations().contains_key(&key));
+        plugin.handle_events(&[other("file-closed", "\"/project/app.log\"")], &host.invocation());
+        assert!(!host.decorations().contains_key(&key));
     }
 }

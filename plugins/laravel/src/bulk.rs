@@ -2,7 +2,11 @@
 //! Project view, IDE helper PHPDoc removal for all models, and factory and resource bodies filled
 //! from the migration columns. Generators use native project writes; bulk edits use one undoable FileAction.
 
-use openidea_plugin::{Error, Invocation, NotificationLevel, Project, host};
+use openidea_plugin::{
+    Error, Project,
+    file_actions::{FileAction, FileOperation},
+    host,
+};
 
 use crate::index::Index;
 use crate::unused;
@@ -11,8 +15,6 @@ use crate::unused;
 mod config;
 #[path = "related_generation_selection.rs"]
 mod selection;
-
-const SOURCE: &str = "Laravel";
 
 /// Model class names of the model files among the selected Project view entries (a folder selects the models below it).
 pub fn selected_models(index: &Index, selected: &[String]) -> Vec<(String, String)> {
@@ -30,16 +32,61 @@ pub fn selected_models(index: &Index, selected: &[String]) -> Vec<(String, Strin
         .collect()
 }
 
-pub fn remove_phpdocs(_ctx: &Invocation, _index: Option<&Index>) -> Result<Option<String>, Error> {
-    host::notify(
-        NotificationLevel::Info,
-        SOURCE,
-        crate::ui_text::text(
-            "native.bulk.822537f9ce",
-            "Open a model and choose ‘Remove IDE helper PHPDoc from indexed models’ from editor actions. The native workspace edit is atomic and undoable.",
-        ),
-    );
-    Ok(None)
+/// A model whose PHPDoc has IDE helper tags, to anchor the bulk removal action.
+pub fn phpdoc_anchor(index: &Index, project: &Project) -> Option<String> {
+    index.model_files.keys().find(|path| {
+        crate::owns_current_path(project, path)
+            && project.read_file(path).is_ok_and(|text| {
+                text.len() <= 128 << 10
+                    && text
+                        .match_indices("class ")
+                        .any(|(at, _)| unused::remove_model_phpdocs(&text, at).is_some())
+            })
+    }).cloned()
+}
+
+/// Writes a resolved editor action with project writes, for commands that can't hand the host a
+/// workspace edit. Deletes and renames are refused before anything is written.
+pub(crate) fn write_action(project: &Project, action: &FileAction) -> Result<usize, Error> {
+    let mut files = std::collections::BTreeMap::<String, String>::new();
+    for operation in &action.operations {
+        match operation {
+            FileOperation::Create { path, text, overwrite } => {
+                if !overwrite && project.exists(path)? {
+                    return Err(Error::Stale);
+                }
+                files.insert(path.clone(), text.clone());
+            }
+            FileOperation::Delete { path } | FileOperation::Rename { from: path, .. } => {
+                return Err(Error::Invalid(crate::ui_text::format(
+                    "native.bulk.removeByHand",
+                    "Delete or move {path} yourself, then try again.",
+                    &[("path", path)],
+                )));
+            }
+        }
+    }
+    for (path, edits) in &action.edits {
+        let source = match files.get(path) {
+            Some(text) => text.clone(),
+            None => project.read_file(path)?,
+        };
+        files.insert(path.clone(), crate::helper_automation::apply_edits(&source, edits)?);
+    }
+    for (path, text) in &files {
+        project.write_file(path, text).map_err(|error| {
+            ui_kit::denied::map(error, "Writing project files", "project.write", "Laravel")
+        })?;
+    }
+    if let Some(path) = &action.open {
+        host::open_editor(path, None)?;
+    }
+    Ok(files.len())
+}
+
+/// The key and anchor of the related-model generation prepared for this project.
+pub(crate) fn pending_generation(plans: &ModelPlans, root: &str) -> Option<(String, String)> {
+    plans.pending.borrow().get(root).map(|plan| (plan.key.clone(), plan.anchor.clone()))
 }
 
 fn cleanup_plan(
@@ -107,8 +154,8 @@ pub fn actions(
     {
         found.push(openidea_plugin::file_actions::FileAction {
             title: crate::ui_text::text(
-                "native.bulk.64568e0c26",
-                "Remove IDE helper PHPDoc from indexed models",
+                "native.bulk.removeFromModels",
+                "Remove IDE helper PHPDoc from models",
             )
             .into(),
             kind: Some("refactor.rewrite".into()),
@@ -861,15 +908,6 @@ fn prepare_model_file_with(
     };
     plans.next.set(next);
     plans.pending.borrow_mut().insert(root, pending);
-    host::open_editor(&model.path, None)?;
-    host::notify(
-        NotificationLevel::Info,
-        SOURCE,
-        crate::ui_text::text(
-            "native.bulk.7f4dbea30b",
-            "Generation is prepared without writing files. Choose ‘Apply prepared related-model generation…’ from this model's editor actions to review and create it atomically.",
-        ),
-    );
     Ok(Some(model.path))
 }
 fn generation_actions(

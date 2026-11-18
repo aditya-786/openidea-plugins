@@ -496,6 +496,9 @@ impl State {
             _ => Err(Error::Invalid("Unknown module scaffold operation".into())),
         }
     }
+    pub(crate) fn prepared(&self, root: &str) -> Option<(String, String)> {
+        self.pending.get(root).map(|pending| (pending.key.clone(), pending.anchor.clone()))
+    }
     pub(crate) fn actions(&self, doc: &Document) -> Vec<FileAction> {
         self.pending
             .iter()

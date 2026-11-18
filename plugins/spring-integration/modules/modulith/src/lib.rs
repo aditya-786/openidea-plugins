@@ -4,24 +4,21 @@
 //! modules a module doesn't allow, and lists the modules in a tool window.
 //! Text-based, Java only: imports and proved project-qualified type positions.
 
-use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Document, LineMarker, Providers};
+use openidea_plugin::providers::{CodeAction, CompletionItem, CompletionKind, Document, Providers};
 use openidea_plugin::text::offset;
-use openidea_plugin::views::{Body, Button, TreeItem, View, ViewEvent, Viewport, Views};
+use openidea_plugin::views::{Body, Button, TreeItem, View, ViewEvent};
 use openidea_plugin::{
-    Diagnostic, Error, Invocation, Location, NotificationLevel, Plugin, Position, Project, Range, Severity, TextEdit, host,
+    Diagnostic, Error, Invocation, Location, NotificationLevel, Position, Project, Range, Severity, TextEdit, host,
 };
 use spring_text::diagram::{self, Edge, Node};
-use spring_text::index::{COMMAND_BUDGET, Index, Indexes, PROVIDER_BUDGET};
+use spring_text::index::{COMMAND_BUDGET, View as IndexView};
 use spring_text::java::{self, Annotation, JavaFile, Str};
 use spring_text::tree::Expansion;
 use spring_text::{contains, range};
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 mod expose;
-#[path = "../../../src/source_scope.rs"]
-mod source_scope;
 
 const DIAGRAM_VIEW: &str = "diagram";
 const COPY_DOCS: &str = "copy-docs";
@@ -175,7 +172,7 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn build(index: &Index<Unit>) -> Self {
+    pub fn build(index: &Units<'_>) -> Self {
         let units: Vec<(&str, &Unit)> = index.iter().filter(|(p, _)| !is_test(p)).collect();
         let mut metadata=BTreeMap::<&str,usize>::new();for (_,unit) in &units {if unit.info.as_ref().is_some_and(|info|info.module.is_some()||info.named_interface.is_some()) {*metadata.entry(&unit.package).or_default()+=1;}}
         let mut model = Model {
@@ -368,8 +365,24 @@ fn text_of(text: &str, r: Range) -> String {
     text[from..to].to_owned()
 }
 
+/// The module facts of every Java and Kotlin file, as one part of the owner's shared index.
+pub type Units<'a> = IndexView<'a, Unit>;
+
+/// Where the owner keeps the shared index: each file is read and parsed once for all modules.
+pub trait Source {
+    /// The index of the project holding `doc`, with `doc` applied, read on for a provider budget.
+    fn for_document(&mut self, doc: &Document) -> Option<Units<'_>>;
+    /// Like [`Self::for_document`], without reading any more of the project.
+    fn cached(&mut self, doc: &Document) -> Option<Units<'_>>;
+    /// The index of `project`, read on for at most `budget`.
+    fn project(&mut self, project: &Project, budget: std::time::Duration) -> Units<'_>;
+    /// Starts the index over, unless a scan of it is in progress (that would throw away what it has read).
+    fn restart(&mut self, project: &Project);
+}
+
+impl Providers for ModulithTools {}
+
 pub struct ModulithTools {
-    indexes: Indexes<Unit>,
     expansion: Expansion,
     decoration_sets:BTreeSet<String>,
     expose:expose::Exposes,
@@ -377,24 +390,21 @@ pub struct ModulithTools {
 
 impl Default for ModulithTools {
     fn default() -> Self {
-        Self { indexes: Indexes::new(&["**/*.java","**/*.kt"], scan), expansion: Expansion::default(),decoration_sets:BTreeSet::new(),expose:Default::default() }
+        Self { expansion: Expansion::default(),decoration_sets:BTreeSet::new(),expose:Default::default() }
     }
 }
 
 impl ModulithTools {
-    fn index(&mut self,doc:&Document)->Option<&Index<Unit>> {
-        let scope=source_scope::Scope::for_path(&doc.path)?;let index=self.indexes.for_document(&doc.path,&doc.text,PROVIDER_BUDGET)?;let scope=scope.refresh_for_path(&doc.path)?;scope.prune(index).then_some(&*index)
-    }
-    pub fn expose_actions(&mut self,doc:&Document,selection:Range)->Vec<openidea_plugin::file_actions::FileAction> {
-        let Some(scope)=source_scope::Scope::for_path(&doc.path) else{return vec![];};let Some(index)=self.indexes.for_cached_document(&doc.path,&doc.text) else{return vec![];};if !scope.prune(index) {return vec![];}self.expose.actions(index,doc,selection)
+    pub fn expose_actions(&mut self,doc:&Document,selection:Range,source:&mut impl Source)->Vec<openidea_plugin::file_actions::FileAction> {
+        if spring_text::index::owning_root(&doc.path).is_none() {return vec![];}let Some(index)=source.cached(doc) else{return vec![];};self.expose.actions(&index,doc,selection)
     }
     pub fn resolve_expose(&mut self,doc:&Document,action:openidea_plugin::file_actions::FileAction)->Result<openidea_plugin::file_actions::FileAction,Error> {self.expose.resolve(doc,action)}
-    pub fn warm_project(&mut self, project: &Project, budget: std::time::Duration) {
+    pub fn warm_project(&mut self, project: &Project, budget: std::time::Duration, source: &mut impl Source) {
         use std::hash::{Hash,Hasher};
         let Ok(root)=project.root() else{return;};let mut hash=std::collections::hash_map::DefaultHasher::new();root.hash(&mut hash);
         let set=format!("modulith.modules.{:016x}",hash.finish());
         let _=host::clear_file_decorations(&set);self.decoration_sets.insert(set.clone());
-        let index=self.indexes.get(project,budget);let Some(scope)=source_scope::Scope::current(&root) else{return;};if !scope.prune(index) {return;}if !index.fresh() || index.files().len()>1000 {return;}
+        if spring_text::scope::scope_path(&root).is_none() {return;}let index=source.project(project,budget);let index=&index;if !index.fresh() || index.len()>1000 {return;}
         let model=Model::build(index);if model.uncertain {return;}let mut badges=BTreeMap::<String,bool>::new();let mut attempted=BTreeSet::new();
         for (path,unit) in index.iter().filter(|(path,_)|!is_test(path)) {
             let Some((name,base))=model.module_of(&unit.package) else{continue;};let Some(module)=model.modules.get(&name) else{continue;};
@@ -414,35 +424,27 @@ impl ModulithTools {
     }
     pub fn reset_live(&mut self) {
         for set in std::mem::take(&mut self.decoration_sets) {let _=host::clear_file_decorations(&set);}
-        self.indexes.reset();
     }
 
     /// Cached project model plus current text; no file discovery on the typing path.
-    pub fn live_diagnostics(&mut self, doc: &Document) -> Vec<Diagnostic> {
-        let Some(scope)=source_scope::Scope::for_path(&doc.path) else{return Vec::new();};
-        let Some(index) = self.indexes.for_cached_document(&doc.path, &doc.text) else { return Vec::new() };
-        let Some(scope)=scope.refresh_for_path(&doc.path) else{return Vec::new();};if !scope.prune(index) {return Vec::new();}
-        if !index.fresh() || index.files().len() > 1000 { return Vec::new(); }
+    pub fn live_diagnostics(&mut self, doc: &Document, source: &mut impl Source) -> Vec<Diagnostic> {
+        if spring_text::index::owning_root(&doc.path).is_none() {return Vec::new();}
+        let Some(index) = source.cached(doc) else { return Vec::new() };
+        let index = &index;
+        if !index.fresh() || index.len() > 1000 { return Vec::new(); }
         let model = Model::build(index);
         diagnostics(&model, true, &doc.path, &spring_text::parse_source(&doc.path,&doc.text), &doc.text)
     }
 }
 
-impl Providers for ModulithTools {
-    fn line_markers(&mut self, doc: &Document) -> Vec<LineMarker> {
-        let Some(index) = self.index(doc) else { return Vec::new() };
-        let model = Model::build(index);
-        let problems = diagnostics(&model, index.complete(), &doc.path, &spring_text::parse_source(&doc.path,&doc.text), &doc.text);
-        publish(&doc.path, &problems);
-        Vec::new()
-    }
-
-    fn completion(&mut self, doc: &Document, at: Position, _trigger: Option<&str>) -> Vec<CompletionItem> {
+impl ModulithTools {
+    pub fn completion(&mut self, doc: &Document, at: Position, source: &mut impl Source) -> Vec<CompletionItem> {
         let f=spring_text::parse_source(&doc.path,&doc.text);
         if !doc.path.ends_with("package-info.java")&&!f.types.iter().any(|ty|ty.outer.is_none()&&ty.has(&["PackageInfo"])) {return Vec::new();}
         let Some(at) = offset(&doc.text, at) else { return Vec::new() };
         let Some(s) = allowed_literals(&f).into_iter().find(|s| s.holds(at)) else { return Vec::new() };
-        let Some(index) = self.index(doc) else { return Vec::new() };
+        let Some(index) = source.for_document(doc) else { return Vec::new() };
+        let index = &index;
         let model = Model::build(index);if model.uncertain {return Vec::new();}
         let own = model.module_of(&f.package).map(|m| m.0);
         let replace = Some(range(&doc.text, s.at, s.end));
@@ -463,13 +465,13 @@ impl Providers for ModulithTools {
         out
     }
 
-    fn definition(&mut self,doc:&Document,at:Position)->Vec<Location> {
+    pub fn definition(&mut self,doc:&Document,at:Position,source:&mut impl Source)->Vec<Location> {
         if !matches!(doc.language.as_str(),"java"|"kotlin") {return Vec::new();}
         let file=spring_text::parse_source(&doc.path,&doc.text);if !doc.path.ends_with("package-info.java")&&!file.types.iter().any(|ty|ty.outer.is_none()&&ty.has(&["PackageInfo"])) {return Vec::new();}
         let Some(at)=offset(&doc.text,at) else{return Vec::new();};
         let Some(literal)=allowed_literals(&file).into_iter().find(|s|s.holds(at)) else{return Vec::new();};
         let dependency=literal.value.split_whitespace().collect::<String>();
-        let Some(index)=self.index(doc) else{return Vec::new();};
+        let Some(index)=source.for_document(doc) else{return Vec::new();};let index=&index;
         if !index.fresh() {return Vec::new();}
         let model=Model::build(index);if model.uncertain||!model.knows(&dependency) {return Vec::new();}
         let (name,interface)=dependency.split_once("::").map_or((dependency.as_str(),None),|(m,i)|(m,Some(i)));
@@ -487,8 +489,9 @@ impl Providers for ModulithTools {
         module.location.clone().into_iter().collect()
     }
 
-    fn code_actions(&mut self, doc: &Document, selection: Range) -> Vec<CodeAction> {
-        let Some(index) = self.index(doc) else { return Vec::new() };
+    pub fn code_actions(&mut self, doc: &Document, selection: Range, source: &mut impl Source) -> Vec<CodeAction> {
+        let Some(index) = source.for_document(doc) else { return Vec::new() };
+        let index = &index;
         let model = Model::build(index);
         violations(&model, &doc.path, &spring_text::parse_source(&doc.path,&doc.text), &doc.text)
             .into_iter()
@@ -517,7 +520,7 @@ fn key(model: &Model, open: &str, rest: &str) -> String {
 type Dependencies<'m> = BTreeMap<&'m str, BTreeMap<&'m str, Option<Violation>>>;
 
 /// For each module, the modules it imports from and the worst violation of those imports.
-fn dependencies<'m>(model: &'m Model, index: &Index<Unit>) -> Dependencies<'m> {
+fn dependencies<'m>(model: &'m Model, index: &Units<'_>) -> Dependencies<'m> {
     let mut dependencies: Dependencies = BTreeMap::new();
     for (_, u) in index.iter().filter(|(p, _)| !is_test(p)) {
         let Some((from, _)) = model.module_of(&u.package) else { continue };
@@ -543,7 +546,7 @@ fn violation_label(v: &Violation) -> String {
 }
 
 /// Modules as nodes, one edge per module importing from another; violations are warning edges.
-fn diagram_of(model: &Model, index: &Index<Unit>) -> (Vec<Node>, Vec<Edge>) {
+fn diagram_of(model: &Model, index: &Units<'_>) -> (Vec<Node>, Vec<Edge>) {
     let nodes = model
         .modules
         .values()
@@ -565,7 +568,7 @@ fn diagram_of(model: &Model, index: &Index<Unit>) -> (Vec<Node>, Vec<Edge>) {
 }
 
 /// PlantUML component diagram of the modules and their dependencies.
-pub fn plantuml(model: &Model, index: &Index<Unit>) -> String {
+pub fn plantuml(model: &Model, index: &Units<'_>) -> String {
     let mut out = String::from("@startuml\n");
     for m in model.modules.values() {
         out.push_str(&format!("component [{}]\n", m.name));
@@ -582,30 +585,29 @@ pub fn plantuml(model: &Model, index: &Index<Unit>) -> String {
     out
 }
 
-#[cfg(feature = "embedded")]
 impl ModulithTools {
     /// Typed source-model facts; no classpath/runtime module resolution is added.
-    pub fn diagram_snapshot(&mut self, ctx: &Invocation) -> Result<(Vec<Node>,Vec<Edge>,Vec<(String,Location)>,String),Error> {
+    pub fn diagram_snapshot(&mut self, ctx: &Invocation, source: &mut impl Source) -> Result<(Vec<Node>,Vec<Edge>,Vec<(String,Location)>,String),Error> {
         let project=ctx.project().ok_or(Error::Stale)?;
         if project.root()?.is_empty(){return Err(Error::Stale);}
-        let index=self.indexes.get(&project,COMMAND_BUDGET);let scope=source_scope::Scope::current(&project.root()?).ok_or(Error::Stale)?;if !scope.prune(index) {return Err(Error::Stale);}
+        spring_text::index::scoped_root(&project).ok_or(Error::Stale)?;let index=source.project(&project,COMMAND_BUDGET);let index=&index;
         if index.scanning(){refresh(&id(DIAGRAM_VIEW));}
         let model=Model::build(index);
         let (nodes,edges)=diagram_of(&model,index);
         let sources=model.modules.values().filter_map(|m|m.location.as_ref().map(|at|(key(&model,&m.name,""),at.clone()))).collect();
         let status=if model.modules.is_empty(){
             if !index.complete(){"Scanning application-module source…".into()}else if model.roots.is_empty(){"No @SpringBootApplication or @Modulithic source root found.".into()}else{"No application-module source candidates.".into()}
-        }else{format!("{} modules · {} dependencies{} · cached lexical Modulith source model",nodes.len(),edges.len(),if index.complete(){""}else{" · scanning…"})};
+        }else{format!("{} modules · {} dependencies{}",nodes.len(),edges.len(),if index.complete(){""}else{" · scanning…"})};
         let status=if model.uncertain {format!("{status} · unresolved package/alias metadata; boundary diagnostics withheld")}else{status};
         Ok((nodes,edges,sources,status))
     }
 }
 
-impl Views for ModulithTools {
-    fn render(&mut self, view: &str, _viewport: Option<Viewport>, ctx: &Invocation) -> Result<View, Error> {
+impl ModulithTools {
+    pub fn render(&mut self, view: &str, ctx: &Invocation, source: &mut impl Source) -> Result<View, Error> {
         (|| -> Result<View, Error> {
             let Some(project) = ctx.project() else { return Ok(View::message("Open a project to see its application modules.")) };
-            let index = self.indexes.get(&project, COMMAND_BUDGET);let scope=source_scope::Scope::current(&project.root()?).ok_or(Error::Stale)?;if !scope.prune(index) {return Err(Error::Stale);}
+            spring_text::index::scoped_root(&project).ok_or(Error::Stale)?;let index = source.project(&project, COMMAND_BUDGET);let index = &index;
             let complete = index.complete();
             if index.scanning() {
                 refresh(view);
@@ -662,7 +664,7 @@ impl Views for ModulithTools {
         })().map(ui_kit::actions::available)
     }
 
-    fn handle(&mut self, view: &str, event: ViewEvent, ctx: &Invocation) -> Result<(), Error> {
+    pub fn handle(&mut self, view: &str, event: ViewEvent, ctx: &Invocation, source: &mut impl Source) -> Result<(), Error> {
         if self.expansion.handle(&event) {
             refresh(view);
             return Ok(());
@@ -670,11 +672,8 @@ impl Views for ModulithTools {
 
         match event {
             ViewEvent::Button(b) if b == "refresh" => {
-                // Resetting a scan in progress would throw away what it has read.
-                if let Some(project) = ctx.project()
-                    && self.indexes.get(&project, Duration::ZERO).complete()
-                {
-                    self.indexes.reset();
+                if let Some(project) = ctx.project() {
+                    source.restart(&project);
                 }
                 refresh(view);
             }
@@ -682,7 +681,8 @@ impl Views for ModulithTools {
                 let project = ctx.project().ok_or(Error::Stale)?;
                 let root = project.root()?;
                 if root.is_empty() { return Err(Error::Stale); }
-                let index = self.indexes.get(&project, COMMAND_BUDGET);
+                let index = source.project(&project, COMMAND_BUDGET);
+                let index = &index;
                 let model = Model::build(index);
                 let valid = if view == id(DIAGRAM_VIEW) {
                     diagram_of(&model,index).0.iter().any(|node| node.id == key)
@@ -715,13 +715,14 @@ impl Views for ModulithTools {
     }
 }
 
-impl Plugin for ModulithTools {
-    fn run_command(&mut self, id: &str, ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
+impl ModulithTools {
+    pub fn run_command(&mut self, id: &str, ctx: &Invocation, source: &mut impl Source) -> Result<Option<String>, Error> {
         if id != self::id(COPY_DOCS) {
             return Err(Error::NotFound(format!("command {id}")));
         }
         let project = ctx.project().ok_or_else(|| Error::Invalid("Open a project first.".into()))?;
-        let index = self.indexes.get(&project, COMMAND_BUDGET);
+        let index = source.project(&project, COMMAND_BUDGET);
+        let index = &index;
         let model = Model::build(index);
         if model.modules.is_empty() {
             host::notify(NotificationLevel::Info, TITLE, "No application modules found.");
@@ -732,7 +733,7 @@ impl Plugin for ModulithTools {
             Err(Error::Denied(_)) => host::notify(
                 NotificationLevel::Warning,
                 TITLE,
-                "Allow the clipboard for Spring Modulith Tools in Settings › Plugins to copy the module diagram.",
+                &ui_kit::denied::message("Copying the module diagram", "clipboard", "Spring Structure Tools"),
             ),
             Err(e) => return Err(e),
         }
@@ -744,53 +745,117 @@ pub const WINDOW_SECTION: &str = "modulith";
 
 const OWNER_WINDOW: &str = "structure";
 
-fn window(view: &str) -> &str {
-    if cfg!(feature = "embedded") { OWNER_WINDOW } else { view }
+fn window(_view: &str) -> &str {
+    OWNER_WINDOW
 }
 
 fn id(name: &str) -> String {
-    if cfg!(feature = "embedded") { format!("{WINDOW_SECTION}.{name}") } else { name.to_owned() }
+    format!("{WINDOW_SECTION}.{name}")
 }
 
 pub(crate) fn refresh(view: &str) {
     host::refresh_view(window(view));
 }
 
-thread_local! {
-    static PROBLEMS: RefCell<Vec<Diagnostic>> = const { RefCell::new(Vec::new()) };
-}
+#[cfg(test)]
+mod harness {
+    use super::*;
+    use openidea_plugin::views::Viewport;
+    use spring_text::index::{Index, Indexes, PROVIDER_BUDGET};
 
-/// The diagnostics belong to the owner plugin, which publishes every module's together: a publish replaces the whole file.
-fn publish(path: &str, problems: &[Diagnostic]) {
-    if cfg!(feature = "embedded") {
-        PROBLEMS.set(problems.to_vec());
-        return;
+    /// The module over an index of its own facts, as the owner's shared index is for it.
+    pub struct ModulithTools {
+        inner: super::ModulithTools,
+        pub indexes: Indexes<Unit>,
     }
-    let _ = host::publish_diagnostics(path, problems);
+
+    impl Default for ModulithTools {
+        fn default() -> Self {
+            Self { inner: Default::default(), indexes: Indexes::new(&["**/*.java", "**/*.kt"], scan).excluding_nested_projects() }
+        }
+    }
+
+    pub fn model(index: &Index<Unit>) -> Model {
+        Model::build(&index.view(|unit| Some(unit)))
+    }
+
+    struct Own<'a>(&'a mut Indexes<Unit>);
+
+    impl Source for Own<'_> {
+        fn for_document(&mut self, doc: &Document) -> Option<Units<'_>> {
+            spring_text::index::owning_root(&doc.path)?;
+            Some(self.0.for_document(&doc.path, &doc.text, PROVIDER_BUDGET)?.view(|unit| Some(unit)))
+        }
+
+        fn cached(&mut self, doc: &Document) -> Option<Units<'_>> {
+            spring_text::index::owning_root(&doc.path)?;
+            Some(self.0.for_cached_document(&doc.path, &doc.text)?.view(|unit| Some(unit)))
+        }
+
+        fn project(&mut self, project: &Project, budget: std::time::Duration) -> Units<'_> {
+            self.0.get(project, budget).view(|unit| Some(unit))
+        }
+
+        fn restart(&mut self, project: &Project) {
+            let index = self.0.get(project, std::time::Duration::ZERO);
+            if index.complete() && !index.scanning() {
+                self.0.reset();
+            }
+        }
+    }
+
+    impl ModulithTools {
+        pub fn completion(&mut self, doc: &Document, at: Position, _trigger: Option<&str>) -> Vec<CompletionItem> {
+            self.inner.completion(doc, at, &mut Own(&mut self.indexes))
+        }
+
+        pub fn definition(&mut self, doc: &Document, at: Position) -> Vec<Location> {
+            self.inner.definition(doc, at, &mut Own(&mut self.indexes))
+        }
+
+        pub fn code_actions(&mut self, doc: &Document, selection: Range) -> Vec<CodeAction> {
+            self.inner.code_actions(doc, selection, &mut Own(&mut self.indexes))
+        }
+
+        pub fn live_diagnostics(&mut self, doc: &Document) -> Vec<Diagnostic> {
+            self.inner.live_diagnostics(doc, &mut Own(&mut self.indexes))
+        }
+
+        pub fn warm_project(&mut self, project: &Project, budget: std::time::Duration) {
+            self.inner.warm_project(project, budget, &mut Own(&mut self.indexes))
+        }
+
+        pub fn reset_live(&mut self) {
+            self.inner.reset_live();
+            self.indexes.reset();
+        }
+
+        pub fn expose_actions(&mut self, doc: &Document, selection: Range) -> Vec<openidea_plugin::file_actions::FileAction> {
+            self.inner.expose_actions(doc, selection, &mut Own(&mut self.indexes))
+        }
+
+        pub fn resolve_expose(&mut self, doc: &Document, action: openidea_plugin::file_actions::FileAction) -> Result<openidea_plugin::file_actions::FileAction, Error> {
+            self.inner.resolve_expose(doc, action)
+        }
+
+        pub fn render(&mut self, view: &str, _viewport: Option<Viewport>, ctx: &Invocation) -> Result<View, Error> {
+            self.inner.render(view, ctx, &mut Own(&mut self.indexes))
+        }
+
+        pub fn handle(&mut self, view: &str, event: ViewEvent, ctx: &Invocation) -> Result<(), Error> {
+            self.inner.handle(view, event, ctx, &mut Own(&mut self.indexes))
+        }
+
+        pub fn run_command(&mut self, id: &str, ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
+            self.inner.run_command(id, ctx, &mut Own(&mut self.indexes))
+        }
+    }
 }
-
-pub fn take_problems() -> Vec<Diagnostic> {
-    PROBLEMS.take()
-}
-
-const BUILD_FILES: [&str; 3] = ["pom.xml", "build.gradle", "build.gradle.kts"];
-const DEPENDENCY_MARKERS: [&str; 7] = ["spring-modulith", "<module>", "include(", "include '", "include \"", "(libs.", " libs."];
-
-/// True when unsure: a multi-module build or a version catalog hides the dependency from the root build file.
-pub fn applies(project: &Project) -> bool {
-    let Ok(root) = project.root() else { return true };
-    BUILD_FILES
-        .iter()
-        .filter_map(|file| project.read_file(&format!("{root}/{file}")).ok())
-        .any(|build| DEPENDENCY_MARKERS.iter().any(|marker| build.contains(marker)))
-}
-
-#[cfg(not(feature = "embedded"))]
-openidea_plugin::register_plugin!(ModulithTools, providers, views);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::{ModulithTools, model};
     use openidea_plugin::mock::MockHost;
     use openidea_plugin::text::position;
 
@@ -855,10 +920,10 @@ class Shipper {}
         assert_eq!(problems.iter().filter(|p|p.code.as_deref()==Some("module-internal")).count(),1);
         assert_eq!(problems.iter().filter(|p|p.code.as_deref()==Some("module-not-allowed")).count(),2);
         assert!(problems.iter().any(|p|p.range.start==pos(text,"com.acme.order.internal.OrderRepository")));
-        let index=tools.indexes.get(&host.invocation().project().unwrap(),COMMAND_BUDGET);let model=Model::build(index);
+        let index=tools.indexes.get(&host.invocation().project().unwrap(),COMMAND_BUDGET);let model=model(index);
         let refs=scan(&d.path,text).unwrap().qualified_uses;assert_eq!(refs.len(),3);
         assert!(refs.iter().all(|name|model.declared_types.contains(name)));
-        let graph=dependencies(&model,index);assert!(graph["shipping"].contains_key("order"));assert!(graph["shipping"].contains_key("inventory"));
+        let graph=dependencies(&model,&index.view(|u|Some(u)));assert!(graph["shipping"].contains_key("order"));assert!(graph["shipping"].contains_key("inventory"));
     }
     #[test]
     fn qualified_type_candidates_skip_comments_strings_unknown_types_and_receivers() {
@@ -909,7 +974,7 @@ class Shipper {}
         let source="package app.shipping\nimport app.orders.internal.Repository\nimport app.orders.api.Api\nclass Shipping";
         let d=Document{path:"/project/src/main/kotlin/app/shipping/Shipping.kt".into(),language:"kotlin".into(),text:source.into(),version:1};host.add_file(&d.path,source);let mut tools=ModulithTools::default();tools.warm_project(&host.invocation().project().unwrap(),COMMAND_BUDGET);
         let found=tools.live_diagnostics(&d);assert_eq!(found.len(),1,"{found:?}");assert_eq!(found[0].code.as_deref(),Some("module-internal"));
-        let index=tools.indexes.get(&host.invocation().project().unwrap(),COMMAND_BUDGET);let model=Model::build(index);assert_eq!(model.roots,["app"]);assert_eq!(model.modules.len(),2);assert_eq!(model.modules["shipping"].allowed,Some(vec!["orders::api".into()]));assert!(model.modules["orders"].interfaces.iter().any(|(name,package)|name=="api"&&package=="app.orders.api"));
+        let index=tools.indexes.get(&host.invocation().project().unwrap(),COMMAND_BUDGET);let model=model(index);assert_eq!(model.roots,["app"]);assert_eq!(model.modules.len(),2);assert_eq!(model.modules["shipping"].allowed,Some(vec!["orders::api".into()]));assert!(model.modules["orders"].interfaces.iter().any(|(name,package)|name=="api"&&package=="app.orders.api"));
         let fixed=Document{text:source.replace("import app.orders.internal.Repository\n",""),version:2,..d};assert!(tools.live_diagnostics(&fixed).is_empty());
         let path="/project/src/main/kotlin/app/shipping/Metadata.kt";let text=host.invocation().project().unwrap().read_file(path).unwrap();let metadata=Document{path:path.into(),language:"kotlin".into(),text:text.clone(),version:1};let at=pos(&text,"orders::api");
         assert!(tools.completion(&metadata,at,None).iter().any(|item|item.label=="orders::*"));let locations=tools.definition(&metadata,at);assert_eq!(locations.len(),1);assert!(locations[0].path.ends_with("/orders/api/Metadata.kt"));
@@ -924,8 +989,8 @@ class Shipper {}
     fn kotlin_constant_expression_and_duplicate_package_metadata_are_not_absence_evidence() {
         let unit=scan("/project/Metadata.kt","package app.orders\n@PackageInfo @NamedInterface(API_NAME) class Metadata").unwrap();assert!(unit.uncertain);
         let cast=scan("/project/Cast.kt","package app.orders\nclass Cast { fun cast(value: Any): String = value as String }").unwrap();assert!(!cast.uncertain);
-        let _host=setup();let mut index=Index::new(&["**/*.java","**/*.kt"],scan);
-        index.update("/project/Main.kt","package app\n@SpringBootApplication class Main");index.update("/project/One.kt","package app.orders\n@PackageInfo @ApplicationModule class One");index.update("/project/Two.kt","package app.orders\n@PackageInfo @NamedInterface(\"api\") class Two");let model=Model::build(&index);assert!(model.uncertain);assert!(model.check("shipping","app.orders.Internal").is_none());
+        let _host=setup();let mut index=spring_text::index::Index::new(&["**/*.java","**/*.kt"],scan);
+        index.update("/project/Main.kt","package app\n@SpringBootApplication class Main");index.update("/project/One.kt","package app.orders\n@PackageInfo @ApplicationModule class One");index.update("/project/Two.kt","package app.orders\n@PackageInfo @NamedInterface(\"api\") class Two");let model=model(&index);assert!(model.uncertain);assert!(model.check("shipping","app.orders.Internal").is_none());
     }
     #[test]
     fn reads_package_info() {
@@ -942,37 +1007,6 @@ class Shipper {}
         assert_eq!(fix("@ApplicationModule\npackage a.b;"), format!("@ApplicationModule({OPEN})\npackage a.b;"));
         assert_eq!(fix("@ApplicationModule()\npackage a.b;"), format!("@ApplicationModule({OPEN})\npackage a.b;"));
         assert_eq!(fix("@ApplicationModule(displayName = \"B\")\npackage a.b;"), format!("@ApplicationModule(displayName = \"B\", {OPEN})\npackage a.b;"));
-    }
-
-    #[cfg(not(feature = "embedded"))]
-    #[test]
-    fn warns_about_internal_and_unlisted_dependencies() {
-        let host = setup();
-        let mut tools = ModulithTools::default();
-        assert!(tools.line_markers(&doc("shipping/Shipper.java", SHIPPER)).is_empty());
-        let problems = &host.diagnostics()[&format!("{SRC}shipping/Shipper.java")];
-        let found: Vec<_> = problems.iter().map(|p| (p.code.as_deref().unwrap(), p.range.start, p.message.as_str())).collect();
-        assert_eq!(found, [
-            (
-                "module-internal",
-                pos(SHIPPER, "com.acme.order.internal"),
-                "`OrderRepository` is internal to module `order`: use its API package or a named interface."
-            ),
-            (
-                "module-not-allowed",
-                pos(SHIPPER, "com.acme.inventory.Inventory"),
-                "Module `shipping` doesn't list `inventory` in its allowedDependencies."
-            ),
-            (
-                "module-not-allowed",
-                pos(SHIPPER, "com.acme.inventory.spi"),
-                "Module `shipping` doesn't list `inventory::hooks` in its allowedDependencies."
-            ),
-        ]);
-        let test = "package com.acme.shipping;\nimport com.acme.order.internal.OrderRepository;\nclass ShipperTest {}\n";
-        let test_doc = Document { path: "/project/src/test/java/com/acme/shipping/ShipperTest.java".into(), ..doc("", test) };
-        tools.line_markers(&test_doc);
-        assert!(!host.diagnostics().contains_key(&test_doc.path));
     }
 
     #[test]
@@ -1003,22 +1037,6 @@ class Box<OrderRepository extends Object> { OrderRepository value; }
         let d=doc("shipping/Box.java",shadow);host.add_file(&d.path,&d.text);
         let uses=tools.live_diagnostics(&d).into_iter().filter(|p|p.code.as_deref()==Some("module-internal")).count();
         assert_eq!(uses,1);
-    }
-
-    #[cfg(not(feature = "embedded"))]
-    #[test]
-    fn checks_and_completes_allowed_dependencies() {
-        let host = setup();
-        let mut tools = ModulithTools::default();
-        let text = "@ApplicationModule(allowedDependencies = {\"order\", \"inventory :: api\", \"billing\", \"order::x\", \"inventory::*\"})\npackage com.acme.shipping;\n";
-        let d = doc("shipping/package-info.java", text);
-        tools.line_markers(&d);
-        let problems = &host.diagnostics()[&d.path];
-        let found: Vec<_> = problems.iter().map(|p| (p.code.as_deref().unwrap(), p.range.start)).collect();
-        assert_eq!(found, [("unknown-module", pos(text, "billing")), ("unknown-module", pos(text, "order::x"))]);
-
-        let labels: Vec<_> = tools.completion(&d, pos(text, "billing"), None).into_iter().map(|i| i.label).collect();
-        assert_eq!(labels, ["inventory", "inventory::*", "inventory::api", "inventory::hooks", "order", "order::*"]);
     }
 
     #[test]
@@ -1106,8 +1124,8 @@ class Box<OrderRepository extends Object> { OrderRepository value; }
         let host = setup();
         let mut tools = ModulithTools::default();
         let index = tools.indexes.get(&host.invocation().project().unwrap(), COMMAND_BUDGET);
-        let model = Model::build(index);
-        let (nodes, edges) = diagram_of(&model, index);
+        let model = model(index);
+        let (nodes, edges) = diagram_of(&model, &index.view(|u|Some(u)));
         let nodes: Vec<_> = nodes.iter().map(|n| (n.id.split("#source:").next().unwrap(), n.label.as_str(), n.detail.as_deref())).collect();
         assert_eq!(nodes, [
             ("open:inventory#", "inventory", Some("closed")),
@@ -1133,6 +1151,15 @@ class Box<OrderRepository extends Object> { OrderRepository value; }
     }
 
     #[test]
+    fn copy_module_diagram_denied_names_permission() {
+        let denied = MockHost::install().with_capabilities(&["project.read"]);
+        denied.add_file("src/main/java/com/acme/Application.java", "package com.acme;\n@SpringBootApplication\nclass Application {}\n");
+        denied.add_file("src/main/java/com/acme/order/Order.java", "package com.acme.order;\nclass Order {}\n");
+        ModulithTools::default().run_command(&id(COPY_DOCS), &denied.invocation(), None).unwrap();
+        assert!(denied.notifications().iter().any(|n| n.body.contains("needs the clipboard permission") && n.body.contains("Settings › Plugins › Spring Structure Tools")));
+    }
+
+    #[test]
     fn modulith_plantuml_text_lists_modules_and_dependencies() {
         let host = setup();
         let mut tools = ModulithTools::default();
@@ -1144,7 +1171,7 @@ class Box<OrderRepository extends Object> { OrderRepository value; }
         denied.add_file("src/main/java/com/acme/order/Order.java", "package com.acme.order;\nclass Order {}\n");
         ModulithTools::default().run_command(&id(COPY_DOCS), &denied.invocation(), None).unwrap();
         assert_eq!(denied.clipboard(), None);
-        assert!(denied.notifications().iter().any(|n| n.body.contains("Allow the clipboard")));
+        assert!(denied.notifications().iter().any(|n| n.body.contains("needs the clipboard permission") && n.body.contains("Settings › Plugins › Spring Structure Tools")));
     }
 
     const PLANTUML: &str = "@startuml
@@ -1156,30 +1183,7 @@ component [shipping]
 @enduml
 ";
 
-    #[test]
-    fn applies_follows_the_root_build_file() {
-        let host = MockHost::install();
-        let project = &host::projects().unwrap()[0];
-        assert!(!applies(project), "no build file");
-        host.add_file("pom.xml", "<project><artifactId>spring-boot-starter-web</artifactId></project>");
-        assert!(!applies(project));
-        host.add_file("pom.xml", "<project><artifactId>spring-modulith-core</artifactId></project>");
-        assert!(applies(project));
-        host.add_file("pom.xml", "<project><modules><module>app</module></modules></project>");
-        assert!(applies(project), "multi-module is unsure");
-        host.add_file("pom.xml", "<project><build><plugins><include>**/*Test.java</include></plugins></build></project>");
-        assert!(!applies(project), "surefire include is not a module");
-        host.add_file("pom.xml", "");
-        host.add_file("build.gradle.kts", "includeBuild(\"tools\")\ndependencies { implementation(\"org.slf4j:slf4j-api\") }");
-        assert!(!applies(project), "gradle without the dependency");
-        host.add_file("build.gradle.kts", "dependencies { implementation(libs.spring.thing) }");
-        assert!(applies(project), "version catalog is unsure");
-        host.add_file("build.gradle.kts", "include(\"app\")");
-        assert!(applies(project), "gradle multi-module is unsure");
-    }
-
-    #[cfg(feature = "embedded")]
-    #[test]
+        #[test]
     fn refresh_goes_to_the_owner_window_when_embedded() {
         let host = MockHost::install();
         refresh("diagram");
@@ -1189,7 +1193,7 @@ component [shipping]
     #[test]
     fn diagram_and_tree_actions_require_current_keys_and_source_facts() {
         let host=setup();let mut tools=ModulithTools::default();tools.render(&id(DIAGRAM_VIEW),None,&host.invocation()).unwrap();
-        let index=tools.indexes.get(&host.invocation().project().unwrap(),COMMAND_BUDGET);let valid=key(&Model::build(index),"order","");
+        let index=tools.indexes.get(&host.invocation().project().unwrap(),COMMAND_BUDGET);let valid=key(&model(index),"order","");
         for key in ["open:unknown#","open:order#forged","open:order#a:forged"] {
             assert!(tools.handle(&id(DIAGRAM_VIEW),ViewEvent::Message(key.into()),&host.invocation()).is_err());
         }
@@ -1201,7 +1205,7 @@ component [shipping]
     #[test]
     fn module_source_navigation_refuses_foreign_project_and_oversized_reread() {
         let host=setup();let mut tools=ModulithTools::default();tools.render(&id(DIAGRAM_VIEW),None,&host.invocation()).unwrap();
-        let index=tools.indexes.get(&host.invocation().project().unwrap(),COMMAND_BUDGET);let valid=key(&Model::build(index),"order","");
+        let index=tools.indexes.get(&host.invocation().project().unwrap(),COMMAND_BUDGET);let valid=key(&model(index),"order","");
         host.add_file("src/main/java/com/acme/order/package-info.java",&" ".repeat(512*1024+1));
         assert!(tools.handle(&id(DIAGRAM_VIEW),ViewEvent::Message(valid.clone()),&host.invocation()).is_err());
         host.set_project_root(Some("/other"));

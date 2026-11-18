@@ -3,6 +3,5 @@
   "laravel-generators",
   "laravel-processes",
   "laravel-models",
-  "laravel-database",
-  "laravel-schema"
+  "laravel-database"
 ]

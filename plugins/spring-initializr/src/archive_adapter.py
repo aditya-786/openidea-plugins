@@ -121,6 +121,16 @@ def inspect_tree(target):
 def main():
     require(sys.version_info >= (3,8), 'Python 3.8 or newer is required')
     request = json.loads(sys.stdin.read(1 << 20))
+    if request['operation'] == 'remove-archive':
+        archive = request['archive']
+        require(os.path.isabs(archive) and os.path.basename(archive) == 'generation-archive.zip', 'Refusing to remove another file')
+        try:
+            os.remove(archive)
+        except FileNotFoundError:
+            pass
+        print(json.dumps({'removed': True}));return
+    if not os.path.isdir(request['target'] if request['operation'] in ('inspect-tree','verify-tree') else request['parent']):
+        print(json.dumps({'error':'not-local'}));return
     if request['operation'] in ('inspect-tree','verify-tree'):
         proof=inspect_tree(request['target'])
         if request['operation']=='verify-tree':

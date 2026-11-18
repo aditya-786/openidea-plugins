@@ -50,7 +50,7 @@ fn decode(text:&str,schema:u64)->Result<Model,Error> {
 fn read()->Result<(Raw,Model),Error> {
     let bounded=|key|->Result<Option<String>,Error>{
         let value=host::storage::get(key)?;
-        if value.as_ref().is_some_and(|v|v.len()>16384) {return Err("Stored Ignore preferences exceed16KiB; preserved without changes.".into());}
+        if value.as_ref().is_some_and(|v|v.len()>16384) {return Err("Stored Ignore preferences exceed 16KiB; preserved without changes.".into());}
         Ok(value)
     };
     let raw=Raw{legacy:bounded(KEY)?,current:bounded(KEY2)?};
@@ -134,7 +134,7 @@ impl State {
             "scope",
             "Scope and ownership",
             FieldValue::readonly_text(
-                "Application-global Ignore plugin preferences. Inherit uses Settings > Plugins scalar values. Explicit On/Off overrides them. This form changes Ignore's own behaviour. Built-in colouring, file types and the IDE's static New menu stay unchanged.",
+                "On or Off overrides Settings › Plugins › .ignore for all projects; Inherit keeps the value from Settings.",
                 true,
             ),
         )];
@@ -151,7 +151,7 @@ impl State {
                 FieldValue::Choice(vec!["Inherit".into(), "On".into(), "Off".into()], choice.into()),
             ));
         }
-        fields.push(Field::new("dialects","File-type options",FieldValue::readonly_text("Editor assistance controls checks, completion, navigation, directory markers and template append for the selected exact filename. Creation is independent. Built-in colouring and static New menu entries remain controlled by the IDE. Additional ignore-file colouring is shared across that family; use its shared switch above. Changes apply on the next edit/open; disabled tracked problems are cleared on Save. Older plugin builds retain their earlier preferences.",true)));
+        fields.push(Field::new("dialects","File-type options",FieldValue::readonly_text("Editor assistance turns checks, completion, navigation, markers and templates on or off for the chosen file type. Changes apply the next time a file is edited or opened.",true)));
         let names=names();let i=draft.selected;let name=names[i];
         fields.push(Field::new(&self.id("dialect-select"),"Ignore file type",FieldValue::Choice(names.iter().map(|name|(*name).into()).collect(),name.into())));
         let syntax=match check::dialect(name).unwrap_or(Dialect{syntax:check::Syntax::Glob,switchable:false}) {
@@ -160,13 +160,13 @@ impl State {
         fields.push(Field::new(&self.id(&format!("support:{i}")),"Editor assistance",FieldValue::Checkbox(!draft.model.disabled_support.contains(name))));
         fields.push(Field::new(&self.id(&format!("create:{i}")),"Allow Create action for this file type",FieldValue::Checkbox(!draft.model.disabled_creation.contains(name))));
         fields.push(Field::new(&self.id(&format!("dialect:{i}")),&format!("Checks ({syntax}; requires editor assistance)"),FieldValue::Checkbox(!draft.model.disabled.contains(name))));
-        fields.push(Field::new("colouring","Colouring scope",FieldValue::readonly_text("Turning off editor assistance removes its extra markers and highlighting where supported. Shared additional-file colouring has one family-wide switch. This does not hide or unregister any IDE file type, built-in grammar or native New menu item.",true)));
+        fields.push(Field::new("colouring","Colouring scope",FieldValue::readonly_text("Turning off editor assistance removes this plugin's markers and highlighting. The IDE's own colouring and New menu are not affected.",true)));
         Ok(View::new(Body::Form(fields))
             .button(Button::new(&self.id("prefs-save"), "Save").icon("check"))
             .button(Button::new(&self.id("prefs-cancel"), "Cancel").icon("close"))
             .button(Button::new(&self.id("prefs-reload"), "Reload / discard draft").icon("refresh"))
             .status(self.message.as_deref().unwrap_or(
-                "Draft only. Save validates all fields and checks for external preference/scalar changes; Cancel discards edits.",
+                "Changes apply when you press Save; Cancel discards them.",
             )))
     }
 }
@@ -227,21 +227,16 @@ impl IgnorePlugin {
                             let scalars: Vec<_> = FLAGS.iter().map(|(key, _, _)| host::setting(key)).collect();
                             if current != draft.raw || scalars != draft.scalars {
                                 return Err(
-                                    "Preferences or scalar settings changed elsewhere. Reload before saving; draft retained.".into()
+                                    "Preferences or settings changed elsewhere. Reload before saving; your changes are kept until then.".into()
                                 );
                             }
                             let encoded=serde_json::json!({"schema":2,"scope":"application:aritti.ignore","overrides":draft.model.overrides,"disabledChecks":draft.model.disabled,"disabledSupport":draft.model.disabled_support,"disabledCreation":draft.model.disabled_creation}).to_string();
-                            if encoded.len()>16384 {return Err("Ignore preferences exceed16KiB; nothing saved.".into());}
+                            if encoded.len()>16384 {return Err("Ignore preferences exceed 16KiB; nothing saved.".into());}
                             host::storage::set(KEY2, &encoded)?;
                             self.preferences.draft = None;
                             self.preferences.message = Some(
-                                "Saved application-global Ignore overrides. Other documents refresh their checks on next open/save.".into(),
+                                "Saved. Other open files update their checks when next opened or saved.".into(),
                             );
-                            for path in &self.checked_paths {
-                                if !checks(path) {
-                                    let _ = host::publish_diagnostics(path, &[]);
-                                }
-                            }
                             show_ignored_status(ctx.editor().as_ref().map(|e| e.path()).as_deref());
                         }
                         _ => return Err("Unknown preferences button.".into()),
@@ -356,12 +351,15 @@ mod tests {
         host.add_file(".gitignore", "a\na\n");
         let ctx = host.invocation();
         let mut plugin = IgnorePlugin::default();
+        host.open_editor("/project/.gitignore", "ignore", "a\na\n", &[]);
         plugin.handle_events(&[Event::FileOpened("/project/.gitignore".into())], &ctx);
-        assert!(!host.diagnostics()["/project/.gitignore"].is_empty());
+        host.refresh_diagnostics(&mut plugin);
+        assert!(!host.provider_diagnostics()["/project/.gitignore"].is_empty());
         render(&mut plugin);
         field(&mut plugin, "dialect:0", "false", &ctx).unwrap();
         button(&mut plugin, "prefs-save", &ctx).unwrap();
-        assert!(host.diagnostics().get("/project/.gitignore").is_none_or(Vec::is_empty));
+        host.refresh_diagnostics(&mut plugin);
+        assert!(host.provider_diagnostics().get("/project/.gitignore").is_none_or(Vec::is_empty));
         assert!(!checks("/project/.gitignore"));
         assert!(checks("/project/.hgignore"));
         assert!(checks("/project/.customignore"));
@@ -370,7 +368,8 @@ mod tests {
         use openidea_plugin::file_actions::FileActions;
         assert!(plugin.file_actions(&d, Range::default()).iter().any(|a| a.title.contains("Create exact-name")));
         plugin.handle_events(&[Event::FileSaved(d.path.clone())], &ctx);
-        assert!(host.diagnostics().get(&d.path).is_none_or(Vec::is_empty));
+        host.refresh_diagnostics(&mut plugin);
+        assert!(host.provider_diagnostics().get(&d.path).is_none_or(Vec::is_empty));
     }
     #[test]
     fn invalid_values_block_save_until_corrected_and_scoped_ids_expire() {
@@ -494,14 +493,14 @@ mod tests {
         assert!(!plugin.completion(&completion,Position::new(0,2),None).is_empty());
         assert_eq!(plugin.definition(&navigation,Position::new(0,2)).len(),1);
         assert!(!plugin.line_markers(&decorated).is_empty()&&!plugin.semantic_tokens(&decorated).is_empty());
-        plugin.handle_events(&[Event::FileOpened(duplicate.path.clone())],&ctx);assert!(!host.diagnostics()[&duplicate.path].is_empty());
+        host.open_editor(&duplicate.path,"ignore",&duplicate.text,&[]);plugin.handle_events(&[Event::FileOpened(duplicate.path.clone())],&ctx);host.refresh_diagnostics(&mut plugin);assert!(!host.provider_diagnostics()[&duplicate.path].is_empty());
         render(&mut plugin);field(&mut plugin,"support:0","false",&ctx).unwrap();button(&mut plugin,"prefs-save",&ctx).unwrap();
         assert!(!checks(&duplicate.path)&&!enabled(&duplicate.path)&&creation(&duplicate.path));
         assert!(plugin.completion(&completion,Position::new(0,2),None).is_empty());
         assert!(plugin.definition(&navigation,Position::new(0,2)).is_empty());
         assert!(plugin.line_markers(&decorated).is_empty()&&plugin.semantic_tokens(&decorated).is_empty());
         assert!(plugin.code_actions(&duplicate,Range::new(Position::new(1,0),Position::new(1,0))).is_empty());
-        assert!(host.diagnostics().get(&duplicate.path).is_none_or(Vec::is_empty));
+        host.refresh_diagnostics(&mut plugin);assert!(host.provider_diagnostics().get(&duplicate.path).is_none_or(Vec::is_empty));
         let actions=plugin.file_actions(&decorated,Range::default());
         assert!(actions.iter().any(|a|a.title.contains("Create exact-name"))&&!actions.iter().any(|a|a.title.contains("Append ignore")));
         let other=source_doc("/project/.dockerignore","build/\n# note\n*.o\n");

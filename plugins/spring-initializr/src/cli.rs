@@ -65,7 +65,7 @@ impl State {
             }
             run.child = None;
             run.status = format!(
-                "{reason}; stop requested. Partial files may remain; nothing cleaned or opened."
+                "{reason}; stopped. Files generated so far are kept."
             );
         }
         Ok(())
@@ -113,7 +113,7 @@ impl State {
             if let Some(code) = chunk.status {
                 run.exit = Some(code);
                 run.status = format!(
-                    "CLI exited with status {code}. Generated files are NOT validated; no cleanup or project opening performed."
+                    "Spring Boot CLI exited with status {code}."
                 );
                 run.child = None;
                 break;
@@ -140,7 +140,7 @@ impl State {
                 ),
                 (
                     "cli-output",
-                    "Observed output (bounded)",
+                    "Output",
                     run.output.clone(),
                 ),
             ] {
@@ -151,22 +151,22 @@ impl State {
                 ));
             }
         }
-        let status=if let Some(t)=&self.terminal {format!("Native terminal active for {}: spring {}. Use its native terminal controls to stop/close it. Completion does not validate generated files.",t.root,serde_json::to_string(&t.args).unwrap_or_default())} else if let Some(completed)=&self.completed_terminal {format!("CLI completed successfully for {}. Review and verify the generated folder before opening; no build has been run.",completed.target)} else {self.run.as_ref().map(|r|format!("{} Elapsed {}s. Check polls only when requested; Cancel or window close stops a still-running CLI. Existing/partial generated files are never removed automatically.",r.status,r.at.elapsed().as_secs())).unwrap_or_else(||"No managed CLI run. The terminal launcher is separate; neither path certifies generated files.".into())};
+        let status=if let Some(t)=&self.terminal {format!("Running in a terminal for {}: spring {}. Stop or close it from the terminal.",t.root,serde_json::to_string(&t.args).unwrap_or_default())} else if let Some(completed)=&self.completed_terminal {format!("Spring Boot CLI finished for {}. Click Open Generated Folder… to check the files and open it.",completed.target)} else {self.run.as_ref().map(|r|format!("{} Elapsed {}s. Click Refresh Output to see new output; Stop Spring Boot CLI or closing the window stops it. Files already generated are kept.",r.status,r.at.elapsed().as_secs())).unwrap_or_else(||"Spring Boot CLI hasn't run yet.".into())};
         View::new(Body::Form(fields))
             .status(&status)
             .button(
-                Button::new("managed-cli-start", "Review and run CLI…")
+                Button::new("managed-cli-start", "Run Spring Boot CLI…")
                     .icon("run")
                     .enabled(can_start && !self.running() && self.terminal.is_none()),
             )
-            .button(Button::new("managed-cli-open", "Review and Open Generated Folder…").icon("folder-open").enabled(self.run.as_ref().is_some_and(|run|run.exit==Some(0)) || self.completed_terminal.is_some()))
+            .button(Button::new("managed-cli-open", "Open Generated Folder…").icon("folder-open").enabled(self.run.as_ref().is_some_and(|run|run.exit==Some(0)) || self.completed_terminal.is_some()))
             .button(
-                Button::new("managed-cli-check", "Check status / output")
+                Button::new("managed-cli-check", "Refresh Output")
                     .icon("refresh")
                     .enabled(self.running()),
             )
             .button(
-                Button::new("managed-cli-cancel", "Cancel CLI")
+                Button::new("managed-cli-cancel", "Stop Spring Boot CLI")
                     .icon("stop")
                     .enabled(self.running()),
             )
@@ -199,7 +199,7 @@ impl Launcher {
         let artifact = self.get("artifactId");
         if artifact.starts_with('.') || artifact.len() > 128 {
             return Err(Error::Invalid(
-                "Destination must be a non-hidden artifact child of at most128bytes.".into(),
+                "Destination must be a non-hidden artifact child of at most 128 bytes.".into(),
             ));
         }
         let target = format!("{root}/{artifact}");
@@ -248,8 +248,8 @@ impl Launcher {
         if exit.status==Some(0) && !exit.closed {
             self.cli.completed_terminal=Some(Proof{root:root.clone(),target,args});
         }
-        let outcome = if exit.closed { "Terminal closed".into() } else { format!("CLI exited with status {:?}", exit.status) };
-        host::notify(NotificationLevel::Info, "Spring Initializr", &format!("{outcome}. Generated files are NOT validated; no cleanup or project opening performed."));
+        let outcome = match exit.status { _ if exit.closed => "Terminal closed.".into(), Some(0) => "Spring Boot CLI finished. Click Open Generated Folder… in the Spring Initializr tool window to open the project.".into(), status => format!("Spring Boot CLI exited with status {}.", status.map_or("unknown".into(), |code| code.to_string())) };
+        host::notify(NotificationLevel::Info, "Spring Initializr", &outcome);
         host::refresh_view("initializr");
     }
     pub(crate) fn start_managed_cli(&mut self, ctx: &Invocation) -> Result<(), Error> {
@@ -264,7 +264,7 @@ impl Launcher {
     ) -> Result<(), Error> {
         let (_, proof) = self.cli_proof(ctx)?;
         let preview = format!(
-            "Project/CWD: {}\nDestination: {}\nProgram: spring\nExact arguments: {}\n\nThe installed Spring CLI executes code, may access the selected service/network and creates files. The inherited Java/environment configuration applies; no environment override is added. Destination absence is a preflight check, not exclusive reservation. No build is requested.\n\nThe child continues until exit, Cancel or window close. Status checks are explicit, not a timer. Output is bounded32KiB and may be incomplete; reaching the bound requests stop. Failure/cancellation may leave partial files. No automatic cleanup, generated-tree validation or project opening occurs.",
+            "Project/CWD: {}\nDestination: {}\nProgram: spring\nExact arguments: {}\n\nThe installed Spring CLI executes code, may access the selected service/network and creates files. The inherited Java/environment configuration applies; no environment override is added. Destination absence is a preflight check, not exclusive reservation. No build is requested.\n\nThe child continues until exit, Cancel or window close. Status checks are explicit, not a timer. Output is bounded 32KiB and may be incomplete; reaching the bound requests stop. Failure/cancellation may leave partial files. No automatic cleanup, generated-tree validation or project opening occurs.",
             proof.root,
             proof.target,
             serde_json::to_string(&proof.args).unwrap_or_default()
@@ -282,7 +282,7 @@ impl Launcher {
             proof,
             child: Some(child),
             output: String::new(),
-            status: "Running; no generated-tree validity claim.".into(),
+            status: "Running.".into(),
             at: Instant::now(),
             exit: None,
         });
@@ -460,7 +460,6 @@ mod tests {
                     .status
                     .contains(&format!("status {code}"))
             );
-            assert!(l.cli.run.as_ref().unwrap().status.contains("NOT validated"));
             assert_eq!(killed.get(), 0);
             assert!(!h.invocation().project().unwrap().exists("demo").unwrap());
             assert!(h.opened_projects().is_empty());
@@ -624,7 +623,7 @@ mod tests {
         let event = h.finish_terminal(&key).unwrap();
         l.handle_events(&[event.clone()], &h.invocation());
         assert!(l.cli.terminal.is_none());
-        assert!(h.notifications().iter().any(|n| n.body.contains("NOT validated")));
+        assert!(h.notifications().iter().any(|n| n.body.contains("Spring Boot CLI finished") && n.body.contains("Open Generated Folder…")));
         let count = h.notifications().len();
         l.handle_events(&[event], &h.invocation());
         assert_eq!(h.notifications().len(), count);

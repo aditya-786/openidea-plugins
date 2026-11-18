@@ -2,7 +2,7 @@
 use openidea_plugin::{Error, Invocation, PickItem, host};
 use ui_kit::routes::Route;
 
-fn label(route: &Route) -> String {
+pub(crate) fn label(route: &Route) -> String {
     format!(
         "{} {} · {} · {}{}",
         route.method,

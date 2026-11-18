@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use spring_text::config::canonical;
+use std::collections::HashMap;
 
 /// The endpoints read, in order; the first one tells whether the application is up.
 pub const ENDPOINTS: [&str; 9] = ["beans", "env", "conditions", "health", "mappings", "configprops", "scheduledtasks", "loggers", "caches"];
@@ -25,23 +26,83 @@ fn health_text(s: &str, max: usize) -> String {
 
 /// A bound or reported value as it may be shown: sensitive keys hidden, URL userinfo masked, bounded.
 pub fn masked_value(key: &str, raw: &str) -> String {
-    if sensitive_key(key) { MASK.to_owned() } else { health_text(&mask_userinfo(raw), 200) }
-}
-
-fn sensitive_key(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-    ["password", "passwd", "secret", "token", "key", "credential", "auth"].iter().any(|w| k.contains(w))
-}
-
-/// `scheme://user:pw@host` becomes `scheme://******@host`.
-fn mask_userinfo(v: &str) -> String {
-    let Some(i) = v.find("://") else { return v.to_owned() };
-    let rest = &v[i + 3..];
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    match authority.rfind('@') {
-        Some(at) => format!("{}{MASK}{}", &v[..i + 3], &rest[at..]),
-        None => v.to_owned(),
+    if sensitive_key(key) {
+        return MASK.to_owned();
     }
+    let command_line = matches!(key, "sun.java.command" | "JAVA_TOOL_OPTIONS" | "JDK_JAVA_OPTIONS" | "_JAVA_OPTIONS");
+    let raw = if command_line { mask_arguments(raw) } else { raw.to_owned() };
+    health_text(&mask_userinfo(&raw), 200)
+}
+
+/// `--db.password=x -Dapi.key=y` becomes `--db.password=****** -Dapi.key=******`, as InputArguments are shown.
+fn mask_arguments(raw: &str) -> String {
+    raw.split(' ')
+        .map(|arg| match arg.split_once('=') {
+            Some((key, _)) if sensitive_key(key) => format!("{key}={MASK}"),
+            _ => arg.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Boot's Sanitizer rule, widened: the last word of the last key segment names a secret.
+/// Words split on `-`, `_` and camel/acronym boundaries (`ABCKey` is `ABC`, `Key`).
+pub fn sensitive_key(key: &str) -> bool {
+    const ENDINGS: [&str; 6] = ["password", "passwd", "secret", "token", "credentials", "credential"];
+    const KEYS: [&str; 8] = ["key", "apikey", "accesskey", "secretkey", "privatekey", "signingkey", "encryptionkey", "masterkey"];
+    let segment = key.rsplit('.').next().unwrap_or(key);
+    let segment = segment.split('[').next().unwrap_or(segment);
+    let chars: Vec<char> = segment.chars().collect();
+    let mut last_word = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if matches!(c, '-' | '_') {
+            last_word.clear();
+            continue;
+        }
+        let previous = i.checked_sub(1).map(|p| chars[p]);
+        let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+        let camel = previous.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit());
+        let acronym_end = previous.is_some_and(char::is_uppercase) && next_lower;
+        if c.is_uppercase() && (camel || acronym_end) {
+            last_word.clear();
+        }
+        last_word.extend(c.to_lowercase());
+    }
+    ENDINGS.iter().any(|e| last_word.ends_with(e)) || last_word == "authorization" || KEYS.contains(&last_word.as_str())
+}
+
+/// `scheme://user:pw@host` becomes `scheme://******@host`, also when the password holds `/`, `?` or `#`.
+pub(crate) fn mask_userinfo(v: &str) -> String {
+    let mut masked = String::new();
+    let mut rest = v;
+    while let Some(i) = rest.find("://") {
+        masked.push_str(&rest[..i + 3]);
+        rest = &rest[i + 3..];
+        if let Some(at) = userinfo_end(rest) {
+            masked.push_str(MASK);
+            rest = &rest[at..];
+        }
+    }
+    masked.push_str(rest);
+    masked
+}
+
+/// Where the userinfo of the text after `://` ends (its last `@`), if it has one.
+fn userinfo_end(after_scheme: &str) -> Option<usize> {
+    let token = after_scheme.split(char::is_whitespace).next().unwrap_or("");
+    let authority = token.split(['/', '?', '#']).next().unwrap_or("");
+    if let Some(at) = authority.rfind('@') {
+        return Some(at);
+    }
+    // ponytail: `user:pa/ss@host` is told apart from `host:5432/db?u=a@b` only by a non-numeric text after the colon;
+    // an all-digit password cut by `/`, `?` or `#` still shows.
+    let first_at = token.find('@')?;
+    let (_, after_colon) = authority.rsplit_once(':')?;
+    if after_colon.is_empty() || after_colon.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let host = token[first_at + 1..].split(['/', '?', '#']).next().unwrap_or("");
+    Some(host.rfind('@').map_or(first_at, |j| first_at + 1 + j))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -69,6 +130,12 @@ pub struct Snapshot {
     /// Only `ROOT` and the loggers with a configured level.
     pub loggers: Vec<Logger>,
     pub caches: Vec<Cache>,
+    /// Endpoints whose data came from the previous refresh because this one could not reach them.
+    #[serde(default)]
+    pub kept: Vec<String>,
+    /// The raw `spring.datasource.password` of the highest-precedence source that had one, with that source's index; memory only, never stored.
+    #[serde(skip)]
+    pub datasource_password: Option<(usize, String)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -273,7 +340,14 @@ impl Snapshot {
             "env" => {
                 self.profiles = items(&json["activeProfiles"]).map(text).collect();
                 for s in items(&json["propertySources"]) {
-                    let props = entries(&s["properties"]).map(|(k, p)| (k.clone(), text(&p["value"]))).collect();
+                    let mut props = Vec::new();
+                    for (k, p) in entries(&s["properties"]) {
+                        let raw = text(&p["value"]);
+                        if k == "spring.datasource.password" && self.datasource_password.is_none() && !raw.is_empty() && !raw.chars().all(|c| c == '*') {
+                            self.datasource_password = Some((self.sources.len(), raw.clone()));
+                        }
+                        props.push((k.clone(), masked_value(k, &raw)));
+                    }
                     self.sources.push(Source { name: text(&s["name"]), props });
                 }
             }
@@ -412,6 +486,8 @@ impl Snapshot {
 
     /// The value `key` has at runtime and the property source it comes from,
     /// matched with relaxed binding (`SPRING_DATASOURCE_URL` is `spring.datasource.url`).
+    /// Scans every property: marker paths use [`Lookup`] instead.
+    #[cfg(test)]
     pub fn effective(&self, key: &str) -> Option<(&str, &str)> {
         let relaxed = canonical(key);
         let env_form = relaxed.replace(['.', '[', ']'], "");
@@ -422,6 +498,40 @@ impl Snapshot {
                 .find(|(k, _)| if env { canonical(k).replace(['.', '[', ']'], "") == env_form } else { canonical(k) == relaxed })
                 .map(|(_, v)| (v.as_str(), s.name.as_str()))
         })
+    }
+
+    /// Takes over what the previous snapshot knew of the endpoints this one
+    /// could not reach (a timeout is not a removed endpoint).
+    pub fn keep_unreachable(&mut self, previous: &Snapshot) {
+        let unreachable: Vec<String> = self
+            .missing
+            .iter()
+            .filter(|m| m.contains("(transport failed"))
+            .filter_map(|m| m.split(' ').next().map(str::to_owned))
+            .filter(|endpoint| previous.has(endpoint))
+            .collect();
+        for endpoint in unreachable {
+            match endpoint.as_str() {
+                "beans" => self.beans = previous.beans.clone(),
+                "env" => {
+                    self.profiles = previous.profiles.clone();
+                    self.sources = previous.sources.clone();
+                }
+                "conditions" => self.conditions = previous.conditions.clone(),
+                "health" => {
+                    self.health = previous.health.clone();
+                    self.health_details = previous.health_details.clone();
+                }
+                "mappings" => self.mappings = previous.mappings.clone(),
+                "configprops" => self.configprops = previous.configprops.clone(),
+                "scheduledtasks" => self.scheduled = previous.scheduled.clone(),
+                "loggers" => self.loggers = previous.loggers.clone(),
+                "caches" => self.caches = previous.caches.clone(),
+                _ => continue,
+            }
+            self.missing.retain(|m| m.split(' ').next() != Some(endpoint.as_str()));
+            self.kept.push(endpoint);
+        }
     }
 
     /// Legacy conversion helper. Current persistence stores the full model or rejects it.
@@ -442,6 +552,42 @@ impl Snapshot {
     pub fn has(&self, endpoint: &str) -> bool {
         let kept = !self.trimmed || matches!(endpoint, "beans" | "env");
         kept && !self.missing.iter().any(|m| m.split(' ').next() == Some(endpoint))
+    }
+}
+
+/// [`Snapshot::effective`] answered from two maps built once per snapshot.
+/// Environment sources match with separators dropped, the others relaxed.
+#[derive(Default)]
+pub struct Lookup {
+    relaxed: HashMap<String, (usize, usize)>,
+    environment: HashMap<String, (usize, usize)>,
+}
+
+impl Lookup {
+    pub fn new(snapshot: &Snapshot) -> Self {
+        let mut lookup = Self::default();
+        for (source, s) in snapshot.sources.iter().enumerate() {
+            let environment = s.name.contains("systemEnvironment");
+            for (prop, (key, _)) in s.props.iter().enumerate() {
+                let relaxed = canonical(key);
+                let (map, key) = if environment {
+                    (&mut lookup.environment, relaxed.replace(['.', '[', ']'], ""))
+                } else {
+                    (&mut lookup.relaxed, relaxed)
+                };
+                map.entry(key).or_insert((source, prop));
+            }
+        }
+        lookup
+    }
+
+    pub fn get<'a>(&self, snapshot: &'a Snapshot, key: &str) -> Option<(&'a str, &'a str)> {
+        let relaxed = canonical(key);
+        let environment = relaxed.replace(['.', '[', ']'], "");
+        let (source, prop) = [self.relaxed.get(&relaxed), self.environment.get(&environment)].into_iter().flatten().min().copied()?;
+        let source = snapshot.sources.get(source)?;
+        let (_, value) = source.props.get(prop)?;
+        Some((value.as_str(), source.name.as_str()))
     }
 }
 
@@ -599,5 +745,94 @@ mod boot_shape_tests {
             "handler":"h","predicate":"p","details":{"handlerMethod":{"className":"com.acme.Users","name":"find","descriptor":"()V"},
             "requestMappingConditions":{"methods":["GET"],"patterns":["/u"]}}}]}},"parentId":null}}}));
         assert_eq!(s.mappings[0].method, Some(("com.acme.Users".to_owned(), "find".to_owned())));
+    }
+}
+
+#[cfg(test)]
+mod env_secret_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn env_snapshot() -> Snapshot {
+        let mut s = Snapshot::default();
+        s.read("env", &json!({"activeProfiles":[],"propertySources":[{"name":"application.properties","properties":{
+            "spring.datasource.password":{"value":"s3cret"},"spring.datasource.url":{"value":"jdbc:postgresql://h/db"}}}]}));
+        s
+    }
+
+    #[test]
+    fn sensitive_key_by_segment() {
+        assert!(sensitive_key("spring.datasource.password"));
+        assert!(sensitive_key("x.client-secret"));
+        assert!(sensitive_key("x.api-key"));
+        assert!(sensitive_key("apiToken"));
+        assert!(sensitive_key("DB_PASSWORD"));
+        assert!(!sensitive_key("keyStoreType"));
+        assert!(!sensitive_key("oauth2.authorization-uri"));
+        assert!(!sensitive_key("monkey"));
+    }
+
+    #[test]
+    fn userinfo_masked_when_password_holds_url_delimiters() {
+        assert_eq!(mask_userinfo("jdbc:mysql://u:pa/ss@h/db"), "jdbc:mysql://******@h/db");
+        assert_eq!(mask_userinfo("http://u:p?w#x@h/x"), "http://******@h/x");
+        assert_eq!(mask_userinfo("http://u:p@w@h/x?a=b@c"), "http://******@h/x?a=b@c");
+        assert_eq!(mask_userinfo("jdbc:postgresql://h:5432/db?user=a@b"), "jdbc:postgresql://h:5432/db?user=a@b");
+        assert_eq!(mask_userinfo("http://h/path@x"), "http://h/path@x");
+    }
+
+    #[test]
+    fn command_line_values_mask_secret_arguments() {
+        let shown = masked_value("sun.java.command", "app.jar --spring.datasource.password=hunter2 --server.port=8080");
+        assert_eq!(shown, "app.jar --spring.datasource.password=****** --server.port=8080");
+        assert_eq!(masked_value("JAVA_TOOL_OPTIONS", "-Dapi.key=abc -Xmx1g"), "-Dapi.key=****** -Xmx1g");
+    }
+
+    #[test]
+    fn sensitive_key_masks_compound_and_acronym_secret_names() {
+        for key in ["APIKEY", "apikey", "secretkey", "accesskey", "PRIVATEKEY", "AWSKey", "ABCKey", "jwtsecret", "authtoken", "dbpassword", "x.authorization", "signingKey", "x.encryption-key", "masterkey", "key", "my.credential"] {
+            assert!(sensitive_key(key), "{key} should be masked");
+        }
+        for key in ["monkey", "keyStoreType", "oauth2.authorization-uri", "turkey", "keyAlias", "x.token-uri"] {
+            assert!(!sensitive_key(key), "{key} should show");
+        }
+    }
+
+    #[test]
+    fn env_password_masked_in_tree_and_tooltip() {
+        let s = env_snapshot();
+        assert!(!serde_json::to_string(&s.sources).unwrap().contains("s3cret"));
+        assert_eq!(s.effective("spring.datasource.password").unwrap().0, MASK);
+        assert_eq!(s.effective("spring.datasource.url").unwrap().0, "jdbc:postgresql://h/db");
+    }
+
+    #[test]
+    fn persisted_snapshot_has_no_raw_env_secret() {
+        let s = env_snapshot();
+        assert!(!serde_json::to_string(&s).unwrap().contains("s3cret"));
+    }
+
+    #[test]
+    fn datasource_password_available_in_memory() {
+        assert_eq!(env_snapshot().datasource_password, Some((0, "s3cret".to_owned())));
+        let mut s = Snapshot::default();
+        s.read("env", &json!({"propertySources":[{"name":"a","properties":{"spring.datasource.password":{"value":"******"}}}]}));
+        assert_eq!(s.datasource_password, None);
+    }
+
+    #[test]
+    fn effective_lookup_matches_scan() {
+        let s = Snapshot {
+            sources: vec![
+                Source { name: "systemEnvironment".into(), props: vec![("SPRING_DATASOURCE_URL".into(), "env-url".into()), ("PATH".into(), "p".into())] },
+                Source { name: "application.yml".into(), props: vec![("spring.datasource.url".into(), "file-url".into()), ("my-prop.some_key".into(), "v".into()), ("spring.datasource.url".into(), "dup".into())] },
+                Source { name: "defaults".into(), props: vec![("spring.datasource.username".into(), "u".into()), ("list[0].name".into(), "n".into())] },
+            ],
+            ..Snapshot::default()
+        };
+        let lookup = Lookup::new(&s);
+        for key in ["spring.datasource.url", "SPRING_DATASOURCE_URL", "spring.datasource.username", "myProp.someKey", "my-prop.some-key", "list[0].name", "path", "missing.key", ""] {
+            assert_eq!(lookup.get(&s, key), s.effective(key), "{key}");
+        }
     }
 }

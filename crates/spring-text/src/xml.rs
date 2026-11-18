@@ -1,6 +1,11 @@
 //! An XML element scanner: start tags with their attributes, nesting and
 //! extent. Comments, CDATA, processing instructions and the doctype are
 //! skipped; entities are left as written. Offsets are UTF-8 bytes.
+//! Plus the well-formedness gates: [`analysis_valid`] before reading a file,
+//! [`generation_valid`] before writing into one.
+
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::reader::NsReader;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attr {
@@ -230,6 +235,139 @@ pub fn bean_ids(elements: &[Element]) -> Vec<&Attr> {
     out
 }
 
+/// Whether the namespace bindings of `element` are legal: a qualified name
+/// with at most one prefix, every prefix bound, and no reserved namespace
+/// rebound or aliased.
+pub fn namespace_valid<R>(
+    reader: &quick_xml::reader::NsReader<R>,
+    element: &quick_xml::events::BytesStart<'_>,
+) -> bool {
+    use quick_xml::name::ResolveResult;
+    const XML: &str = "http://www.w3.org/XML/1998/namespace";
+    const XMLNS: &str = "http://www.w3.org/2000/xmlns/";
+    let qualified = |name: &str| {
+        let parts: Vec<_> = name.split(':').collect();
+        parts.len() <= 2 && parts.iter().all(|p| !p.is_empty())
+    };
+    if !qualified(element.name().as_ref())
+        || element.name().as_ref().starts_with("xmlns:")
+        || matches!(
+            reader.resolver().resolve_element(element.name()).0,
+            ResolveResult::Unknown(_)
+        )
+    {
+        return false;
+    }
+    for attribute in element.attributes() {
+        let Ok(attribute) = attribute else {
+            return false;
+        };
+        let key = attribute.key.as_ref();
+        if !qualified(key) {
+            return false;
+        }
+        if key == "xmlns" || key.starts_with("xmlns:") {
+            let Ok(value) = attribute.normalized_value(quick_xml::XmlVersion::Implicit1_0) else {
+                return false;
+            };
+            if key == "xmlns:xmlns"
+                || key.starts_with("xmlns:") && value.is_empty()
+                || key == "xmlns:xml" && value != XML
+                || key != "xmlns:xml" && matches!(value.as_ref(), XML | XMLNS)
+            {
+                return false;
+            }
+        } else if matches!(
+            reader.resolver().resolve_attribute(attribute.key).0,
+            ResolveResult::Unknown(_)
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `text` is a well-formed, namespace-valid XML document worth
+/// analysing: one root, nothing but whitespace, comments and processing
+/// instructions around it, a DOCTYPE and predefined or numeric entities
+/// allowed. Bounded by size (512 KiB) and depth (128), never by time, so the
+/// answer doesn't depend on machine speed.
+pub fn analysis_valid(text: &str) -> bool {
+    text.len() <= 512 * 1024 && walk(text, false)
+}
+
+/// Whether `text` is safe to generate into: [`analysis_valid`]'s envelope
+/// without a DOCTYPE or any entity reference, with well-formed comments, and
+/// at most 8192 parse events.
+pub fn generation_valid(text: &str) -> bool {
+    walk(text, true)
+}
+
+/// The shared well-formedness walk; `strict` is [`generation_valid`]'s rules.
+fn walk(text: &str, strict: bool) -> bool {
+    let mut reader = NsReader::from_str(text);
+    reader.config_mut().check_comments = strict;
+    let (mut depth, mut roots, mut declaration) = (0usize, 0usize, false);
+    for events in 0usize.. {
+        if strict && events == 8192 {
+            return false;
+        }
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                if !open(&reader, &e, depth, &mut roots) {
+                    return false;
+                }
+                depth += 1;
+                if depth > 128 {
+                    return false;
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                if !open(&reader, &e, depth, &mut roots) {
+                    return false;
+                }
+            }
+            Ok(Event::End(_)) => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+            }
+            Ok(Event::Text(t)) if depth == 0 && !t.as_ref().trim_ascii().is_empty() => return false,
+            Ok(Event::CData(_)) if depth == 0 => return false,
+            Ok(Event::GeneralRef(r)) => {
+                let known = if r.is_char_ref() {
+                    matches!(r.resolve_char_ref(), Ok(Some(_)))
+                } else {
+                    matches!(&*r, "amp" | "lt" | "gt" | "quot" | "apos")
+                };
+                if strict || depth == 0 || !known {
+                    return false;
+                }
+            }
+            Ok(Event::Decl(_)) => {
+                if depth != 0 || roots != 0 || declaration {
+                    return false;
+                }
+                declaration = true;
+            }
+            Ok(Event::DocType(_)) if strict || depth != 0 || roots != 0 => return false,
+            Ok(Event::Eof) => return depth == 0 && roots == 1,
+            Err(_) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Counts a root and checks the namespaces of an opening tag at `depth`.
+fn open<R>(reader: &NsReader<R>, element: &BytesStart<'_>, depth: usize, roots: &mut usize) -> bool {
+    if depth == 0 {
+        *roots += 1;
+    }
+    *roots == 1 && namespace_valid(reader, element)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +417,53 @@ mod tests {
         let els = elements(XML);
         let at = XML.find("ref=\"c").unwrap() + 5;
         assert_eq!(element_at(&els, at), Some(2));
+    }
+
+    #[test]
+    fn analysis_valid_accepts_entities_and_doctype() {
+        assert!(analysis_valid("<beans><bean id='a' value='x &amp; y'>a &amp; b &lt; c &#38; d &#x26;</bean></beans>"));
+        assert!(analysis_valid("<?xml version='1.0'?>\n<!DOCTYPE beans>\n<beans xmlns='urn:b'/>"));
+        assert!(analysis_valid(XML.replace("  <broken attr=\n", "").as_str()));
+        for bad in [
+            "<beans><bean></beans>",
+            "<beans><bean>",
+            "<beans>&nbsp;</beans>",
+            "<beans>&#0;</beans>",
+            "<a/><b/>",
+            "text<a/>",
+            "<a><unbound:b/></a>",
+            "<a xmlns:q=''/>",
+        ] {
+            assert!(!analysis_valid(bad), "{bad}");
+        }
+        let deep = format!("{}{}", "<r>".repeat(129), "</r>".repeat(129));
+        assert!(!analysis_valid(&deep));
+        assert!(!analysis_valid(&format!("<a>{}</a>", " ".repeat(512 * 1024))));
+        assert!(analysis_valid("<beans><!-- a -- b --></beans>"));
+    }
+
+    #[test]
+    fn analysis_valid_large_file() {
+        let beans: String = (0..2000).map(|i| format!("<bean id='b{i}'>\n  <property name='x'/>\n</bean>\n")).collect();
+        assert!(analysis_valid(&format!("<beans>\n{beans}</beans>")));
+    }
+
+    #[test]
+    fn generation_valid_keeps_the_strict_rules() {
+        assert!(generation_valid("<?xml version='1.0'?><beans xmlns='urn:b'><bean id='a'/></beans>"));
+        for bad in [
+            "<!DOCTYPE beans><beans/>",
+            "<beans>&amp;</beans>",
+            "<beans><!-- a -- b --></beans>",
+            "<beans><bean></beans>",
+            "<beans/><beans/>",
+            "<a><b:c/></a>",
+            "<?xml version='1.0'?><?xml version='1.0'?><beans/>",
+        ] {
+            assert!(!generation_valid(bad), "{bad}");
+        }
+        let many: String = (0..5000).map(|i| format!("<b id='b{i}'/>\n")).collect();
+        assert!(!generation_valid(&format!("<beans>{many}</beans>")));
     }
 
     #[test]

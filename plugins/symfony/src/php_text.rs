@@ -177,6 +177,7 @@ struct Header {
 }
 
 pub(crate) fn line_end(masked: &str, from: usize) -> usize {
+    let from = (from..=masked.len()).find(|at| masked.is_char_boundary(*at)).unwrap_or(masked.len());
     masked[from..].find('\n').map_or(masked.len(), |at| from + at + 1)
 }
 
@@ -190,9 +191,10 @@ fn scan_header(masked: &str) -> Header {
         let line = masked[offset..next_line].trim();
 
         if depth == 0 && line.starts_with("use ") {
-            let statement_end = masked[offset..].find(';').map_or(masked.len(), |at| offset + at + 1);
+            let semicolon = masked[offset..].find(';').map(|at| offset + at);
+            let statement_end = semicolon.map_or(masked.len(), |at| at + 1);
             let end = line_end(masked, statement_end.saturating_sub(1));
-            let statement = masked[offset + 4..statement_end.saturating_sub(1).max(offset + 4)].trim();
+            let statement = masked[offset + 4..semicolon.unwrap_or(masked.len()).max(offset + 4)].trim();
             if !statement.starts_with("function ") && !statement.starts_with("const ") {
                 let mut imports = Vec::new();
                 match statement.split_once('{') {

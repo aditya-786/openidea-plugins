@@ -324,10 +324,10 @@ pub(super) fn run_with(
             state.pending.borrow_mut().push((id, key, root, full));
             Ok(())
         }
-        Err(Error::Denied(_)) => Err(crate::ui_text::format(
-            "generator.legacy.allowProcess",
-            "Allow the process:{program} capability in Settings › Plugins.",
-            &[("program", runner.name())],
+        Err(Error::Denied(_)) => Err(ui_kit::denied::message(
+            "Running artisan",
+            &format!("process:{}", runner.name()),
+            "Laravel",
         )
         .into()),
         Err(error) => Err(error),
@@ -518,7 +518,7 @@ pub fn make(
                     .map(|k| (k.id, kind_label(k))),
             );
             let Some(chosen) = host::pick(
-                crate::ui_text::text("native.generate.8f92550a35", "Generate with artisan make"),
+                crate::ui_text::text("native.generate.8f92550a35", "Generate with Artisan make"),
                 &choices,
             )?
             else {
@@ -770,14 +770,13 @@ pub fn create_missing(
     let name = &document.text[reference.start..reference.end];
 
     if reference.kind == Kind::View && !index.views.contains_key(name) {
-        host::notify(
-            openidea_plugin::NotificationLevel::Info,
-            "Laravel",
-            crate::ui_text::text(
-                "native.generate.9205f0f36d",
-                "Choose Create missing literal Blade view from the editor's intentions to review an undoable file creation. Only supported plain literal references and the conventional resources/views root are offered; other view scopes remain unsupported.",
-            ),
-        );
+        let doc = openidea_plugin::providers::Document {
+            path: editor.path(),
+            language: editor.language(),
+            version: document.version,
+            text: document.text.clone(),
+        };
+        crate::view_creation::create_from_command(index, &doc, offset)?;
         return Ok(None);
     }
 

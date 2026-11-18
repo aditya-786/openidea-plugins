@@ -192,16 +192,28 @@ struct Repo {
 
 fn gitlab_project(ctx: &Invocation) -> Result<Repo, Error> {
     let project = ctx.project().ok_or("No project is open.")?;
-    let status = project.vcs_status()?.ok_or("The project is not in a git repository.")?;
+    let status = project.vcs_status()?.ok_or(NO_REPOSITORY)?;
 
     let (remote, path) = project
         .vcs_remotes()?
         .into_iter()
         .filter_map(|(name, url)| api::project_path(&url).map(|path| (name, path)))
         .min_by_key(|(name, _)| name != "origin")
-        .ok_or("The repository has no remote on the configured GitLab server.")?;
+        .ok_or(NO_REMOTE)?;
 
     Ok(Repo { status, path, remote })
+}
+
+const NO_REPOSITORY: &str = "The project is not in a git repository.";
+const NO_REMOTE: &str = "The repository has no remote on the configured GitLab server. \
+Share it on GitLab, clone a project from the Projects tab, or check the GitLab server in Settings › Plugins › GitLab.";
+
+/// A missing repository or GitLab remote offers Share Project instead of a dead end.
+fn with_share_offer(view: View, message: &str) -> View {
+    if message != NO_REPOSITORY && message != NO_REMOTE {
+        return view;
+    }
+    view.button(Button::new("share-project", "Share Project on GitLab…").icon("upload"))
 }
 
 fn selection_scope(repo: &Repo) -> String {
@@ -292,6 +304,8 @@ fn date(timestamp: &str) -> &str {
 
 /// Buttons that run only on a second click, relabelled "Confirm …" in between.
 const CONFIRMED: [&str; 4] = ["merge", "close", "delete-note", "cancel"];
+
+const MORE: &str = "more-actions";
 
 const NOTE_ACTIONS: [&str; 3] = ["edit-note", "delete-note", "react"];
 
@@ -559,6 +573,7 @@ impl GitLab {
     /// Switches every merge request view to `iid`, dropping what belonged to the previous one.
     fn select_merge_request(&mut self, iid: u64) -> Result<(), Error> {
         storage::set(SELECTED_KEY, &iid.to_string())?;
+        let _ = host::set_context("mrSelected", true);
         self.timeline = timeline::State::default();
         storage::delete(COMMENT_KEY)?;
         self.details = None;
@@ -887,6 +902,9 @@ impl GitLab {
             self.checked_selection(&repo, ctx)?;
         }
         if let ViewEvent::Button(id) = &event {
+            if id == MORE {
+                return self.pick_more_action(ctx);
+            }
             if id == "open-overview-snapshot" {
                 return self.open_content_snapshot(ctx, content_tabs::Kind::Overview);
             }
@@ -934,7 +952,7 @@ impl GitLab {
 
     fn render_details(&mut self, ctx: &Invocation) -> Result<View, Error> {
         let Some(iid) = Self::selected() else {
-            return Ok(View::message("Select a merge request in the Merge Requests tool window."));
+            return Ok(View::message("Select a merge request in the GitLab window."));
         };
 
         let repo = gitlab_project(ctx)?;
@@ -949,6 +967,7 @@ impl GitLab {
         let as_draft = preference(AS_DRAFT_KEY, true);
         let emoji = note_actions_enabled().then(|| self.emoji.clone().unwrap_or_else(|| safe::EMOJIS[0].to_owned()));
         let fields = details_fields(details, thread.as_ref(), comment, as_draft, emoji);
+        let mut merge_hint = None;
         let mut view =
             View::new(Body::Form(fields)).button(Button::new("comment", comment_label(as_draft, thread.is_some())).icon("review-comment"));
 
@@ -971,8 +990,6 @@ impl GitLab {
                     .button(Button::new("delete-note", delete).icon("trash"));
             }
 
-            let react = if thread.is_some() { "React to Comment" } else { "React" };
-            view = view.button(Button::new("react", react).icon("star"));
         }
 
         if opened {
@@ -987,34 +1004,35 @@ impl GitLab {
             let can_merge = mr.user.as_ref().is_some_and(|u| u.can_merge);
             let mergeable = mr.detailed_merge_status.as_deref() == Some("mergeable");
             let merge = match self.confirm == Some(format!("merge:{}", mr.iid)) {
-                true => format!("Confirm Merge !{} into {}", mr.iid, mr.target_branch),
+                true => {
+                    let options: Vec<&str> = [(details.squash, "squash"), (details.remove_source_branch, "delete source branch")]
+                        .into_iter()
+                        .filter_map(|(on, option)| on.then_some(option))
+                        .collect();
+                    match options.is_empty() {
+                        true => format!("Confirm Merge !{} into {}", mr.iid, mr.target_branch),
+                        false => format!("Confirm Merge !{} into {} ({})", mr.iid, mr.target_branch, options.join(", ")),
+                    }
+                }
                 false => "Merge".into(),
             };
             view = view.button(Button::new("merge", &merge).icon("github-pr-merged").enabled(can_merge && mergeable));
+            // The merge status already explains other blocks; a hidden Merge on a ready request means no permission.
+            if mergeable && !can_merge {
+                merge_hint = Some("You cannot merge this merge request");
+            }
 
             if mr.detailed_merge_status.as_deref() == Some("need_rebase") {
                 view = view.button(Button::new("rebase", "Rebase").icon("branch"));
             }
 
-            if !mr.reviewers.iter().any(|u| u.id == me.id) {
-                view = view.button(Button::new("review", "Add Me as Reviewer").icon("github-review"));
-            }
+            view = view.button(Button::new("edit", "Edit Labels, People, Milestone…").icon("edit"));
 
-            view = view.button(Button::new("rerequest-review", "Re-request Review…").icon("github-review").enabled(!mr.reviewers.is_empty()));
-            view = view.button(Button::new("edit", "Edit Labels, People, Milestone").icon("edit"));
-            for (key, label) in attributes::ATTRIBUTES {
-                view = view.button(Button::new(&format!("edit-attribute:{key}"), label).icon("edit"));
-            }
-
-            let (draft, draft_icon) = match mr.draft {
-                true => ("Mark as Ready", "github-pr-open"),
-                false => ("Mark as Draft", "github-pr-draft"),
-            };
             let close = match self.confirm == Some(format!("close:{}", mr.iid)) {
                 true => format!("Confirm Close !{}", mr.iid),
                 false => "Close".into(),
             };
-            view = view.button(Button::new("draft", draft).icon(draft_icon)).button(Button::new("close", &close).icon("github-pr-closed"));
+            view = view.button(Button::new("close", &close).icon("github-pr-closed"));
         }
 
         if mr.state == "closed" {
@@ -1026,18 +1044,64 @@ impl GitLab {
         }
 
         view = view
-            .button(Button::new("open-overview-snapshot", "Open MR Snapshot").icon("file"))
-            .button(Button::new("open-diff-snapshot", "Open Diff Snapshot").icon("diff"))
-            .button(Button::new("open-existing-worktree", "Open Existing Worktree").icon("folder"))
             .button(Button::new("browser", "Open on GitLab").icon("external-link"))
-            .button(Button::new("copy", "Copy Link").icon("copy"))
+            .button(Button::new(MORE, "More…").icon("more"))
             .button(Button::new("refresh", "Refresh").icon("refresh"));
 
-        let summary = details_summary(details);
+        let mut summary = details_summary(details);
+        if let Some(hint) = merge_hint {
+            summary.push_str(&format!(" · {hint}"));
+        }
         Ok(match &self.status {
             Some(status) => view.status(&format!("{status} · {summary}")),
             None => view.status(&summary),
         })
+    }
+
+    /// Secondary Overview actions behind More…; only those available for the loaded merge request.
+    fn more_actions(&mut self) -> Result<Vec<(&'static str, &'static str)>, Error> {
+        let me = self.me()?;
+        let details = self.details.as_ref().ok_or("The merge request is not loaded; refresh it.")?;
+        let mr = &details.mr;
+        let mut actions = Vec::new();
+
+        if note_actions_enabled() {
+            actions.push(("react", if self.thread(mr.iid).is_some() { "React to Comment" } else { "React" }));
+        }
+
+        if mr.state == "opened" {
+            if !mr.reviewers.iter().any(|u| u.id == me.id) {
+                actions.push(("review", "Add Me as Reviewer"));
+            }
+
+            if !mr.reviewers.is_empty() {
+                actions.push(("rerequest-review", "Re-request Review…"));
+            }
+
+            actions.push(("draft", if mr.draft { "Mark as Ready" } else { "Mark as Draft" }));
+        }
+
+        actions.extend([
+            ("open-overview-snapshot", "Open MR Snapshot"),
+            ("open-diff-snapshot", "Open Diff Snapshot"),
+            ("open-existing-worktree", "Open Existing Worktree"),
+            ("copy", "Copy Link"),
+        ]);
+        Ok(actions)
+    }
+
+    fn pick_more_action(&mut self, ctx: &Invocation) -> Result<(), Error> {
+        let actions = self.more_actions()?;
+        let items: Vec<PickItem> = actions.iter().map(|(id, label)| PickItem::new(id, label)).collect();
+        let Some(chosen) = host::pick("More merge request actions", &items)? else {
+            return Ok(());
+        };
+
+        if !actions.iter().any(|(id, _)| *id == chosen) {
+            return Err(Error::Stale);
+        }
+
+        self.handle_section(ViewEvent::Button(chosen), ctx)
     }
 
     fn handle_details(&mut self, event: ViewEvent, ctx: &Invocation) -> Result<(), Error> {
@@ -1210,7 +1274,7 @@ impl GitLab {
             "checkout" => {
                 let project = ctx.project().ok_or("No project is open.")?;
                 branch::checkout(&project, &repo.remote, mr).map_err(|e| match e {
-                    Error::Denied(_) => "Allow git for GitLab in Settings › Plugins to check out branches.".into(),
+                    Error::Denied(_) => ui_kit::denied::message("Checking out a branch", "process:git", "GitLab").into(),
                     e => e,
                 })
             }
@@ -1320,7 +1384,8 @@ fn first_listed<'a>(first: &str, branches: impl Iterator<Item = &'a str>) -> Vec
 fn copy_link(url: &str) -> Result<(), Error> {
     match host::copy_to_clipboard(url) {
         Err(Error::Denied(_)) => {
-            host::notify(NotificationLevel::Info, "GitLab link", url);
+            let denied = ui_kit::denied::message("Copying the link", "clipboard", "GitLab");
+            host::notify(NotificationLevel::Info, "GitLab link", &format!("{denied}\n{url}"));
             Ok(())
         }
         other => other,
@@ -1364,13 +1429,12 @@ fn selected_link(ctx: &Invocation, path: &str) -> Result<String, Error> {
     })
 }
 
-fn open_link(ctx: &Invocation) -> Result<(), Error> {
-    let link = match ctx.selected_paths().first() {
-        Some(path) => selected_link(ctx, path)?,
-        None => file_link(ctx)?,
-    };
-
-    host::open_url(&link)
+/// The Project view selection's link, or the focused editor's.
+fn current_link(ctx: &Invocation) -> Result<String, Error> {
+    match ctx.selected_paths().first() {
+        Some(path) => selected_link(ctx, path),
+        None => file_link(ctx),
+    }
 }
 
 /// The focused file's repository path (its name outside the repository) and the selection, or the whole file.
@@ -1474,16 +1538,20 @@ impl Plugin for GitLab {
         let mut parts=context.api_version.split('.');let major=parts.next();let minor=parts.next();let patch=parts.next();
         let numeric=|s:&str|!s.is_empty()&&s.bytes().all(|b|b.is_ascii_digit());
         self.trace_transport=major==Some("1")&&minor.is_some_and(|m|numeric(m)&&m.parse::<u32>().is_ok_and(|n|n>=4))&&patch.is_none_or(numeric)&&parts.next().is_none()&&context.has("net:gitlab.com");
-        self.retire_job_snapshots();Ok(())
+        self.retire_job_snapshots();
+        let _ = host::set_context("mrSelected", Self::selected().is_some());
+        let _ = host::set_context("pendingFolder", repo::has_pending_folder());
+        Ok(())
     }
 
     fn run_command(&mut self, id: &str, ctx: &Invocation, _arg: Option<&str>) -> Result<Option<String>, Error> {
+        let _interactive = api::Interactive::start();
         self.ensure_account()?;
         api::begin_budget();
         match id {
             "new-token" => host::open_url(&api::new_token_url())?,
-            "open-in-browser" => open_link(ctx)?,
-            "copy-link" => copy_link(&file_link(ctx)?)?,
+            "open-in-browser" => host::open_url(&current_link(ctx)?)?,
+            "copy-link" => copy_link(&current_link(ctx)?)?,
             "create-snippet" => return create_snippet(ctx),
             "share-project" => {
                 if !host::secret_is_set(api::token()) {
@@ -1728,7 +1796,7 @@ impl GitLab {
             Err(Error::Denied(_)) => host::notify(
                 NotificationLevel::Warning,
                 "Worktree not added",
-                "Allow git for GitLab in Settings › Plugins to add worktrees.",
+                &ui_kit::denied::message("Adding a worktree", "process:git", "GitLab"),
             ),
             Err(e) => return Err(e),
         }
@@ -1744,6 +1812,10 @@ impl GitLab {
         let repo = gitlab_project(ctx)?;
         let iid = self.command_target()?;
         let api = api::Project(&repo.path);
+        let target = api.merge_request(iid)?.target_branch;
+        if !host::confirm(&format!("Rebase !{iid} onto {target}?"), "GitLab rewrites the source branch on the server. Your local branches are not changed.")? {
+            return Ok(None);
+        }
         api.rebase(iid)?;
 
         let state = api.rebase_state(iid)?;
@@ -1821,7 +1893,7 @@ impl GitLab {
         }
 
         let Some(iid) = Self::selected() else {
-            return Ok(View::message("Select a merge request in the Merge Requests tool window."));
+            return Ok(View::message("Select a merge request in the GitLab window."));
         };
 
         if self.commits.as_ref().map(|(i, _)| *i) != Some(iid) {
@@ -1928,7 +2000,7 @@ impl GitLab {
         }
 
         let Some(iid) = Self::selected() else {
-            return Ok(View::message("Select a merge request in the Merge Requests tool window."));
+            return Ok(View::message("Select a merge request in the GitLab window."));
         };
 
         let repo = gitlab_project(ctx)?;
@@ -2254,7 +2326,7 @@ impl Views for GitLab {
             }
 
             if matches!(view, LIST | DETAILS) {
-                if let Err(error) = self.ensure_view_owner(ctx) { return Ok(View::message(&error.to_string())); }
+                if let Err(error) = self.ensure_view_owner(ctx) { let message = error.to_string(); return Ok(with_share_offer(View::message(&message), &message)); }
             }
 
             let rendered = match view {
@@ -2264,11 +2336,15 @@ impl Views for GitLab {
                 _ => return Err(Error::NotFound(format!("view {view}"))),
             };
 
-            Ok(rendered.unwrap_or_else(|e| View::message(&e.to_string()).button(Button::new("refresh", "Refresh").icon("refresh"))))
+            Ok(rendered.unwrap_or_else(|e| {
+                let message = e.to_string();
+                with_share_offer(View::message(&message).button(Button::new("refresh", "Refresh").icon("refresh")), &message)
+            }))
         })().map(ui_kit::actions::available)
     }
 
     fn handle(&mut self, view: &str, event: ViewEvent, ctx: &Invocation) -> Result<(), Error> {
+        let _interactive = api::Interactive::start();
         self.ensure_account()?;
         if self.handle_content_action(view, &event, ctx)? {
             return Ok(());
@@ -2284,6 +2360,9 @@ impl Views for GitLab {
         }
         if matches!(&event, ViewEvent::Button(id) if id == "new-token") {
             return host::open_url(&api::new_token_url());
+        }
+        if matches!(&event, ViewEvent::Button(id) if id == "share-project") {
+            return self.run_command("share-project", ctx, None).map(|_| ());
         }
         if matches!(view, LIST | DETAILS) { self.ensure_view_owner(ctx)?; }
 

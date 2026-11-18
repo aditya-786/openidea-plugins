@@ -199,7 +199,7 @@ mod tests {
         let legacy=spring_text::config::yaml(&amplified);
         let legacy_paths=legacy.iter().map(|key|key.key.len()).sum::<usize>();
         assert!(legacy_paths>4<<20);
-        eprintln!("controlled pre-budget observation: input{}bytes yielded{}allocated pathbytes in legacy scanner; bounded scanner refuses before aggregate4MiB allocation",amplified.len(),legacy_paths);
+        eprintln!("controlled pre-budget observation: input{}bytes yielded{}allocated pathbytes in legacy scanner; bounded scanner refuses before aggregate 4MiB allocation",amplified.len(),legacy_paths);
         drop(legacy);
         assert!(keys(&amplified,8192,4<<20,48).is_none());
         assert!(crate::pointer_status::Proof::parse(&amplified).is_none());

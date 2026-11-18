@@ -19,6 +19,12 @@ pub(crate) struct Adapter {
     snapshot: Option<Snapshot>,
     eligible: bool,
 }
+impl Adapter {
+    pub(crate) fn source(&self) -> Option<(String, String)> {
+        let snapshot = self.snapshot.as_ref()?;
+        Some((snapshot.path.clone(), snapshot.root.clone()))
+    }
+}
 struct Snapshot {
     root: String,
     path: String,
@@ -124,7 +130,7 @@ impl Ideolog {
             || doc.text.lines().count() > 512
             || doc.text.lines().any(|l| l.len() > 4096)
         {
-            return Err("JVM observations support a nonempty log up to64KiB/512lines, each at most4096bytes.".into());
+            return Err("JVM observations support a nonempty log up to 64 KiB and 512 lines, each at most 4096 bytes.".into());
         }
         let config = patterns::combined(&host::setting_string(CUSTOM_PATTERNS).unwrap_or_default());
         let formats: Vec<_> = log::elements(&config)
@@ -175,28 +181,15 @@ impl Ideolog {
             .collect();
         let indexes = indexes.map_err(|_| "Invalid JVM capture column.")?;
         if indexes.iter().any(|n| !(-1..=128).contains(n)) {
-            return Err("JVM capture columns must be -1 through128.".into());
+            return Err("JVM capture columns must be -1 through 128.".into());
         }
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(&path);
         let preview = format!(
-            "Run approved Java17+ source launcher in plugin-private storage; no project/application bootstrap.\nLog: {}\nFormat: {}\nInput: {}bytes, {}lines\nLocale: {}\nTimezone: {}\nRegex: {}\nDate pattern: {}\n\nOnly this bounded log is sent to the local Java helper. Snapshot results do not change editor highlighting.",
-            path,
+            "Java 17 or newer runs the {} regex and date pattern on the {} lines of {name} and lists what each line matches.\nIt only reads this log; nothing in your project runs.\nEditor highlighting does not change.",
             field("name", "Custom format"),
-            doc.text.len(),
-            doc.text.lines().count(),
-            if locale.is_empty() {
-                "JVM default"
-            } else {
-                &locale
-            },
-            if zone.is_empty() {
-                "JVM default"
-            } else {
-                &zone
-            },
-            regex,
-            date
+            doc.text.lines().count()
         );
-        if !ui_kit::prompts::confirm_exact("Capture Java regex/date observations?", &preview)? {
+        if !ui_kit::prompts::confirm_exact(&format!("Capture JVM regex and date observations for {name}?"), &preview)? {
             return Err(Error::Cancelled);
         }
         let latest = editor.document()?;
@@ -236,7 +229,8 @@ impl Ideolog {
         let child = host::start(
             &host::Command::new("java").args(["-Xmx64m", "--source", "17", &helper, &input.0]),
             None,
-        )?;
+        )
+        .map_err(|e| ui_kit::denied::map(e, "Capture JVM Regex and Date Observations", "process:java", "Ideolog"))?;
         child.close_stdin()?;
         let task = host::begin_task("Capture JVM log observations", true);
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -262,7 +256,7 @@ impl Ideolog {
             }
             if let Some(status) = chunk.status {
                 if status != 0 {
-                    return Err(format!("Java17+ helper failed (status{status}); verify approved JDK and custom patterns. Previous observations retained. {}",errors.chars().take(512).collect::<String>()).into());
+                    return Err(format!("Java 17+ helper failed (status {status}); verify approved JDK and custom patterns. Previous observations retained. {}",errors.chars().take(512).collect::<String>()).into());
                 }
                 break;
             }
@@ -450,7 +444,7 @@ impl Ideolog {
     pub(crate) fn render_jvm(&self, ctx: &Invocation) -> Result<View, Error> {
         let Some(snapshot) = &self.jvm.snapshot else {
             return Ok(View::message(
-                "No JVM observations. Focus a project log and run Capture JVM Observations. Java17+ is optional; syntax providers never launch it.",
+                "No JVM observations. Focus a log file of this project and run Ideolog: Capture JVM Regex and Date Observations. It needs Java 17 or newer.",
             ));
         };
         if ctx.project().and_then(|p| p.root().ok()).as_deref() != Some(&snapshot.root) {
@@ -572,7 +566,7 @@ mod tests {
         h.answer_next_prompt(Some(&[]));
         assert!(matches!(
             Ideolog::default().capture_jvm(&h.invocation()),
-            Err(Error::Denied(_))
+            Err(Error::Invalid(m)) if m == "Capture JVM Regex and Date Observations needs the process:java permission. Allow it in Settings › Plugins › Ideolog."
         ));
         assert!(h.process_runs().is_empty());
         h.open_editor("/project/huge.log", "log", &"x".repeat(65537), &[]);

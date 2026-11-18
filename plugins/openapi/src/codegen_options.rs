@@ -9,11 +9,11 @@ pub(crate) struct Options {
 }
 fn catalog(output: &str) -> Result<Vec<(String, String)>, Error> {
     if output.len() > 128 << 10 {
-        return Err("Generator option help exceeds128KiB.".into());
+        return Err("The generator's option list is too long (over 128 KiB).".into());
     }
     let (_, body) = output
         .split_once("CONFIG OPTIONS")
-        .ok_or("Unknown installed generator option-help format.")?;
+        .ok_or("Couldn't read the generator's option list. Check that swagger-codegen works.")?;
     let mut options: Vec<(String, String)> = Vec::new();
     for line in body.lines() {
         if let Some(name) = line
@@ -27,11 +27,11 @@ fn catalog(output: &str) -> Result<Vec<(String, String)>, Error> {
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
                 || options.iter().any(|(key, _)| key == name)
             {
-                return Err("Ambiguous generator option names.".into());
+                return Err("The generator lists an option twice or with an unusual name, so options can't be offered.".into());
             }
             options.push((name.into(), String::new()));
             if options.len() > 256 {
-                return Err("Generator declares more than256 options.".into());
+                return Err("Generator declares more than 256 options.".into());
             }
         } else if let Some((_, description)) = options.last_mut() {
             if description.len() < 4096 {
@@ -54,7 +54,7 @@ fn relative_template(root: &str, input: &str) -> Result<String, Error> {
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
         })
     {
-        return Err("Template directory must be a project-relative physical path.".into());
+        return Err("Use a path relative to the project, with only letters, digits, . _ and - in each part.".into());
     }
     Ok(format!("{}/{input}", root.trim_end_matches('/')))
 }
@@ -66,7 +66,7 @@ fn parse_config(
     available: &[(String, String)],
 ) -> Result<Vec<(String, String)>, Error> {
     if text.len() > 16 << 10 {
-        return Err("Generator JSON config exceeds 16KiB.".into());
+        return Err("The generator JSON config is too large (over 16 KiB).".into());
     }
     let serde_json::Value::Object(map) = serde_json::from_str(text)
         .map_err(|_| Error::from("Generator JSON config is not valid JSON."))?
@@ -80,7 +80,7 @@ fn parse_config(
             .iter()
             .any(|word| lower.contains(word))
         {
-            return Err("Generator JSON config must not contain secrets; pass them natively.".into());
+            return Err("The generator JSON config can't contain passwords, tokens or keys. Pass them to swagger-codegen directly.".into());
         }
         if !available.iter().any(|(name, _)| name == &key) {
             return Err(format!("Generator JSON config option `{key}` is not offered by the installed generator.").into());
@@ -105,7 +105,7 @@ pub(crate) fn collect(project: &Project, root: &str, generator: &str) -> Result<
         None,
     )?;
     if help.status != Some(0) {
-        return Err("Installed generator could not describe its configuration.".into());
+        return Err("swagger-codegen couldn't list this generator's options. Check that it is installed and works.".into());
     }
     let available = catalog(&help.stdout)?;
     let items: Vec<_> = available
@@ -116,7 +116,7 @@ pub(crate) fn collect(project: &Project, root: &str, generator: &str) -> Result<
         })
         .collect();
     let keys = host::pick_many(
-        "Installed generator options to set (empty uses defaults)",
+        "Generator options to set (none keeps the defaults)",
         &items,
     )?
     .ok_or(Error::Cancelled)?;
@@ -131,12 +131,12 @@ pub(crate) fn collect(project: &Project, root: &str, generator: &str) -> Result<
         let description: String = description.chars().take(300).collect();
         let value = host::input(&format!("{key}: {description}"), None)?.ok_or(Error::Cancelled)?;
         if !valid_value(&value) {
-            return Err("Option values must be at most2048 bytes without controls, comma or equals; use a native CLI config file for more complex values.".into());
+            return Err("Option values can be up to 2048 bytes, without commas, = or control characters. Run swagger-codegen with its own config file for other values.".into());
         }
         options.values.push((key, value));
     }
     let config = host::input(
-        "Generator JSON config file, relative to project (empty skips; values are shown for review)",
+        "Generator JSON config file, relative to the project (leave empty to skip)",
         Some(""),
     )?
     .ok_or(Error::Cancelled)?;
@@ -148,7 +148,7 @@ pub(crate) fn collect(project: &Project, root: &str, generator: &str) -> Result<
             != Some(root)
             || project.stat(&path)?.kind != openidea_plugin::FileKind::File
         {
-            return Err("Generator JSON config is not a file owned by this project.".into());
+            return Err("The generator JSON config file wasn't found in this project.".into());
         }
         for (key, value) in parse_config(&project.read_file(&path)?, &available)? {
             if options.values.iter().any(|(k, _)| k == &key) {
@@ -171,7 +171,7 @@ pub(crate) fn collect(project: &Project, root: &str, generator: &str) -> Result<
             != Some(root)
             || project.stat(&path)?.kind != openidea_plugin::FileKind::Directory
         {
-            return Err("Custom template directory is not owned by this project.".into());
+            return Err("The template folder wasn't found in this project.".into());
         }
         let items = [
             PickItem::new("default", "Generator default template engine"),
@@ -179,7 +179,7 @@ pub(crate) fn collect(project: &Project, root: &str, generator: &str) -> Result<
             PickItem::new("handlebars", "Handlebars"),
         ];
         let engine =
-            host::pick("Installed CLI template engine", &items)?.ok_or(Error::Cancelled)?;
+            host::pick("Template engine", &items)?.ok_or(Error::Cancelled)?;
         if !items.iter().any(|item| item.key == engine) {
             return Err(Error::Stale);
         }

@@ -90,7 +90,6 @@ impl LanguageFeatures for Ideolog {
     fn folding(&mut self, doc: &Document) -> Vec<FoldRange> {
         if doc.language != "log"
             || doc.text.len() > MAX_DOCUMENT_BYTES
-            || doc.text.lines().take(8193).count() > 8192
         {
             return Vec::new();
         }
@@ -111,9 +110,7 @@ impl LanguageFeatures for Ideolog {
         let Ok(format) = config.detect_checked(&doc.text, &mut check) else {
             return Vec::new();
         };
-        let Ok(events) = log::events_checked(format, &doc.text, &mut check) else {
-            return Vec::new();
-        };
+        let events = log::events_partial(format, &doc.text, &mut check);
         events
             .into_iter()
             .filter(|event| event.lines.len() > 1)
@@ -236,5 +233,19 @@ mod tests {
         d.language = "log".into();
         d.text = "x".repeat(MAX_DOCUMENT_BYTES + 1);
         assert!(LanguageFeatures::folding(&mut p, &d).is_empty());
+    }
+
+    #[test]
+    fn folding_returns_partial_folds_when_the_deadline_expires() {
+        let config = Config::default();
+        let text = "2024-05-01 10:00:00,123 [   1] ERROR - #a.B - boom\n    at a.B.c(B.java:1)\n".repeat(3000);
+        let format = config.detect(&text);
+        let mut checks = 0;
+        let events = log::events_partial(format, &text, || {
+            checks += 1;
+            if checks > 2000 { Err(()) } else { Ok(()) }
+        });
+        assert!(!events.is_empty() && events.len() < 3000);
+        assert!(events.iter().all(|e| e.lines.len() == 2), "the event being extended is dropped");
     }
 }

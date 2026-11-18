@@ -1,0 +1,13 @@
+html,body{margin:0;overflow-x:clip;background:var(--ui-bg);color:var(--ui-fg);font:var(--ui-text)/var(--ui-leading) var(--ui-font)}
+.ops-toolbar{position:sticky;top:0;z-index:1;padding:var(--ui-space-1)}
+.ops-toolbar .ui-input{flex:1;width:100%}
+.ops-status{margin:0;padding:var(--ui-space-1) var(--ui-space-2);color:var(--ui-muted);font-size:var(--ui-text-small)}
+.ops-status:empty{display:none}
+.ops-tag{display:flex;justify-content:space-between;gap:var(--ui-space-2);margin:0;padding:var(--ui-space-1) var(--ui-space-2);font:inherit;font-weight:600;color:var(--ui-strong);overflow-wrap:anywhere}
+.ops-tag span{color:var(--ui-muted);font-weight:400}
+/* Rows are buttons (the kit decorates them): laid out as list rows, not push buttons. */
+.ops-row{display:flex;align-items:baseline;justify-content:flex-start;gap:var(--ui-space-2);width:100%;height:auto;min-height:24px;min-width:0;padding:2px var(--ui-space-2);border:0;border-radius:0;background:transparent;color:var(--ui-fg);font:inherit;text-align:left;cursor:pointer}
+.ops-row:hover{background:var(--ui-hover)}
+.ops-row:focus-visible{outline:2px solid var(--ui-focus);outline-offset:-2px}
+.ops-row .ui-http-method{flex:0 0 3.5em;font-size:var(--ui-text-small)}
+.ops-path{min-width:0;font-family:var(--ui-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

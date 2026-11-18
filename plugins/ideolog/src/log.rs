@@ -89,6 +89,9 @@ pub struct Config {
 pub enum Severity {
     Error,
     Warning,
+    Info,
+    Debug,
+    Trace,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -165,6 +168,29 @@ impl Default for Config {
 }
 
 impl Format {
+    /// Whether events of this format can carry `level`. Errors and warnings always can (syslog
+    /// finds them in the message); a pattern that spells out its levels (`DEBUG|INFO|…`) and
+    /// leaves one out cannot.
+    // ponytail: reads the pattern's text; a custom format listing levels in an odd spelling shows a row too many or too few.
+    pub fn expresses(&self, level: Severity) -> bool {
+        if matches!(level, Severity::Error | Severity::Warning) {
+            return true;
+        }
+        if self.level_from_message || self.severity_column.is_none() {
+            return false;
+        }
+        let pattern = self.pattern.as_str().to_ascii_uppercase();
+        let spells = |words: &[&str]| words.iter().any(|word| pattern.contains(word));
+        if !spells(&["DEBUG", "DBG"]) {
+            return true;
+        }
+        match level {
+            Severity::Info => spells(&["INFO", "INF", "NOTICE"]),
+            Severity::Trace => spells(&["TRACE", "TRC", "VRB", "VERBOSE", "FINER"]),
+            _ => true,
+        }
+    }
+
     fn new(uuid: &str, pattern: &str, line_start: &str, time: i64, severity: i64, category: i64) -> Result<Self, String> {
         // Ideolog compiles parsing patterns with DOTALL.
         let compile = |p: &str, flags: &str| Regex::new(&format!("{flags}{p}")).map_err(|e| format!("{p}: {e}"));
@@ -411,7 +437,15 @@ impl<'a> Parsed<'a> {
 
     /// From the severity column (the first column of plain logs), normalized
     /// like Ideolog's `LogEvent.level`.
+    /// Error or warning only: what colours, the outline and next-error use.
     pub fn severity(&self, format: Option<&Format>) -> Option<Severity> {
+        self.level(format).filter(|level| matches!(level, Severity::Error | Severity::Warning))
+    }
+
+    /// Every level, with java.util.logging's FINE as debug and FINER/FINEST as trace. Single
+    /// letters other than E and W count only in a format's own severity column, not in the
+    /// first word of a plain log.
+    pub fn level(&self, format: Option<&Format>) -> Option<Severity> {
         if format.is_some_and(|f| f.level_from_message) {
             return message_severity(self.message());
         }
@@ -423,6 +457,12 @@ impl<'a> Parsed<'a> {
                 Some(Severity::Error)
             }
             "W" | "WRN" | "WARN" | "WARNING" => Some(Severity::Warning),
+            "INFO" | "INF" | "NOTICE" | "CONFIG" => Some(Severity::Info),
+            "DEBUG" | "DBG" | "FINE" => Some(Severity::Debug),
+            "TRACE" | "TRC" | "VRB" | "VERBOSE" | "FINER" | "FINEST" => Some(Severity::Trace),
+            "I" if format.is_some() => Some(Severity::Info),
+            "D" if format.is_some() => Some(Severity::Debug),
+            "T" | "V" if format.is_some() => Some(Severity::Trace),
             _ => None,
         }
     }
@@ -543,7 +583,27 @@ pub fn events<'a>(format: Option<&Format>, text: &'a str) -> Vec<Event<'a>> {
 /// The same grouping with cooperative checkpoints before each physical line.
 /// A single synchronous regex match remains non-preemptible.
 pub fn events_checked<'a, E>(format: Option<&Format>, text: &'a str, mut checkpoint: impl FnMut() -> Result<(), E>) -> Result<Vec<Event<'a>>, E> {
-    let mut events: Vec<Event> = Vec::new();
+    let mut events = Vec::new();
+    group_events(format, text, &mut checkpoint, &mut events)?;
+    Ok(events)
+}
+
+/// The events complete when the checkpoint stopped the grouping; the event
+/// being extended at that point is dropped because it may continue.
+pub fn events_partial<'a, E>(format: Option<&Format>, text: &'a str, mut checkpoint: impl FnMut() -> Result<(), E>) -> Vec<Event<'a>> {
+    let mut events = Vec::new();
+    if group_events(format, text, &mut checkpoint, &mut events).is_err() {
+        events.pop();
+    }
+    events
+}
+
+fn group_events<'a, E>(
+    format: Option<&Format>,
+    text: &'a str,
+    checkpoint: &mut impl FnMut() -> Result<(), E>,
+    events: &mut Vec<Event<'a>>,
+) -> Result<(), E> {
     for (index, (offset, line)) in lines(text).enumerate() {
         checkpoint()?;
         let index = index as u32;
@@ -557,8 +617,7 @@ pub fn events_checked<'a, E>(format: Option<&Format>, text: &'a str, mut checkpo
 
         events.push(Event { text: &text[offset..offset + line.len()], offset, lines: index..index + 1 });
     }
-    checkpoint()?;
-    Ok(events)
+    checkpoint()
 }
 
 pub fn floor_char_boundary(text: &str, mut at: usize) -> usize {
@@ -880,5 +939,38 @@ mod tests {
     #[test]
     fn unescapes_xml_entities() {
         assert_eq!(unescape("msg=&quot;(.*)&quot; &amp;&lt;&gt; &#65;&#x42; &bogus"), r#"msg="(.*)" &<> AB &bogus"#);
+    }
+
+    #[test]
+    fn levels_cover_common_spellings_and_isolated_letters_only() {
+        let config = Config::default();
+        let level = |line: &str| {
+            let format = config.detect(line);
+            Parsed::new(format, line).level(format)
+        };
+        let pipe = |value: &str| level(&format!("2024-05-01|{value}|main|message"));
+        for (value, expected) in [
+            ("INFO", Severity::Info),
+            ("notice", Severity::Info),
+            ("CONFIG", Severity::Info),
+            ("DEBUG", Severity::Debug),
+            ("FINE", Severity::Debug),
+            ("FINER", Severity::Trace),
+            ("FINEST", Severity::Trace),
+            ("trace", Severity::Trace),
+            ("I", Severity::Info),
+            ("D", Severity::Debug),
+            ("T", Severity::Trace),
+            ("SEVERE", Severity::Error),
+            ("W", Severity::Warning),
+        ] {
+            assert_eq!(pipe(value), Some(expected), "{value}");
+        }
+        assert_eq!(pipe("CUSTOM"), None);
+        assert_eq!(level("05-01 10:00:00.000  1234  1234 V Tag: verbose"), Some(Severity::Trace));
+        assert_eq!(level("2024-05-01 10:00:00.000 +02:00 [DBG] x"), Some(Severity::Debug));
+        assert_eq!(Parsed::new(None, "I think so").level(None), None);
+        assert_eq!(Parsed::new(None, "DEBUG plain").level(None), Some(Severity::Debug));
+        assert_eq!(Parsed::new(None, "DEBUG plain").severity(None), None, "colours and next-error stay error/warning only");
     }
 }

@@ -167,10 +167,10 @@ fn known_wrong_return(f: &JavaFile, text:&str, kotlin: bool, m: &Member) -> bool
     )
 }
 
-pub(super) fn check(doc: &Document, f: &JavaFile) -> Vec<Diagnostic> {
+pub(super) fn check(doc: &Document, f: &JavaFile, extended: &dyn Fn(&str) -> bool) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let text = &doc.text;
-    for t in &f.types {
+    for (ti, t) in f.types.iter().enumerate() {
         let legacy: Vec<_> = t
             .methods()
             .filter(|m| {
@@ -181,8 +181,8 @@ pub(super) fn check(doc: &Document, f: &JavaFile) -> Vec<Diagnostic> {
         let mut indicators = HashSet::new();
         for command in &legacy {
             let a = command.annotation("ShellMethod").unwrap();
-            if t.annotations.is_empty() && t.supers().next().is_none() && t.kind == "class" {
-                out.push(problem(range(text,command.at,command.at+command.name.len()),Severity::Warning,"missing-shell-component","Legacy command's unannotated enclosing class has no ShellComponent declaration. Registration through external/meta configuration is not inferred.".into()));
+            if t.annotations.is_empty() && t.supers().next().is_none() && t.kind == "class" && !t.modifiers.iter().any(|m| m == "abstract") && !extended(&f.qualified(ti)) {
+                out.push(problem(range(text,command.at,command.at+command.name.len()),Severity::Warning,"missing-shell-component","This class has no @ShellComponent, so Spring Shell may not register its @ShellMethod commands. Ignore this if the class is registered another way.".into()));
             }
             let missing = a.arg("value").is_none()
                 || literals(a, "value").is_some_and(|s| s.len() == 1 && s[0].value.is_empty());
@@ -227,7 +227,7 @@ pub(super) fn check(doc: &Document, f: &JavaFile) -> Vec<Diagnostic> {
                                 literal_range(text, values[0]),
                                 Severity::Warning,
                                 "availability-method-reference",
-                                "No local zero-argument indicator method has this literal name."
+                                "This class has no method with this name and no parameters."
                                     .into(),
                             ));
                         }
@@ -280,7 +280,7 @@ pub(super) fn check(doc: &Document, f: &JavaFile) -> Vec<Diagnostic> {
                     })
                     .count();
                 if candidates > 1 {
-                    out.push(problem(range(text,command.at,command.at+command.name.len()),Severity::Error,"availability-ambiguous","Multiple literal named availability selectors apply to this command; no local higher-priority indicator is declared.".into()));
+                    out.push(problem(range(text,command.at,command.at+command.name.len()),Severity::Error,"availability-ambiguous","Several @ShellMethodAvailability methods name this command. Keep only one.".into()));
                 }
             }
         }
@@ -330,7 +330,7 @@ pub(super) fn check(doc: &Document, f: &JavaFile) -> Vec<Diagnostic> {
                                     literal_range(text, s),
                                     Severity::Error,
                                     "unknown-command",
-                                    format!("No local legacy command declares the literal availability selector `{}`.", s.value),
+                                    format!("No @ShellMethod command in this class is named `{}`.", s.value),
                                 ));
                             }
                         }
@@ -362,7 +362,7 @@ pub(super) fn check(doc: &Document, f: &JavaFile) -> Vec<Diagnostic> {
                                 range(text, a.name_at, a.name_at + a.name.len()),
                                 Severity::Warning,
                                 "option-arity-range",
-                                "Literal arityMax is below arityMin; supported annotation registration normalizes the maximum upward."
+                                "arityMax is lower than arityMin. Spring Shell raises arityMax to arityMin."
                                     .into(),
                             ));
                         }
@@ -416,7 +416,9 @@ mod tests {
     }
     fn codes(text: &str) -> Vec<String> {
         let doc = doc(text, false);
-        ShellTools::default()
+        let mut tools = ShellTools::default();
+        tools.line_markers(&doc);
+        tools
             .diagnostics(&doc)
             .into_iter()
             .map(|d| d.code.unwrap())
@@ -637,7 +639,7 @@ mod tests {
     }
     #[test]
     fn component_placement_warns_only_for_unannotated_closed_classes() {
-        let _host = MockHost::install().with_capabilities(&[]);
+        let _host = MockHost::install();
         let bare = "import org.springframework.shell.standard.ShellMethod; class C { @ShellMethod(\"Run\") void run(){} }";
         assert_eq!(codes(bare), ["missing-shell-component"]);
         for quiet in [

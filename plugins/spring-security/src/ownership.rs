@@ -1,8 +1,6 @@
 //! Read-only source candidates. Semantic Spring bean ownership stays separate.
 use super::*;
 use openidea_plugin::hover::Hover;
-use quick_xml::{events::Event, reader::NsReader};
-use std::time::{Duration, Instant};
 const SECURITY: &str = "http://www.springframework.org/schema/security";
 const BEANS: &str = "http://www.springframework.org/schema/beans";
 const MAX_TEXT: usize = 32 << 10;
@@ -22,49 +20,9 @@ fn candidate(doc: &Document, at: Position) -> Option<Candidate> {
         || !doc.path.ends_with(".xml")
         || doc.text.len() > MAX_TEXT
         || doc.text.contains('&')
-        || !doc.path.starts_with('/')
-        || doc.path.contains('\\')
-        || doc.path.split('/').any(|s| s == "." || s == "..")
-        || spring_text::index::project_of(&doc.path).is_none()
+        || spring_text::index::owning_root(&doc.path).is_none()
+        || !xml::analysis_valid(&doc.text)
     {
-        return None;
-    }
-    let deadline = Instant::now() + Duration::from_millis(10);
-    let mut reader = NsReader::from_str(&doc.text);
-    let mut depth = 0usize;
-    let mut roots = 0;
-    for count in 0..=4096 {
-        if count == 4096 || Instant::now() >= deadline {
-            return None;
-        }
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                if depth == 0 {
-                    roots += 1;
-                }
-                if !crate::xml_namespaces::valid(&reader, &e) {
-                    return None;
-                }
-                depth += 1;
-            }
-            Ok(Event::Empty(e)) => {
-                if depth == 0 {
-                    roots += 1;
-                }
-                if !crate::xml_namespaces::valid(&reader, &e) {
-                    return None;
-                }
-            }
-            Ok(Event::End(_)) => depth = depth.checked_sub(1)?,
-            Ok(Event::DocType(_) | Event::GeneralRef(_)) | Err(_) => return None,
-            Ok(Event::Text(t)) if depth == 0 && !t.as_ref().trim().is_empty() => return None,
-            Ok(Event::CData(_)) if depth == 0 => return None,
-            Ok(Event::Decl(_)) if depth != 0 || roots != 0 => return None,
-            Ok(Event::Eof) => break,
-            _ => {}
-        }
-    }
-    if roots != 1 || depth != 0 {
         return None;
     }
     let elements = xml::elements(&doc.text);
@@ -75,9 +33,6 @@ fn candidate(doc: &Document, at: Position) -> Option<Candidate> {
     let off = offset(&doc.text, at)?;
     let mut selected = None;
     for (i, e) in elements.iter().enumerate() {
-        if Instant::now() >= deadline {
-            return None;
-        }
         if xml::namespace(&elements, i) != Some(SECURITY) {
             continue;
         }
@@ -92,9 +47,6 @@ fn candidate(doc: &Document, at: Position) -> Option<Candidate> {
     let mut targets = Vec::new();
     let mut conflict = false;
     for (i, e) in elements.iter().enumerate().filter(|(_, e)| e.parent == Some(0)) {
-        if Instant::now() >= deadline {
-            return None;
-        }
         if e.value("id") == Some(selected.value.as_str()) && (xml::namespace(&elements, i) != Some(BEANS) || e.local() != "bean") {
             conflict = true;
         }

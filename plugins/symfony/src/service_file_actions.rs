@@ -164,8 +164,8 @@ pub(crate) fn resolve(
     let mut proposed = services.clone();
     proposed.replace_range(range.clone(), &replacement);
     let preview = format!(
-        "Source: {}\nVersion: {}\nClass: {}\nTarget: {target}\n\nExact resulting service file:\n{proposed}\n\nConstructor values are source-based suggestions/placeholders, not proven runtime wiring. One atomic existing-file edit; PHP source remains unchanged.",
-        doc.path, doc.version, model.fqcn
+        "Adds a service for {} to {target}.\nConstructor values are suggestions or placeholders; check them. The PHP class is unchanged.\nUndo in the editor.\n\nResulting file:\n{proposed}",
+        model.fqcn
     );
     if !ui_kit::prompts::confirm_exact("Add service definition?", &preview)? {
         return Err(Error::Cancelled);

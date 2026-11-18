@@ -1,7 +1,6 @@
 //! Current-document transition candidates; no discovery, source reads or Rename graph.
 use crate::*;
 use openidea_plugin::hover::Hover;
-use quick_xml::{events::Event, reader::NsReader};
 const NS: &str = "http://www.springframework.org/schema/batch";
 const MAX_TEXT: usize = 32 * 1024;
 const STATES: &[&str] = &["step", "flow", "split", "decision"];
@@ -16,13 +15,7 @@ struct Model {
     candidates: Vec<Candidate>,
     eligible: bool,
 }
-fn literal(s: &str) -> bool {
-    let mut b = s.bytes();
-    s.len() <= 128
-        && b.next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
-        && b.all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
-}
+use spring_text::provenance::literal;
 fn model(doc: &Document, at: Position) -> Option<Model> {
     if doc.language != "xml"
         || !doc.path.ends_with(".xml")
@@ -41,55 +34,9 @@ fn model(doc: &Document, at: Position) -> Option<Model> {
     if doc.text.len() > MAX_TEXT || doc.text.contains('&') {
         return Some(empty());
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10);
-    let mut reader = NsReader::from_str(&doc.text);
-    let mut roots = 0usize;
-    let mut declarations = 0usize;
-    let mut depth = 0usize;
-    for count in 0..=4096 {
-        if count == 4096 || std::time::Instant::now() >= deadline {
-            return Some(empty());
-        }
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                if depth == 0 {
-                    roots += 1;
-                }
-                if !crate::xml_namespaces::valid(&reader, &e) {
-                    return Some(empty());
-                }
-                depth += 1;
-            }
-            Ok(Event::Empty(e)) => {
-                if depth == 0 {
-                    roots += 1;
-                }
-                if !crate::xml_namespaces::valid(&reader, &e) {
-                    return Some(empty());
-                }
-            }
-            Ok(Event::End(_)) => {
-                let Some(next) = depth.checked_sub(1) else {
-                    return Some(empty());
-                };
-                depth = next;
-            }
-            Ok(Event::DocType(_) | Event::GeneralRef(_)) | Err(_) => return Some(empty()),
-            Ok(Event::Text(t))
-                if depth == 0 && !t.as_ref().bytes().all(|b| b.is_ascii_whitespace()) =>
-            {
-                return Some(empty());
-            }
-            Ok(Event::CData(_)) if depth == 0 => return Some(empty()),
-            Ok(Event::Decl(_)) => {
-                if depth != 0 || roots != 0 || declarations != 0 || !doc.text.strip_prefix('\u{feff}').unwrap_or(&doc.text).starts_with("<?xml") { return Some(empty()); }
-                declarations += 1;
-            }
-            Ok(Event::Eof) => break,
-            _ => {}
-        }
-    }
-    if roots != 1 || depth != 0 {
+    let unprefixed = doc.text.strip_prefix('\u{feff}').unwrap_or(&doc.text);
+    let declaration_misplaced = unprefixed.contains("<?xml") && !unprefixed.starts_with("<?xml");
+    if !spring_text::xml::analysis_valid(&doc.text) || doc.text.to_ascii_lowercase().contains("<!doctype") || declaration_misplaced {
         return Some(empty());
     }
     let elements = xml::elements(&doc.text);
@@ -174,9 +121,6 @@ fn model(doc: &Document, at: Position) -> Option<Model> {
         .enumerate()
         .filter(|(_, e)| e.parent == Some(scope) && STATES.contains(&e.local()))
     {
-        if std::time::Instant::now() >= deadline {
-            return Some(empty());
-        }
         if xml::namespace(&elements, i) != Some(NS) {
             continue;
         }
@@ -326,6 +270,15 @@ mod tests {
         assert!(items.iter().all(
             |i| i.replace == Some(Range::new(pos, Position::new(pos.line, pos.character + 6)))
         ));
+    }
+    #[test]
+    fn lowercase_doctype_disables_navigation() {
+        let _h = MockHost::install();
+        let mut owner = structure::Structure::default();
+        let d = doc(
+            "<!doctype b:job []><b:job id='one'><b:step id='a' next='finish'/><b:step id='finish'/></b:job>",
+        );
+        assert!(owner.definition(&d, at(&d, "finish")).is_empty());
     }
     #[test]
     fn missing_target_never_falls_back_to_other_jobs_or_project_sources() {

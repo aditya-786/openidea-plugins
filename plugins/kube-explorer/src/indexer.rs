@@ -91,31 +91,33 @@ fn value_of(line: &str, line_number: u32, after_colon: usize) -> Option<Value> {
     let offset = after_colon + (rest.len() - rest.trim_start().len());
     let mut raw = line[offset..].trim_end();
     let mut start = offset;
-    let quoted = raw.starts_with(['\"', '\'']);
-    if let Some(quote) = raw.chars().next().filter(|c| matches!(c, '"' | '\'')) {
-        raw = &raw[1..];
-        start += 1;
-        let end = raw.find(quote)?;
-        let tail = raw[end + quote.len_utf8()..].trim_start();
+    let quoted = raw.starts_with(['"', '\'']);
+    let mut unescaped = None;
+    if quoted {
+        let (text, end) = crate::label_refs::unquote(line, offset)?;
+        let tail = line[end + 1..].trim_start();
         if !tail.is_empty() && !tail.starts_with('#') {
             return None;
         }
-        raw = &raw[..end];
+        start += 1;
+        raw = &line[start..end];
+        unescaped = Some(text);
     } else if let Some((before, _)) = raw.split_once(" #") {
         raw = before.trim_end();
     }
+    let text = unescaped.unwrap_or_else(|| raw.to_owned());
     let numeric = raw.replace('_', "");
     let typed_scalar =
         matches!(raw.to_ascii_lowercase().as_str(), "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off" | "y" | "n")
             || numeric.parse::<f64>().is_ok()
             || numeric.strip_prefix("0x").is_some_and(|v| u64::from_str_radix(v, 16).is_ok())
             || numeric.strip_prefix("0o").is_some_and(|v| u64::from_str_radix(v, 8).is_ok());
-    if !quoted && typed_scalar || raw.is_empty() || raw.contains("{{") || raw.contains("${") {
+    if !quoted && typed_scalar || text.is_empty() || text.contains("{{") || text.contains("${") {
         return None;
     }
     let column = line[..start].encode_utf16().count() as u32;
     Some(Value {
-        text: raw.to_owned(),
+        text,
         range: Range::new(Position::new(line_number, column), Position::new(line_number, column + raw.encode_utf16().count() as u32)),
     })
 }
@@ -218,7 +220,7 @@ fn parse(text: &str) -> Option<Vec<Manifest>> {
     let mut stack: Vec<(usize, String)> = Vec::new();
     for (line_number, line) in text.split_inclusive('\n').enumerate() {
         let body = line.trim_end_matches(['\r', '\n']);
-        if matches!(body, "---" | "...") || body.starts_with("--- #") || body.starts_with("... #") {
+        if crate::manifest::is_separator(body) || matches!(body, "...") || body.starts_with("... #") {
             if docs.len() == MAX_ANCHORS {
                 return None;
             }
@@ -481,20 +483,44 @@ fn edges_at(path: &str, text: &str) -> Edges {
     edges_in(path, text, false)
 }
 
+const TRANSFORMER_MARKERS: [&str; 4] = ["kustomization.yaml", "kustomization.yml", "Kustomization", "Chart.yaml"];
+
+pub(crate) fn transformer_marker(path: &str) -> bool {
+    path.rsplit('/').next().is_some_and(|name| TRANSFORMER_MARKERS.contains(&name))
+}
+
+/// Per project root: whether any kustomization or chart exists, found once instead of once per indexed file.
+#[derive(Default)]
+pub(crate) struct TransformerFlags(BTreeMap<String, bool>);
+
+impl TransformerFlags {
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn present(&mut self, project: &openidea_plugin::Project, root: &str) -> bool {
+        if let Some(present) = self.0.get(root) {
+            return *present;
+        }
+        let present = ["**/kustomization.yaml", "**/kustomization.yml", "**/Kustomization", "**/Chart.yaml"]
+            .iter()
+            .any(|pattern| !matches!(project.find_files(pattern, 1), Ok(found) if found.is_empty()));
+        self.0.insert(root.into(), present);
+        present
+    }
+}
+
 /// Overlay/Helm transforms can rewrite even explicitly written namespaces/names.
 /// Isolate affected source files; reaching no known root or a probe/time bound
 /// is also conservative, never evidence that no overlay exists.
-pub(crate) fn deployment_isolation(path: &str) -> Option<bool> {
+pub(crate) fn deployment_isolation(path: &str, flags: &mut TransformerFlags) -> Option<bool> {
     let project = openidea_plugin::host::project_of(path)?;
     let root = project.root().ok()?;
     // A sibling overlay can reference a base outside its own ancestor chain.
     // A detected deployment transformer anywhere in this indexed project makes
     // source relationships file-local; do not attempt to evaluate overlays.
-    for pattern in ["**/kustomization.yaml", "**/kustomization.yml", "**/Kustomization", "**/Chart.yaml"] {
-        match project.find_files(pattern, 1) {
-            Ok(found) if found.is_empty() => {}
-            _ => return Some(true),
-        }
+    if flags.present(&project, &root) {
+        return Some(true);
     }
     let root = Path::new(&root);
     let mut directory = Path::new(path).parent()?;
@@ -503,7 +529,7 @@ pub(crate) fn deployment_isolation(path: &str) -> Option<bool> {
     }
     let started = Instant::now();
     for _ in 0..32 {
-        for marker in ["kustomization.yaml", "kustomization.yml", "Kustomization", "Chart.yaml"] {
+        for marker in TRANSFORMER_MARKERS {
             let candidate = directory.join(marker);
             match project.exists(candidate.to_str()?) {
                 Ok(true) => return Some(true),
@@ -522,15 +548,15 @@ pub(crate) fn deployment_isolation(path: &str) -> Option<bool> {
     Some(true)
 }
 
+/// Warms the private caches for every indexed YAML file, opened or not. It publishes no
+/// anchors or markers: a users key would have definitions only at usages, which Rename cannot close.
 impl DocumentIndexer for KubeExplorer {
     fn index(&mut self, doc: &Document) -> Edges {
         self.navigation.warm(&doc.path, &doc.text);
         self.crd_schema.warm(&doc.path, &doc.text);
-        self.label_refs.warm(&doc.path,&doc.text);
+        self.label_refs.warm(&doc.path, &doc.text);
         self.kustomize_paths.warm(&doc.path);
-        self.helm_assistance.warm(&doc.path,&doc.text);
-        // A valid declaration span does not establish reference closure or one
-        // deployment identity. Keep the export empty to clear older host graphs.
+        self.helm_assistance.warm(&doc.path, &doc.text);
         Edges::default()
     }
 }
@@ -541,6 +567,25 @@ mod tests {
 
     fn keys(anchors: &[Anchor]) -> Vec<&str> {
         anchors.iter().map(|a| a.key.as_str()).collect()
+    }
+
+    #[test]
+    fn value_of_handles_escaped_quote() {
+        let line = r#"name: "a\"b" # c"#;
+        let value = value_of(line, 0, 5).unwrap();
+        assert_eq!(value.text, "a\"b");
+        assert_eq!(value.range, Range::new(Position::new(0, 7), Position::new(0, 11)));
+        assert_eq!(value_of("name: 'it''s'", 0, 5).unwrap().text, "it's");
+        assert!(value_of("name: \"a\" x", 0, 5).is_none());
+    }
+
+    #[test]
+    fn separator_with_trailing_space_or_tag() {
+        for separator in ["--- ", "--- !tag", "---\t"] {
+            let text = format!("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n  namespace: ns\n{separator}\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: b\n  namespace: ns\n");
+            let defined: Vec<_> = edges(&text).definitions.iter().filter(|d| d.key.starts_with("kube:")).map(|d| d.key.clone()).collect();
+            assert_eq!(defined.len(), 2, "{separator:?}: {defined:?}");
+        }
     }
 
     #[test]
@@ -783,7 +828,7 @@ metadata:
 
     fn indexed(kube: &mut KubeExplorer, path: &str, text: &str) -> Edges {
         let _ = kube;
-        deployment_isolation(path).map_or_else(Edges::default, |isolated| edges_in(path, text, isolated))
+        deployment_isolation(path, &mut TransformerFlags::default()).map_or_else(Edges::default, |isolated| edges_in(path, text, isolated))
     }
 
     #[test]

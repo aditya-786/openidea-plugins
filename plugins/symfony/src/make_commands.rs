@@ -1,6 +1,6 @@
-//! Commands that run MakerBundle, guide to atomic template creation, or insert form rows.
+//! Commands that run MakerBundle, create Twig templates, or insert form rows.
 
-use openidea_plugin::{Error, Invocation, NotificationLevel, PickItem, Position, Range, TextEdit, host};
+use openidea_plugin::{Error, Invocation, PickItem, Position, Range, TextEdit, host};
 
 use crate::php_checks::{arguments, trimmed};
 use crate::php_text::{mask, skip_whitespace};
@@ -37,7 +37,10 @@ impl Main {
     pub(crate) fn make(&mut self, ctx: &Invocation) -> Result<Option<String>, Error> {
         let project = ctx.project().ok_or("No project is open.")?;
         let args = ["bin/console".to_owned(), "list".to_owned(), "make".to_owned(), "--raw".to_owned()];
-        let listed = project.run_process("php", &args, None).ok().filter(|output| output.status == Some(0));
+        let listed = {
+            let _task = host::begin_task("Listing console makers", false);
+            project.run_process("php", &args, None).ok().filter(|output| output.status == Some(0))
+        };
 
         let mut makers: Vec<(String, String)> = Vec::new();
         for line in listed.iter().flat_map(|output| output.stdout.lines()) {
@@ -57,19 +60,33 @@ impl Main {
         };
 
         let mut args = vec!["bin/console".to_owned(), format!("make:{maker}")];
-        args.extend(arguments.split_whitespace().map(str::to_owned));
+        args.extend(shell_words::split(&arguments).map_err(|_| Error::Invalid("Unbalanced quote in the arguments.".into()))?);
         match host::open_terminal(&format!("make:{maker}"), "php", &args) {
-            Err(Error::Denied(_)) => Err("Allow the process:php capability in Settings › Plugins.".into()),
+            Err(Error::Denied(_)) => Err(crate::PHP_DENIED.into()),
             result => result.map(|()| None),
         }
     }
 
-    pub(crate) fn create_template(&mut self, _ctx: &Invocation) -> Result<Option<String>, Error> {
-        host::notify(
-            NotificationLevel::Info,
-            SOURCE,
-            "Place the caret inside a literal unqualified Twig extends/include/embed/use template name, then invoke the Create missing Twig template… intention. Review the exact target/content before one atomic non-overwriting Create. Commands cannot return native FileActions; this command does not write a file.",
-        );
+    pub(crate) fn create_template(&mut self, ctx: &Invocation) -> Result<Option<String>, Error> {
+        let project = ctx.project().ok_or("No project is open.")?;
+        let editor = ctx.editor().filter(|editor| editor.document().is_ok());
+        if let Some(editor) = editor {
+            if ui_kit::command_file_action::run_titled(self, &project, &editor, "Create missing Twig template", SOURCE)? {
+                return Ok(None);
+            }
+        }
+
+        let Some(name) = host::input("Template name (e.g. blog/show.html.twig)", None)? else { return Ok(None) };
+        let name = name.trim();
+        let invalid_name = name.contains('\\')
+            || name.split('/').any(|part| part.is_empty() || part == "..")
+            || !name.ends_with(".twig");
+        if invalid_name {
+            return Err("Use a template name inside templates/ ending in .twig, without '..', empty parts or '\\'.".into());
+        }
+
+        let target = format!("{}/templates/{name}", project.root()?.trim_end_matches('/'));
+        ui_kit::command_file_action::create_empty(&project, &target, "Create Twig template?", SOURCE)?;
         Ok(None)
     }
 
@@ -96,7 +113,7 @@ impl Main {
             index.classes.get(&class).and_then(|entry| project.read_file(&entry.path).ok()).ok_or("The form type cannot be read.")?;
         let fields = form_fields(&source);
         if fields.is_empty() {
-            return Err("The form type adds no fields with a literal name.".into());
+            return Err("The form type has no fields with a fixed name. Add fields with string names first.".into());
         }
 
         let document = editor.document()?;

@@ -6,7 +6,7 @@ fn source(ctx: &Invocation) -> Result<(String, Document), Error> {
     let editor = ctx
         .editor()
         .ok_or("Open a Spring Boot datasource configuration file first.")?;
-    let current = editor.document()?;
+    let current = editor.document().map_err(|error| ui_kit::denied::map(error, "Configure Database from Current Source", "editor.read", "Spring Boot Tools"))?;
     let doc = Document {
         path: editor.path(),
         language: editor.language(),
@@ -237,11 +237,12 @@ pub(crate) fn configure(ctx: &Invocation) -> Result<Option<String>, Error> {
     let (root, doc) = source(ctx)?;
     let (desired, password) = desired(&root, &doc)?;
     let project = ctx.project().ok_or(Error::Stale)?;
-    let ids = project.data_sources()?;
+    let denied = |error| ui_kit::denied::map(error, "Configure Database from Current Source", "database.sources", "Spring Boot Tools");
+    let ids = project.data_sources().map_err(denied)?;
     if !host::confirm(
         "Configure Database from this source file?",
         &format!(
-            "{} the owned Database source from {}\nDriver: {}\nHost: {}\nPort: {}\nDatabase: {}\nUser: {}\nCredential: {}\n\nOnly values declared in this editor are used. Active profiles, imported configuration and runtime overrides are not resolved. This action does not connect, introspect or execute SQL.",
+            "{} the Spring Boot database connection from {}\nDriver: {}\nHost: {}\nPort: {}\nDatabase: {}\nUser: {}\nCredential: {}\n\nUses only the values in this file; other profiles and imported files are ignored. Nothing connects yet.",
             if ids.contains(&desired.id) {
                 "Update"
             } else {
@@ -266,11 +267,11 @@ pub(crate) fn configure(ctx: &Invocation) -> Result<Option<String>, Error> {
     if current_root != root || current != doc {
         return Err(Error::Stale);
     }
-    project.upsert_data_source(&desired)?;
+    project.upsert_data_source(&desired).map_err(denied)?;
     if let Some(password) = password {
-        project.set_data_source_credential(&desired.id, &password)?;
+        project.set_data_source_credential(&desired.id, &password).map_err(denied)?;
     }
-    Ok(Some("Owned Database source configured from the reviewed editor values. No connection or SQL was executed; open Database to connect explicitly.".into()))
+    Ok(Some("Database connection saved from this file. Open the Database window to connect.".into()))
 }
 #[cfg(test)]
 mod tests {
@@ -420,5 +421,12 @@ mod tests {
         assert!(!result.contains("private-secret"));
         assert_eq!(project.data_sources().unwrap().len(), 1);
         assert!(host.requests().is_empty() && host.process_runs().is_empty());
+    }
+    #[test]
+    fn denied_database_sources_names_the_permission() {
+        let host = MockHost::install().with_capabilities(&["project.read", "editor.read"]);
+        host.open_editor("/project/application.properties", "properties", SOURCE, &[(0, 0, 0, 0)]);
+        let error = BootTools::default().run_command("configure-source-database", &host.invocation(), None).unwrap_err().to_string();
+        assert!(error.contains("Configure Database from Current Source needs the database.sources permission. Allow it in Settings › Plugins › Spring Boot Tools."), "{error}");
     }
 }

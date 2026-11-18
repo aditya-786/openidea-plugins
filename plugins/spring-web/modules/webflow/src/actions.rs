@@ -245,7 +245,7 @@ impl FileActions for WebFlow {
             },
         );
         vec![FileAction {
-            title: "Add reviewed local Web Flow transition…".into(),
+            title: "Add Web Flow transition…".into(),
             kind: Some("refactor.rewrite".into()),
             data: Some(key),
             ..Default::default()

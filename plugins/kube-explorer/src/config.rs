@@ -22,8 +22,11 @@ pub fn kubeconfigs() -> Vec<String> {
     setting_list("kubeconfig")
 }
 
-/// One file, never a merge: the stored choice while it is still listed, else the first.
+/// One file, never a merge: the imported profile in use, else the stored choice while it is still listed, else the first.
 pub fn kubeconfig() -> Option<String> {
+    if let Some(imported) = crate::kubeconfig_import::selected_path() {
+        return Some(imported);
+    }
     let files = kubeconfigs();
     let chosen = host::storage::get(CHOSEN_KUBECONFIG).ok().flatten();
     chosen.filter(|file| files.contains(file)).or_else(|| files.into_iter().next())
@@ -36,22 +39,81 @@ pub fn notify_success(title: &str, body: &str) {
     host::notify(NotificationLevel::Info, title, body);
 }
 
-fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
-    match pattern.split_first() {
-        None => text.is_empty(),
-        Some((b'*', rest)) => {
-            let (rest, crosses_slash) = match rest.split_first() {
-                Some((b'*', deeper)) => (deeper, true),
-                _ => (rest, false),
-            };
-            let rest = if crosses_slash { rest.strip_prefix(b"/").unwrap_or(rest) } else { rest };
-            (0..=text.len())
-                .take_while(|&at| crosses_slash || !text[..at].contains(&b'/'))
-                .any(|at| glob_match(rest, &text[at..]))
-        }
-        Some((b'?', rest)) => text.split_first().is_some_and(|(c, tail)| *c != b'/' && glob_match(rest, tail)),
-        Some((c, rest)) => text.split_first().is_some_and(|(t, tail)| t == c && glob_match(rest, tail)),
+/// `notify_success` with buttons; a plain balloon if the host refuses them.
+pub fn notify_success_with(title: &str, body: &str, actions: &[openidea_plugin::NotificationAction]) {
+    if host::setting_bool("notifySuccess") == Some(false) {
+        return;
     }
+    if host::notify_with_actions(NotificationLevel::Info, title, body, actions).is_err() {
+        host::notify(NotificationLevel::Info, title, body);
+    }
+}
+
+enum Token {
+    Literal(u8),
+    AnyChar,
+    Star { crosses_slash: bool },
+}
+
+fn tokens(pattern: &[u8]) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while at < pattern.len() {
+        match pattern[at] {
+            b'*' if pattern.get(at + 1) == Some(&b'*') => {
+                at += 2;
+                if pattern.get(at) == Some(&b'/') {
+                    at += 1;
+                }
+                tokens.push(Token::Star { crosses_slash: true });
+            }
+            b'*' => {
+                at += 1;
+                tokens.push(Token::Star { crosses_slash: false });
+            }
+            b'?' => {
+                at += 1;
+                tokens.push(Token::AnyChar);
+            }
+            byte => {
+                at += 1;
+                tokens.push(Token::Literal(byte));
+            }
+        }
+    }
+    tokens
+}
+
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    let mut reachable = vec![false; text.len() + 1];
+    reachable[0] = true;
+    for token in tokens(pattern) {
+        let mut next = vec![false; text.len() + 1];
+        match token {
+            Token::Literal(byte) => {
+                for at in 0..text.len() {
+                    next[at + 1] = reachable[at] && text[at] == byte;
+                }
+            }
+            Token::AnyChar => {
+                for at in 0..text.len() {
+                    next[at + 1] = reachable[at] && text[at] != b'/';
+                }
+            }
+            Token::Star { crosses_slash } => {
+                let mut open = false;
+                for at in 0..=text.len() {
+                    open |= reachable[at];
+                    next[at] = open;
+                    if at < text.len() && !crosses_slash && text[at] == b'/' {
+                        open = false;
+                    }
+                }
+            }
+        }
+        reachable = next;
+    }
+    reachable[text.len()]
 }
 
 /// A pattern with a slash matches the end of the path, one without matches the file name.
@@ -110,7 +172,7 @@ impl KubeExplorer {
                 host::notify(
                     NotificationLevel::Info,
                     "Telepresence",
-                    "Allow the optional process:telepresence capability to run telepresence from here.",
+                    &ui_kit::denied::message("Running Telepresence", "process:telepresence", "Kube Explorer"),
                 );
                 Ok(())
             }
@@ -143,6 +205,18 @@ mod tests {
         assert!(!matches_glob("ci/*.yml", "/p/ci/sub/build.yml"));
         assert!(!matches_glob("*.tpl.yaml", "/p/a/b.yaml"));
         assert!(matches_glob("docker-compose?.yml", "/p/docker-compose2.yml"));
+    }
+
+    #[test]
+    fn glob_match_many_stars_fast() {
+        let pattern = "*a".repeat(7) + "b";
+        let text = "a".repeat(30);
+        let started = std::time::Instant::now();
+        assert!(!glob_match(pattern.as_bytes(), text.as_bytes()));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50), "{:?}", started.elapsed());
+        assert!(glob_match(b"**/x*y", b"p/x/xzy"));
+        assert!(glob_match(b"a/**/b", b"a/b"));
+        assert!(!glob_match(b"*a", b"/a"));
     }
 
     #[test]
