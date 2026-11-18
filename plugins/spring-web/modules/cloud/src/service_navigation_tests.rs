@@ -128,6 +128,8 @@ fn unknown_or_conflicting_module_identity_is_not_silently_excluded() {
         ("application.yaml", "spring.application.name: admin\n---\nspring.application.name: users\n"),
         ("application.yaml", "spring.application.name: admin\nspring.config.activate.on-profile: prod\n"),
         ("application-dev.yaml", "spring: {application: {name: users}}\n"),
+        ("application-dev.yaml", "{spring: {application: {name: users}}}\n"),
+        ("application.yaml", "# shared\n{spring: {application: {name: admin}}}\n"),
         ("application-dev.yaml", "spring:\n  application: *shared\n"),
     ] {
         let (host, mut tools, doc) = setup();

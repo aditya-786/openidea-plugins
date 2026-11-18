@@ -66,7 +66,10 @@ impl Config {
             || text.lines().any(|l| {
                 let l = l.trim();
                 matches!(l, "---" | "..." | "#---" | "!---") || l.starts_with("--- ") || l.contains("<<:")
-            });
+            })
+            // A YAML document written as one flow mapping or sequence isn't read by the key parser.
+            || (!file.ends_with(".properties")
+                && text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).is_some_and(|l| l.starts_with(['{', '['])));
         let mut result = Self { unresolved, ..Self::default() };
         for key in &names {
             if valid_name(&key.value) {
